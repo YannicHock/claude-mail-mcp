@@ -97,6 +97,14 @@ export function verifyAssertion(
  * Every failure answers the same 401 with the same body. Telling the caller whether
  * the signature, the expiry or the path was wrong would help nobody who is supposed
  * to be here.
+ *
+ * Depends on `req.path` being the full path the OAuth layer signed as `htu` (e.g.
+ * `/settings/mailboxes/work`). That only holds if the settings router is mounted at
+ * `/` with routes declared at their full path — mounting it at a prefix (e.g.
+ * `/settings`, with routes declared relative to it) strips that prefix from
+ * `req.path` and every assertion here starts failing closed with 401s and no other
+ * signal. Do not "fix" that by reading `req.baseUrl`/`req.originalUrl` instead —
+ * mount the router at `/`.
  */
 export function requireSettingsAssertion(opts: {
   key: string;
@@ -105,6 +113,10 @@ export function requireSettingsAssertion(opts: {
 }): RequestHandler {
   const key = new TextEncoder().encode(opts.key);
   return (req, res, next) => {
+    // req.header() cannot hand us an array here: @types/express special-cases only
+    // set-cookie as string[], and Node joins a repeated header's values with ", ",
+    // so a duplicated x-settings-assertion just degrades to a string that fails the
+    // MAC check below.
     const header = req.header(ASSERTION_HEADER);
     const verified =
       header === undefined
