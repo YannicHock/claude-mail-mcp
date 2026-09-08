@@ -57,7 +57,7 @@ chgrp mailmcp /var/www/mail-mcp/.env
 chmod 640 /var/www/mail-mcp/.env
 ```
 
-If you build or deploy an OAuth shim (see step 7, Option B below — none ships in this repository) and it authenticates against an htpasswd file, give its service user group-read access:
+The OAuth layer under `oauth/` (see step 7, Option B below) authenticates the operator against a scrypt hash, not htpasswd, so it needs no such grant. If you run a *different* front end that does authenticate against an htpasswd file, give its service user group-read access:
 
 ```bash
 chgrp mailmcp /etc/nginx/.htpasswd_mail
@@ -299,17 +299,17 @@ certbot --nginx -d mcp-mail.example.com
 
 ### Option B — claude.ai web (OAuth 2.1 + DCR)
 
-claude.ai will only connect to remote MCP servers that advertise OAuth 2.1 discovery, and this server only speaks plain Bearer auth. **This is an open point, not a shipped component: no OAuth shim is bundled with or referenced by this repository.** To use claude.ai's web/mobile client (as opposed to Claude Desktop, Option A above) you have to build or source that OAuth 2.1 + DCR + PKCE layer yourself and run it in front of the connector.
+claude.ai will only connect to remote MCP servers that advertise OAuth 2.1 discovery, and this connector only speaks plain Bearer auth. **That layer ships in this repository, under `oauth/`** — it is a separate service, deployed alongside the connector by `docker-compose.yml`, and it is the only one of the two reachable from the internet.
 
-At minimum, that layer needs to:
-- Implement `/.well-known/oauth-authorization-server`, `/authorize`, `/token`, `/register`, `/jwks.json`
-- Validate Claude's PKCE flow + Dynamic Client Registration
-- Forward `/mcp` traffic to this connector with the upstream `AUTH_TOKEN` Bearer header injected
-- Authenticate the human in `/authorize` (an htpasswd file is one option)
+It implements:
+- `/.well-known/oauth-authorization-server` and `/.well-known/oauth-protected-resource`, `/authorize`, `/token`, `/register`
+- Claude's PKCE flow and Dynamic Client Registration
+- `/mcp` forwarding to this connector with the upstream `AUTH_TOKEN` substituted in
+- A sign-in page for the human at `/authorize`, backed by a scrypt password hash
 
-Until you have one running, use **Option A (Claude Desktop)** above — it talks to this server's Bearer auth directly and needs no OAuth layer at all.
+If you only use Claude Desktop, you do not need it: **Option A** above talks to this connector's Bearer auth directly.
 
-Once you have an OAuth shim of your own in front:
+With the OAuth layer running in front:
 
 1. claude.ai → **Settings → Connectors → Add custom connector**
 2. URL: `https://mcp-mail.example.com/mcp` (the shim's public URL)
@@ -441,7 +441,7 @@ The `data/` directory itself keeps its default mode (`755`) — uid 100 only nee
 to traverse it, and the directory name carries no secret. If `chown` reports
 "Operation not permitted", you are not root: prefix both commands with `sudo`.
 
-`docker-compose.yml` bind-mounts `./data` read-only at `/data` inside the container. The backend picks up edits to `data/accounts.json` via `fs.watch` — no restart needed, same behavior as the systemd deployment's `accounts.json`.
+`docker-compose.yml` bind-mounts `./data` at `/data` inside the container, writable — the connector writes `accounts.json` itself when the settings UI is enabled (see step 6 below). The backend picks up edits to `data/accounts.json` via `fs.watch` — no restart needed, same behavior as the systemd deployment's `accounts.json`.
 
 > Hot reload relies on inotify events crossing the bind mount, which they do on a Linux host — the deployment this document describes. They do **not** cross a Docker Desktop bind mount on Windows or macOS: the container reads the updated file correctly, but no watch event ever fires, so the running process keeps the accounts it started with. If you develop on one of those, `docker compose restart` after editing `accounts.json`.
 
@@ -457,15 +457,96 @@ curl http://127.0.0.1:3220/health
 
 ### 5. Reverse proxy and adding to Claude
 
-Same as steps 6 and 7 above: nginx terminates TLS on the public hostname and proxies to `http://127.0.0.1:3220`. Option A (Claude Desktop, Bearer auth) works as soon as the container is reachable through nginx; Option B (claude.ai web) still needs the OAuth 2.1 shim discussed there — none ships with this repository, container or not.
+Same as steps 6 and 7 above: nginx terminates TLS on the public hostname and proxies to `http://127.0.0.1:3220`. Option A (Claude Desktop, Bearer auth) works as soon as the container is reachable through nginx; Option B (claude.ai web) uses the `mail-oauth` service that `docker-compose.yml` already brings up — point nginx at `127.0.0.1:8080` for the public hostname instead, and leave the connector unreachable from outside.
 
-### 6. Updating
+### 6. Enable the settings UI (optional)
+
+Without this, the connector behaves exactly as it did before the UI existed: the
+routes are not mounted at all, and `accounts.json` stays a file you edit by hand.
+With it, mailboxes are added, tested, edited and removed from the browser, and
+connected Claude clients can be reviewed and revoked.
+
+The UI is served from the **OAuth layer's public origin**, not from the connector.
+The connector's own `/settings` routes are reachable only on the internal Docker
+network, and only with a signed assertion from the OAuth layer — so this step
+assumes the `mail-oauth` service above is running.
+
+**Generate the shared signing key.** Both services mount the *same* file. It is what
+lets the connector trust that a settings request really came from the OAuth layer:
+
+```bash
+mkdir -p secrets
+openssl rand -base64 48 > secrets/settings_signing_key.txt
+chmod 600 secrets/settings_signing_key.txt
+```
+
+`secrets/` is already in `.gitignore`. Never commit this file. `docker-compose.yml`
+wires it into both services as `SETTINGS_SIGNING_KEY_FILE=/run/secrets/settings_signing_key`.
+Without it the connector does not mount its settings routes and the OAuth layer does
+not mount the UI — the feature is off, not half-on.
+
+**Make the data directory writable.** The connector now writes `accounts.json`:
+
+```bash
+sudo chown -R 100:101 data
+sudo chmod 700 data
+sudo chmod 600 data/accounts.json   # if the file already exists
+```
+
+Both the directory *and* the file. Saving writes a temp file next to `accounts.json`
+and renames it into place, which needs write permission on the **directory**. Getting
+this wrong produces an `EACCES` on the first save from the browser — not at startup,
+so a healthy-looking container still fails the first time someone adds a mailbox.
+
+**Make `PUBLIC_URL` identical in both services.** `.env` (connector) and `.env.oauth`
+(OAuth layer) must carry the same value:
+
+```bash
+grep PUBLIC_URL .env .env.oauth
+# both must print the same host, e.g. https://mail-mcp.example.com
+```
+
+It is the assertion's `iss` claim and both sides compare it. A mismatch makes every
+settings request fail closed with `401`, and the only trace is a
+`rejected settings request` line in the connector's log. Nothing else breaks — `/mcp`
+keeps working — which is what makes this one hard to spot.
+
+**Know where the operator password lives now.** `AUTH_PASSWORD_HASH` (or
+`AUTH_PASSWORD_HASH_FILE`) *seeds* the operator record once, on first start. After
+that the live value lives in `oauth-data/operator.json`, because `/run/secrets` is
+mounted read-only and a password change has to be able to write somewhere.
+
+The consequence worth knowing before it costs you an evening: **editing the secret
+later has no effect.** The service logs which source is live at startup and warns by
+name when the stored hash differs from the secret. Set `OPERATOR_FILE=none` in
+`.env.oauth` to restore the old behaviour — hash from the secret only, password
+change disabled.
+
+**Start it and sign in.**
+
+```bash
+docker compose up -d
+```
+
+Open `https://<your PUBLIC_URL>/settings` and sign in with `AUTH_USERNAME` and the
+password you hashed earlier. From there:
+
+- `/settings/mailboxes` — add, test, edit and remove mailboxes
+- `/settings/clients` — review and revoke connected Claude clients
+- `/settings/password` — change the operator password
+
+The sign-in shares its rate limit with the `/authorize` consent screen, deliberately:
+both guard the same credential. Five failed attempts lock **both** for fifteen
+minutes, so a failed settings login also blocks connecting a new Claude client during
+that window.
+
+### 7. Updating
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-### 7. Operational notes
+### 8. Operational notes
 
 Same as the systemd operational notes above (`AUTH_TOKEN` rotation, `/health` monitoring), plus: back up `.env` and `data/accounts.json` — the latter holds every mailbox credential and is not recoverable from anywhere else. `docker-compose.test.yml` in the repo is unrelated to this deployment; it only exists to give the integration test suite (`npm run test:integration`) a disposable mail server to talk to.
