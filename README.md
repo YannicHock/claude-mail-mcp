@@ -104,7 +104,9 @@ curl http://localhost:3220/health
 
 ## Run with Docker
 
-CI builds a multi-arch (amd64/arm64) image and pushes it to `ghcr.io/yannichock/claude-mail-mcp` on every push to `main` and on version tags. The package is newly created and not guaranteed to be public — if `docker pull` gets rejected, `docker login ghcr.io` first with a GitHub token that has `read:packages`.
+Two multi-arch (amd64/arm64) images are published to GHCR: `ghcr.io/yannichock/claude-mail-mcp` and `ghcr.io/yannichock/claude-mail-mcp-oauth`. A push to `main` publishes them tagged `sha-<short>` and nothing else; a `v*` tag publishes `X.Y.Z` and moves `latest`. So **`:latest` always names a release**, and `sha-<short>` is how you run an unreleased commit — it names one commit and can never move. Both images carry a build-provenance attestation, checkable with `gh attestation verify --owner YannicHock oci://ghcr.io/yannichock/claude-mail-mcp:latest`.
+
+The package is newly created and not guaranteed to be public — if `docker pull` gets rejected, `docker login ghcr.io` first with a GitHub token that has `read:packages`.
 
 Either path needs the same two things as the Quick start above: an `AUTH_TOKEN` and an `accounts.json` (an empty one is fine to boot with).
 
@@ -251,7 +253,9 @@ npm test            # alias for test:unit
 npm run test:integration
 ```
 
-CI runs typecheck (`tsc --noEmit`), the unit suite and the integration suite on every push and pull request, plus a Docker build smoke test (build only, no push) so a broken `Dockerfile` fails the PR instead of only surfacing at release time. A release build (multi-arch, pushed to GHCR) only runs after that same test suite passes in the same workflow run.
+CI runs typecheck (`tsc --noEmit`), the unit suite and the integration suite for both packages on every pull request and every push to `main`, alongside `scripts/check-versions.sh` — which fails the run if the eight places this repository states its version stop agreeing. A pull request also builds both images without pushing, so a broken `Dockerfile` fails the PR rather than surfacing at release time.
+
+Releases are cut by pushing a `v*` tag. That runs the same suite, re-runs the version check with the tag as the expected value, publishes both images, and creates the GitHub release from the matching `## [x.y.z]` section of [`CHANGELOG.md`](CHANGELOG.md) — so a tag whose version the tree does not carry, or that has no changelog section, fails before anything is built. Run `scripts/check-versions.sh v0.5.0` yourself before tagging to find that out sooner.
 
 ---
 

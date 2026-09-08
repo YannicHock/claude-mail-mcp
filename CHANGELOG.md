@@ -2,6 +2,22 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Release pipeline. No runtime behavior changes.
+
+### Changed
+
+- **`main` and version tags now have separate pipelines.** `ci.yml` owns branches: it runs the suite and, on `main`, publishes both images tagged `sha-<short>` and nothing else. `release.yml` triggers only on `v*` and owns `X.Y.Z` and `latest`. Previously both workflows triggered on `main`, so every push ran the whole suite twice and built both images three times over — and `latest` tracked the last merge rather than the last release. `:latest` now always names a release; `sha-<short>` is how an unreleased commit is run.
+- **The `{{major}}` and `{{major}}.{{minor}}` image tags are gone.** They came from `docker/metadata-action`'s example configuration, which encodes the convention of the official base images: independent consumers tracking a minor line and receiving patches without editing anything. Nothing in this repository referred to them — `docker-compose.yml`, the README and `docs/DEPLOYMENT.md` all use `latest`. For a 0.x project `0` also claims a compatibility line SemVer explicitly withholds. And moving tags are the only tags an older release can overwrite: pushing `v0.3.0` and `v0.4.0` together once left `0` pointing wherever the race landed, because the concurrency group is keyed per ref.
+
+### Added
+
+- **`scripts/check-versions.sh`** — fails when the eight places this repository states its version stop agreeing (`package.json`, `oauth/package.json`, both lockfiles at two positions each, and the `VERSION` constant in each `app.ts`). Given a tag it also requires the tree to match it and `CHANGELOG.md` to carry the matching `## [x.y.z]` section. Both workflows run it before anything is built; run it by hand before tagging.
+- **A GitHub release per tag**, with the matching CHANGELOG section as its body. Cut with the runner's preinstalled `gh` rather than a third-party action.
+- **Build provenance and an SBOM for every published image.** Provenance comes from `actions/attest-build-provenance` rather than buildx, which writes its attestations into the manifest index where registry interfaces show them as an `unknown/unknown` platform; verify with `gh attestation verify`.
+- **Every GitHub Action is pinned to a commit sha**, with the version in a trailing comment. A major-version tag is mutable by whoever controls the action's repository.
+
 ## [0.4.0] — 2026-09-08
 
 OAuth 2.1 authorization layer, so Claude's hosted surfaces can connect. No change to the connector's own behavior: Claude Desktop and Claude Code still talk to it directly with the static `AUTH_TOKEN` and need none of this.

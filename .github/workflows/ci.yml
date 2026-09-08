@@ -1,34 +1,141 @@
 name: CI
 
-# Runs on every push to main and on every pull request: typecheck, unit
-# tests, integration tests against GreenMail (via the shared _test.yml
-# workflow), and a Docker build smoke test so a broken Dockerfile fails
-# the PR instead of only being discovered at release time.
+# Pull requests and pushes to main.
+#
+# This workflow owns main outright. It runs the suite, checks the tree agrees with
+# itself about its version, and — on main only — publishes both images tagged with
+# the commit sha and nothing else.
+#
+# No `latest` and no version tag are published here. Those belong to a release, which
+# release.yml owns and a v* tag triggers. Between two releases the way to run main is
+# `sha-<short>`: it names exactly one commit and can never move.
+#
+# Until 2026-09-08 release.yml also triggered on main, so every push ran the whole
+# suite twice — once here, once there — and built both images three times over.
+# It no longer triggers on a branch at all.
+
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+
+# Read-only by default. The publishing job widens its own and nothing else does.
+permissions:
+  contents: read
 
 jobs:
+  versions:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Cheap, and it catches the failure that is most expensive to notice late: a
+      # tree whose eight version strings disagree. 0.3.0 and 0.4.0 both reached main
+      # while package.json read 0.2.1 and /health reported 0.2.1 to every caller.
+      - name: Check that every version string agrees
+        run: scripts/check-versions.sh
+
   test:
     name: Test
     permissions:
       contents: read
     uses: ./.github/workflows/_test.yml
 
-  docker-build:
-    name: Docker build smoke test
+  image:
+    name: Image — ${{ matrix.component }}
+    needs: [test, versions]
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Only used on main; a pull request never reaches the publishing steps, and a
+      # fork's token would not carry these anyway.
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      # One image failing to build should not hide whether the other one does.
+      fail-fast: false
+      matrix:
+        include:
+          # Image names are hardcoded lowercase rather than derived from
+          # github.repository ("YannicHock/claude-mail-mcp"): GHCR rejects uppercase
+          # in image references. They cannot come from workflow-level `env` either,
+          # which is not in scope while a matrix is evaluated.
+          - component: connector
+            image: ghcr.io/yannichock/claude-mail-mcp
+            context: .
+            file: Dockerfile
+            cache_scope: connector
+          # The OAuth layer is self-contained: its build context is oauth/, not the
+          # repository root, so nothing from the connector's tree can end up in it.
+          # That is also what makes a stray `import "../src/..."` fail here rather
+          # than in production.
+          - component: oauth
+            image: ghcr.io/yannichock/claude-mail-mcp-oauth
+            context: oauth
+            file: oauth/Dockerfile
+            cache_scope: oauth
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # No push here on purpose: this only proves the image still
-      # builds. Pushing to GHCR is release.yml's job, gated on tests.
-      - name: Build connector image
-        run: docker build -t claude-mail-mcp:ci-smoke-test .
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
-      - name: Build OAuth layer image
-        run: docker build -f oauth/Dockerfile -t claude-mail-mcp-oauth:ci-smoke-test oauth
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ matrix.image }}
+          # `latest=false` is not optional. The default flavor adds `latest`
+          # whenever any rule matches, which is the opposite of what this workflow
+          # is for: main must never claim to be the released version.
+          flavor: |
+            latest=false
+          tags: |
+            type=sha
+
+      - name: Build${{ github.event_name == 'push' && ' and push' || '' }}
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          # A pull request builds amd64 only. arm64 there runs under QEMU emulation
+          # and costs several minutes to prove something the release build proves
+          # properly; what a PR needs to know is whether the Dockerfile is still
+          # sound.
+          platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Provenance comes from actions/attest-build-provenance below instead of
+          # from buildx. Buildx writes its attestations as extra entries in the
+          # manifest index, where they surface in registry UIs as an
+          # `unknown/unknown` platform; the attestation action leaves the index
+          # alone and produces something `gh attestation verify` can check.
+          provenance: false
+          sbom: ${{ github.event_name == 'push' }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+
+      - name: Attest build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
