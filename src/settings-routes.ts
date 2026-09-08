@@ -183,7 +183,19 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
   const caldavUser = raw(body, "caldav.user");
 
   let caldav: CalDavCreds | undefined;
-  if (!removeCaldav && caldavUrl.trim() !== "") {
+  if (removeCaldav) {
+    // Explicit removal — caldav stays undefined below.
+  } else if (caldavUrl.trim() === "") {
+    if (existing?.caldav) {
+      // Clearing the URL field is not how a CalDAV block is removed — that is
+      // the "Remove CalDAV" checkbox above. Falling through to `undefined`
+      // here would silently drop the stored CalDAV username and password
+      // from accounts.json the moment the operator saves.
+      errors["caldav.url"] = 'Required — tick "Remove CalDAV" to remove it.';
+    }
+    // No existing CalDAV block and a blank URL: there was never a CalDAV
+    // block to begin with, which is not an error.
+  } else {
     if (caldavUser.trim() === "") {
       errors["caldav.user"] = "Required.";
     }
