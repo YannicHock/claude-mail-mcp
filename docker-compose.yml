@@ -87,8 +87,15 @@ services:
 #                        static token, which mail-oauth substitutes into every
 #                        proxied request and never sends to a client
 #   oauth_signing_key    openssl rand -base64 48
-#   auth_password_hash   docker compose run --rm --no-TTY mail-oauth \
-#                          node dist/hash-password.js > secrets/auth_password_hash.txt
+#   auth_password_hash   read -rs PW && printf '%s\n' "$PW" | \
+#                          docker compose run --rm -T --entrypoint node \
+#                          mail-oauth dist/hash-password.js \
+#                          > secrets/auth_password_hash.txt; unset PW
+#
+#                        The --entrypoint override is required: the image's
+#                        ENTRYPOINT is `node dist/index.js`, so a trailing
+#                        command is appended to it as arguments and starts the
+#                        server instead of the hashing tool.
 secrets:
   auth_token:
     file: ./secrets/auth_token.txt
