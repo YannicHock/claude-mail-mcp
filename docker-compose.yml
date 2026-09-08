@@ -32,21 +32,67 @@ services:
     # Healthcheck is inherited from the image's HEALTHCHECK instruction
     # (GET /health via a plain node http request — Alpine has no curl).
 
-    # -------------------------------------------------------------------
-    # Future: OAuth shim attachment point (claude.ai requires OAuth 2.1 +
-    # DCR discovery; see docs/DEPLOYMENT.md, "Option B — claude.ai web").
-    # The shim doesn't exist yet — this is only the anchor for wiring it
-    # in later as a second service, e.g.:
-    #
-    # oauth-shim:
-    #   image: <shim image, once published>
-    #   restart: unless-stopped
-    #   depends_on:
-    #     - mail-mcp
-    #   ports:
-    #     - "127.0.0.1:8080:8080"
-    #   environment:
-    #     UPSTREAM_MCP_URL: http://mail-mcp:3220
-    #   env_file:
-    #     - .env.oauth-shim
-    # -------------------------------------------------------------------
+  # ---------------------------------------------------------------------
+  # OAuth 2.1 layer. Only needed for claude.ai web and Cowork, which cannot
+  # send a custom Authorization header and require OAuth discovery instead.
+  # Claude Desktop talks to mail-mcp directly with the static AUTH_TOKEN and
+  # needs none of this — see docs/DEPLOYMENT.md, "Option A".
+  #
+  # Comment this service out if you only use Option A.
+  # ---------------------------------------------------------------------
+  mail-oauth:
+    image: ghcr.io/yannichock/claude-mail-mcp-oauth:latest
+    init: true
+    restart: unless-stopped
+    depends_on:
+      - mail-mcp
+    # WARNING — loopback only, for the same reason as mail-mcp above. If your
+    # TLS terminator runs in a container rather than on the host (Nginx Proxy
+    # Manager, Traefik, Caddy in Docker), it cannot reach the host's 127.0.0.1:
+    # drop this `ports` block entirely and put both services on the proxy's
+    # network instead. docs/DEPLOYMENT.md documents that variant, which
+    # publishes nothing to the host at all and is the tighter arrangement.
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Service name resolution on the compose network; mail-mcp is never
+      # reachable from outside it.
+      UPSTREAM_MCP_URL: http://mail-mcp:3220
+      UPSTREAM_AUTH_TOKEN_FILE: /run/secrets/auth_token
+      SIGNING_KEY_FILE: /run/secrets/oauth_signing_key
+      AUTH_PASSWORD_HASH_FILE: /run/secrets/auth_password_hash
+      STATE_FILE: /data/oauth-state.json
+    env_file:
+      # PUBLIC_URL, AUTH_USERNAME, LOG_LEVEL — copy from oauth/.env.example.
+      # Secrets belong in secrets/ below, not here: values set through env_file
+      # are visible in `docker inspect` and to anything that can read the
+      # container's environment.
+      - .env.oauth
+    secrets:
+      - auth_token
+      - oauth_signing_key
+      - auth_password_hash
+    volumes:
+      # Registered clients and live refresh sessions. Writable, unlike the
+      # connector's mount: losing it logs every Claude client out and forces
+      # re-registration.
+      - ./oauth-data:/data
+    # Healthcheck is inherited from the image's HEALTHCHECK instruction.
+
+# Docker file-secrets rather than environment variables: these are mounted read
+# only at /run/secrets/<name>, are not visible in `docker inspect`, and do not
+# end up in the process environment.
+#
+#   auth_token           the same value as AUTH_TOKEN in .env — the connector's
+#                        static token, which mail-oauth substitutes into every
+#                        proxied request and never sends to a client
+#   oauth_signing_key    openssl rand -base64 48
+#   auth_password_hash   docker compose run --rm --no-TTY mail-oauth \
+#                          node dist/hash-password.js > secrets/auth_password_hash.txt
+secrets:
+  auth_token:
+    file: ./secrets/auth_token.txt
+  oauth_signing_key:
+    file: ./secrets/oauth_signing_key.txt
+  auth_password_hash:
+    file: ./secrets/auth_password_hash.txt

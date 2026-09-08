@@ -1,0 +1,247 @@
+/**
+ * Configuration.
+ *
+ * Every secret can be supplied either directly (`NAME`) or as a path to a file
+ * holding it (`NAME_FILE`). The file form is what the deployment uses: the target
+ * host mounts Docker file-secrets under /run/secrets, matching how the other
+ * applications there are configured, and it keeps credentials out of `docker
+ * inspect` output and the process environment.
+ *
+ * Validation is strict and happens at startup. A service that sits in front of
+ * live mailboxes should refuse to run misconfigured rather than discover it on
+ * the first request — in particular, a missing signing key must never silently
+ * become a generated one, or every restart would log the operator out and, worse,
+ * make it impossible to tell a rotation from an attack.
+ */
+
+import { readFileSync } from "node:fs";
+
+import type { LogLevel } from "./logger.js";
+import { isValidHashFormat } from "./passwords.js";
+import {
+  HOSTED_CLAUDE_REDIRECT_URIS,
+  LOOPBACK_REDIRECT_URIS,
+  canonicalResource,
+  isTransportSafeRedirectUri,
+  normalisePublicUrl,
+} from "./urls.js";
+
+export interface OAuthConfig {
+  port: number;
+  host: string;
+  /** Issuer and public base URL, canonical, no trailing slash. */
+  issuer: string;
+  /** Path the MCP endpoint is served at, e.g. "/mcp". */
+  mcpPath: string;
+  /** Canonical resource identifier: issuer + mcpPath. */
+  resource: string;
+  /** Where to forward authenticated MCP traffic, e.g. http://mail-mcp:3220. */
+  upstreamMcpUrl: string;
+  /** The connector's static AUTH_TOKEN. Never leaves this process. */
+  upstreamAuthToken: string;
+  signingKey: Uint8Array;
+  authUsername: string;
+  authPasswordHash: string;
+  stateFile: string | null;
+  accessTokenTtl: number;
+  refreshTokenTtl: number;
+  redirectAllowlist: string[];
+  logLevel: LogLevel;
+}
+
+const LOG_LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];
+
+/** Minimum signing key length. 32 bytes matches the HS256 output size. */
+const MIN_SIGNING_KEY_BYTES = 32;
+
+export class ConfigError extends Error {}
+
+type Env = Record<string, string | undefined>;
+
+/**
+ * Read a value that may be given inline or as a file path.
+ *
+ * `NAME_FILE` wins when both are set, and an unreadable `NAME_FILE` is an error
+ * rather than a silent fallback to `NAME` — a typo in a secret mount should stop
+ * the service, not quietly downgrade it to whatever was in the environment.
+ */
+function readSecret(env: Env, name: string): string | undefined {
+  const filePath = env[`${name}_FILE`];
+  if (filePath && filePath.trim() !== "") {
+    try {
+      return readFileSync(filePath.trim(), "utf8").trim();
+    } catch (err) {
+      throw new ConfigError(
+        `Cannot read ${name}_FILE at ${filePath.trim()}: ` +
+          (err instanceof Error ? err.message : String(err))
+      );
+    }
+  }
+  const inline = env[name];
+  return inline && inline.trim() !== "" ? inline.trim() : undefined;
+}
+
+function required(env: Env, name: string): string {
+  const value = readSecret(env, name);
+  if (value === undefined) {
+    throw new ConfigError(
+      `Missing required configuration: ${name} (or ${name}_FILE). See oauth/.env.example.`
+    );
+  }
+  return value;
+}
+
+function optional(env: Env, name: string, fallback: string): string {
+  return readSecret(env, name) ?? fallback;
+}
+
+function integer(env: Env, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new ConfigError(`${name} must be a positive integer, got ${raw}.`);
+  }
+  return parsed;
+}
+
+function boolean(env: Env, name: string, fallback: boolean): boolean {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const normalised = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalised)) return true;
+  if (["0", "false", "no", "off"].includes(normalised)) return false;
+  throw new ConfigError(`${name} must be a boolean, got ${raw}.`);
+}
+
+export function loadConfig(env: Env = process.env): OAuthConfig {
+  const publicUrlRaw = required(env, "PUBLIC_URL");
+  let issuer: string;
+  try {
+    issuer = normalisePublicUrl(publicUrlRaw);
+  } catch (err) {
+    throw new ConfigError(
+      `PUBLIC_URL must be an absolute http(s) URL without a fragment: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+  if (!issuer.startsWith("https://") && !issuer.startsWith("http://localhost")) {
+    // Claude reaches this service over the public internet and OAuth 2.1 requires
+    // HTTPS for every authorization server endpoint. Plain http is tolerated only
+    // for a local development run.
+    throw new ConfigError(
+      `PUBLIC_URL must use https (got ${issuer}). TLS is terminated by the reverse proxy; ` +
+        `set PUBLIC_URL to the public https URL, not the internal one.`
+    );
+  }
+
+  const mcpPath = normaliseMcpPath(optional(env, "MCP_PATH", "/mcp"));
+  const resource = canonicalResource(`${issuer}${mcpPath}`);
+
+  const upstreamMcpUrl = optional(env, "UPSTREAM_MCP_URL", "http://mail-mcp:3220");
+  try {
+    const parsed = new URL(upstreamMcpUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("must be http or https");
+    }
+  } catch (err) {
+    throw new ConfigError(
+      `UPSTREAM_MCP_URL is not a usable URL (${upstreamMcpUrl}): ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+
+  const signingKeyRaw = required(env, "SIGNING_KEY");
+  const signingKey = new TextEncoder().encode(signingKeyRaw);
+  if (signingKey.length < MIN_SIGNING_KEY_BYTES) {
+    throw new ConfigError(
+      `SIGNING_KEY must be at least ${MIN_SIGNING_KEY_BYTES} bytes; got ${signingKey.length}. ` +
+        `Generate one with: openssl rand -base64 48`
+    );
+  }
+
+  const authPasswordHash = required(env, "AUTH_PASSWORD_HASH");
+  if (!isValidHashFormat(authPasswordHash)) {
+    throw new ConfigError(
+      "AUTH_PASSWORD_HASH is not a valid scrypt hash. Generate one with: npm run hash-password"
+    );
+  }
+
+  const logLevelRaw = optional(env, "LOG_LEVEL", "info");
+  if (!LOG_LEVELS.includes(logLevelRaw as LogLevel)) {
+    throw new ConfigError(
+      `LOG_LEVEL must be one of ${LOG_LEVELS.join(", ")}; got ${logLevelRaw}.`
+    );
+  }
+
+  const stateFileRaw = optional(env, "STATE_FILE", "/data/oauth-state.json");
+  const stateFile = stateFileRaw === "" || stateFileRaw === "none" ? null : stateFileRaw;
+
+  return {
+    port: integer(env, "PORT", 8080),
+    host: optional(env, "HOST", "0.0.0.0"),
+    issuer,
+    mcpPath,
+    resource,
+    upstreamMcpUrl: upstreamMcpUrl.replace(/\/+$/, ""),
+    upstreamAuthToken: required(env, "UPSTREAM_AUTH_TOKEN"),
+    signingKey,
+    authUsername: optional(env, "AUTH_USERNAME", "operator"),
+    authPasswordHash,
+    stateFile,
+    accessTokenTtl: integer(env, "ACCESS_TOKEN_TTL", 3600),
+    refreshTokenTtl: integer(env, "REFRESH_TOKEN_TTL", 30 * 24 * 3600),
+    redirectAllowlist: buildRedirectAllowlist(env),
+    logLevel: logLevelRaw as LogLevel,
+  };
+}
+
+/**
+ * The set of redirect URIs a client may register.
+ *
+ * Claude's two hosted callbacks are always present. Loopback support is off by
+ * default: it exists for Claude Code, which does not need this service at all
+ * (it can use the connector's static token directly), so enabling it would widen
+ * the allowlist for a client that has a simpler path available.
+ */
+function buildRedirectAllowlist(env: Env): string[] {
+  const allowlist: string[] = [...HOSTED_CLAUDE_REDIRECT_URIS];
+
+  if (boolean(env, "ALLOW_LOOPBACK_REDIRECT", false)) {
+    allowlist.push(...LOOPBACK_REDIRECT_URIS);
+  }
+
+  const extra = env.EXTRA_REDIRECT_URIS;
+  if (extra && extra.trim() !== "") {
+    for (const entry of extra.split(",").map((value) => value.trim())) {
+      if (entry === "") continue;
+      if (!isTransportSafeRedirectUri(entry)) {
+        throw new ConfigError(
+          `EXTRA_REDIRECT_URIS entry is not usable as a redirect URI: ${entry}. ` +
+            `Every entry must use https, or http on a loopback address.`
+        );
+      }
+      allowlist.push(entry);
+    }
+  }
+
+  return allowlist;
+}
+
+function normaliseMcpPath(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === "" || trimmed === "/") return "";
+  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/+$/, "");
+}
+
+/**
+ * The path segment appended to /.well-known/oauth-protected-resource for the
+ * path-suffixed variant Claude probes first. Empty when the MCP endpoint sits at
+ * the origin root, in which case only the bare well-known path applies.
+ */
+export function wellKnownSuffix(mcpPath: string): string {
+  return mcpPath;
+}

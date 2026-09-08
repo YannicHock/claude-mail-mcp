@@ -1,6 +1,12 @@
 node_modules
 dist
 .git
+# The OAuth layer is a separate package with its own Dockerfile and its own
+# build context (oauth/). Nothing from it belongs in the connector image, and
+# leaving it in the context would ship its node_modules across on every build.
+oauth
+secrets
+oauth-data
 .gitignore
 .env
 .env.*
