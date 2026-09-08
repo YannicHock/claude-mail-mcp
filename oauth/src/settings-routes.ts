@@ -122,7 +122,7 @@ export function requireSession(deps: SettingsDeps): express.RequestHandler {
 export function requireCsrf(deps: SettingsDeps): express.RequestHandler {
   const { config } = deps;
   return (req, res, next) => {
-    const session = res.locals.session as SessionClaims | undefined;
+    const session = res.locals.session;
     const sameOrigin = isSameOrigin(
       { origin: req.get("origin"), referer: req.get("referer") },
       config.issuer
@@ -149,7 +149,7 @@ export function requireCsrf(deps: SettingsDeps): express.RequestHandler {
  * doesn't require passing `res` around everywhere it's needed.
  */
 export function sessionOf(req: Request): SessionClaims {
-  return (req.res as Response).locals.session as SessionClaims;
+  return (req.res as Response).locals.session!;
 }
 
 /**
@@ -243,7 +243,8 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
     const ok = await operator.verify(username, password);
     if (!ok) {
       throttle.recordFailure(ip);
-      // Fixed shape: the fail2ban filter in docs/HARDENING.md matches this line.
+      // Fixed shape: this line is the deployment API for an external
+      // fail2ban-style jail (see docs/HARDENING.md); do not change it casually.
       log("warn", LOGIN_FAILURE_EVENT, { ip, endpoint: "settings" });
       sendSignIn(res, 401, "Incorrect username or password.");
       return;
@@ -392,7 +393,8 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
     const currentOk = await operator.verify(operator.username, currentPassword);
     if (!currentOk) {
       throttle.recordFailure(ip);
-      // Fixed shape: the fail2ban filter in docs/HARDENING.md matches this line.
+      // Fixed shape: this line is the deployment API for an external
+      // fail2ban-style jail (see docs/HARDENING.md); do not change it casually.
       log("warn", LOGIN_FAILURE_EVENT, { ip, endpoint: "settings-password" });
       res
         .status(401)

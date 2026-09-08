@@ -1,4 +1,4 @@
-﻿/**
+/**
  * The connector's operator-facing settings routes: list, create, edit, delete and
  * "make default" for mailbox accounts, plus a probe-only "test connection" action
  * on both the create and edit forms.
@@ -230,9 +230,10 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
   };
 }
 
-/** `ProbeReport` (probe.ts) and `ProbeReportView` (settings-pages.ts) were written
- * concurrently and declare the same shape independently; this is a structural,
- * no-op conversion now that both exist. */
+/** `ProbeReport` (probe.ts) and `ProbeReportView` (settings-pages.ts) declare
+ * the same shape independently rather than sharing a type, since
+ * settings-pages.ts must compile without importing probe.ts; this is a
+ * structural, no-op conversion between the two. */
 function toProbeView(report: ProbeReport): ProbeReportView {
   return { imap: report.imap, smtp: report.smtp, caldav: report.caldav };
 }

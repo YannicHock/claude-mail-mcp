@@ -36,13 +36,13 @@ export interface VerifiedAssertion {
 }
 
 // `res.locals` is otherwise untyped in this codebase, which leaves every read
-// site (here and in oauth/'s `res.locals.session`) relying on a cast that a
-// middleware-ordering mistake would not catch. This is the one open interface
-// @types/express ships specifically for this kind of augmentation (see
-// express-serve-static-core's `declare global { namespace Express { interface
-// Locals {} } }`) — declaring the field here means a route that reads
-// `res.locals.assertion` before `requireSettingsAssertion` has run gets a
-// compile-time `| undefined`, not a silent `any`.
+// site relying on a cast that a middleware-ordering mistake would not catch.
+// This is the one open interface @types/express ships specifically for this
+// kind of augmentation (see express-serve-static-core's `declare global {
+// namespace Express { interface Locals {} } }`) — declaring the field here
+// means a route that reads `res.locals.assertion` before
+// `requireSettingsAssertion` has run gets a compile-time `| undefined`, not a
+// silent `any`. Mirrored for `res.locals.session` in oauth/src/session.ts.
 declare global {
   namespace Express {
     interface Locals {

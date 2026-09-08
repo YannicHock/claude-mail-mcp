@@ -37,6 +37,22 @@ export interface SessionClaims {
   epoch: number;
 }
 
+// `res.locals` is otherwise untyped in this codebase, which leaves every read
+// site relying on a cast that a middleware-ordering mistake would not catch.
+// This is the one open interface @types/express ships specifically for this
+// kind of augmentation (see express-serve-static-core's `declare global {
+// namespace Express { interface Locals {} } }`) — declaring the field here
+// means a route that reads `res.locals.session` before `requireSession` has
+// run gets a compile-time `| undefined`, not a silent `any`. Mirrors the same
+// augmentation for `res.locals.assertion` in src/settings-assertion.ts.
+declare global {
+  namespace Express {
+    interface Locals {
+      session?: SessionClaims;
+    }
+  }
+}
+
 /** Mint claims for a newly authenticated operator. Never called before sign-in succeeds. */
 export function newSession(username: string, epoch: number): SessionClaims {
   return {

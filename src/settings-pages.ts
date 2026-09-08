@@ -2,7 +2,7 @@
  * Rendering for the mailbox settings pages — the list and the editor form.
  *
  * Pure functions: plain data in, an HTML string out. No I/O, no Express — that
- * lives in the router that mounts these (task 14). Every interaction is a form
+ * lives in settings-routes.ts, which mounts these. Every interaction is a form
  * submission; nothing here emits a `<script>` tag, an inline `on…=` handler, or a
  * `javascript:` URL, matching the no-JavaScript, no-build-step rule that governs
  * every settings page.
@@ -24,10 +24,10 @@
 import type { Account } from "./accounts.js";
 
 /**
- * Mirrors `ProbeReport` from `./probe.ts`, which is being written in parallel and
- * is not present in this file's dependency graph. Declared locally and
- * structurally so this module compiles standalone; the router that joins the two
- * (task 14) can pass a real `ProbeReport` here because the shapes match.
+ * Mirrors `ProbeReport` from `./probe.ts`, which is not present in this file's
+ * dependency graph. Declared locally and structurally so this module compiles
+ * standalone; settings-routes.ts, which imports both, passes a real
+ * `ProbeReport` here because the shapes match.
  */
 export interface ProbeResultView {
   ok: boolean;
@@ -265,7 +265,8 @@ ${notice}
 ${rows}
 </tbody>
 </table>
-<a href="/settings/mailboxes/new">Add mailbox</a>`;
+<a href="/settings/mailboxes/new">Add mailbox</a>
+<p><a href="/settings">Back to settings</a></p>`;
 
   return page("Mailboxes", body);
 }
@@ -451,7 +452,8 @@ ${probeSectionHtml(opts.probe)}
   <button type="submit" formaction="${escapeHtml(testPath)}" name="_action" value="test">
     Test connection
   </button>
-</form>`;
+</form>
+<p><a href="/settings">Back to settings</a></p>`;
 
   return page(isNew ? "Add mailbox" : "Edit mailbox", body);
 }

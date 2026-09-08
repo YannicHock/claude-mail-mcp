@@ -7,9 +7,10 @@
  * oversight — see docs/HARDENING.md — and it is why these functions take plain data
  * and return a string, with no DOM, no template engine and no build step involved.
  *
- * These functions are pure: no I/O, no Express. The routes that call them (task 6
- * and task 9) are responsible for authentication, CSRF verification and talking to
- * the connector; this file only ever turns already-validated data into markup.
+ * These functions are pure: no I/O, no Express. The routes in settings-routes.ts
+ * that call them are responsible for authentication, CSRF verification and
+ * talking to the connector; this file only ever turns already-validated data
+ * into markup.
  */
 
 import { escapeHtml } from "./login.js";
@@ -277,7 +278,8 @@ export function renderClients(opts: ClientsData): string {
   <form method="post" action="/settings/clients/revoke-all">
     ${csrfField(opts.csrf)}
     <button type="submit">Revoke everything</button>
-  </form>`;
+  </form>
+  <p><a href="/settings">Back to settings</a></p>`;
 
   return page("Connected clients", body);
 }

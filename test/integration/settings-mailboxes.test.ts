@@ -399,10 +399,10 @@ test("an oversized settings form body gets a clean JSON 4xx, not an HTML error p
 });
 
 /**
- * Extra coverage beyond the brief's eleven cases: mounting the settings router
- * (scoped bearerAuth on /settings, the router itself at "/") must not change
- * the 404 behaviour of every other path — see the "bearer check must not
- * become a global" decision this task was handed.
+ * Mounting the settings router (scoped bearerAuth on /settings, the router
+ * itself at "/") must not change the 404 behaviour of every other path — the
+ * bearer check that already gated /mcp must stay scoped to the paths it
+ * covered before, not become a global gate over the whole app.
  */
 test("an unrelated unknown path still 404s exactly as before, with the settings router mounted", async () => {
   const { url, close } = await startConnector();

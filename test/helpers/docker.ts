@@ -16,14 +16,12 @@
  * makes that a real problem the moment two files here both own the
  * lifecycle: package.json's `test:integration` script passes
  * `--test-concurrency=1` specifically to serialize integration test files
- * for this reason (see the task-12 fix-round report in
- * .superpowers/sdd/2026-09-08-settings-ui/ for how this was found — running
- * mail-server.test.ts and probe.test.ts together without it produced
- * ECONNREFUSED/"Connection not available" failures in whichever file's
- * `before()` lost the race). That flag is a real fix, not a workaround to
- * later remove — but it does mean adding a third Docker-backed integration
- * file costs every other one a little more wall-clock time, serialized
- * rather than parallel.
+ * for this reason — running mail-server.test.ts and probe.test.ts together
+ * without it produced ECONNREFUSED/"Connection not available" failures in
+ * whichever file's `before()` lost the race. That flag is a real fix, not a
+ * workaround to later remove — but it does mean adding a third Docker-backed
+ * integration file costs every other one a little more wall-clock time,
+ * serialized rather than parallel.
  *
  * The flag could be dropped only if this file's lifecycle became actually
  * shared-safe: e.g. genuine cross-process reference counting (a lockfile

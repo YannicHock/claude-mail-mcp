@@ -59,8 +59,8 @@ export interface StoreData {
    * Bumped whenever the operator revokes every connected client at once. Access
    * tokens are stateless JWTs and carry the epoch that was current when they were
    * issued; a token whose epoch is behind this one is rejected even though it has
-   * not expired on its own. See Task 8, which is what actually reads this to
-   * reject a token.
+   * not expired on its own. tokens.ts's access-token verification is what actually
+   * reads this to reject a token.
    */
   tokenEpoch: number;
 }
@@ -171,8 +171,8 @@ export class Store {
 
   /**
    * Revoke every connected client at once: bump the token epoch so already-issued
-   * access tokens stop working (Task 8 checks this), clear every refresh session,
-   * and mark every client record revoked.
+   * access tokens stop working (tokens.ts's access-token verification checks
+   * this), clear every refresh session, and mark every client record revoked.
    */
   revokeEverything(at: number): void {
     this.#data.tokenEpoch += 1;
@@ -303,7 +303,7 @@ function parseData(raw: string): StoreData | null {
   // than rejecting the file — quarantining it would log every connected Claude
   // client out on upgrade. Negative is out of the field's domain (an epoch
   // counter never goes backward), so it is sanitized to zero too rather than
-  // carried through into the comparison Task 8 builds revocation on.
+  // carried through into the comparison tokens.ts builds revocation on.
   const tokenEpoch =
     typeof candidate.tokenEpoch === "number" &&
     Number.isInteger(candidate.tokenEpoch) &&

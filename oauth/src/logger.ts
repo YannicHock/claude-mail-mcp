@@ -27,8 +27,10 @@ const LEVELS: Record<LogLevel, number> = {
 };
 
 /**
- * The message a failed login logs. The fail2ban filter documented in
- * docs/HARDENING.md matches on this string plus the `ip` field; keep them in sync.
+ * The message a failed login logs. This string plus the `ip` field is the
+ * deployment API for an external fail2ban-style jail (see docs/HARDENING.md,
+ * which documents the shape but ships no filter of its own) — an operator's
+ * jail may already be matching on it, so its shape must not change casually.
  */
 export const LOGIN_FAILURE_EVENT = "login failed";
 
