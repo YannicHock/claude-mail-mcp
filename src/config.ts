@@ -47,9 +47,15 @@ export const config = {
     | "error",
 
   /**
-   * Path to the multi-account credentials file managed by the OAuth shim's
-   * /settings UI. Default suits the published deployment recipe; OSS users
-   * can override.
+   * Path to the multi-account credentials file (see src/accounts.ts). Created
+   * by hand — no setup UI ships with this repository.
+   *
+   * Every documented deployment sets this explicitly: .env.example points at
+   * /var/lib/mail-mcp/accounts.json for the systemd path, and the Dockerfile
+   * and docker-compose.yml both pin /data/accounts.json for the container.
+   * The fallback below is only reached by running the binary with neither, and
+   * is kept for backwards compatibility with pre-0.2.1 installs; prefer to set
+   * ACCOUNTS_FILE. See docs/DEPLOYMENT.md.
    */
   accountsFile: optional(
     "ACCOUNTS_FILE",
@@ -58,8 +64,8 @@ export const config = {
 
   /**
    * Bearer token a client must present in the Authorization header when
-   * calling /mcp. The OAuth shim injects this on behalf of the user after
-   * verifying their token.
+   * calling /mcp — the only thing gating that endpoint. Required: the process
+   * refuses to start without it.
    */
   authToken: required("AUTH_TOKEN"),
   publicUrl: optional("PUBLIC_URL", "http://localhost:3220"),

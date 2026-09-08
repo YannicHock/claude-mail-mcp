@@ -1,11 +1,12 @@
 /**
  * Accounts store — multi-account credential management.
  *
- * Replaces the single-account .env approach from v0.1. Accounts live in a
- * JSON file (default: /root/.config/mail-mcp/accounts.json) that is written
- * by the OAuth shim's /settings UI. The backend reads the file on startup
- * and re-reads it whenever the file changes (fs.watch), so credentials can
- * be added or rotated without restarting the server.
+ * Replaces the single-account .env approach from v0.1. Accounts live in a JSON
+ * file whose path comes from ACCOUNTS_FILE — /var/lib/mail-mcp/accounts.json
+ * for the systemd deployment, /data/accounts.json in the container. You write
+ * it by hand; no setup UI ships with this repository. The backend reads the
+ * file on startup and re-reads it whenever the file changes (fs.watch), so
+ * credentials can be added or rotated without restarting the server.
  *
  * File format (version 1):
  *   {
@@ -23,8 +24,9 @@
  *     ]
  *   }
  *
- * Storage security: the file is expected to be chmod 600 and live on a
- * partition the systemd unit's ProtectSystem= can write to. No app-level
+ * Storage security: the file is expected to be chmod 600, owned by the user
+ * the server runs as, and to live on a partition the systemd unit's
+ * ProtectSystem= can write to. No app-level
  * encryption — filesystem perms + systemd hardening are the security
  * boundary. (This matches how SSH keys, GPG keys and most service-credential
  * files are handled.)

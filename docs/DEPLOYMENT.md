@@ -1,6 +1,6 @@
 # Deployment
 
-A typical production deployment behind nginx with pm2 as the process manager. Adapt to your stack as needed.
+A typical production deployment behind nginx, running under a hardened systemd unit. Adapt to your stack as needed. There is also a [container deployment](#container-deployment-docker) further down, and a pm2 config in the repository for local development only — pm2 is not recommended for production and gets none of the systemd isolation below.
 
 ## Requirements
 
@@ -204,7 +204,11 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    # `listen ... http2` has been deprecated since nginx 1.25.1; HTTP/2 is a
+    # server-level directive now. On nginx < 1.25.1, use `listen 443 ssl http2;`
+    # and drop this line.
+    http2 on;
     server_name mcp-mail.example.com;
 
     ssl_certificate     /etc/letsencrypt/live/mcp-mail.example.com/fullchain.pem;
@@ -314,7 +318,15 @@ Once you have an OAuth shim of your own in front:
 ```bash
 # health
 curl https://mcp-mail.example.com/health
-# → {"status":"ok",…,"caldav_enabled":true}
+# → {"status":"ok","server":"claude-mail-mcp","version":"0.2.1",
+#    "accounts":[{"id":"main","label":"Main","default":true,
+#                 "smtp_from":"you@example.com","imap_host":"imap.mailbox.org",
+#                 "caldav_enabled":false}],
+#    "accounts_file":"/var/lib/mail-mcp/accounts.json"}
+#
+# Note `caldav_enabled` is per account, inside accounts[] — there is no
+# top-level field of that name. `accounts` is [] when none are configured,
+# and the endpoint still answers 200 in that state.
 
 # unauthenticated request should be rejected
 curl -i -X POST https://mcp-mail.example.com/mcp -H 'Content-Type: application/json' -d '{}'
@@ -345,9 +357,9 @@ systemctl restart claude-mail-mcp.service
 
 **Credentials.** Rotate `AUTH_TOKEN` periodically. If you use an app-specific password (Gmail, iCloud, Fastmail), revoke it from the provider's UI when the connector is decommissioned.
 
-**Backup.** The service is stateless. Just keep `.env` safe.
+**Backup.** The service is **not** stateless: `/var/lib/mail-mcp/accounts.json` holds every mailbox credential, and losing it means re-entering all of them by hand. Back up that directory *and* `.env` (which holds `AUTH_TOKEN`), encrypted at rest — `restic`, `borgbackup` or a `tar | gpg` pipeline. See [HARDENING.md](HARDENING.md#backup-strategy).
 
-**Monitoring.** Hit `/health` from your uptime checker. Alert on non-200 responses or pm2 restart loops. The endpoint also reports `caldav_enabled` so you can detect misconfiguration.
+**Monitoring.** Hit `/health` from your uptime checker and alert on non-200 responses. Under systemd, also alert on restart loops (`systemctl show -p NRestarts claude-mail-mcp.service`); under Docker, on the container's health status. To catch a silently empty configuration, assert that `accounts` in the response is a non-empty array — the endpoint returns 200 with `"accounts":[]` when the credentials file is missing, so a plain status check would not notice. Per-account CalDAV configuration shows up as `caldav_enabled` *inside* each `accounts[]` entry.
 
 **Connection idle.** The IMAP connection auto-reconnects on demand. If your provider closes idle connections aggressively (some do after 10 minutes), the next tool call simply reopens the socket.
 
@@ -450,4 +462,4 @@ docker compose up -d
 
 ### 7. Operational notes
 
-Same as the systemd operational notes above (`AUTH_TOKEN` rotation, `/health` monitoring), plus: the container is stateless like the systemd process — back up `.env` and `data/accounts.json`. `docker-compose.test.yml` in the repo is unrelated to this deployment; it only exists to give the integration test suite (`npm run test:integration`) a disposable mail server to talk to.
+Same as the systemd operational notes above (`AUTH_TOKEN` rotation, `/health` monitoring), plus: back up `.env` and `data/accounts.json` — the latter holds every mailbox credential and is not recoverable from anywhere else. `docker-compose.test.yml` in the repo is unrelated to this deployment; it only exists to give the integration test suite (`npm run test:integration`) a disposable mail server to talk to.

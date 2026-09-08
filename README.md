@@ -51,8 +51,8 @@ Every tool accepts an optional `account: "<id>"` parameter to pick a mailbox; om
 
 Hosted email-AI services need full mailbox access. That's a lot of trust to hand to a vendor. This connector flips the model: **you run it, you hold the credentials, no third party between Claude and your inbox**.
 
-- One Node process per mailbox
-- Credentials in a single `.env` file
+- One Node process for all your mailboxes
+- Credentials in a single `accounts.json` you own, on your own disk
 - One Bearer token gates every MCP call
 - Add the URL to Claude.ai once, done
 
@@ -212,15 +212,18 @@ Claude.ai (web) isn't in this diagram: it needs an OAuth 2.1 layer between itsel
 
 See **[SECURITY.md](SECURITY.md)** for the threat model and **[docs/HARDENING.md](docs/HARDENING.md)** for the full operator checklist.
 
-Defaults in one sentence: TLS via Let's Encrypt + HSTS/security headers + a rate-limited static Bearer token + non-root systemd unit with `ProtectSystem=strict` + loopback-only binding + credentials chmod 600 owned by a dedicated `mailmcp` user. **No OAuth, no sessions, and no `/settings` route ship with this repository** — see below.
+In one sentence: TLS via Let's Encrypt + HSTS/security headers + a rate-limited static Bearer token + loopback-only binding + a credentials file readable only by the service. **No OAuth, no sessions, and no `/settings` route ship with this repository** — see below.
 
 ### Quick summary
 
+The transport, auth, network and output rows below apply to **both** deployments. The **process** and **storage** rows describe the **systemd** deployment in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) specifically — `ProtectSystem=strict`, `ProtectHome`, `SystemCallFilter` and `MemoryMax` are systemd unit settings and have no equivalent in the Docker path, which gets its isolation from the container runtime instead. Each row says which.
+
 - **Transport:** TLS 1.3 (Let's Encrypt, auto-renew), HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex` — delivered by the nginx config in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - **Auth:** `/mcp` is gated by a single static Bearer token (`AUTH_TOKEN`), checked on every request — no OAuth, no per-user sessions, no token expiry. Rate-limited at nginx (120 req/min per IP on `/mcp`, `/health` is unthrottled) — sized for JSON-RPC, where each MCP message is a separate POST, rather than for a login form.
-- **Process:** Runs as a dedicated non-root `mailmcp` system user (no shell). Full systemd hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `ProtectKernel*`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `RestrictNamespaces`, `LockPersonality`, `SystemCallFilter=@system-service ~@privileged @resources`, `MemoryMax=512M`.
+- **Process (systemd path):** Runs as a dedicated non-root `mailmcp` system user (no shell). Full systemd hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `ProtectKernel*`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `RestrictNamespaces`, `LockPersonality`, `SystemCallFilter=@system-service ~@privileged @resources`, `MemoryMax=512M`.
+- **Process (Docker path):** Runs as the non-root `mailmcp` user (uid 100) inside the container, with `dist/` and `node_modules/` owned by root so the runtime user cannot rewrite its own code, and `/data` mounted read-only. None of the systemd settings above apply; add container-level limits (`--memory`, `--read-only`, `--cap-drop ALL`) if you want their equivalents.
 - **Network:** Backend bound to `127.0.0.1` only — nginx is the only thing that can reach it from outside. UFW default-deny on the host.
-- **Storage:** Credentials chmod 600, owned by `mailmcp`, in `/var/lib/mail-mcp/`. `.env` chmod 640 `root:mailmcp`.
+- **Storage (systemd path):** Credentials chmod 600, owned by `mailmcp`, in `/var/lib/mail-mcp/`. `.env` chmod 640 `root:mailmcp`. **(Docker path):** `./data/accounts.json` chmod 600, owned by the container's uid 100 / gid 101, bind-mounted read-only at `/data`.
 - **Output:** `list_accounts` returns id/label/From — never credentials. Logs never include passwords or Bearer tokens.
 - **Destructive tools** (`delete_message`) document irreversibility so Claude.ai surfaces a confirmation step. Prefer `move_message` to a Trash folder for reversibility.
 
@@ -252,7 +255,7 @@ CI runs typecheck (`tsc --noEmit`), the unit suite and the integration suite on 
 
 ## Roadmap
 
-- **v0.2** ✅ — Multi-account per deployment, browser setup flow (this release)
+- **v0.2** ✅ — Multi-account per deployment (this release). No browser setup flow: accounts are configured by editing `accounts.json` — see [Connecting from Claude.ai](#connecting-from-claudeai).
 - **v0.3** — Threading-aware `list_threads` tool, attachment download as base64, calendar invitation (iMIP) sending
 - **v0.4** — CardDAV (contacts), JMAP support as an alternative to IMAP for Fastmail/Topicbox
 - **v1.0** — Audit log, Prometheus metrics, rate limiting, hardened deployment guide
