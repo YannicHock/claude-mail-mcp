@@ -1,0 +1,7 @@
+# Shell scripts must keep LF endings in the working tree, on every platform.
+#
+# This repository is developed on Windows, where core.autocrlf=true rewrites
+# checked-out files to CRLF. A shell script that arrives with CRLF fails on Linux
+# with "bash: \r: command not found" — including inside the CI container and inside
+# the images, where scripts/check-versions.sh is the gate in front of every release.
+*.sh text eol=lf
