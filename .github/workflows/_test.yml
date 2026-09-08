@@ -46,18 +46,16 @@ jobs:
       - name: Start GreenMail fixture
         run: docker compose -f docker-compose.test.yml up -d
 
-      - name: Wait for GreenMail to be ready
-        run: |
-          for i in $(seq 1 30); do
-            if docker compose -f docker-compose.test.yml logs 2>&1 | grep -q "Started GreenMail"; then
-              echo "GreenMail is up."
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::GreenMail did not report ready in time." >&2
-          docker compose -f docker-compose.test.yml logs
-          exit 1
+      # Deliberately no "wait for GreenMail" step here. No line GreenMail
+      # logs is a reliable readiness signal (this image never prints a
+      # "Started" banner, and its "Starting ..." lines print before the
+      # listeners actually accept connections), so readiness is owned
+      # entirely by the integration suite itself: test/helpers/docker.ts
+      # polls the IMAP/SMTP ports for a real protocol handshake, and
+      # test/helpers/imap-setup.ts retries the IMAP login on top of that
+      # to absorb the fixture users registering slightly later still. Do
+      # not re-add a log-scraping or fixed-sleep wait loop here — it can
+      # only duplicate that logic and drift from it.
 
       - name: Integration tests
         run: npm run test:integration
