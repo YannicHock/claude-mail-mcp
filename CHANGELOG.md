@@ -2,7 +2,31 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] — 2026-09-08
+
+OAuth 2.1 authorization layer, so Claude's hosted surfaces can connect. No change to the connector's own behavior: Claude Desktop and Claude Code still talk to it directly with the static `AUTH_TOKEN` and need none of this.
+
+From this release the connector and the OAuth layer are versioned and released together, from the same commit and the same workflow run — `release.yml` already tagged their images in lockstep, and the in-tree versions now agree with it. That is why `oauth/package.json` moves from 0.1.0 straight to 0.4.0.
+
+### Added
+
+- **`oauth/` — a second service**, published as `ghcr.io/yannichock/claude-mail-mcp-oauth`. It exists because claude.ai web and Cowork cannot send a custom `Authorization` header: they require OAuth discovery and a browser sign-in, which the connector does not speak. It runs as uid 102 / gid 103 — deliberately not the connector's 100/101, so neither container can read the other's data — and is the only one of the two on the reverse proxy's network.
+- **Discovery** — RFC 9728 protected-resource metadata and RFC 8414 authorization-server metadata. The protected-resource document is served both at the bare well-known path and at the path-suffixed variant Claude probes first, so neither probe order misses.
+- **Dynamic client registration** (RFC 7591) against a redirect-URI allowlist. Claude's two hosted callbacks are always allowed; loopback redirects are off by default, because the client that would use them (Claude Code) has the simpler static-token path available. Registrations are capped at 200, oldest evicted first.
+- **Authorization endpoint with PKCE S256**, required rather than optional. The operator signs in with a username and an scrypt password hash. The step holds no server-side state: the authorization request is signed into a hidden form field that doubles as the CSRF token, which also pins the redirect URI between the two requests. An Origin/Referer check runs alongside it, and failed sign-ins are throttled at 5 per 15 minutes per client address.
+- **Token endpoint** — `authorization_code` and `refresh_token`. Refresh tokens rotate on every use, and presenting a rotated token revokes the whole family: a replayed refresh token is evidence of theft, not of a retry.
+- **Authenticated proxy in front of `POST /mcp`.** The client's bearer token is verified and then *replaced* with the connector's static `AUTH_TOKEN`; neither credential is ever passed through to the other side. Nothing is buffered, so a streamed response reaches the client as it is produced; hop-by-hop headers are dropped in both directions and the connector's own `WWW-Authenticate` is suppressed, since sending its static-token challenge to an OAuth client would start a flow that cannot succeed.
+- **State file** (`oauth-state.json`) for registered clients and live refresh sessions — written to a sibling temp file and renamed into place, so a crash mid-write leaves the previous version intact. An unreadable file is moved aside and the service starts empty rather than refusing to boot.
+- **`hash-password` CLI** (`dist/hash-password.js`) for generating the operator's scrypt hash.
+- **Docker file-secrets** for the connector token, the signing key and the password hash: mounted read-only under `/run/secrets`, invisible to `docker inspect` and absent from the process environment.
+- **CI** — `_test.yml` gains a job for the new package, and `release.yml` publishes both images behind the same `needs: test` gate. 201 unit and 57 integration tests.
+
+### Fixed
+
+- **The login throttle is keyed on the address the proxy observed.** `trust proxy` is a hop count, never `true`: `true` takes the leftmost `X-Forwarded-For` entry, which the client writes, so an attacker could pick a fresh `req.ip` per attempt and never be throttled — and could write an address of their choosing into the log line a fail2ban filter reads.
+- **The documented `hash-password` invocation now works.** The image's `ENTRYPOINT` is `node dist/index.js`, so a trailing command is appended as arguments and starts the server instead of the hashing tool; the procedure needs `--entrypoint node`.
+
+## [0.3.0] — 2026-09-08
 
 Test foundation, Docker packaging and CI. No runtime behavior changes.
 

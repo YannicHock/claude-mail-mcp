@@ -97,7 +97,7 @@ Smoke test:
 
 ```bash
 curl http://localhost:3220/health
-# {"status":"ok","server":"claude-mail-mcp","version":"0.2.1","accounts":[{…}],…}
+# {"status":"ok","server":"claude-mail-mcp","version":"0.4.0","accounts":[{…}],…}
 ```
 
 ---
@@ -128,7 +128,7 @@ docker run -d \
   ghcr.io/yannichock/claude-mail-mcp:latest
 
 curl http://127.0.0.1:3220/health
-# {"status":"ok","server":"claude-mail-mcp","version":"0.2.1","accounts":[],"accounts_file":"/data/accounts.json"}
+# {"status":"ok","server":"claude-mail-mcp","version":"0.4.0","accounts":[],"accounts_file":"/data/accounts.json"}
 ```
 
 Always publish with an explicit loopback host IP, `-p 127.0.0.1:3220:3220` — **never a bare `-p 3220:3220`**. The image binds `0.0.0.0` *inside* the container out of necessity (that's how Docker's port publishing reaches it at all); the host-side exposure is controlled entirely by how you publish the port. A bare publish puts the unauthenticated `GET /health` endpoint — it leaks the server name, version, account count and `accounts_file` path — on every interface, including the public internet on a host like Hetzner. The `Dockerfile` carries the same warning inline.
@@ -257,13 +257,12 @@ CI runs typecheck (`tsc --noEmit`), the unit suite and the integration suite on 
 
 ## Roadmap
 
-✅ marks what is merged into `main` and running; *(untagged)* marks the entries
-that have no release tag yet.
+✅ marks a released version.
 
 - **v0.1** ✅ — Single account configured through `.env`; IMAP, SMTP and CalDAV tools over MCP
 - **v0.2** ✅ — Multi-account per deployment. No browser setup flow: accounts are configured by editing `accounts.json` — see [Connecting from Claude.ai](#connecting-from-claudeai).
-- **v0.3** ✅ *(untagged)* — Docker image on GHCR, test foundation (25 unit, 14 integration), CI and release pipeline
-- **v0.4** ✅ *(untagged)* — OAuth 2.1 layer in `oauth/` for claude.ai web and Cowork: discovery, dynamic client registration, PKCE, refresh rotation, and an authenticated proxy in front of `/mcp`
+- **v0.3** ✅ — Docker image on GHCR, test foundation (25 unit, 14 integration), CI and release pipeline
+- **v0.4** ✅ — OAuth 2.1 layer in `oauth/` for claude.ai web and Cowork: discovery, dynamic client registration, PKCE, refresh rotation, and an authenticated proxy in front of `/mcp`
 - **v0.5** — Browser settings UI: manage mailboxes, verify IMAP/SMTP/CalDAV credentials before saving, review and revoke connected Claude clients
 - **v0.6** — Threading-aware `list_threads` tool, attachment download as base64, calendar invitation (iMIP) sending
 - **v0.7** — CardDAV (contacts), JMAP support as an alternative to IMAP for Fastmail/Topicbox

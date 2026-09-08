@@ -320,7 +320,7 @@ Once you have an OAuth shim of your own in front:
 ```bash
 # health
 curl https://mcp-mail.example.com/health
-# → {"status":"ok","server":"claude-mail-mcp","version":"0.2.1",
+# → {"status":"ok","server":"claude-mail-mcp","version":"0.4.0",
 #    "accounts":[{"id":"main","label":"Main","default":true,
 #                 "smtp_from":"you@example.com","imap_host":"imap.mailbox.org",
 #                 "caldav_enabled":false}],
