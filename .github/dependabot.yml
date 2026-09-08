@@ -25,6 +25,13 @@ updates:
       types:
         patterns:
           - "@types/*"
+    ignore:
+      # @types/node tracks the runtime, not the newest release on npm. While the
+      # images run Node 24, @types/node must stay on 24 — a 26 bump would describe
+      # APIs that are not there. It moves when the Node line does, in the same
+      # change as the Dockerfiles and the engines fields.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "npm"
     directory: "/oauth"
@@ -34,6 +41,13 @@ updates:
       types:
         patterns:
           - "@types/*"
+    ignore:
+      # @types/node tracks the runtime, not the newest release on npm. While the
+      # images run Node 24, @types/node must stay on 24 — a 26 bump would describe
+      # APIs that are not there. It moves when the Node line does, in the same
+      # change as the Dockerfiles and the engines fields.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   # The Node base image both Dockerfiles build on. Major updates are ignored on
   # purpose: which Node line this project runs is a decision about long-term
