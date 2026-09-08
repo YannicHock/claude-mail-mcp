@@ -33,9 +33,11 @@ import {
   protectedResourceMetadata,
   wwwAuthenticate,
 } from "./metadata.js";
+import type { OperatorRecord } from "./operator.js";
 import { constantTimeEquals, verifyPassword } from "./passwords.js";
 import { CODE_CHALLENGE_METHOD, isValidCodeChallenge, verifyChallenge } from "./pkce.js";
 import { createProxy } from "./proxy.js";
+import { createSettingsRouter, type MailboxSummary } from "./settings-routes.js";
 import { Store } from "./store.js";
 import { LoginThrottle } from "./throttle.js";
 import { TokenIssuer } from "./tokens.js";
@@ -48,6 +50,12 @@ export interface CreateAppOptions {
   config: OAuthConfig;
   store: Store;
   log?: Logger;
+  /**
+   * The live operator credential. Required for the settings UI to mount: see
+   * the settings-router block below. Absent in a configuration that has not
+   * opted into the settings UI at all.
+   */
+  operator?: OperatorRecord;
   /** Overrides for tests; production uses the defaults. */
   codeStore?: CodeStore;
   throttle?: LoginThrottle;
@@ -488,6 +496,26 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
     res.json({ status: "ok", service: SERVICE_NAME, version: VERSION });
   });
 
+  // ---- Settings UI ---------------------------------------------------------
+
+  // Mounted only when a settings signing key is configured and an operator
+  // record is available. Without both there is nothing the connector would
+  // accept for the mailbox pages, and a half-mounted UI that can list but not
+  // reach them is worse than no UI.
+  if (config.settingsSigningKey !== null && opts.operator) {
+    app.use(
+      "/settings",
+      createSettingsRouter({
+        config,
+        store,
+        operator: opts.operator,
+        throttle,
+        log,
+        upstreamHealth: () => fetchUpstreamHealth(config, log),
+      })
+    );
+  }
+
   app.use((req, res) => {
     res.status(404).json({
       error: "not_found",
@@ -593,6 +621,60 @@ function describeTokenFailure(reason: string): string {
       return "A refresh token cannot be used as a bearer credential.";
     default:
       return "The access token is invalid.";
+  }
+}
+
+/**
+ * Ask the connector how it is doing, for the settings overview.
+ *
+ * Never throws and never rejects: any failure — network error, timeout, a
+ * non-2xx status, an unparseable body — comes back as `reachable: false`, so
+ * the overview page says the connector is unreachable rather than the
+ * settings request itself erroring. Bounded to 3 seconds so an operator
+ * loading their own settings page is never left waiting on a connector that
+ * is down.
+ *
+ * The connector's /health reports mailboxes as `accounts: [{ id, label,
+ * default, ... }]` — note `default`, not `isDefault`; that field is renamed
+ * here to match what settings-pages.ts renders.
+ */
+async function fetchUpstreamHealth(
+  config: OAuthConfig,
+  log: Logger
+): Promise<{ reachable: boolean; version: string | null; mailboxes: MailboxSummary[] }> {
+  try {
+    const res = await fetch(`${config.upstreamMcpUrl}/health`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!res.ok) return { reachable: false, version: null, mailboxes: [] };
+
+    const body = (await res.json()) as {
+      version?: unknown;
+      accounts?: Array<{ id?: unknown; label?: unknown; default?: unknown }>;
+    };
+    const mailboxes: MailboxSummary[] = Array.isArray(body.accounts)
+      ? body.accounts
+          .filter(
+            (account): account is { id: string; label: string; default?: unknown } =>
+              typeof account.id === "string" && typeof account.label === "string"
+          )
+          .map((account) => ({
+            id: account.id,
+            label: account.label,
+            isDefault: account.default === true,
+          }))
+      : [];
+
+    return {
+      reachable: true,
+      version: typeof body.version === "string" ? body.version : null,
+      mailboxes,
+    };
+  } catch (err) {
+    log("warn", "upstream health check failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { reachable: false, version: null, mailboxes: [] };
   }
 }
 
