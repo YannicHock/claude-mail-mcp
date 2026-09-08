@@ -31,7 +31,14 @@ jobs:
         run: npm ci
 
       - name: Type check
-        run: npx tsc --noEmit
+        run: npm run typecheck
+
+      # tsconfig.json's `include` is ["src/**/*"], so the step above compiles
+      # nothing under test/ — and the suites run through tsx, which strips
+      # types without checking them. Without this second step the ~1,400 lines
+      # of TypeScript in test/ would never be typechecked anywhere.
+      - name: Type check tests
+        run: npm run typecheck:test
 
       - name: Unit tests
         run: npm run test:unit

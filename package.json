@@ -4,13 +4,13 @@
   "description": "Self-hosted IMAP/SMTP/CalDAV connector for Claude — Streamable HTTP MCP server. Read+write email and calendar against any RFC-compliant mailbox (Mailbox.org, Fastmail, iCloud, Mailcow, iRedMail, Migadu, Nextcloud, …).",
   "license": "MIT",
   "author": "Markus Stöger <hi@markusstoeger.com> (https://markusstoeger.com)",
-  "homepage": "https://markusstoeger.com/repos#claude-mail-mcp",
+  "homepage": "https://github.com/YannicHock/claude-mail-mcp#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/maxx3250/claude-mail-mcp.git"
+    "url": "https://github.com/YannicHock/claude-mail-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/maxx3250/claude-mail-mcp/issues"
+    "url": "https://github.com/YannicHock/claude-mail-mcp/issues"
   },
   "keywords": [
     "claude",
@@ -41,6 +41,8 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "test": "npm run test:unit",
     "test:unit": "node --import tsx --test test/unit/*.test.ts",
     "test:integration": "node --import tsx --test test/integration/*.test.ts"

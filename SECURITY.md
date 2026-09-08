@@ -13,14 +13,22 @@ Until v1.0, only the latest minor release is supported with security fixes.
 
 **Please do not open a public GitHub issue for security problems.**
 
-Preferred channel:
+Report it here, in this fork:
 
 1. **GitHub Private Vulnerability Reporting** — open a private advisory at
-   <https://github.com/maxx3250/claude-mail-mcp/security/advisories/new>
+   <https://github.com/YannicHock/claude-mail-mcp/security/advisories/new>
 
-Alternative channel:
+This repository is a fork of
+[maxx3250/claude-mail-mcp](https://github.com/maxx3250/claude-mail-mcp) and is
+maintained separately. The container image, `docker-compose.yml`, the nginx
+reverse-proxy recipe and the CI workflows exist **only here**, so a report about
+any of them has to come to this repository — the upstream maintainer cannot act
+on code that is not in their tree.
 
-2. Email **security@markusstoeger.com**. PGP is not required.
+If the issue is in code inherited from upstream and therefore affects that
+project too, please also report it there, via
+<https://github.com/maxx3250/claude-mail-mcp/security/advisories/new> or
+**security@markusstoeger.com**.
 
 ## What to include
 
@@ -69,7 +77,7 @@ If you add an OAuth layer in front (not part of this repository — see [docs/HA
 
 ### Authentication
 - `/mcp` is gated by a single static Bearer token (`AUTH_TOKEN`), checked on every request. There is no per-user auth, no token expiry, and no OAuth flow in this repository — the whole deployment shares one secret.
-- `/mcp` is additionally rate-limited by nginx (`limit_req`, 10 req/min per IP with a burst of 5) — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). `/health` is deliberately not rate-limited, since uptime checkers poll it and it carries no credentials.
+- `/mcp` is additionally rate-limited by nginx (`limit_req`, 120 req/min per IP with a burst of 60) — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The limit is sized for JSON-RPC traffic, where every MCP message is a separate `POST /mcp`, not for a login form; it caps a guessing loop at two attempts per second without cutting a live conversation off mid-way. Against 128 bits of token entropy it is defence in depth, not the primary defence. `/health` is deliberately not rate-limited, since uptime checkers poll it and it carries no credentials.
 - `/health` is unauthenticated by design (liveness probe + a non-sensitive account summary — no credentials).
 
 **If you expose this server to a remote MCP client over the public internet** — for example claude.ai web, which requires OAuth 2.1 discovery — you need to put an OAuth 2.1 layer in front that authenticates the human and forwards the Bearer token to this server on their behalf. **That layer is not part of this repository.** An earlier version of this document described it as already deployed and linked to a "reference implementation" (`markusstoeger/mcp-oauth-shim`); that repository does not exist, and no substitute is provided here. See [docs/HARDENING.md](docs/HARDENING.md) for what such a layer should satisfy if you build or adopt one — OAuth 2.1 + DCR + PKCE, short-lived signed tokens, a brute-force-throttled login, and a CSRF guard on any state-changing endpoint it exposes. Those are properties the *layer* needs, not properties this project has today.
@@ -82,7 +90,7 @@ If you add an OAuth layer in front (not part of this repository — see [docs/HA
 - If you add an OAuth layer in front, apply the same systemd hardening and dedicated non-root user to it — it isn't covered by this project's install steps.
 
 ### Credentials at rest
-- `accounts.json` is owned by `mailmcp:mailmcp` and chmod 600.
+- `accounts.json` is owned by `mailmcp:mailmcp` and chmod 600, at `/var/lib/mail-mcp/accounts.json` — the `ACCOUNTS_FILE` default in `.env.example` and the path [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) step 4 creates. Under the container deployment in that same document it is `./data/accounts.json` on the host, mounted read-only at `/data/accounts.json` and owned by the container's uid 100 / gid 101.
 - `.env` (holds `AUTH_TOKEN` and, for single-account setups, mailbox credentials) is `root:mailmcp` 640 (root can edit, the service can read).
 - If you add an OAuth layer that keeps its own state (signing keys, refresh-token hashes, an htpasswd file), apply the same ownership/permission discipline to it — it isn't part of this project's code or install steps.
 

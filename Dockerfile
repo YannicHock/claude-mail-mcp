@@ -39,7 +39,19 @@ COPY --from=builder /app/dist ./dist
 
 # Dedicated non-root user. `dist/` and `node_modules/` stay owned by root
 # so the runtime user cannot write to its own application code.
-RUN addgroup -S mailmcp && adduser -S mailmcp -G mailmcp
+#
+# The uid/gid are pinned explicitly rather than left to busybox's
+# "first free system id" allocation. docs/DEPLOYMENT.md tells the operator to
+# `chown 100:101` the host-side accounts.json so the container can read a
+# mode-600 credentials file; if a base-image change shifted these numbers, that
+# documented deployment would silently become a crash loop (EACCES on
+# /data/accounts.json). They are part of this image's published contract —
+# keep them in sync with docs/DEPLOYMENT.md and verify with:
+#   docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
+# (gid 101, not 100: alpine already ships gid 100 as the "users" group.)
+RUN addgroup -S -g 101 mailmcp && adduser -S -u 100 -G mailmcp mailmcp
+LABEL com.claude-mail-mcp.runtime-uid="100" \
+      com.claude-mail-mcp.runtime-gid="101"
 # Pre-create the ACCOUNTS_FILE directory so a bare `docker run` without any
 # volume mount gets a normal "file doesn't exist yet" startup (empty account
 # list) instead of EACCES from a root-only path. A real deployment bind-mounts
