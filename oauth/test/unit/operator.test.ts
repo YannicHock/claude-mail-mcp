@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -9,6 +9,16 @@ import { OperatorRecord } from "../../src/operator.js";
 import { hashPassword } from "../../src/passwords.js";
 
 const FAST_SCRYPT = { N: 1024, r: 8, p: 1 } as const;
+
+// Windows/NTFS does not honour POSIX mode bits at all — writeFile's `mode`
+// option and an explicit chmod are both silently ignored, and stat() always
+// reports 0o666 regardless of what was requested. CI runs Linux, where this
+// assertion holds; skip only this one case on Windows rather than leaving a
+// permanently-red test that trains people to ignore failures.
+const MODE_BITS_HONOURED: { skip: string } | Record<string, never> =
+  process.platform === "win32"
+    ? { skip: "Windows/NTFS does not honour POSIX mode bits; this assertion holds on the Linux CI runner" }
+    : {};
 
 async function seed() {
   return { username: "operator", passwordHash: await hashPassword("first", FAST_SCRYPT) };
@@ -52,7 +62,7 @@ test("a wrong username costs the same answer as a wrong password", async () => {
   assert.equal(await record.verify("operator", "wrong"), false);
 });
 
-test("the file is written 0600", async () => {
+test("the file is written 0600", MODE_BITS_HONOURED, async () => {
   const path = await tempFile();
   const record = await OperatorRecord.open(path, await seed(), silentLogger);
   await record.changePassword("second");
@@ -72,4 +82,30 @@ test("with no path the record is read-only and the password cannot be changed", 
   assert.equal(record.canChangePassword, false);
   assert.equal(await record.verify("operator", "first"), true);
   await assert.rejects(() => record.changePassword("second"), /OPERATOR_FILE/);
+});
+
+test("a second changePassword after a failed write still attempts the write", async () => {
+  // The parent directory does not exist yet, so every write through it fails
+  // with ENOENT until it is created. open() itself must not throw over this
+  // (a misconfigured OPERATOR_FILE should degrade, not crash startup).
+  const base = await mkdtemp(join(tmpdir(), "operator-"));
+  const missingDir = join(base, "does-not-exist-yet");
+  const path = join(missingDir, "operator.json");
+
+  const record = await OperatorRecord.open(path, await seed(), silentLogger);
+
+  // First write attempt fails — the directory still does not exist.
+  await assert.rejects(() => record.changePassword("second"));
+
+  // If a failed write permanently poisoned the internal write chain, this
+  // second attempt would reject immediately with the same stale error and
+  // never touch the filesystem again. It must instead retry for real.
+  await mkdir(missingDir, { recursive: true });
+  await record.changePassword("third");
+
+  assert.equal(await record.verify("operator", "third"), true);
+  assert.equal(record.sessionEpoch, 2);
+
+  const written = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(written.sessionEpoch, 2);
 });

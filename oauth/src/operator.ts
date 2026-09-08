@@ -72,8 +72,18 @@ export class OperatorRecord {
 
     if (raw === null) {
       const record = new OperatorRecord(path, fresh, log);
-      await record.#persist();
-      log("info", "operator credential source", { source: "secret (seeded)", path });
+      try {
+        await record.#persist();
+        log("info", "operator credential source", { source: "secret (seeded)", path });
+      } catch (err) {
+        // A misconfigured OPERATOR_FILE (e.g. a directory the deployment never
+        // created) must not crash startup: fall back to the secret in memory for
+        // this process rather than locking the operator out of their own server.
+        log("error", "cannot create operator file, continuing with the secret for this process", {
+          path,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
       return record;
     }
 
@@ -143,18 +153,33 @@ export class OperatorRecord {
    * Temp file, then rename. The same recipe as store.ts: a crash mid-write leaves
    * the previous credential intact rather than a truncated one that would lock the
    * operator out of their own server.
+   *
+   * The chain itself must never become a rejected promise: once a `.then()`-only
+   * chain rejects, every later `.then()` on it skips its callback and re-throws
+   * the same stale error forever, so a single transient failure (ENOSPC, EACCES,
+   * a missing directory) would silently stop every future write for the rest of
+   * the process's life. So the chain always resolves — failures are caught and
+   * logged inside it — while this specific attempt's own outcome, success or
+   * failure, is what the caller of #persist() awaits.
    */
   async #persist(): Promise<void> {
     const path = this.#path;
     if (path === null) return;
     const payload = JSON.stringify(this.#data, null, 2);
-    this.#writeChain = this.#writeChain.then(async () => {
+    const doWrite = async () => {
       const temp = join(dirname(path), `.${randomUUID()}.tmp`);
       await writeFile(temp, payload, { encoding: "utf8", mode: 0o600 });
       await chmod(temp, 0o600);
       await rename(temp, path);
+    };
+    const attempt = this.#writeChain.catch(() => {}).then(doWrite);
+    this.#writeChain = attempt.catch((err) => {
+      this.#log("error", "failed to persist operator record", {
+        path,
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
-    return this.#writeChain;
+    return attempt;
   }
 }
 
