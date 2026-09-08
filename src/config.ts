@@ -40,6 +40,14 @@ function int(name: string, fallback: number): number {
  * rather than a silent fallback to `NAME` — a typo in a secret mount should stop
  * the process, not quietly downgrade it. Mirrors the same helper in
  * oauth/src/config.ts.
+ *
+ * Both the inline and the file-sourced path are trimmed. A secret like this one
+ * has to come out byte-identical on both services for an HMAC to verify, so
+ * incidental whitespace (a trailing newline pasted from `openssl rand -base64
+ * 48` output) must not survive on one path but not the other. Trimming is
+ * scoped to this helper rather than folded into `optional()`, which other
+ * call sites (ACCOUNTS_FILE, PUBLIC_URL, HOST, LOG_LEVEL) rely on to preserve
+ * incidental whitespace as-is.
  */
 function secret(name: string, fallback: string): string {
   const filePath = process.env[`${name}_FILE`];
@@ -53,7 +61,7 @@ function secret(name: string, fallback: string): string {
       );
     }
   }
-  return optional(name, fallback);
+  return optional(name, fallback).trim();
 }
 
 export const config = {

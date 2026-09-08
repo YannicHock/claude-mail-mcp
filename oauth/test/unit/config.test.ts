@@ -230,6 +230,17 @@ describe("settings signing key", () => {
       /at least 32 bytes/
     );
   });
+
+  it("trims an inline value, matching the connector's SETTINGS_SIGNING_KEY handling", () => {
+    // Both services must derive byte-identical keys from the same secret. A
+    // trailing newline pasted from `openssl rand -base64 48` output must not
+    // change the key on one side but not the other.
+    const key = "x".repeat(32);
+    const config = loadConfig(
+      baseEnv({ SETTINGS_SIGNING_KEY: `  ${key}  \n` })
+    );
+    assert.deepEqual(config.settingsSigningKey, new TextEncoder().encode(key));
+  });
 });
 
 describe("operator file", () => {
