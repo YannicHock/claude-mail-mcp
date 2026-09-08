@@ -1,0 +1,34 @@
+services:
+  # GreenMail — disposable IMAP/SMTP server for the integration suite
+  # (test/integration/*.test.ts). Not part of the application's own
+  # deployment (see docker-compose.yml); this file exists only to give
+  # `npm run test:integration` something real to talk to.
+  #
+  # Verified invocation — see .superpowers/sdd/plan-dockerize-ci-tests/
+  # greenmail-findings.md for how these settings were derived:
+  #   - `-Dgreenmail.hostname=0.0.0.0` is mandatory: GreenMail defaults to
+  #     binding 127.0.0.1 *inside the container*, which is unreachable
+  #     through Docker's published ports.
+  #   - No TLS is configured or needed: port 3143 advertises no STARTTLS
+  #     capability, so the test accounts connect with tls:false and there
+  #     is no self-signed certificate in the path to reject or trust.
+  #     NODE_TLS_REJECT_UNAUTHORIZED is never set anywhere in this repo.
+  #   - `-Dgreenmail.setup.test.all` creates the standard "test" port set
+  #     (offset by +3000 from the protocol default: SMTP 3025, IMAP 3143,
+  #     IMAPS 3993, ...).
+  #   - `-Dgreenmail.users=...` pre-creates the two mailboxes the
+  #     integration tests log into. Log in with the local part (`alice`),
+  #     not the full address.
+  greenmail:
+    image: greenmail/standalone:latest
+    ports:
+      - "3143:3143" # IMAP (plain — used by the tests)
+      - "3993:3993" # IMAPS (unused: no STARTTLS on 3143 means there's no
+      #                TLS path to test here; exposed for parity with the
+      #                task brief and in case a future test wants it)
+      - "3025:3025" # SMTP (plain — used by the tests)
+    environment:
+      GREENMAIL_OPTS: >-
+        -Dgreenmail.setup.test.all
+        -Dgreenmail.hostname=0.0.0.0
+        -Dgreenmail.users=alice:pw1@example.com,bob:pw2@example.com
