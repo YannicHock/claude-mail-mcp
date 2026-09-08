@@ -174,5 +174,45 @@ export function createApp(opts: CreateAppOptions): express.Express {
     });
   });
 
+  // App-wide rather than router-only: the global express.json() above (on
+  // /mcp) and the settings router's express.urlencoded() both call next(err)
+  // on a malformed or oversized body, and neither is a route handler that can
+  // catch that itself — it never reaches one. Without this, such an error
+  // falls through to Express 5's default handler, which renders an HTML page
+  // (including a stack trace unless NODE_ENV=production, which nothing here
+  // sets) instead of this app's otherwise-consistent JSON error shape. This
+  // sits after the 404 handler, not before it: the 404 handler always sends a
+  // response itself rather than calling next(), so ordering the two doesn't
+  // matter for correctness, but an error handler reads better last. It leaves
+  // the /mcp handler's own try/catch above alone — that one only ever sees
+  // errors from mcp.connect()/handleRequest() *after* the body already parsed
+  // successfully, so the two paths cannot both fire for the same request.
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const status = errorStatus(err);
+    log("warn", "rejected malformed request body", {
+      path: req.path,
+      status,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    res.status(status).json({
+      error: "bad_request",
+      message: "The request could not be processed: malformed or oversized body.",
+    });
+  });
+
   return app;
+}
+
+/** Body-parser errors (body-parser/raw-body) set `.status`/`.statusCode` to a
+ * real 4xx (413 too large, 400 malformed, etc.); anything else defaults to 400
+ * rather than assuming a 500 for what is, in every case this handler is
+ * reached, a request the client sent wrong. */
+function errorStatus(err: unknown): number {
+  const candidate =
+    (err as { status?: unknown } | null)?.status ?? (err as { statusCode?: unknown } | null)?.statusCode;
+  return typeof candidate === "number" && candidate >= 400 && candidate < 600 ? candidate : 400;
 }

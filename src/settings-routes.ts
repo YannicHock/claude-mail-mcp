@@ -35,6 +35,7 @@ import {
   AccountsStore,
   AccountsStoreError,
   NoSuchAccountError,
+  RESERVED_IDS,
   type Account,
   type CalDavCreds,
 } from "./accounts.js";
@@ -147,6 +148,11 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
     id = requireStr("id");
     if (id !== "" && !ID_PATTERN.test(id)) {
       errors.id = "Use lowercase letters, digits, _ or -, up to 32 characters, starting alphanumeric.";
+    } else if (RESERVED_IDS.has(id)) {
+      // Same rule AccountsStore.create() enforces (see RESERVED_IDS in
+      // accounts.ts) — caught here too so the operator sees a clean field
+      // error instead of the generic AccountsStoreError re-render below.
+      errors.id = `"${id}" is reserved and can't be used as a mailbox id. Choose another id.`;
     }
   }
 

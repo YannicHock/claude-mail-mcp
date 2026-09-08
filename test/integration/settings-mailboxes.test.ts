@@ -337,6 +337,68 @@ test("a test submission probes without writing", async () => {
 });
 
 /**
+ * Fix round 1: "new" and "test" are reserved (see RESERVED_IDS in
+ * src/accounts.ts) because they collide with the settings UI's own
+ * single-segment routes — an account actually named "test" would render a
+ * real edit page whose action silently routes to the create-probe handler
+ * instead of updating it, so saves through the browser would never persist.
+ * Rejecting the id at create time means that state can never be reached.
+ */
+test("creating a mailbox with a reserved id ('new' or 'test') is rejected up front", async () => {
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    for (const reserved of ["new", "test"]) {
+      const res = await post(
+        url,
+        "/settings/mailboxes",
+        await withStamp(accountsPath, validForm({ id: reserved }))
+      );
+      assert.equal(res.status, 400, `id="${reserved}" should be rejected`);
+      assert.match(await res.text(), /reserved/i);
+    }
+    assert.deepEqual(
+      JSON.parse(await readFile(accountsPath, "utf8")).accounts,
+      [],
+      "neither reserved id was persisted"
+    );
+  } finally {
+    await close();
+  }
+});
+
+/**
+ * Fix round 1: express.urlencoded's 64kb limit on the settings routes calls
+ * next(err) on an oversized body, which — with no error-handling middleware —
+ * would fall through to Express 5's default handler and render an HTML page
+ * (including a stack trace outside NODE_ENV=production, which nothing here
+ * sets). This proves the app-wide error handler in app.ts intercepts that and
+ * answers on the same plain-JSON error shape as every other rejection here.
+ */
+test("an oversized settings form body gets a clean JSON 4xx, not an HTML error page", async () => {
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const oversized = "x".repeat(80 * 1024); // over the settings routes' 64kb cap
+    const assertion = mint("POST", "/settings/mailboxes");
+    const res = await fetch(`${url}/settings/mailboxes`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${AUTH_TOKEN}`,
+        [ASSERTION_HEADER]: assertion,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: `label=${oversized}`,
+    });
+    assert.ok(res.status >= 400 && res.status < 500, `expected a 4xx, got ${res.status}`);
+    assert.equal(res.headers.get("content-type")?.split(";")[0].trim(), "application/json");
+    const body = await res.json();
+    assert.equal(body.error, "bad_request");
+    assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
+  } finally {
+    await close();
+  }
+});
+
+/**
  * Extra coverage beyond the brief's eleven cases: mounting the settings router
  * (scoped bearerAuth on /settings, the router itself at "/") must not change
  * the 404 behaviour of every other path — see the "bearer check must not
