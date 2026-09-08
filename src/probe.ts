@@ -167,15 +167,74 @@ async function probeSmtp(creds: SmtpCreds, perProbeMs: number): Promise<ProbeRes
   }
 }
 
-async function probeCalDav(creds: CalDavCreds): Promise<ProbeResult> {
+/**
+ * tsdav has no timeout option of its own to configure the way imapflow and
+ * nodemailer do above — it goes straight through the platform `fetch()`,
+ * which has no default timeout at all. Left alone, `withTimeout()` here
+ * would only stop *watching* a stuck `createDAVClient()`/`fetchCalendars()`
+ * call at `perProbeMs`; the request underneath would keep running against
+ * the host's own OS-level TCP retry budget, which can run well past a
+ * minute against a black-holed address.
+ *
+ * The fix is an `AbortController` threaded through `fetchOptions`, tied to
+ * `withTimeout`'s `onTimeout` callback the same way probeImap() ties its
+ * client's `close()` to it. Confirmed from tsdav's bundled source
+ * (node_modules/tsdav/dist/tsdav.cjs.js) that this actually reaches the
+ * network call, not just the type surface:
+ *   - `davRequest()` (~line 233) spreads `fetchOptions` (with `signal`
+ *     intact — only `headers` is stripped out of it) straight into the
+ *     `fetch(url, {...})` call.
+ *   - `createDAVClient()` (~line 1626) stores our `fetchOptions` as
+ *     `defaultFetchOptions` and passes it to the initial account/PROPFIND
+ *     discovery it does internally — the phase most likely to be the one
+ *     that hangs, since it runs before we ever get to call fetchCalendars().
+ *   - `defaultParam()` (~line 1515), which is what `client.fetchCalendars`
+ *     actually is, merges that same `defaultFetchOptions` in as the default
+ *     for every subsequent call unless the caller overrides it — so calling
+ *     `client.fetchCalendars()` with no arguments here still carries the
+ *     same `signal` forward, with nothing further to wire up.
+ *
+ * One controller, one `abort()` call, covers both phases with a single
+ * deadline; no separate per-call signal is needed.
+ *
+ * This bounds what actually matters — the probe *result* — at `perProbeMs`:
+ * `abort()` rejects the pending `fetch()` immediately, same as imapflow's
+ * `close()` does for `connect()`. What it does *not* do, unlike
+ * `client.close()`, is synchronously free the underlying OS socket: a
+ * standalone repro against a black-holed address
+ * (fetch(url, { signal }) + controller.abort() at various delays, checking
+ * process._getActiveHandles() right after the rejection) showed live
+ * `Socket` handles still present immediately after `abort()` rejects the
+ * promise, and the process not exiting for a further ~9-10s regardless of
+ * whether the abort fired at 300ms, 1.5s or 5s — a fixed tail tied to the
+ * underlying connect attempt's own lifecycle, not to when we cancel our
+ * logical request. There is no lever in Node's built-in `fetch()` to shorten
+ * that without a custom dispatcher (the standalone `undici` package's
+ * `Agent`), which would be a new runtime dependency this module doesn't
+ * take. Unlike the pre-fix bug this whole module exists to prevent, that
+ * tail is bounded and inert: nothing is left waiting on it (the operator's
+ * form submission already has its answer), it self-clears without further
+ * action, and it does not compound across repeated resubmissions the way an
+ * un-configured 90s/120s imapflow/nodemailer default would have.
+ */
+async function probeCalDav(creds: CalDavCreds, perProbeMs: number): Promise<ProbeResult> {
+  const controller = new AbortController();
   try {
-    const client = await createDAVClient({
-      serverUrl: creds.url,
-      credentials: { username: creds.user, password: creds.pass },
-      authMethod: "Basic",
-      defaultAccountType: "caldav",
-    });
-    await client.fetchCalendars();
+    await withTimeout(
+      (async () => {
+        const client = await createDAVClient({
+          serverUrl: creds.url,
+          credentials: { username: creds.user, password: creds.pass },
+          authMethod: "Basic",
+          defaultAccountType: "caldav",
+          fetchOptions: { signal: controller.signal },
+        });
+        await client.fetchCalendars();
+      })(),
+      perProbeMs,
+      "CalDAV",
+      () => controller.abort()
+    );
     return { ok: true };
   } catch (err) {
     return toFailure(err);
@@ -209,7 +268,7 @@ export async function probeAccount(
       probeImap(input.imap, perProbeMs).catch(toFailure),
       probeSmtp(input.smtp, perProbeMs).catch(toFailure),
       input.caldav
-        ? withTimeout(probeCalDav(input.caldav), perProbeMs, "CalDAV").catch(toFailure)
+        ? probeCalDav(input.caldav, perProbeMs).catch(toFailure)
         : Promise.resolve(null),
     ]);
     return { imap, smtp, caldav };

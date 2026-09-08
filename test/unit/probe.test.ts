@@ -120,3 +120,37 @@ test("probeAccount resolves, never rejects, even if the total bound fires before
   assert.equal(report.smtp.ok, false);
   assert.equal(report.caldav, null);
 });
+
+test("an unresponsive CalDAV host fails within the per-probe timeout via an aborted fetch", async () => {
+  // Same TEST-NET-1 blackhole as the IMAP/SMTP case above (192.0.2.1, RFC
+  // 5737 -- reserved, never routed, no RST). Unlike imapflow/nodemailer,
+  // tsdav has no connectionTimeout of its own to configure -- it goes
+  // straight through the platform fetch(), which has no default timeout at
+  // all -- so this is the one case that actually proves probeCalDav()'s
+  // AbortController is wired to withTimeout's onTimeout and really aborts
+  // the underlying request, rather than just declining to await it further.
+  //
+  // IMAP/SMTP point at a closed port here (not another blackhole target) so
+  // this test isolates the CalDAV path: they resolve in a few milliseconds
+  // via ECONNREFUSED, well inside perProbeMs, leaving the wall-clock bound
+  // below to be governed by the CalDAV probe alone.
+  const started = Date.now();
+  const report = await probeAccount(
+    {
+      imap: creds({ port: 1 }),
+      smtp: creds({ port: 1 }),
+      caldav: { url: "http://192.0.2.1/dav", user: "u", pass: "p" },
+    },
+    { perProbeMs: 1500, totalMs: 5000 }
+  );
+  assert.equal(report.caldav?.ok, false);
+  assert.ok(
+    Date.now() - started < 4000,
+    "a blackholed CalDAV host should fail at the per-probe timeout, not hang toward the total one"
+  );
+  // As with the IMAP/SMTP blackhole case, the proof this doesn't leak a live
+  // request is external to this assertion: `node --import tsx --test` does
+  // not force-exit, so if the underlying fetch() were still pending when
+  // this test's assertions passed, the whole process would hang on it
+  // afterward. See the task report for the wall-clock evidence.
+});
