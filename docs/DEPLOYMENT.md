@@ -41,7 +41,7 @@ chgrp mailmcp /var/www/mail-mcp/.env
 chmod 640 /var/www/mail-mcp/.env
 ```
 
-If you use an htpasswd file for the bundled OAuth shim, give the shim's user group-read access:
+If you build or deploy an OAuth shim (see step 6, Option B below — none ships in this repository) and it authenticates against an htpasswd file, give its service user group-read access:
 
 ```bash
 chgrp mailmcp /etc/nginx/.htpasswd_mail
@@ -175,20 +175,22 @@ certbot --nginx -d mcp-mail.example.com
 
 ### Option B — claude.ai web (OAuth 2.1 + DCR)
 
-claude.ai will only connect to remote MCP servers that advertise OAuth 2.1 discovery. To support that, run a thin OAuth shim in front of the connector. A reference implementation lives at <https://github.com/markusstoeger/mcp-oauth-shim>.
+claude.ai will only connect to remote MCP servers that advertise OAuth 2.1 discovery, and this server only speaks plain Bearer auth. **This is an open point, not a shipped component: no OAuth shim is bundled with or referenced by this repository.** To use claude.ai's web/mobile client (as opposed to Claude Desktop, Option A above) you have to build or source that OAuth 2.1 + DCR + PKCE layer yourself and run it in front of the connector.
 
-The shim:
-- Implements `/.well-known/oauth-authorization-server`, `/authorize`, `/token`, `/register`, `/jwks.json`
-- Validates Claude's PKCE flow + DCR registration
-- Forwards `/mcp` traffic to the connector with the upstream Bearer header injected
-- Authenticates the human in `/authorize` against an htpasswd file
+At minimum, that layer needs to:
+- Implement `/.well-known/oauth-authorization-server`, `/authorize`, `/token`, `/register`, `/jwks.json`
+- Validate Claude's PKCE flow + Dynamic Client Registration
+- Forward `/mcp` traffic to this connector with the upstream `AUTH_TOKEN` Bearer header injected
+- Authenticate the human in `/authorize` (an htpasswd file is one option)
 
-When the shim is in front:
+Until you have one running, use **Option A (Claude Desktop)** above — it talks to this server's Bearer auth directly and needs no OAuth layer at all.
+
+Once you have an OAuth shim of your own in front:
 
 1. claude.ai → **Settings → Connectors → Add custom connector**
 2. URL: `https://mcp-mail.example.com/mcp` (the shim's public URL)
 3. claude.ai discovers the OAuth endpoints automatically
-4. A login popup asks for the htpasswd user/password
+4. Whatever login your shim implements runs
 5. The tools appear in the connector
 
 ## 7. Verify
@@ -230,3 +232,77 @@ systemctl restart claude-mail-mcp.service
 **Monitoring.** Hit `/health` from your uptime checker. Alert on non-200 responses or pm2 restart loops. The endpoint also reports `caldav_enabled` so you can detect misconfiguration.
 
 **Connection idle.** The IMAP connection auto-reconnects on demand. If your provider closes idle connections aggressively (some do after 10 minutes), the next tool call simply reopens the socket.
+
+## Container deployment (Docker)
+
+An alternative to the systemd path above: pull the prebuilt image from GHCR and run it with `docker compose`, instead of building from source and managing a systemd unit yourself. Steps 5 and 6 above (nginx reverse proxy, adding to Claude) apply unchanged either way — the container listens on `127.0.0.1:3220`, the same address the systemd-run process listens on.
+
+### 1. Get the compose file and pull the image
+
+```bash
+mkdir -p /opt/mail-mcp && cd /opt/mail-mcp
+# clone the repo as in step 1 above and cd into it, or just copy
+# docker-compose.yml and .env.docker.example from your own checkout
+docker login ghcr.io   # only if the package isn't public for your account
+docker compose pull
+```
+
+### 2. Configure `.env`
+
+```bash
+cp .env.docker.example .env
+# generate the Bearer token clients will send to /mcp
+echo "AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
+# edit .env: PUBLIC_URL, LOG_LEVEL
+```
+
+`HOST`, `PORT` and `ACCOUNTS_FILE` are fixed by the image and `docker-compose.yml` — they're not set in `.env` (see the comments in `.env.docker.example`).
+
+### 3. Create `accounts.json`
+
+```bash
+mkdir -p data
+cat > data/accounts.json <<'JSON'
+{
+  "version": 1,
+  "accounts": [
+    {
+      "id": "main",
+      "label": "Main",
+      "default": true,
+      "imap": { "host": "imap.mailbox.org", "port": 993, "user": "you@example.com", "pass": "secret", "tls": true },
+      "smtp": { "host": "smtp.mailbox.org", "port": 465, "user": "you@example.com", "pass": "secret", "tls": true },
+      "mail": { "defaultFrom": "you@example.com", "draftsFolder": "Drafts", "sentFolder": "Sent" }
+    }
+  ]
+}
+JSON
+chmod 600 data/accounts.json
+```
+
+`docker-compose.yml` bind-mounts `./data` read-only at `/data` inside the container. The backend picks up edits to `data/accounts.json` via `fs.watch` — no restart needed, same behavior as the systemd deployment's `accounts.json`.
+
+### 4. Start it
+
+```bash
+docker compose up -d
+docker compose logs -f
+curl http://127.0.0.1:3220/health
+```
+
+`docker-compose.yml` already publishes the port as `127.0.0.1:3220:3220`, loopback only — see the warning comment in that file and in the `Dockerfile`. Never change that to a bare `3220:3220` or `0.0.0.0:3220:3220`: the container binds `0.0.0.0` *inside* itself out of necessity (Docker's port publishing requires it), so the host-side exposure is controlled entirely by this setting, and `GET /health` is unauthenticated.
+
+### 5. Reverse proxy and adding to Claude
+
+Same as steps 5 and 6 above: nginx terminates TLS on the public hostname and proxies to `http://127.0.0.1:3220`. Option A (Claude Desktop, Bearer auth) works as soon as the container is reachable through nginx; Option B (claude.ai web) still needs the OAuth 2.1 shim discussed there — none ships with this repository, container or not.
+
+### 6. Updating
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+### 7. Operational notes
+
+Same as the systemd operational notes above (`AUTH_TOKEN` rotation, `/health` monitoring), plus: the container is stateless like the systemd process — back up `.env` and `data/accounts.json`. `docker-compose.test.yml` in the repo is unrelated to this deployment; it only exists to give the integration test suite (`npm run test:integration`) a disposable mail server to talk to.

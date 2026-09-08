@@ -69,7 +69,7 @@ npm run build
 npm start
 ```
 
-The server boots with **no mailboxes configured** — that's fine. Add them via the OAuth shim's `/settings` UI (see [Deployment](docs/DEPLOYMENT.md)) or hand-craft an `accounts.json`:
+The server boots with **no mailboxes configured** — that's fine. Hand-craft an `accounts.json` (no setup UI ships with this repo yet — see [Deployment](docs/DEPLOYMENT.md) for the OAuth-shim caveat):
 
 ```json
 {
@@ -95,6 +95,51 @@ Smoke test:
 curl http://localhost:3220/health
 # {"status":"ok","server":"claude-mail-mcp","version":"0.2.0","accounts":[{…}],…}
 ```
+
+---
+
+## Run with Docker
+
+CI builds a multi-arch (amd64/arm64) image and pushes it to `ghcr.io/yannichock/claude-mail-mcp` on every push to `main` and on version tags. The package is newly created and not guaranteed to be public — if `docker pull` gets rejected, `docker login ghcr.io` first with a GitHub token that has `read:packages`.
+
+Either path needs the same two things as the Quick start above: an `AUTH_TOKEN` and an `accounts.json` (an empty one is fine to boot with).
+
+### `docker run`
+
+```bash
+mkdir -p data
+echo '{"version":1,"accounts":[]}' > data/accounts.json   # or a real one, see Quick start
+
+docker run -d \
+  --name claude-mail-mcp \
+  -p 127.0.0.1:3220:3220 \
+  -e AUTH_TOKEN="$(openssl rand -hex 32)" \
+  -e PUBLIC_URL=https://mcp-mail.example.com \
+  -v "$(pwd)/data:/data:ro" \
+  ghcr.io/yannichock/claude-mail-mcp:latest
+
+curl http://127.0.0.1:3220/health
+# {"status":"ok","server":"claude-mail-mcp","version":"0.2.1","accounts":[],"accounts_file":"/data/accounts.json"}
+```
+
+Always publish with an explicit loopback host IP, `-p 127.0.0.1:3220:3220` — **never a bare `-p 3220:3220`**. The image binds `0.0.0.0` *inside* the container out of necessity (that's how Docker's port publishing reaches it at all); the host-side exposure is controlled entirely by how you publish the port. A bare publish puts the unauthenticated `GET /health` endpoint — it leaks the server name, version, account count and `accounts_file` path — on every interface, including the public internet on a host like Hetzner. The `Dockerfile` carries the same warning inline.
+
+### docker-compose
+
+`docker-compose.yml` in this repo already pins the port publish above and mounts `/data` read-only:
+
+```bash
+cp .env.docker.example .env
+# fill in AUTH_TOKEN, PUBLIC_URL, LOG_LEVEL
+mkdir -p data
+echo '{"version":1,"accounts":[]}' > data/accounts.json   # or a real one, see Quick start
+docker compose up -d
+docker compose logs -f
+```
+
+`docker-compose.test.yml` is a separate file for local development only — it spins up a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) server for the integration test suite (see [Development](#development) below) and has nothing to do with running the connector itself.
+
+Neither path includes an OAuth shim — see [Connecting from Claude.ai](#connecting-from-claudeai) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for that prerequisite and for putting nginx in front on a real host.
 
 ---
 
@@ -177,6 +222,26 @@ Defaults in one sentence: TLS via Let's Encrypt + HSTS + rate-limited htpasswd +
 - **Destructive tools** (`delete_message`) document irreversibility so Claude.ai surfaces a confirmation step. Prefer `move_message` to a Trash folder for reversibility.
 
 Full threat-model walkthrough and operator hardening checklist in [docs/HARDENING.md](docs/HARDENING.md). Reporting issues: see [SECURITY.md](SECURITY.md).
+
+---
+
+## Development
+
+```bash
+npm install
+npm run build       # tsc
+npm test            # alias for test:unit
+```
+
+`npm run test:unit` runs 25 tests, offline — no network, no Docker required.
+
+`npm run test:integration` runs 14 more: 9 exercise the IMAP/SMTP tools end-to-end against a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) container started from `docker-compose.test.yml`, 5 exercise the MCP protocol surface (auth rejection, `initialize`, `tools/list`, `/health`). The suite manages the GreenMail container itself — no manual `docker compose up` needed — and skips cleanly instead of failing when the Docker daemon isn't reachable.
+
+```bash
+npm run test:integration
+```
+
+CI runs typecheck (`tsc --noEmit`), the unit suite and the integration suite on every push and pull request, plus a Docker build smoke test (build only, no push) so a broken `Dockerfile` fails the PR instead of only surfacing at release time. A release build (multi-arch, pushed to GHCR) only runs after that same test suite passes in the same workflow run.
 
 ---
 

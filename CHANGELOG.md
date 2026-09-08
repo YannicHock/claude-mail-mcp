@@ -2,6 +2,26 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Test foundation, Docker packaging and CI. No runtime behavior changes.
+
+### Added
+
+- **Unit test suite** (`npm run test:unit`, also `npm test`) — 25 offline tests covering account loading/validation, `resolve()`, `publicSummaries()` credential redaction, hot reload, and the `ClientPool`, plus config defaults/overrides/validation. No network, no Docker required.
+- **Integration test suite** (`npm run test:integration`) — 14 tests: 9 exercise the IMAP/SMTP tools end-to-end against a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) container, 5 exercise the MCP protocol surface (auth rejection, `initialize`, `tools/list`, `/health`). Starts and tears down its own GreenMail container; skips cleanly instead of failing when the Docker daemon isn't reachable.
+- **`docker-compose.test.yml`** — the disposable GreenMail fixture the integration suite runs against. Not part of the application's own deployment.
+- **`Dockerfile`** — multi-stage Node 22 Alpine build (~284 MB final image), runs as a non-root `mailmcp` user, `HEALTHCHECK` against `/health`, container-appropriate defaults (`HOST=0.0.0.0`, `ACCOUNTS_FILE=/data/accounts.json`) with an inline warning against publishing the port on anything but `127.0.0.1`.
+- **`docker-compose.yml`** — reference deployment for the image: publishes `127.0.0.1:3220:3220` only, mounts `/data` read-only, reads secrets from `.env`. Includes a commented anchor for where a future OAuth shim would attach as a second service.
+- **`.env.docker.example`** — container-side environment template for `docker-compose.yml`.
+- **CI** (`.github/workflows/`): `_test.yml` (reusable — typecheck, unit tests, integration tests against GreenMail), `ci.yml` (runs `_test.yml` on every push to `main` and every pull request, plus a Docker build smoke test with no push), `release.yml` (runs `_test.yml` as a gate, then builds and pushes a multi-arch amd64/arm64 image to `ghcr.io/yannichock/claude-mail-mcp` on push to `main` and on `v*` tags).
+- **README**: "Run with Docker" section (`docker run` and `docker compose` paths, GHCR image) and "Development" section (`npm run test:unit` / `npm run test:integration`).
+- **`docs/DEPLOYMENT.md`**: new "Container deployment (Docker)" section alongside the existing systemd path — pull the image, configure `.env` and `accounts.json`, start compose, same nginx/Claude steps as the systemd deployment.
+
+### Fixed
+
+- **`docs/DEPLOYMENT.md`** no longer describes a "bundled OAuth shim" — none ships with this repository. The claude.ai web (Option B) section and the htpasswd note in the service-user setup now say plainly that the OAuth 2.1 + DCR + PKCE layer is a prerequisite the operator has to supply, not a shipped component, and no longer link to a reference implementation that doesn't exist (the previously linked repository 404s).
+
 ## [0.2.1] — 2026-05-21
 
 Security hardening pass. No new features; no breaking API changes.
