@@ -301,9 +301,13 @@ function parseData(raw: string): StoreData | null {
   }
   // Missing on any file written before tokenEpoch existed. Read as zero rather
   // than rejecting the file — quarantining it would log every connected Claude
-  // client out on upgrade.
+  // client out on upgrade. Negative is out of the field's domain (an epoch
+  // counter never goes backward), so it is sanitized to zero too rather than
+  // carried through into the comparison Task 8 builds revocation on.
   const tokenEpoch =
-    typeof candidate.tokenEpoch === "number" && Number.isInteger(candidate.tokenEpoch)
+    typeof candidate.tokenEpoch === "number" &&
+    Number.isInteger(candidate.tokenEpoch) &&
+    candidate.tokenEpoch >= 0
       ? candidate.tokenEpoch
       : 0;
   return {

@@ -232,4 +232,16 @@ describe("Store revocation", () => {
     openStores.push(store);
     assert.equal(store.tokenEpoch, 0, "missing means zero, not a corrupt file");
   });
+
+  it("a negative tokenEpoch on disk loads as zero, not carried through", async () => {
+    const path = join(await mkdtemp(join(tmpdir(), "store-")), "state.json");
+    await writeFile(
+      path,
+      JSON.stringify({ version: 1, clients: {}, sessions: {}, tokenEpoch: -5 }),
+      "utf8"
+    );
+    const store = await Store.open(path, silentLogger);
+    openStores.push(store);
+    assert.equal(store.tokenEpoch, 0, "negative is out of domain, not a valid epoch");
+  });
 });
