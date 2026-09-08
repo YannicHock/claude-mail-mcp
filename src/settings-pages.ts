@@ -66,6 +66,25 @@ export function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
+/**
+ * Response headers every settings page sets.
+ *
+ * Mirrors `SETTINGS_HEADERS` in oauth/src/settings-pages.ts byte-for-byte. The
+ * two packages have separate Docker build contexts and cannot share a module,
+ * so this duplication is required, not an oversight — if you change one,
+ * change both. These pages carry a CSRF token and a mailbox password field,
+ * must not be cached anywhere, and have no reason to be framed; the CSP
+ * allows inline styles and nothing else, matching the no-JavaScript rule
+ * that governs every settings page.
+ */
+export const SETTINGS_HEADERS: Record<string, string> = {
+  "Cache-Control": "no-store",
+  "X-Frame-Options": "DENY",
+  "Content-Security-Policy":
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+  "Referrer-Policy": "no-referrer",
+};
+
 const STYLE = `
 :root { color-scheme: light dark; }
 body {

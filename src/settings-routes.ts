@@ -41,7 +41,12 @@ import {
 } from "./accounts.js";
 import { StaleStampError } from "./accounts-writer.js";
 import { probeAccount, type ProbeReport } from "./probe.js";
-import { renderMailboxForm, renderMailboxList, type ProbeReportView } from "./settings-pages.js";
+import {
+  renderMailboxForm,
+  renderMailboxList,
+  SETTINGS_HEADERS,
+  type ProbeReportView,
+} from "./settings-pages.js";
 import { requireSettingsAssertion, type VerifiedAssertion } from "./settings-assertion.js";
 
 export interface SettingsRouterDeps {
@@ -251,11 +256,11 @@ function assertionOf(res: Response): VerifiedAssertion {
 }
 
 function sendHtml(res: Response, status: number, html: string): void {
-  res.status(status).type("html").send(html);
+  res.status(status).type("html").set(SETTINGS_HEADERS).send(html);
 }
 
 function sendPlain(res: Response, status: number, text: string): void {
-  res.status(status).type("text/plain").send(text);
+  res.status(status).type("text/plain").set(SETTINGS_HEADERS).send(text);
 }
 
 function csrfMatches(expected: string, submitted: unknown): boolean {

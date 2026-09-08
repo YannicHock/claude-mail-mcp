@@ -101,7 +101,12 @@ export const config = {
    * refuses to start without it.
    */
   authToken: required("AUTH_TOKEN"),
-  publicUrl: optional("PUBLIC_URL", "http://localhost:3220"),
+  // Trimmed and stripped of a trailing slash so this matches the OAuth layer's
+  // own normalisation of the same URL (see normalisePublicUrl() in
+  // oauth/src/urls.ts). The two values are compared as the assertion's `iss`
+  // on every settings request; a difference as small as a trailing slash
+  // makes that comparison fail silently and permanently.
+  publicUrl: optional("PUBLIC_URL", "http://localhost:3220").trim().replace(/\/+$/, ""),
 
   /**
    * Shared key for the settings assertion the OAuth layer sends with proxied
