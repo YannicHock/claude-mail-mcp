@@ -51,94 +51,118 @@ export interface McpTestApp {
  * `close()` guarantees the listener is closed, the store's fs.watch is
  * stopped, and pooled IMAP connections are closed, regardless of what the
  * caller did in between.
+ *
+ * The same guarantee also holds on the *startup* path: everything from
+ * `store.start()` onward (building the pool, registering tools, binding
+ * the port) runs inside a try/catch that calls `store.stop()` before
+ * rethrowing. Without that, a failure anywhere in this function — e.g.
+ * `app.listen` erroring under port exhaustion or a firewall — would leave
+ * `store`'s `fs.watch()` running with no handle ever reaching a caller to
+ * stop it: the exact Windows `node --test` hang Wave 1's `fixtures.ts`
+ * (`withAccountsStore`) was built to make structurally impossible. This
+ * mirrors that same try/finally-style guarantee, just anchored to a
+ * try/catch since only the failure path needs cleanup here (the success
+ * path deliberately leaves the store running until the caller's `close()`).
  */
 export async function startMcpApp(opts: {
   accountsFile: string;
   authToken: string;
 }): Promise<McpTestApp> {
   const store = new AccountsStore(opts.accountsFile);
-  await store.start();
+  try {
+    await store.start();
 
-  const pool = new ClientPool(store);
+    const pool = new ClientPool(store);
 
-  const mcp = new McpServer({
-    name: HARNESS_SERVER_NAME,
-    version: HARNESS_SERVER_VERSION,
-  });
-  registerMailTools(mcp, pool, store);
-  registerCalendarTools(mcp, pool);
-
-  const app = express();
-  app.disable("x-powered-by");
-  app.use(express.json({ limit: "5mb" }));
-
-  app.get("/health", (_req, res) => {
-    res.json({
-      status: "ok",
-      server: HARNESS_SERVER_NAME,
+    const mcp = new McpServer({
+      name: HARNESS_SERVER_NAME,
       version: HARNESS_SERVER_VERSION,
-      accounts: store.publicSummaries(),
-      accounts_file: opts.accountsFile,
     });
-  });
+    registerMailTools(mcp, pool, store);
+    registerCalendarTools(mcp, pool);
 
-  // Mirrors src/index.ts's bearerAuth exactly — keep in sync by hand.
-  function bearerAuth(req: Request, res: Response, next: NextFunction): void {
-    const header = req.header("authorization") ?? "";
-    const match = /^Bearer\s+(.+)$/i.exec(header);
-    if (!match || match[1] !== opts.authToken) {
-      res.status(401).json({
-        error: "unauthorized",
-        message: "Missing or invalid Bearer token",
+    const app = express();
+    app.disable("x-powered-by");
+    // Mirrors src/index.ts:89 — kept in sync by hand, like the rest of this
+    // Express glue (see the file header comment).
+    app.set("trust proxy", true);
+    app.use(express.json({ limit: "5mb" }));
+
+    app.get("/health", (_req, res) => {
+      res.json({
+        status: "ok",
+        server: HARNESS_SERVER_NAME,
+        version: HARNESS_SERVER_VERSION,
+        accounts: store.publicSummaries(),
+        accounts_file: opts.accountsFile,
       });
-      return;
-    }
-    next();
-  }
+    });
 
-  app.post("/mcp", bearerAuth, async (req, res) => {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true,
-    });
-    res.on("close", () => {
-      transport.close().catch(() => {});
-    });
-    try {
-      await mcp.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-    } catch (err) {
-      if (!res.headersSent) {
-        res.status(500).json({
-          error: "internal_error",
-          message: err instanceof Error ? err.message : "Unknown error",
+    // Mirrors src/index.ts's bearerAuth exactly — keep in sync by hand.
+    function bearerAuth(req: Request, res: Response, next: NextFunction): void {
+      const header = req.header("authorization") ?? "";
+      const match = /^Bearer\s+(.+)$/i.exec(header);
+      if (!match || match[1] !== opts.authToken) {
+        res.status(401).json({
+          error: "unauthorized",
+          message: "Missing or invalid Bearer token",
         });
+        return;
       }
+      next();
     }
-  });
 
-  app.use((req, res) => {
-    res.status(404).json({
-      error: "not_found",
-      message: `${req.method} ${req.path} is not a valid endpoint. Use GET /health or POST /mcp.`,
+    app.post("/mcp", bearerAuth, async (req, res) => {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+      });
+      res.on("close", () => {
+        transport.close().catch(() => {});
+      });
+      try {
+        await mcp.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      } catch (err) {
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: "internal_error",
+            message: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      }
     });
-  });
 
-  const server = await new Promise<Server>((resolve, reject) => {
-    const s: Server = app.listen(0, "127.0.0.1", () => resolve(s));
-    s.on("error", reject);
-  });
-  const { port } = server.address() as AddressInfo;
+    app.use((req, res) => {
+      res.status(404).json({
+        error: "not_found",
+        message: `${req.method} ${req.path} is not a valid endpoint. Use GET /health or POST /mcp.`,
+      });
+    });
 
-  return {
-    url: `http://127.0.0.1:${port}`,
-    port,
-    store,
-    pool,
-    close: async () => {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      store.stop();
-      await pool.closeAll().catch(() => {});
-    },
-  };
+    const server = await new Promise<Server>((resolve, reject) => {
+      const s: Server = app.listen(0, "127.0.0.1", () => resolve(s));
+      s.on("error", reject);
+    });
+    const { port } = server.address() as AddressInfo;
+
+    return {
+      url: `http://127.0.0.1:${port}`,
+      port,
+      store,
+      pool,
+      close: async () => {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        store.stop();
+        await pool.closeAll().catch(() => {});
+      },
+    };
+  } catch (err) {
+    // Structural guarantee, not a convention: any failure from here on —
+    // including store.start() itself — stops the store's fs.watch before
+    // the error propagates, so a thrown startMcpApp() never leaks a
+    // listener that nothing can ever stop() again.
+    store.stop();
+    throw err;
+  }
 }
