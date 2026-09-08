@@ -4,7 +4,9 @@ Self-hosted **IMAP / SMTP / CalDAV connector for Claude** with multi-account sup
 
 > Built because every other Claude email connector targets Gmail. This one is for the rest of us — Mailbox.org, Fastmail, iCloud, Mailcow, iRedMail, Migadu, Nextcloud, your own Postfix box. If your provider speaks IMAP, SMTP and CalDAV, this works. One connector, all your inboxes.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Node](https://img.shields.io/badge/node-%3E=20-brightgreen.svg)](https://nodejs.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Node](https://img.shields.io/badge/node-20.19%2B_or_22.7%2B-brightgreen.svg)](https://nodejs.org)
+
+> **Node requirement:** `^20.19.0 || >=22.7.0` (see `engines` in [`package.json`](package.json)). Plain "Node 20" is not enough — Node 20.0–20.18 and 22.0–22.6 fail to load the compiled server (a `tsdav` packaging defect); see [`CHANGELOG.md`](CHANGELOG.md) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 > **This is a maintained fork** of [maxx3250/claude-mail-mcp](https://github.com/maxx3250/claude-mail-mcp), living at [YannicHock/claude-mail-mcp](https://github.com/YannicHock/claude-mail-mcp). The Docker image, `docker-compose.yml`, the test suites and the CI/CD pipeline described below exist only in this fork, so clone from here, open issues here, and report security problems here — see [SECURITY.md](SECURITY.md).
 
