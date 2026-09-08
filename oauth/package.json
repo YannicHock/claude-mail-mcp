@@ -1,6 +1,6 @@
 {
   "name": "claude-mail-mcp-oauth",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "description": "OAuth 2.1 authorization layer in front of the claude-mail-mcp connector — lets Claude's hosted surfaces (claude.ai web, Cowork) connect to a server that only speaks static Bearer auth.",
   "license": "MIT",

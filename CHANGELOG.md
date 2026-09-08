@@ -2,6 +2,14 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] — 2026-09-09
+
+### Fixed
+
+- **Signing in through a browser was impossible.** Both the settings sign-in and the `/authorize` consent screen served `Referrer-Policy: no-referrer`, and their POST handlers verify the request came from this site with `isSameOrigin()`, which reads `Origin` and falls back to `Referer`. Chrome sends no `Origin` header on a *same-origin* form POST, so the policy removed the only remaining signal and every submission was refused with "Request blocked". Both pages now send `Referrer-Policy: same-origin`, which still withholds the referrer from any cross-origin destination — the property that mattered — while leaving the same-origin check something to read.
+
+  The consent-screen half of this has been present since 0.4.0 and is why no client had ever completed a browser sign-in.
+
 ## [0.6.0] — 2026-09-09
 
 A browser settings UI. Mailboxes can be added, tested, edited and removed without a shell on the server; connected Claude clients can be reviewed and revoked; the operator password can be changed.

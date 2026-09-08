@@ -29,7 +29,13 @@ export const SETTINGS_HEADERS: Record<string, string> = {
   "X-Frame-Options": "DENY",
   "Content-Security-Policy":
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
-  "Referrer-Policy": "no-referrer",
+  // same-origin, not no-referrer. These pages submit forms back to this origin,
+  // and the POST handlers verify the request came from here with isSameOrigin(),
+  // which reads Origin and falls back to Referer. Chrome does not send Origin on
+  // a same-origin form POST, so no-referrer left the check with neither header
+  // and refused every browser sign-in. same-origin still withholds the referrer
+  // from any cross-origin destination, which is the property that matters.
+  "Referrer-Policy": "same-origin",
 };
 
 /** Hidden CSRF input. Every state-changing form gets exactly this. */

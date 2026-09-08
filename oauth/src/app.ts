@@ -50,7 +50,7 @@ import { TokenIssuer } from "./tokens.js";
 import { redirectUriAllowed, sameResource } from "./urls.js";
 
 export const SERVICE_NAME = "claude-mail-mcp-oauth";
-export const VERSION = "0.6.0";
+export const VERSION = "0.6.1";
 
 export interface CreateAppOptions {
   config: OAuthConfig;
@@ -649,7 +649,10 @@ function sendLoginPage(
       "Content-Security-Policy",
       "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
     )
-    .set("Referrer-Policy", "no-referrer")
+    // same-origin rather than no-referrer: this page POSTs back to /authorize,
+    // which checks isSameOrigin(). Chrome sends no Origin on a same-origin form
+    // POST, so no-referrer left that check with nothing to read.
+    .set("Referrer-Policy", "same-origin")
     .send(renderLoginPage(options));
 }
 

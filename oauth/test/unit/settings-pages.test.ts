@@ -16,7 +16,10 @@ test("every page declares the strict content security policy and no framing", ()
   );
   assert.equal(SETTINGS_HEADERS["X-Frame-Options"], "DENY");
   assert.equal(SETTINGS_HEADERS["Cache-Control"], "no-store");
-  assert.equal(SETTINGS_HEADERS["Referrer-Policy"], "no-referrer");
+  // Not no-referrer: these pages submit forms whose handlers call isSameOrigin(),
+  // and Chrome sends no Origin header on a same-origin form POST. no-referrer
+  // removed the only remaining signal and made browser sign-in impossible.
+  assert.equal(SETTINGS_HEADERS["Referrer-Policy"], "same-origin");
 });
 
 test("no page carries a script tag or an inline handler", () => {
