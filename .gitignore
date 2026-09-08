@@ -2,6 +2,9 @@ node_modules/
 dist/
 .env
 .env.local
+# Same reasoning as .env: docker-compose.yml reads this one for the OAuth
+# layer, and docs/DEPLOYMENT.md tells operators to create it in the checkout.
+.env.oauth
 *.log
 .DS_Store
 .idea/
@@ -15,3 +18,13 @@ coverage/
 # deployment), so both locations are ignored here. Already in .dockerignore.
 accounts.json
 data/
+
+# OAuth layer secrets — the connector's AUTH_TOKEN, the token signing key and
+# the operator's password hash, mounted as Docker file-secrets. Anything under
+# secrets/ is a credential by definition; committing one would hand over the
+# mailboxes as surely as accounts.json would.
+secrets/
+
+# Registered OAuth clients and live refresh sessions. Not secret, but it is
+# per-deployment runtime state and belongs on the host, not in the repository.
+oauth-data/

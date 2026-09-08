@@ -4,6 +4,11 @@ name: Test
 # GreenMail fixture the integration suite talks to. Called by both
 # ci.yml (every push to main / every PR) and release.yml (as the gate
 # that must pass before an image is pushed to GHCR in the same run).
+#
+# Two jobs, one per package: the connector in src/ and the OAuth layer in
+# oauth/. They have separate lockfiles and separate images, so they are
+# separate jobs rather than extra steps — a failure names which component
+# broke, and the two run in parallel.
 on:
   workflow_call:
 
@@ -70,3 +75,45 @@ jobs:
       - name: Stop GreenMail fixture
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
+
+  oauth:
+    name: OAuth layer — typecheck & tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: oauth
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Pinned to match the oauth/Dockerfile base image. The development
+          # machine for this repository runs Node 24, and a version difference
+          # between it and CI has already surfaced late here once.
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: oauth/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      # tsconfig.json's `include` is ["src/**/*"], so the step above compiles
+      # nothing under test/. Same gap, and same fix, as the connector above.
+      - name: Type check tests
+        run: npm run typecheck:test
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      # No external fixture: the integration suite starts its own stub upstream
+      # and binds ephemeral ports, so there is nothing to wait for and nothing
+      # to tear down.
+      - name: Integration tests
+        run: npm run test:integration

@@ -27,5 +27,8 @@ jobs:
 
       # No push here on purpose: this only proves the image still
       # builds. Pushing to GHCR is release.yml's job, gated on tests.
-      - name: Build image
+      - name: Build connector image
         run: docker build -t claude-mail-mcp:ci-smoke-test .
+
+      - name: Build OAuth layer image
+        run: docker build -f oauth/Dockerfile -t claude-mail-mcp-oauth:ci-smoke-test oauth
