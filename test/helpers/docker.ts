@@ -1,6 +1,40 @@
 /**
  * Docker Compose lifecycle helpers for the GreenMail-backed integration
- * suite (test/integration/mail-server.test.ts).
+ * suite. Used by more than one integration test file — currently
+ * test/integration/mail-server.test.ts and test/integration/probe.test.ts —
+ * each of which independently calls composeUp() in its own `before()` and
+ * composeDown() in its own `after()`.
+ *
+ * composeUp()/composeDown() are unguarded global operations: they act on one
+ * shared Docker Compose project (named after the repo directory, since
+ * docker-compose.test.yml declares no explicit `name:`) and one shared set of
+ * published host ports (3143/3025/3993). There is no reference counting —
+ * whichever file's `after()` runs first tears the fixture down for everyone,
+ * including a file whose tests are still using it.
+ *
+ * `node --test` runs multiple test *files* concurrently by default, which
+ * makes that a real problem the moment two files here both own the
+ * lifecycle: package.json's `test:integration` script passes
+ * `--test-concurrency=1` specifically to serialize integration test files
+ * for this reason (see the task-12 fix-round report in
+ * .superpowers/sdd/2026-09-08-settings-ui/ for how this was found — running
+ * mail-server.test.ts and probe.test.ts together without it produced
+ * ECONNREFUSED/"Connection not available" failures in whichever file's
+ * `before()` lost the race). That flag is a real fix, not a workaround to
+ * later remove — but it does mean adding a third Docker-backed integration
+ * file costs every other one a little more wall-clock time, serialized
+ * rather than parallel.
+ *
+ * The flag could be dropped only if this file's lifecycle became actually
+ * shared-safe: e.g. genuine cross-process reference counting (a lockfile
+ * under the OS temp dir, incremented in composeUp() and only actually
+ * running `down` when it reaches zero in composeDown()), or giving each
+ * integration file its own Compose project name *and* its own set of host
+ * ports (the current ports are hardcoded in docker-compose.test.yml, so two
+ * concurrent `up`s for genuinely separate projects would otherwise collide
+ * trying to publish the same ports). Either is more machinery than this
+ * fixture has needed so far; --test-concurrency=1 is the cheaper trade until
+ * that changes.
  *
  * Dependency-free (Node stdlib only), matching the rule in fixtures.ts.
  */
