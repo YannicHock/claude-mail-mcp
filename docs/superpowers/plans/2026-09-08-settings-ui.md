@@ -16,6 +16,8 @@ Every task's requirements implicitly include this section.
 
 - **Node floor `>=24.0.0`.** CI runs Node 24, matching `node:24-alpine`. Anything reported green must be verified in a Node 24 container, not only on the dev machine. The command is in "Verifying on Node 24" below.
 - **No new runtime dependency in either package.** `oauth/` stays on `express` + `jose`; the connector stays on its current eight. This is why the cross-service assertion is an HMAC over a literal string rather than a JWT (spec §4).
+- **The toolchain is TypeScript 7, `tsx` 4.23, zod 4, imapflow 2 and nodemailer 10**, as of the 0.5.0 refresh. Two consequences for the code below: nodemailer ships its own type definitions now — `@types/nodemailer` was removed because they are stricter — and the connector's tool schemas are on zod 4, which the MCP SDK accepts alongside 3. Nothing in this plan needs a zod schema, but a `probe.ts` written against nodemailer's old community types will not compile.
+- **Do not change any version string.** `scripts/check-versions.sh` runs in CI and fails the build when the eight places this repository states its version stop agreeing, so a partial bump is worse than none. Releasing is a separate act, after this plan is finished.
 - **The two packages cannot import from each other.** `oauth/Dockerfile` builds with `context: oauth`, so nothing under `src/` is in its build context. Constants shared between them are duplicated verbatim and each copy carries a comment naming the other.
 - **No JavaScript is served to the browser, and no build step is added.** Every page is server-rendered HTML with inline CSS, and every interaction is a form submission.
 - **Attribution:** contributions must never name "Claude" or "Anthropic" as an author. No `Co-Authored-By:` trailers, no "Generated with" footers, no session links, no mention of AI assistance in commit messages, PR text or code comments. The product name and references to MCP clients are unaffected.
@@ -1352,7 +1354,7 @@ test("no page carries a script tag or an inline handler", () => {
       csrf: "c",
       username: "operator",
       connectorReachable: true,
-      connectorVersion: "0.4.0",
+      connectorVersion: "0.5.0",
       mailboxes: [{ id: "work", label: "Work", isDefault: true }],
       clientCount: 1,
       sessionCount: 1,
@@ -2629,9 +2631,19 @@ and the whole thing wrapped in the total bound. Each probe:
 - **SMTP** — `nodemailer.createTransport({ host, port, secure: tls, auth: { user, pass } })`, `verify()`, then `close()`.
 - **CalDAV** — `createDAVClient({ serverUrl: url, credentials: { username: user, password: pass }, authMethod: "Basic", defaultAccountType: "caldav" })`, then `fetchCalendars()`.
 
+All three signatures were re-verified against the versions installed by the 0.5.0
+refresh (imapflow 2, nodemailer 10, tsdav 2.3) and are unchanged from the versions
+this plan was written against.
+
 Failures are converted by `describe(err)`, which takes `err.message`, collapses
 whitespace, truncates to `MAX_MESSAGE_LENGTH` and appends `…`. It never interpolates
 credentials; the tests assert that.
+
+One thing worth using that imapflow 2 added: it exports an `AuthenticationFailure`
+error class. Check for it before falling through to `describe(err)`, and report
+"the server rejected these credentials" rather than whatever the provider's wording
+happens to be. Wrong password and unreachable host are the two outcomes an operator
+needs told apart, and they are the two this distinction gets right.
 
 - [ ] **Step 4: Run the unit test**
 
