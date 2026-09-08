@@ -59,10 +59,21 @@ test("correct credentials against GreenMail report success", SKIP, async () => {
   assert.deepEqual(report.smtp, { ok: true });
 });
 
-test("a wrong password reports failure, not success", SKIP, async () => {
+test("a wrong password reports failure, not success, and the message doesn't echo it", SKIP, async () => {
+  // Unlike the unit suite's "no password in the message" case (which only
+  // ever reaches ECONNREFUSED against a closed port — a class of error that
+  // structurally never carries credentials in imapflow, nodemailer or
+  // tsdav), this is a genuine authentication failure from a real server.
+  // That's the case worth asserting the password's absence against.
+  const wrongPassword = "wrong";
   const report = await probeAccount({
-    imap: { ...greenmailImap(), pass: "wrong" },
+    imap: { ...greenmailImap(), pass: wrongPassword },
     smtp: greenmailSmtp(),
   });
   assert.equal(report.imap.ok, false);
+  if (report.imap.ok) return;
+  assert.ok(
+    !report.imap.message.includes(wrongPassword),
+    `failure message must not echo the password, got: ${report.imap.message}`
+  );
 });
