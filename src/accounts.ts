@@ -84,6 +84,29 @@ export interface AccountsFile {
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
+/**
+ * Ids the settings UI's routing cannot serve. `settings-pages.ts` builds its edit
+ * form's action and its "test connection" `formaction` as `/settings/mailboxes/${id}`
+ * and `/settings/mailboxes/${id}/test`; `settings-routes.ts` registers the literal
+ * single-segment `/settings/mailboxes/new` (GET) and `/settings/mailboxes/test`
+ * (POST) ahead of the `:id` routes they would otherwise collide with, so the literal
+ * always wins. An account named "test" can still be *viewed* via
+ * `GET /settings/mailboxes/test` (that route has no literal collision), but its edit
+ * form posts to a URL that is actually the create-probe route, so saving through the
+ * browser silently never persists. An account named "new" can't even be opened.
+ *
+ * `AccountsStore.create()` below refuses these at the one place every new account
+ * — programmatic or via the form — has to pass through. This is deliberately *not*
+ * enforced in `parseAccount()`/`parseAccountsFile()`, which both load an existing
+ * accounts.json and validate one being written back out: rejecting a reserved id
+ * there would make a file that already has an account called "test" fail to load
+ * at all, taking every other configured mailbox down with it. An operator who
+ * already has such an account keeps a broken in-place edit until they delete and
+ * recreate it under another id — worse than ideal, but far better than the
+ * connector refusing to start.
+ */
+export const RESERVED_IDS = new Set(["new", "test"]);
+
 export class AccountsStoreError extends Error {
   constructor(message: string) {
     super(message);
@@ -233,8 +256,15 @@ export class AccountsStore {
     return readStamp(this.filePath);
   }
 
-  /** Add a new account. Rejects if `account.id` is already taken. */
+  /** Add a new account. Rejects if `account.id` is already taken or reserved
+   * (see {@link RESERVED_IDS}) — the one entry point every new account, whether
+   * created through the settings form or programmatically, has to pass through. */
   async create(account: Account, stamp: string): Promise<void> {
+    if (RESERVED_IDS.has(account.id)) {
+      throw new AccountsStoreError(
+        `"${account.id}" is a reserved id and can't be used for a mailbox. Choose another id.`
+      );
+    }
     await this.mutate(stamp, (accounts) => {
       if (accounts.some((a) => a.id === account.id)) {
         throw new AccountsStoreError(`An account with id "${account.id}" already exists.`);

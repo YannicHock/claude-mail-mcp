@@ -131,6 +131,30 @@ test("a duplicate id is refused", async () => {
   }
 });
 
+// "new" and "test" collide with the settings UI's own single-segment routes
+// (GET /settings/mailboxes/new, POST /settings/mailboxes/test) — see
+// RESERVED_IDS in src/accounts.ts. create() is the one entry point every new
+// account has to pass through, programmatic or via the form, so it is refused
+// here regardless of how it was constructed — and refused *before* the stamp
+// is even checked, since it's not a concurrency question.
+test("a reserved id ('new' or 'test') is refused on create", async () => {
+  const store = new AccountsStore(await tempAccounts());
+  await store.start();
+  try {
+    await assert.rejects(
+      async () => store.create(sampleAccount("new"), await store.stamp()),
+      /reserved/i
+    );
+    await assert.rejects(
+      async () => store.create(sampleAccount("test"), await store.stamp()),
+      /reserved/i
+    );
+    assert.deepEqual(store.ids(), [], "neither reserved id was persisted");
+  } finally {
+    store.stop();
+  }
+});
+
 test("updating an unknown id is refused", async () => {
   const store = new AccountsStore(await tempAccounts());
   await store.start();

@@ -65,6 +65,8 @@ async function main(): Promise<void> {
     pool,
     authToken: config.authToken,
     accountsFile: config.accountsFile,
+    settingsSigningKey: config.settingsSigningKey,
+    publicUrl: config.publicUrl,
     log,
   });
 
