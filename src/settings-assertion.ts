@@ -17,6 +17,9 @@
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
+import type { RequestHandler } from "express";
+
+import type { Logger } from "./app.js";
 
 /** Header the assertion travels in. Mirrored in oauth/src/assertion.ts. */
 export const ASSERTION_HEADER = "x-settings-assertion";
@@ -81,4 +84,38 @@ export function verifyAssertion(
     return null;
   }
   return { sub, sid, csrf };
+}
+
+/**
+ * Express guard for the settings routes.
+ *
+ * Two credentials must hold to reach a mailbox through here: the static AUTH_TOKEN
+ * that already gates /mcp, checked by the existing bearer middleware, and this
+ * assertion. The bearer proves the request came from the OAuth layer; the assertion
+ * proves a human signed in there moments ago, for this method and this path.
+ *
+ * Every failure answers the same 401 with the same body. Telling the caller whether
+ * the signature, the expiry or the path was wrong would help nobody who is supposed
+ * to be here.
+ */
+export function requireSettingsAssertion(opts: {
+  key: string;
+  issuer: string;
+  log: Logger;
+}): RequestHandler {
+  const key = new TextEncoder().encode(opts.key);
+  return (req, res, next) => {
+    const header = req.header(ASSERTION_HEADER);
+    const verified =
+      header === undefined
+        ? null
+        : verifyAssertion(header, key, opts.issuer, req.method, req.path);
+    if (verified === null) {
+      opts.log("warn", "rejected settings request", { ip: req.ip, path: req.path });
+      res.status(401).type("text/plain").send("Unauthorized");
+      return;
+    }
+    res.locals.assertion = verified;
+    next();
+  };
 }
