@@ -6,8 +6,13 @@ services:
     # SIGTERM reaches node and triggers the graceful shutdown in src/index.ts.
     init: true
     restart: unless-stopped
-    # Loopback only: nginx terminates TLS in front of this, see
-    # docs/DEPLOYMENT.md. Never publish this on 0.0.0.0.
+    # WARNING — loopback only. The image binds 0.0.0.0 *inside* the
+    # container (required for Docker's port publishing to work at all),
+    # so this host_ip is the only thing standing between the unauthenticated
+    # GET /health endpoint (leaks server name, version, account count,
+    # accounts_file path) and the public internet on a host like Hetzner.
+    # nginx terminates TLS in front of this — see docs/DEPLOYMENT.md.
+    # Never change this to "3220:3220" or "0.0.0.0:3220:3220".
     ports:
       - "127.0.0.1:3220:3220"
     env_file:

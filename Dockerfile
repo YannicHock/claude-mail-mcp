@@ -25,6 +25,12 @@ ENV NODE_ENV=production
 # docs/DEPLOYMENT.md) — this only concerns the container-internal listener.
 ENV HOST=0.0.0.0
 ENV PORT=3220
+# Container-appropriate default so a bare `docker run` (no compose, no
+# ACCOUNTS_FILE override) doesn't crash trying to open the app's own
+# default path (/root/.config/mail-mcp/accounts.json), which the non-root
+# user below can't read. Harmless when docker-compose.yml sets the same
+# value again via `environment:` — it's the same path either way.
+ENV ACCOUNTS_FILE=/data/accounts.json
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
@@ -34,9 +40,29 @@ COPY --from=builder /app/dist ./dist
 # Dedicated non-root user. `dist/` and `node_modules/` stay owned by root
 # so the runtime user cannot write to its own application code.
 RUN addgroup -S mailmcp && adduser -S mailmcp -G mailmcp
+# Pre-create the ACCOUNTS_FILE directory so a bare `docker run` without any
+# volume mount gets a normal "file doesn't exist yet" startup (empty account
+# list) instead of EACCES from a root-only path. A real deployment bind-mounts
+# something else over /data anyway (see docker-compose.yml).
+RUN mkdir -p /data && chown mailmcp:mailmcp /data
 USER mailmcp
 
 EXPOSE 3220
+
+# ---------------------------------------------------------------------------
+# WARNING — this image binds 0.0.0.0 *inside* the container (required for
+# Docker's port publishing to reach it at all). That means the host-side
+# exposure is controlled entirely by how you publish the port:
+#
+#   docker run -p 127.0.0.1:3220:3220 ...   <- correct: loopback only
+#   docker run -p 3220:3220 ...             <- WRONG: reachable from the
+#                                               internet on every interface
+#
+# GET /health is unauthenticated and leaks the server name, version,
+# account count and accounts_file path. On a public host (e.g. Hetzner),
+# always publish with an explicit 127.0.0.1 host IP, or better, use
+# docker-compose.yml, which already pins this. See docs/DEPLOYMENT.md.
+# ---------------------------------------------------------------------------
 
 # Alpine ships no curl; do the liveness probe with a plain Node HTTP request.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
