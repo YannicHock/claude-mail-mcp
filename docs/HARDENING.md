@@ -75,7 +75,7 @@ If you need (2), the cleanest approach is to put `/var/lib/mail-mcp` on a LUKS-e
 
 ### Backup strategy
 
-The service is stateful (state in `/var/lib/mail-mcp/`). Losing it means re-entering every account's credentials by hand-editing `accounts.json` (or through whatever account-management UI you've built or added — none ships with this repository). If you run an OAuth layer that stores its own signing key under this directory, losing it would also invalidate tokens *that layer* issued; that doesn't apply if you're only using the static `AUTH_TOKEN`.
+The service is stateful (state in `/var/lib/mail-mcp/`). Losing it means re-entering every account's credentials, either by hand-editing `accounts.json` or through the settings UI (`/settings/mailboxes`, served by the `oauth/` layer — see docs/DEPLOYMENT.md). If you run an OAuth layer that stores its own signing key under this directory, losing it would also invalidate tokens *that layer* issued; that doesn't apply if you're only using the static `AUTH_TOKEN`.
 
 Recommendation: include `/var/lib/mail-mcp/` in your normal backup rotation **with encryption-at-rest** (e.g. `restic`, `borgbackup`, or a `tar | gpg` pipeline). Do not back up to a cloud bucket without encryption.
 
