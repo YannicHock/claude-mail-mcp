@@ -93,7 +93,7 @@ Smoke test:
 
 ```bash
 curl http://localhost:3220/health
-# {"status":"ok","server":"claude-mail-mcp","version":"0.2.0","accounts":[{…}],…}
+# {"status":"ok","server":"claude-mail-mcp","version":"0.2.1","accounts":[{…}],…}
 ```
 
 ---
@@ -180,7 +180,7 @@ For local testing without a shim, you can call `/mcp` directly with `Authorizati
 | iCloud | `https://caldav.icloud.com/` |
 | Nextcloud | `https://cloud.example.com/remote.php/dav/principals/users/USER/` |
 
-If your provider doesn't speak CalDAV, leave `CALDAV_URL` empty and the calendar tools won't be registered. Mail still works.
+If your provider doesn't speak CalDAV, just omit the `caldav` block from that account in `accounts.json` — the calendar tools are always registered, but they return a clear error for any account with no `caldav` configured. Mail still works regardless.
 
 ---
 

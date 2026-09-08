@@ -210,7 +210,9 @@ curl -X POST https://mcp-mail.example.com/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-# → JSON with 9 or 13 tools (depending on whether CALDAV_URL is set)
+# → JSON with 14 tools (1 account + 9 mail + 4 calendar), unconditionally —
+#   calendar tools are always registered; they error per-call for any
+#   account with no `caldav` block in accounts.json
 ```
 
 ## 8. Updating
