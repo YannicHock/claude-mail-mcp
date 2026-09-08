@@ -1,0 +1,92 @@
+name: Release
+
+# Runs on every push to main and on version tags (v*). Tests run first
+# via the shared _test.yml workflow, in this same run; the build/push
+# job is gated on that via `needs`, so a failing test suite blocks the
+# publish to GHCR.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# Per-ref group: rapid pushes to the same ref (e.g. two pushes to main)
+# serialize, and GitHub drops a superseded pending run in that case —
+# which is fine, it was already stale. A main push and a tag push land
+# in different groups and run concurrently on purpose: they publish
+# disjoint tag sets (latest+sha-... vs semver+sha-...), and serializing
+# them would risk GitHub cancelling a pending release run instead of a
+# stale main build. cancel-in-progress stays false so a half-finished
+# registry push is never interrupted.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/yannichock/claude-mail-mcp
+
+jobs:
+  test:
+    name: Test
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_test.yml
+
+  release:
+    name: Build and push image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Image name is hardcoded lowercase above rather than derived from
+      # github.repository (which is "YannicHock/claude-mail-mcp"): GHCR
+      # rejects uppercase in image references.
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # flavor: latest=false is required. metadata-action's default
+          # flavor is `latest=auto`, which adds `latest` on its own
+          # whenever any type=semver rule matches — regardless of our
+          # explicit type=raw rule below, and without checking whether
+          # the tag is actually the newest version. Without this,
+          # pushing an old tag (e.g. a hotfix re-release of v1.0.0 after
+          # main has moved on) would silently overwrite `latest`. With
+          # it, `latest` is controlled solely by the type=raw rule.
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

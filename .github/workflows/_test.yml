@@ -1,0 +1,67 @@
+name: Test
+
+# Reusable workflow: typecheck + unit + integration tests, plus the
+# GreenMail fixture the integration suite talks to. Called by both
+# ci.yml (every push to main / every PR) and release.yml (as the gate
+# that must pass before an image is pushed to GHCR in the same run).
+on:
+  workflow_call:
+
+jobs:
+  test:
+    name: Typecheck & tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Pinned explicitly rather than relying on the package.json
+          # floor (">=20"): the test runner's own glob expansion of
+          # test/unit/*.test.ts and test/integration/*.test.ts needs a
+          # known-good Node version, not "whatever satisfies >=20".
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      # GreenMail is started via the repo's own docker-compose.test.yml
+      # (owned by the test-suite task) rather than redeclared here as a
+      # GitHub Actions service container. That keeps hostnames, ports,
+      # the mandatory -Dgreenmail.hostname=0.0.0.0 flag and the fixture
+      # users in one file that the integration tests are actually
+      # written against, instead of a second, easily-drifting copy of
+      # the same config living in this workflow.
+      - name: Start GreenMail fixture
+        run: docker compose -f docker-compose.test.yml up -d
+
+      - name: Wait for GreenMail to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose -f docker-compose.test.yml logs 2>&1 | grep -q "Started GreenMail"; then
+              echo "GreenMail is up."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::GreenMail did not report ready in time." >&2
+          docker compose -f docker-compose.test.yml logs
+          exit 1
+
+      - name: Integration tests
+        run: npm run test:integration
+
+      - name: Stop GreenMail fixture
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v

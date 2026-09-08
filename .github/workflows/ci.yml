@@ -1,0 +1,31 @@
+name: CI
+
+# Runs on every push to main and on every pull request: typecheck, unit
+# tests, integration tests against GreenMail (via the shared _test.yml
+# workflow), and a Docker build smoke test so a broken Dockerfile fails
+# the PR instead of only being discovered at release time.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_test.yml
+
+  docker-build:
+    name: Docker build smoke test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No push here on purpose: this only proves the image still
+      # builds. Pushing to GHCR is release.yml's job, gated on tests.
+      - name: Build image
+        run: docker build -t claude-mail-mcp:ci-smoke-test .

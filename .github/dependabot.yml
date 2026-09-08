@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Actions are pinned to major versions (per the plan's requirement);
+  # Dependabot is what keeps those pins from silently going stale.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
