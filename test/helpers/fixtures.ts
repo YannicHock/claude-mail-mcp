@@ -8,7 +8,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import type { Account, AccountsFile } from "../../src/accounts.js";
+import { AccountsStore, type Account } from "../../src/accounts.js";
 
 /** Create a fresh, empty temp directory for a test to use as its sandbox. */
 export async function makeTmpDir(prefix = "mail-mcp-test-"): Promise<string> {
@@ -52,6 +52,15 @@ export function makeAccount(overrides: Partial<Account> = {}): Account {
   };
 }
 
+/**
+ * Serialize a version-1 accounts.json body. Takes `unknown[]` rather than
+ * `Account[]` so schema-validation tests can pass deliberately-broken,
+ * non-Account shapes through the same serialization path as valid fixtures.
+ */
+export function serializeAccountsFile(accounts: unknown[]): string {
+  return JSON.stringify({ version: 1, accounts }, null, 2);
+}
+
 /** Write a well-formed accounts.json (version 1) into `dir`. Returns its path. */
 export async function makeAccountsFile(
   dir: string,
@@ -59,8 +68,7 @@ export async function makeAccountsFile(
   filename = "accounts.json"
 ): Promise<string> {
   const filePath = path.join(dir, filename);
-  const data: AccountsFile = { version: 1, accounts };
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
+  await fs.writeFile(filePath, serializeAccountsFile(accounts), "utf8");
   return filePath;
 }
 
@@ -73,6 +81,73 @@ export async function writeRawAccountsFile(
   const filePath = path.join(dir, filename);
   await fs.writeFile(filePath, content, "utf8");
   return filePath;
+}
+
+/**
+ * Own the full lifecycle of a temp-dir-backed AccountsStore: writes
+ * `accounts` (version 1) into a fresh temp dir — or writes no file at all
+ * when `accounts` is `undefined`, for "missing accounts.json" scenarios —
+ * starts the store, hands it to `fn`, and *guarantees* `store.stop()` and
+ * temp-dir removal afterwards regardless of how `fn` or `store.start()`
+ * itself exits.
+ *
+ * This exists so no test has to remember to call `store.stop()` by hand: on
+ * Windows, an AccountsStore that was start()'d (which begins an
+ * `fs.watch()`) but never stop()'d hangs the whole `node --test` process
+ * even though the watcher is created with `persistent: false` — a nasty,
+ * silent way to reintroduce a CI hang. Routing every accounts.test.ts case
+ * through this helper (and withAccountsFileContent below) makes that
+ * cleanup structural instead of a convention someone can forget.
+ */
+export async function withAccountsStore<T>(
+  accounts: Account[] | undefined,
+  fn: (store: AccountsStore, dir: string) => Promise<T> | T,
+  onChange?: (next: Account[], prev: Account[]) => void
+): Promise<T> {
+  const dir = await makeTmpDir();
+  try {
+    const file = path.join(dir, "accounts.json");
+    if (accounts !== undefined) {
+      await fs.writeFile(file, serializeAccountsFile(accounts), "utf8");
+    }
+    const store = new AccountsStore(file);
+    try {
+      await store.start(onChange);
+      return await fn(store, dir);
+    } finally {
+      store.stop();
+    }
+  } finally {
+    await cleanupTmpDir(dir);
+  }
+}
+
+/**
+ * Like {@link withAccountsStore}, but for scenarios where the accounts file
+ * itself is malformed and `store.start()` is expected to reject (bad JSON,
+ * wrong version, missing required fields, duplicate ids, ...). `fn` only
+ * runs if `start()` actually succeeds; typical callers instead wrap the
+ * whole call in `assert.rejects(...)`. `store.stop()` and temp-dir cleanup
+ * are still guaranteed either way.
+ */
+export async function withAccountsFileContent<T>(
+  rawContent: string,
+  fn: (store: AccountsStore, dir: string) => Promise<T> | T = () => undefined as T
+): Promise<T> {
+  const dir = await makeTmpDir();
+  try {
+    const file = path.join(dir, "accounts.json");
+    await fs.writeFile(file, rawContent, "utf8");
+    const store = new AccountsStore(file);
+    try {
+      await store.start();
+      return await fn(store, dir);
+    } finally {
+      store.stop();
+    }
+  } finally {
+    await cleanupTmpDir(dir);
+  }
 }
 
 /** A promise plus its externally-callable resolve/reject, for callback-driven tests. */
