@@ -6,6 +6,8 @@ Self-hosted **IMAP / SMTP / CalDAV connector for Claude** with multi-account sup
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Node](https://img.shields.io/badge/node-%3E=20-brightgreen.svg)](https://nodejs.org)
 
+> **This is a maintained fork** of [maxx3250/claude-mail-mcp](https://github.com/maxx3250/claude-mail-mcp), living at [YannicHock/claude-mail-mcp](https://github.com/YannicHock/claude-mail-mcp). The Docker image, `docker-compose.yml`, the test suites and the CI/CD pipeline described below exist only in this fork, so clone from here, open issues here, and report security problems here — see [SECURITY.md](SECURITY.md).
+
 ---
 
 ## What it does
@@ -59,7 +61,7 @@ Hosted email-AI services need full mailbox access. That's a lot of trust to hand
 ## Quick start
 
 ```bash
-git clone https://github.com/maxx3250/claude-mail-mcp.git
+git clone https://github.com/YannicHock/claude-mail-mcp.git
 cd claude-mail-mcp
 npm install
 cp .env.example .env
@@ -271,4 +273,4 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-Built by [Markus Stöger](https://markusstoeger.com) — WooCommerce, headless commerce and AI integration.
+Originally built by [Markus Stöger](https://markusstoeger.com) — WooCommerce, headless commerce and AI integration. Maintained as a fork at [YannicHock/claude-mail-mcp](https://github.com/YannicHock/claude-mail-mcp).

@@ -13,14 +13,22 @@ Until v1.0, only the latest minor release is supported with security fixes.
 
 **Please do not open a public GitHub issue for security problems.**
 
-Preferred channel:
+Report it here, in this fork:
 
 1. **GitHub Private Vulnerability Reporting** — open a private advisory at
-   <https://github.com/maxx3250/claude-mail-mcp/security/advisories/new>
+   <https://github.com/YannicHock/claude-mail-mcp/security/advisories/new>
 
-Alternative channel:
+This repository is a fork of
+[maxx3250/claude-mail-mcp](https://github.com/maxx3250/claude-mail-mcp) and is
+maintained separately. The container image, `docker-compose.yml`, the nginx
+reverse-proxy recipe and the CI workflows exist **only here**, so a report about
+any of them has to come to this repository — the upstream maintainer cannot act
+on code that is not in their tree.
 
-2. Email **security@markusstoeger.com**. PGP is not required.
+If the issue is in code inherited from upstream and therefore affects that
+project too, please also report it there, via
+<https://github.com/maxx3250/claude-mail-mcp/security/advisories/new> or
+**security@markusstoeger.com**.
 
 ## What to include
 

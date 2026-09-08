@@ -103,7 +103,7 @@ Rotate every 90 days (or after staff turnover):
 
 ```bash
 NEW=$(openssl rand -hex 32)
-sed -i "s/^AUTH_TOKEN=.*/AUTH_TOKEN=$NEW/" /var/www/mcp-mail.markusstoeger.com/.env
+sed -i "s/^AUTH_TOKEN=.*/AUTH_TOKEN=$NEW/" /var/www/mail-mcp/.env
 
 systemctl restart claude-mail-mcp
 ```

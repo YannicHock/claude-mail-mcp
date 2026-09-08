@@ -11,7 +11,7 @@ Thanks for considering a contribution. This project is small and aims to stay sm
 ## Local development
 
 ```bash
-git clone https://github.com/maxx3250/claude-mail-mcp.git
+git clone https://github.com/YannicHock/claude-mail-mcp.git
 cd claude-mail-mcp
 npm install
 cp .env.example .env

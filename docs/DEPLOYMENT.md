@@ -13,7 +13,7 @@ A typical production deployment behind nginx with pm2 as the process manager. Ad
 
 ```bash
 cd /var/www
-git clone https://github.com/maxx3250/claude-mail-mcp.git mail-mcp
+git clone https://github.com/YannicHock/claude-mail-mcp.git mail-mcp
 cd mail-mcp
 npm ci
 npm run build
