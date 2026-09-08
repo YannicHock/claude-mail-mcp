@@ -95,7 +95,7 @@ export class NoSuchAccountError extends Error {
   constructor(public readonly accountId: string, availableIds: string[]) {
     super(
       availableIds.length === 0
-        ? `No mailbox accounts configured yet. Open the setup page at the connector's /settings URL to add one.`
+        ? `No mailbox accounts configured yet. Add one under /settings/mailboxes on this deployment's public URL.`
         : `Account "${accountId}" is not configured. Available: ${availableIds.join(", ")}.`
     );
     this.name = "NoSuchAccountError";

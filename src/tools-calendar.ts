@@ -41,7 +41,7 @@ function requireCaldav(pool: ClientPool, accountId?: string) {
   const clients = pool.for(accountId);
   if (!clients.caldav) {
     throw new Error(
-      `Account "${accountId ?? "(default)"}" has no CalDAV configured. Add a CalDAV URL in the connector's /settings page.`
+      `Account "${accountId ?? "(default)"}" has no CalDAV configured. Add a CalDAV URL under /settings/mailboxes on this deployment's public URL.`
     );
   }
   return clients.caldav;
