@@ -109,6 +109,11 @@ Either path needs the same two things as the Quick start above: an `AUTH_TOKEN` 
 ```bash
 mkdir -p data
 echo '{"version":1,"accounts":[]}' > data/accounts.json   # or a real one, see Quick start
+# Once it holds real credentials, lock it down. The container runs as uid 100 /
+# gid 101 (`mailmcp`), so it needs the ownership change as well as the mode —
+# `chmod 600` alone makes the file unreadable to the container and the server
+# crash-loops on EACCES. See docs/DEPLOYMENT.md, "Container deployment" step 3.
+chown 100:101 data/accounts.json && chmod 600 data/accounts.json
 
 docker run -d \
   --name claude-mail-mcp \
@@ -133,6 +138,7 @@ cp .env.docker.example .env
 # fill in AUTH_TOKEN, PUBLIC_URL, LOG_LEVEL
 mkdir -p data
 echo '{"version":1,"accounts":[]}' > data/accounts.json   # or a real one, see Quick start
+chown 100:101 data/accounts.json && chmod 600 data/accounts.json   # see note above
 docker compose up -d
 docker compose logs -f
 ```

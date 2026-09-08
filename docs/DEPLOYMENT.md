@@ -302,6 +302,18 @@ echo "AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
 
 ### 3. Create `accounts.json`
 
+The container runs as the non-root user `mailmcp`, **uid 100 / gid 101**. Those
+numbers are pinned in the `Dockerfile` and are part of the image's published
+contract; confirm them against the image you actually pulled with:
+
+```bash
+docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
+# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp)
+```
+
+The credentials file has to be readable by that uid *and* unreadable to every
+other user on the host, so it needs an ownership change as well as the mode:
+
 ```bash
 mkdir -p data
 cat > data/accounts.json <<'JSON'
@@ -319,8 +331,23 @@ cat > data/accounts.json <<'JSON'
   ]
 }
 JSON
+chown 100:101 data/accounts.json   # uid/gid of `mailmcp` inside the container
 chmod 600 data/accounts.json
 ```
+
+Do both, in that order. `chmod 600` on its own leaves the file owned by the host
+user that created it — root, if you followed these steps as root — which uid 100
+cannot read. `src/accounts.ts` rethrows every error that is not `ENOENT`, so
+`main()` exits 1 and `restart: unless-stopped` in `docker-compose.yml` turns that
+into an endless crash loop; `docker compose logs` shows nothing but:
+
+```
+Fatal startup error: Error: EACCES: permission denied, open '/data/accounts.json'
+```
+
+The `data/` directory itself keeps its default mode (`755`) — uid 100 only needs
+to traverse it, and the directory name carries no secret. If `chown` reports
+"Operation not permitted", you are not root: prefix both commands with `sudo`.
 
 `docker-compose.yml` bind-mounts `./data` read-only at `/data` inside the container. The backend picks up edits to `data/accounts.json` via `fs.watch` — no restart needed, same behavior as the systemd deployment's `accounts.json`.
 
