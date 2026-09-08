@@ -82,7 +82,7 @@ If you add an OAuth layer in front (not part of this repository — see [docs/HA
 - If you add an OAuth layer in front, apply the same systemd hardening and dedicated non-root user to it — it isn't covered by this project's install steps.
 
 ### Credentials at rest
-- `accounts.json` is owned by `mailmcp:mailmcp` and chmod 600.
+- `accounts.json` is owned by `mailmcp:mailmcp` and chmod 600, at `/var/lib/mail-mcp/accounts.json` — the `ACCOUNTS_FILE` default in `.env.example` and the path [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) step 4 creates. Under the container deployment in that same document it is `./data/accounts.json` on the host, mounted read-only at `/data/accounts.json` and owned by the container's uid 100 / gid 101.
 - `.env` (holds `AUTH_TOKEN` and, for single-account setups, mailbox credentials) is `root:mailmcp` 640 (root can edit, the service can read).
 - If you add an OAuth layer that keeps its own state (signing keys, refresh-token hashes, an htpasswd file), apply the same ownership/permission discipline to it — it isn't part of this project's code or install steps.
 

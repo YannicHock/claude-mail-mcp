@@ -29,6 +29,13 @@ When you follow [DEPLOYMENT.md](DEPLOYMENT.md), you end up with:
        ▼ reads /var/lib/mail-mcp/accounts.json (chmod 600, owner mailmcp)
 ```
 
+That path is where `ACCOUNTS_FILE` in `.env.example` points and where
+[DEPLOYMENT.md](DEPLOYMENT.md) step 4 creates the file. The container
+deployment in that same document is the one variation: there the file is
+`./data/accounts.json` on the host, bind-mounted read-only to
+`/data/accounts.json` and owned by the container's uid 100 / gid 101. Every
+other property below applies to the systemd deployment described here.
+
 This is the whole deployment as it ships: one process, bound to loopback, gated by a single static Bearer token that it checks on every `/mcp` request. There is no separate OAuth/login process in front of it by default. If you need to expose this server to a remote client that requires OAuth 2.1 discovery (see "Optional: adding an OAuth layer" below), that layer is something you add yourself — it is not part of this repository, and there is currently no reference implementation to point you at. An earlier version of this document linked to one (`markusstoeger/mcp-oauth-shim`); that repository no longer exists.
 
 ### Properties this gives you
@@ -48,7 +55,7 @@ This is the whole deployment as it ships: one process, bound to loopback, gated 
 | Process | Limited syscall surface | `SystemCallFilter=@system-service ~@privileged @resources` |
 | Process | Resource caps | `MemoryMax=512M`, `TasksMax=128`, `LimitNOFILE=4096` |
 | Auth | Static Bearer token gates `/mcp` | `AUTH_TOKEN` env var, checked on every request |
-| Storage | Credentials chmod 600, owned by service user | install script |
+| Storage | `/var/lib/mail-mcp/accounts.json` chmod 600, owned by `mailmcp` | `install -o mailmcp -g mailmcp -m 600`, [DEPLOYMENT.md](DEPLOYMENT.md) step 4 |
 
 OAuth 2.1, JWT-based sessions, CSRF guards and subprocess-hardened login checks would all belong to an OAuth layer placed in front of this server — none of that exists in this repository today. See "Optional: adding an OAuth layer" below for what such a layer would need to provide.
 

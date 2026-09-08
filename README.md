@@ -87,7 +87,7 @@ The server boots with **no mailboxes configured** — that's fine. Hand-craft an
 }
 ```
 
-Save as `/root/.config/mail-mcp/accounts.json` (chmod 600), or set `ACCOUNTS_FILE=./accounts.json` in `.env` for local dev. The backend re-reads via `fs.watch`, no restart needed.
+For local development, save it in your checkout and set `ACCOUNTS_FILE=./accounts.json` in `.env` (`accounts.json` and `data/` are git-ignored, so it can't be committed by accident). On a server, `.env.example` already points `ACCOUNTS_FILE` at `/var/lib/mail-mcp/accounts.json`, owned by the `mailmcp` service user at mode 600 — see [Deployment](docs/DEPLOYMENT.md) step 4. The backend re-reads via `fs.watch`, no restart needed.
 
 Smoke test:
 
