@@ -1,6 +1,6 @@
 {
   "name": "claude-mail-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Self-hosted IMAP/SMTP/CalDAV connector for Claude — Streamable HTTP MCP server. Read+write email and calendar against any RFC-compliant mailbox (Mailbox.org, Fastmail, iCloud, Mailcow, iRedMail, Migadu, Nextcloud, …).",
   "license": "MIT",
   "author": "Markus Stöger <hi@markusstoeger.com> (https://markusstoeger.com)",
@@ -48,24 +48,23 @@
     "test:integration": "node --import tsx --test test/integration/*.test.ts"
   },
   "engines": {
-    "node": "^20.19.0 || >=22.7.0"
+    "node": ">=24.0.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.6.1",
-    "express": "^5.0.1",
-    "ical.js": "^2.1.0",
-    "imapflow": "^1.0.180",
-    "mailparser": "^3.7.2",
-    "nodemailer": "^8.0.7",
-    "tsdav": "^2.1.5",
-    "zod": "^3.23.8"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "express": "^5.2.1",
+    "ical.js": "^2.2.1",
+    "imapflow": "^2.0.0",
+    "mailparser": "^3.9.23",
+    "nodemailer": "^10.0.1",
+    "tsdav": "^2.3.3",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
-    "@types/express": "^5.0.0",
-    "@types/mailparser": "^3.4.5",
-    "@types/node": "^22.10.0",
-    "@types/nodemailer": "^7.0.11",
-    "tsx": "^4.23.1",
-    "typescript": "^5.7.2"
+    "@types/express": "^5.0.6",
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^24.13.3",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
   }
 }

@@ -1,8 +1,57 @@
 version: 2
 updates:
-  # Actions are pinned to major versions (per the plan's requirement);
-  # Dependabot is what keeps those pins from silently going stale.
+  # Actions are pinned to commit shas, which is precisely the arrangement that
+  # goes stale without saying so: a sha never stops resolving, it just stops
+  # being current. Dependabot rewrites the sha and the trailing version comment
+  # together.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+
+  # npm was missing entirely until 0.5.0, which is why the dependency set drifted
+  # far enough to need one large refresh rather than a stream of small ones —
+  # three majors behind on imapflow, two on nodemailer, one on zod and TypeScript.
+  # One entry per package: the connector and the OAuth layer have separate
+  # lockfiles and separate images.
+  #
+  # @types/* are grouped so a routine type-definition bump is one pull request
+  # instead of four.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      types:
+        patterns:
+          - "@types/*"
+
+  - package-ecosystem: "npm"
+    directory: "/oauth"
+    schedule:
+      interval: "weekly"
+    groups:
+      types:
+        patterns:
+          - "@types/*"
+
+  # The Node base image both Dockerfiles build on. Major updates are ignored on
+  # purpose: which Node line this project runs is a decision about long-term
+  # support, not a version number to chase. Node 26 exists but is not LTS until
+  # October 2026, and the move happens in both Dockerfiles, both `engines` fields
+  # and _test.yml at once. Patch and minor updates of the 24 line are welcome.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "docker"
+    directory: "/oauth"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]

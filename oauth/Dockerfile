@@ -6,9 +6,13 @@
 # Deliberately mirrors the connector's Dockerfile — same base image, same
 # non-root pattern, same "no build tools in the runtime stage" split — so there
 # is one set of container conventions in this repository rather than two.
+#
+# That mirroring includes the Node line: 24 is the active LTS, and the move to 26
+# happens here and in ../Dockerfile at the same time, once 26 becomes LTS in
+# October 2026. See the note at the top of ../Dockerfile.
 
 # ---- Builder ------------------------------------------------------------
-FROM node:22-alpine AS builder
+FROM node:24-alpine AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -19,7 +23,7 @@ COPY src ./src
 RUN npm run build
 
 # ---- Runtime ------------------------------------------------------------
-FROM node:22-alpine AS runtime
+FROM node:24-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production

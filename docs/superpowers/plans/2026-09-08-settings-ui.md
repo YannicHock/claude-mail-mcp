@@ -14,7 +14,7 @@
 
 Every task's requirements implicitly include this section.
 
-- **Node floor `^20.19.0 || >=22.7.0`.** CI runs Node 22, matching `node:22-alpine`. Anything reported green must be verified in a Node 22 container, not only on the dev machine. The command is in "Verifying on Node 22" below.
+- **Node floor `>=24.0.0`.** CI runs Node 24, matching `node:24-alpine`. Anything reported green must be verified in a Node 24 container, not only on the dev machine. The command is in "Verifying on Node 24" below.
 - **No new runtime dependency in either package.** `oauth/` stays on `express` + `jose`; the connector stays on its current eight. This is why the cross-service assertion is an HMAC over a literal string rather than a JWT (spec §4).
 - **The two packages cannot import from each other.** `oauth/Dockerfile` builds with `context: oauth`, so nothing under `src/` is in its build context. Constants shared between them are duplicated verbatim and each copy carries a comment naming the other.
 - **No JavaScript is served to the browser, and no build step is added.** Every page is server-rendered HTML with inline CSS, and every interaction is a form submission.
@@ -41,13 +41,13 @@ Copy these verbatim wherever they appear. A mismatch between the two packages is
 | Settings key env var | `SETTINGS_SIGNING_KEY` / `SETTINGS_SIGNING_KEY_FILE` |
 | Minimum settings key length | 32 bytes |
 
-### Verifying on Node 22
+### Verifying on Node 24
 
 The repository's `node_modules` is built for Windows and cannot run in the Linux
 container, so the check copies the tree without it and installs fresh:
 
 ```bash
-docker run --rm -v "/c/Users/yanni/IdeaProjects/claude-mail-mcp:/src:ro" node:22-alpine sh -c '
+docker run --rm -v "/c/Users/yanni/IdeaProjects/claude-mail-mcp:/src:ro" node:24-alpine sh -c '
 set -e
 mkdir -p /app && cd /src && tar cf - --exclude=node_modules --exclude=.git --exclude=dist . | (cd /app && tar xf -)
 cd /app && npm ci --silent >/dev/null 2>&1
@@ -2152,9 +2152,9 @@ Then 303 back to `/settings/clients`.
 Run: `cd oauth && node --import tsx --test test/unit/*.test.ts test/integration/*.test.ts`
 Expected: PASS.
 
-- [ ] **Step 7: Verify on Node 22**
+- [ ] **Step 7: Verify on Node 24**
 
-Run the container command from "Verifying on Node 22".
+Run the container command from "Verifying on Node 24".
 Expected: both packages typecheck and their unit suites pass.
 
 - [ ] **Step 8: Commit**
@@ -3094,9 +3094,9 @@ git commit -m "feat(settings): wire the deployment and point the errors at the r
 
 No new features. This is the gate before the branch is offered for review.
 
-- [ ] **Step 1: Run everything on Node 22**
+- [ ] **Step 1: Run everything on Node 24**
 
-Run the container command from "Verifying on Node 22", extended with both integration
+Run the container command from "Verifying on Node 24", extended with both integration
 suites (the connector's needs a reachable Docker daemon for GreenMail, so run that part
 on the host instead).
 Expected: PASS everywhere.

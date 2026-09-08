@@ -37,7 +37,7 @@ import { registerCalendarTools } from "./tools-calendar.js";
 export const SERVER_NAME = "claude-mail-mcp";
 
 /** MCP `serverInfo.version` reported to clients, and the `version` field of `/health`. */
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
