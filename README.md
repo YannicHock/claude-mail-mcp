@@ -257,9 +257,16 @@ CI runs typecheck (`tsc --noEmit`), the unit suite and the integration suite on 
 
 ## Roadmap
 
-- **v0.2** ✅ — Multi-account per deployment (this release). No browser setup flow: accounts are configured by editing `accounts.json` — see [Connecting from Claude.ai](#connecting-from-claudeai).
-- **v0.3** — Threading-aware `list_threads` tool, attachment download as base64, calendar invitation (iMIP) sending
-- **v0.4** — CardDAV (contacts), JMAP support as an alternative to IMAP for Fastmail/Topicbox
+✅ marks what is merged into `main` and running; *(untagged)* marks the entries
+that have no release tag yet.
+
+- **v0.1** ✅ — Single account configured through `.env`; IMAP, SMTP and CalDAV tools over MCP
+- **v0.2** ✅ — Multi-account per deployment. No browser setup flow: accounts are configured by editing `accounts.json` — see [Connecting from Claude.ai](#connecting-from-claudeai).
+- **v0.3** ✅ *(untagged)* — Docker image on GHCR, test foundation (25 unit, 14 integration), CI and release pipeline
+- **v0.4** ✅ *(untagged)* — OAuth 2.1 layer in `oauth/` for claude.ai web and Cowork: discovery, dynamic client registration, PKCE, refresh rotation, and an authenticated proxy in front of `/mcp`
+- **v0.5** — Browser settings UI: manage mailboxes, verify IMAP/SMTP/CalDAV credentials before saving, review and revoke connected Claude clients
+- **v0.6** — Threading-aware `list_threads` tool, attachment download as base64, calendar invitation (iMIP) sending
+- **v0.7** — CardDAV (contacts), JMAP support as an alternative to IMAP for Fastmail/Topicbox
 - **v1.0** — Audit log, Prometheus metrics, rate limiting, hardened deployment guide
 
 ---

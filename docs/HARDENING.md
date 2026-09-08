@@ -91,7 +91,7 @@ The backend speaks to your mailbox provider's IMAP, SMTP and CalDAV. We don't re
 
 ### Multi-operator scenarios
 
-v0.2 is single-tenant: one shared `AUTH_TOKEN` grants access to every configured account, and this server has no per-user login of its own. If you add an OAuth layer in front for multi-user access, its login step becomes the real access-control boundary between humans — this server can't tell them apart. If your use case needs distinguishable humans, deploy multiple instances (each with its own `AUTH_TOKEN` and, if applicable, its own OAuth-layer login), or wait for v0.3 (multi-tenant on the roadmap).
+v0.2 is single-tenant: one shared `AUTH_TOKEN` grants access to every configured account, and this server has no per-user login of its own. If you add an OAuth layer in front for multi-user access, its login step becomes the real access-control boundary between humans — this server can't tell them apart. If your use case needs distinguishable humans, deploy multiple instances, each with its own `AUTH_TOKEN` and, if applicable, its own OAuth-layer login. Multi-tenancy is not on the roadmap.
 
 ## Recommended additions
 
