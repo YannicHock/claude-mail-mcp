@@ -1,6 +1,6 @@
 {
   "name": "claude-mail-mcp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Self-hosted IMAP/SMTP/CalDAV connector for Claude — Streamable HTTP MCP server. Read+write email and calendar against any RFC-compliant mailbox (Mailbox.org, Fastmail, iCloud, Mailcow, iRedMail, Migadu, Nextcloud, …).",
   "license": "MIT",
   "author": "Markus Stöger <hi@markusstoeger.com> (https://markusstoeger.com)",

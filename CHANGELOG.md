@@ -2,6 +2,38 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-09-09
+
+A browser settings UI. Mailboxes can be added, tested, edited and removed without a shell on the server; connected Claude clients can be reviewed and revoked; the operator password can be changed.
+
+Three error messages in this repository had promised that page since 0.2.0 and sent anyone who followed them to a 404. They now name the real one.
+
+### Added
+
+- **Mailbox management at `/settings/mailboxes`.** Create, edit, delete and set the default account from the browser. Writes go through an atomic, round-trip-validated path: the serialised file is handed back to the same parser the loader uses, written to a `0600` temp file, `fsync`ed and renamed into place, so the connector can never write a file it would refuse to read. A hidden size-and-mtime stamp catches a concurrent hand edit and re-renders instead of clobbering it.
+- **A connection test before saving.** IMAP, SMTP and CalDAV are probed concurrently against the submitted values, merged with stored passwords where a field was left blank, so an existing account can be tested without retyping. Nothing is persisted. Every probe is bounded at the library level and torn down when its budget expires.
+- **Connected clients at `/settings/clients`.** Registered clients and live refresh sessions, each revocable. Revoking a client takes effect on its already-issued access tokens immediately, via a token epoch and a per-client `revokedAt` compared at verification — not an hour later when the token would have expired anyway.
+- **Operator password change at `/settings/password`,** with an opt-in checkbox to disconnect every Claude client at the same time. Changing the password invalidates every browser session, including the one making the change.
+- **A stateless operator session.** `__Host-`prefixed cookie, HS256, 60-minute absolute lifetime re-issued on each authenticated GET. The only server-side state is one integer, `sessionEpoch`, which every token carries a copy of — bumping it is what makes "sign out everywhere" and a password change mean anything.
+
+### Changed
+
+- **The connector's `./data` mount is writable.** It is the only process that writes `accounts.json`, and already the only one that reads the credentials in it. The **directory** must be writable by uid 100, not merely the file — saving renames a temp file into place, so missing this is an `EACCES` on first save rather than at startup.
+- **The live operator password hash moved** from the read-only `/run/secrets` mount to `oauth-data/operator.json`. `AUTH_PASSWORD_HASH` now seeds that record once and is ignored afterwards; the service logs which source is live and warns by name when the two differ. `OPERATOR_FILE=none` restores the previous behaviour and disables the password-change page.
+- **The proxy strips `Cookie` before forwarding.** The session cookie is `Path=/` by virtue of the `__Host-` prefix, so the browser sends it to `/mcp` and `/token` as well. The connector authenticates settings requests by assertion alone and must never be able to read browser state.
+- `docs/DEPLOYMENT.md` gained a step for enabling the UI, and four claims that stopped being true when the OAuth layer shipped in 0.4.0 were corrected.
+
+### Security
+
+- A new Docker secret, `settings_signing_key`, mounted into **both** services. It signs a 30-second HMAC assertion binding each proxied settings request to its method and path. Deliberately not the OAuth signing key: a compromised connector must not be able to mint access tokens for `/mcp`. Without the secret the connector refuses `/settings/*` outright and the UI is not mounted — the feature is off, not half-on.
+- CSRF is checked twice over: a same-origin check and a token, and for the proxied mailbox routes the connector verifies that token against the assertion's own `csrf` claim, having never seen the session cookie.
+- No stored password ever reaches the rendered HTML. The password field helper takes no value parameter, so it cannot emit one, and the error re-render strips password keys before the values reach the template.
+
+### Known limitations
+
+- Revoking a single **session** stops it refreshing but leaves its current access token valid until it expires; revoking the **client** is immediate for both. See issue #2.
+- The connection test does not yet distinguish a rejected password from an unreachable host in the most common case. See issue #3.
+
 ## [0.5.0] — 2026-09-08
 
 Runtime and dependency refresh, together with the release pipeline that is meant to keep it from drifting this far again. Not a patch release: the Node floor moves from 20/22 to 24, and four dependencies cross a major boundary.
