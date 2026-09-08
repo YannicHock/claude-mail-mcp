@@ -4,7 +4,9 @@ A typical production deployment behind nginx, running under a hardened systemd u
 
 ## Requirements
 
-- Node.js ≥ 20
+- Node.js 20.19+ or 22.7+ — older releases cannot load the `tsdav`
+  dependency, which ships an ESM file inside a CommonJS package. The Docker
+  image ships Node 22.
 - A public DNS name pointing at your server (HTTPS is required by Claude.ai)
 - An IMAP + SMTP capable mailbox
 - Optionally a CalDAV endpoint
