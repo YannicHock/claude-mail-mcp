@@ -9,6 +9,15 @@ on:
     branches: [main]
     tags: ['v*']
 
+# Two rapid pushes to main, or a main push racing a tag push, would
+# otherwise start two concurrent release jobs that both build multi-arch
+# and both push to GHCR. Queue them instead of cancelling: cancelling a
+# half-finished registry push would leave GHCR in a worse state than
+# just waiting for it to finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   IMAGE_NAME: ghcr.io/yannichock/claude-mail-mcp
 
@@ -51,6 +60,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
+          # flavor: latest=false is required. metadata-action's default
+          # flavor is `latest=auto`, which adds `latest` on its own
+          # whenever any type=semver rule matches — regardless of our
+          # explicit type=raw rule below, and without checking whether
+          # the tag is actually the newest version. Without this,
+          # pushing an old tag (e.g. a hotfix re-release of v1.0.0 after
+          # main has moved on) would silently overwrite `latest`. With
+          # it, `latest` is controlled solely by the type=raw rule.
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
