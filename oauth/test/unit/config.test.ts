@@ -211,3 +211,29 @@ describe("loadConfig", () => {
     });
   });
 });
+
+describe("trust proxy", () => {
+  it("defaults to a single hop, not to trusting the whole chain", () => {
+    // `trust proxy: true` would let a client pick its own req.ip through
+    // X-Forwarded-For and step around the login throttle one address at a time.
+    assert.equal(loadConfig(baseEnv()).trustProxy, 1);
+  });
+
+  it("accepts a different hop count", () => {
+    assert.equal(loadConfig(baseEnv({ TRUST_PROXY: "2" })).trustProxy, 2);
+  });
+
+  it("accepts 0 for a service nothing proxies", () => {
+    assert.equal(loadConfig(baseEnv({ TRUST_PROXY: "0" })).trustProxy, 0);
+  });
+
+  it("rejects a boolean or a negative value", () => {
+    for (const value of ["true", "-1", "yes", "1.5"]) {
+      assert.throws(
+        () => loadConfig(baseEnv({ TRUST_PROXY: value })),
+        ConfigError,
+        `TRUST_PROXY=${value} should be rejected`
+      );
+    }
+  });
+});

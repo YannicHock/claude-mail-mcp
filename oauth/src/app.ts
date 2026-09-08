@@ -78,10 +78,20 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
 
   const app = express();
   app.disable("x-powered-by");
-  // Behind the reverse proxy that terminates TLS, so req.ip must come from
-  // X-Forwarded-For or every throttle bucket and every log line would carry the
-  // proxy's address instead of the client's.
-  app.set("trust proxy", true);
+  // A hop count, never `true`.
+  //
+  // `trust proxy: true` trusts the whole X-Forwarded-For chain and takes its
+  // leftmost entry as req.ip — and that entry is supplied by the client. The
+  // reverse proxy only *appends* the address it saw, so a client sending
+  // `X-Forwarded-For: <anything>` chooses its own req.ip. That defeats the login
+  // throttle outright, since every attempt lands in a different bucket, and it
+  // writes an attacker-chosen address into the log line the fail2ban filter
+  // reads.
+  //
+  // With a hop count, Express skips exactly that many trusted entries from the
+  // socket outward, so req.ip is the address the outermost trusted proxy
+  // actually observed. Default 1, for the single reverse proxy in front.
+  app.set("trust proxy", config.trustProxy);
 
   const jsonBody = express.json({ limit: "64kb" });
   const formBody = express.urlencoded({ extended: false, limit: "64kb" });

@@ -443,3 +443,56 @@ describe("the token endpoint's grant checks", () => {
     assert.equal(((await response.json()) as { error: string }).error, "invalid_target");
   });
 });
+
+describe("login throttling cannot be sidestepped with X-Forwarded-For", () => {
+  it("buckets on the address the reverse proxy observed, not one the client picked", async () => {
+    // The shape this runs in: the reverse proxy appends the address it saw to
+    // whatever X-Forwarded-For the client sent, so the header arriving here is
+    // "<client-supplied>, <real client>". With `trust proxy: true` Express would
+    // take the leftmost entry — the forged one — and every attempt would land in
+    // its own throttle bucket, leaving the login effectively unthrottled and the
+    // fail2ban log line naming an address of the attacker's choosing.
+    const throttled = await startHarness({ throttle: new LoginThrottle(3, 900) });
+    try {
+      const registration = await registerClaudeClient(throttled.baseUrl);
+      const { challenge } = makePkce();
+      const url = new URL(`${throttled.baseUrl}/authorize`);
+      url.searchParams.set("response_type", "code");
+      url.searchParams.set("client_id", registration.body.client_id as string);
+      url.searchParams.set("redirect_uri", CLAUDE_CALLBACK);
+      url.searchParams.set("code_challenge", challenge);
+      url.searchParams.set("code_challenge_method", "S256");
+      const requestToken = extractRequestToken(await (await fetch(url)).text())!;
+
+      const attempt = (forged: string) =>
+        fetch(`${throttled.baseUrl}/authorize`, {
+          method: "POST",
+          redirect: "manual",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            Origin: throttled.baseUrl,
+            // A different forged address every time, with the real one appended.
+            "X-Forwarded-For": `${forged}, 203.0.113.7`,
+          },
+          body: new URLSearchParams({
+            request: requestToken,
+            username: TEST_USERNAME,
+            password: "wrong",
+          }),
+        });
+
+      const statuses: number[] = [];
+      for (let i = 0; i < 5; i += 1) {
+        statuses.push((await attempt(`9.9.9.${i}`)).status);
+      }
+
+      assert.deepEqual(
+        statuses,
+        [401, 401, 401, 429, 429],
+        "rotating the forged X-Forwarded-For entry must not reset the throttle"
+      );
+    } finally {
+      await throttled.close();
+    }
+  });
+});

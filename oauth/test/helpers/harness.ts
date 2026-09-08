@@ -95,6 +95,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     authUsername: TEST_USERNAME,
     authPasswordHash: await hashPassword(TEST_PASSWORD, FAST_SCRYPT),
     stateFile: null,
+    trustProxy: 1,
     accessTokenTtl: 3600,
     refreshTokenTtl: 2592000,
     redirectAllowlist: [...HOSTED_CLAUDE_REDIRECT_URIS],
