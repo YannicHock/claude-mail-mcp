@@ -36,6 +36,8 @@ import { promises as fs } from "node:fs";
 import { watch, FSWatcher } from "node:fs";
 import path from "node:path";
 
+import { readStamp, writeAccountsFile, StaleStampError } from "./accounts-writer.js";
+
 export interface ImapCreds {
   host: string;
   port: number;
@@ -106,6 +108,7 @@ export class AccountsStore {
   private watcher: FSWatcher | null = null;
   private readonly filePath: string;
   private onChange?: (next: Account[], prev: Account[]) => void;
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -141,27 +144,39 @@ export class AccountsStore {
    */
   async reload(): Promise<void> {
     const prev = this.accounts;
+    const { accounts: next, present } = await this.readFromDisk();
+    this.accounts = next;
+    this.byId = new Map(next.map((a) => [a.id, a]));
+    // reload()'s own dispatch contract, unchanged from before: fire whenever
+    // the file was actually present and parsed (even if content is
+    // unchanged — the fs.watch debounce path relies on that), and also on a
+    // missing-file transition away from having had accounts. This is
+    // deliberately unrelated to applyMutation()'s single, success-only fire
+    // below — reload() is also the watcher's path, and its semantics are
+    // out of scope for the write path added here.
+    if (this.onChange && (present || prev.length > 0)) {
+      this.onChange(next, prev);
+    }
+  }
+
+  /**
+   * The read-and-parse half of {@link reload}, without the memory
+   * assignment or the `onChange` dispatch. Used by {@link applyMutation} to
+   * get a fresh, current view of the file without reload()'s unconditional
+   * notification firing before a mutation is even known to succeed.
+   */
+  private async readFromDisk(): Promise<{ accounts: Account[]; present: boolean }> {
     let raw: string;
     try {
       raw = await fs.readFile(this.filePath, "utf8");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        this.accounts = [];
-        this.byId = new Map();
-        if (this.onChange && prev.length > 0) {
-          this.onChange(this.accounts, prev);
-        }
-        return;
+        return { accounts: [], present: false };
       }
       throw err;
     }
-
     const parsed = parseAccountsFile(raw);
-    this.accounts = parsed.accounts;
-    this.byId = new Map(parsed.accounts.map((a) => [a.id, a]));
-    if (this.onChange) {
-      this.onChange(this.accounts, prev);
-    }
+    return { accounts: parsed.accounts, present: true };
   }
 
   /** All currently-loaded accounts. */
@@ -212,6 +227,112 @@ export class AccountsStore {
     }));
   }
 
+  /** The on-disk version this store currently reflects. Pass it back into a
+   * mutation to prove the form it came from hasn't gone stale. */
+  async stamp(): Promise<string> {
+    return readStamp(this.filePath);
+  }
+
+  /** Add a new account. Rejects if `account.id` is already taken. */
+  async create(account: Account, stamp: string): Promise<void> {
+    await this.mutate(stamp, (accounts) => {
+      if (accounts.some((a) => a.id === account.id)) {
+        throw new AccountsStoreError(`An account with id "${account.id}" already exists.`);
+      }
+      return [...accounts, account];
+    });
+  }
+
+  /** Replace an existing account wholesale. Rejects if `id` is unknown. */
+  async update(id: string, account: Account, stamp: string): Promise<void> {
+    await this.mutate(stamp, (accounts) => {
+      const index = accounts.findIndex((a) => a.id === id);
+      if (index === -1) {
+        throw new NoSuchAccountError(
+          id,
+          accounts.map((a) => a.id)
+        );
+      }
+      const next = [...accounts];
+      next[index] = account;
+      return next;
+    });
+  }
+
+  /** Remove an account. Rejects if `id` is unknown. */
+  async remove(id: string, stamp: string): Promise<void> {
+    await this.mutate(stamp, (accounts) => {
+      if (!accounts.some((a) => a.id === id)) {
+        throw new NoSuchAccountError(
+          id,
+          accounts.map((a) => a.id)
+        );
+      }
+      return accounts.filter((a) => a.id !== id);
+    });
+  }
+
+  /** Mark `id` as the default account, clearing the flag on every other one
+   * first — the flag moves rather than accumulating a second holder. */
+  async setDefault(id: string, stamp: string): Promise<void> {
+    await this.mutate(stamp, (accounts) => {
+      if (!accounts.some((a) => a.id === id)) {
+        throw new NoSuchAccountError(
+          id,
+          accounts.map((a) => a.id)
+        );
+      }
+      return accounts.map((a) => ({ ...a, default: a.id === id ? true : undefined }));
+    });
+  }
+
+  /**
+   * Shared mutation path for create/update/remove/setDefault.
+   *
+   * Writes are serialised through `writeChain` so two concurrent form
+   * submissions cannot interleave — each waits for the previous one to
+   * settle before it re-reads the stamp. A failure must not poison later
+   * writes, so the chain itself always resolves; only the promise handed
+   * back to this call's caller carries the rejection.
+   */
+  private mutate(stamp: string, change: (accounts: Account[]) => Account[]): Promise<void> {
+    const attempt = this.writeChain.then(() => this.applyMutation(stamp, change));
+    this.writeChain = attempt.then(
+      () => undefined,
+      () => undefined
+    );
+    return attempt;
+  }
+
+  private async applyMutation(
+    stamp: string,
+    change: (accounts: Account[]) => Account[]
+  ): Promise<void> {
+    // Re-read rather than trusting memory: a hand edit since the last load is
+    // a change the operator meant, and the stamp check is what tells them
+    // apart from a stale form submission. Uses the non-dispatching read, not
+    // reload(), so a rejected mutation (duplicate id, unknown id, a failed
+    // round-trip parse, a stale stamp) never fires onChange as a side
+    // effect — only a write that actually completes does, exactly once,
+    // below.
+    const current = await readStamp(this.filePath);
+    if (current !== stamp) throw new StaleStampError();
+    const { accounts: prev } = await this.readFromDisk();
+
+    const next = change(prev);
+    const file: AccountsFile = { version: 1, accounts: next };
+
+    // Only after the rename returns does memory move — a failed write must
+    // leave both the file and the in-memory list untouched.
+    await writeAccountsFile(this.filePath, file);
+
+    this.accounts = next;
+    this.byId = new Map(next.map((a) => [a.id, a]));
+    if (this.onChange) {
+      this.onChange(next, prev);
+    }
+  }
+
   private watchFile(): void {
     // fs.watch on a missing file throws; watch the parent directory and
     // filter to our basename for robustness across editor save patterns
@@ -252,7 +373,7 @@ export class AccountsStore {
   }
 }
 
-function parseAccountsFile(raw: string): AccountsFile {
+export function parseAccountsFile(raw: string): AccountsFile {
   let json: unknown;
   try {
     json = JSON.parse(raw);
