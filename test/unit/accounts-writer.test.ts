@@ -185,3 +185,99 @@ test("removing the last account leaves a valid empty file", async () => {
     store.stop();
   }
 });
+
+test("a failed mutation does not block a later successful one (chain recovery)", async () => {
+  // Guards against a specific regression: an earlier version of #mutate did
+  // `this.writeChain = this.writeChain.then(async () => {...})` and
+  // returned that same promise. Once one call's inner function threw,
+  // `this.writeChain` became a *rejected* promise, and every subsequent
+  // `.then(fn)` on it skips `fn` and just re-throws — permanently wedging
+  // the store after the very first failed write. This test creates a
+  // duplicate-id failure and then proves the store still accepts a
+  // perfectly good mutation afterward.
+  const store = new AccountsStore(await tempAccounts());
+  await store.start();
+  try {
+    await store.create(sampleAccount("work"), await store.stamp());
+    await assert.rejects(async () => store.create(sampleAccount("work"), await store.stamp()));
+
+    // If the chain were poisoned by the rejection above, this would hang
+    // forever or reject too — neither of which this call tolerates.
+    await store.create(sampleAccount("home"), await store.stamp());
+    assert.deepEqual(store.ids(), ["work", "home"]);
+  } finally {
+    store.stop();
+  }
+});
+
+test("two concurrent create calls serialise rather than interleave", async () => {
+  const path = await tempAccounts();
+  const store = new AccountsStore(path);
+  await store.start();
+  try {
+    const stamp = await store.stamp();
+
+    // Both calls share one stamp, as two browser tabs opening the same form
+    // would. Fired together (not awaited in sequence) so they overlap in
+    // the writer's async work rather than running one after the other.
+    const results = await Promise.allSettled([
+      store.create(sampleAccount("a"), stamp),
+      store.create(sampleAccount("b"), stamp),
+    ]);
+
+    const fulfilledCount = results.filter((r) => r.status === "fulfilled").length;
+    const rejection = results.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+
+    assert.equal(fulfilledCount, 1, "exactly one of the two concurrent submissions should win");
+    assert.ok(rejection, "the other must be refused, not silently interleaved");
+    assert.equal(rejection.reason.name, "StaleStampError");
+
+    // The file must reflect exactly one new account — never both spliced
+    // together by an interleaved write, and never neither (a lost write).
+    assert.equal(store.ids().length, 1);
+    const onDisk = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(onDisk.accounts.length, 1);
+
+    // The rejected concurrent submission must not have poisoned the chain
+    // either — a fresh, correctly-stamped mutation still goes through.
+    await store.create(sampleAccount("c"), await store.stamp());
+    assert.equal(store.ids().length, 2);
+  } finally {
+    store.stop();
+  }
+});
+
+test("onChange fires exactly once for a successful mutation, and not at all for a failed one", async () => {
+  const path = await tempAccounts();
+  const store = new AccountsStore(path);
+  const calls: Array<{ next: string[]; prev: string[] }> = [];
+  await store.start((next, prev) => {
+    calls.push({ next: next.map((a) => a.id), prev: prev.map((a) => a.id) });
+  });
+  try {
+    // start() calls reload() once for the initial load; the file doesn't
+    // exist yet, and reload() only dispatches on a missing file when there
+    // were previously-loaded accounts to report losing — there weren't, so
+    // nothing has fired yet.
+    assert.equal(calls.length, 0, "no onChange from the initial load of a nonexistent file");
+
+    await store.create(sampleAccount("work"), await store.stamp());
+    assert.equal(calls.length, 1, "exactly one onChange after a successful create");
+    assert.deepEqual(calls[0], { next: ["work"], prev: [] });
+
+    // A failed mutation — duplicate id — must not dispatch onChange at all.
+    // Before the fix, applyMutation's internal reload() call fired the
+    // notification unconditionally, before the duplicate-id check even ran.
+    await assert.rejects(async () => store.create(sampleAccount("work"), await store.stamp()));
+    assert.equal(calls.length, 1, "a rejected mutation must not fire onChange");
+
+    // A second successful mutation fires exactly once more, not twice (the
+    // pre-fix code fired once from the internal reload() and again from the
+    // explicit post-write dispatch).
+    await store.create(sampleAccount("home"), await store.stamp());
+    assert.equal(calls.length, 2, "exactly one more onChange after the next successful mutation");
+    assert.deepEqual(calls[1], { next: ["work", "home"], prev: ["work"] });
+  } finally {
+    store.stop();
+  }
+});

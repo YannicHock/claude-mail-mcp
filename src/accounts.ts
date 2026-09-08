@@ -144,27 +144,39 @@ export class AccountsStore {
    */
   async reload(): Promise<void> {
     const prev = this.accounts;
+    const { accounts: next, present } = await this.readFromDisk();
+    this.accounts = next;
+    this.byId = new Map(next.map((a) => [a.id, a]));
+    // reload()'s own dispatch contract, unchanged from before: fire whenever
+    // the file was actually present and parsed (even if content is
+    // unchanged — the fs.watch debounce path relies on that), and also on a
+    // missing-file transition away from having had accounts. This is
+    // deliberately unrelated to applyMutation()'s single, success-only fire
+    // below — reload() is also the watcher's path, and its semantics are
+    // out of scope for the write path added here.
+    if (this.onChange && (present || prev.length > 0)) {
+      this.onChange(next, prev);
+    }
+  }
+
+  /**
+   * The read-and-parse half of {@link reload}, without the memory
+   * assignment or the `onChange` dispatch. Used by {@link applyMutation} to
+   * get a fresh, current view of the file without reload()'s unconditional
+   * notification firing before a mutation is even known to succeed.
+   */
+  private async readFromDisk(): Promise<{ accounts: Account[]; present: boolean }> {
     let raw: string;
     try {
       raw = await fs.readFile(this.filePath, "utf8");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        this.accounts = [];
-        this.byId = new Map();
-        if (this.onChange && prev.length > 0) {
-          this.onChange(this.accounts, prev);
-        }
-        return;
+        return { accounts: [], present: false };
       }
       throw err;
     }
-
     const parsed = parseAccountsFile(raw);
-    this.accounts = parsed.accounts;
-    this.byId = new Map(parsed.accounts.map((a) => [a.id, a]));
-    if (this.onChange) {
-      this.onChange(this.accounts, prev);
-    }
+    return { accounts: parsed.accounts, present: true };
   }
 
   /** All currently-loaded accounts. */
@@ -298,12 +310,15 @@ export class AccountsStore {
   ): Promise<void> {
     // Re-read rather than trusting memory: a hand edit since the last load is
     // a change the operator meant, and the stamp check is what tells them
-    // apart from a stale form submission.
+    // apart from a stale form submission. Uses the non-dispatching read, not
+    // reload(), so a rejected mutation (duplicate id, unknown id, a failed
+    // round-trip parse, a stale stamp) never fires onChange as a side
+    // effect — only a write that actually completes does, exactly once,
+    // below.
     const current = await readStamp(this.filePath);
     if (current !== stamp) throw new StaleStampError();
-    await this.reload();
+    const { accounts: prev } = await this.readFromDisk();
 
-    const prev = this.accounts;
     const next = change(prev);
     const file: AccountsFile = { version: 1, accounts: next };
 
