@@ -36,8 +36,8 @@ This is the whole deployment as it ships: one process, bound to loopback, gated 
 | Layer | Property | Mechanism |
 |-------|----------|-----------|
 | Transport | TLS 1.3, auto-renewed | certbot + Let's Encrypt |
-| Transport | HSTS 2 years, frame-deny, nosniff, no-referrer, noindex | nginx `add_header … always` |
-| Transport | Brute-force throttling at the edge | nginx `limit_req zone=…auth rate=10r/m burst=5 nodelay` |
+| Transport | HSTS 2 years, frame-deny, nosniff, no-referrer, noindex | nginx `add_header … always`, server-level (see [DEPLOYMENT.md](DEPLOYMENT.md)) |
+| Transport | Brute-force throttling on `/mcp` | nginx `limit_req zone=mailmcp_auth rate=10r/m burst=5 nodelay`, scoped to the `/mcp` location only — `/health` is not throttled |
 | Network | Backend never reachable from the public internet | bind 127.0.0.1 + UFW default-deny |
 | Process | No privilege escalation | `NoNewPrivileges` |
 | Process | Read-only filesystem except `/var/lib/mail-mcp` | `ProtectSystem=strict` + `ReadWritePaths=` |
@@ -159,7 +159,7 @@ bantime = 3600
 ### Scenario: brute force against the Bearer token
 
 Path: attacker hits `POST /mcp` with guessed tokens.
-Mitigations: `AUTH_TOKEN` is a 32-byte random hex string (128 bits of entropy) — not practically brute-forceable. nginx `limit_req` (if configured at the edge) further throttles request rate per IP.
+Mitigations: `AUTH_TOKEN` is a 32-byte random hex string (128 bits of entropy) — not practically brute-forceable. The nginx recipe in [DEPLOYMENT.md](DEPLOYMENT.md) also throttles `/mcp` to 10 req/min per IP (`limit_req zone=mailmcp_auth burst=5 nodelay`).
 Residual risk: negligible, assuming the token was generated as documented (`openssl rand -hex 32`) and never leaked (logs, git history, screenshots).
 
 ### Scenario: brute force against an OAuth layer's login (if you add one)

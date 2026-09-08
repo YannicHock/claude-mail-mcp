@@ -113,6 +113,15 @@ The repo ships `ecosystem.config.cjs` for `pm2 start ecosystem.config.cjs`. Not 
 
 ## 5. Reverse proxy (nginx)
 
+`limit_req_zone` has to live in the `http {}` context — it does nothing inside a `server` or `location` block. Add it once, outside any `server` block, e.g. in its own file that your `nginx.conf`'s `http {}` block already includes (`/etc/nginx/conf.d/*.conf` on most distros):
+
+```nginx
+# /etc/nginx/conf.d/mail-mcp-limits.conf
+limit_req_zone $binary_remote_addr zone=mailmcp_auth:10m rate=10r/m;
+```
+
+Then the site itself:
+
 ```nginx
 server {
     listen 80;
@@ -137,7 +146,23 @@ server {
     # Email bodies and attachments can be large
     client_max_body_size 25M;
 
-    location / {
+    # Security headers on every response. None of the location blocks below
+    # define their own `add_header`, so these are inherited by all of them —
+    # `add_header` only stops inheriting once a *more specific* block adds
+    # its own directives. If you ever add a location with its own
+    # `add_header`, repeat these lines there too, or they'll silently drop
+    # for that location.
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    add_header X-Content-Type-Options    "nosniff" always;
+    add_header X-Frame-Options           "DENY" always;
+    add_header Referrer-Policy           "no-referrer" always;
+    add_header X-Robots-Tag              "noindex" always;
+
+    location /mcp {
+        # AUTH_TOKEN is the only thing gating this endpoint — throttle
+        # guessing attempts against it.
+        limit_req zone=mailmcp_auth burst=5 nodelay;
+
         proxy_pass http://127.0.0.1:3220;
         proxy_http_version 1.1;
         proxy_set_header Host              $host;
@@ -146,6 +171,21 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Authorization     $http_authorization;
         proxy_set_header Transfer-Encoding "";
+    }
+
+    location /health {
+        # No rate limit here on purpose — uptime checkers poll this often,
+        # and it carries no credentials worth throttling access to.
+        proxy_pass http://127.0.0.1:3220;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        return 404;
     }
 }
 ```
