@@ -1,9 +1,15 @@
 # syntax=docker/dockerfile:1
 
+# Node 24 is the active LTS line ("Krypton"), maintained into 2028. Node 26 is
+# already released but does not become LTS until October 2026 — move both stages,
+# oauth/Dockerfile, the `engines` fields and .github/workflows/_test.yml to 26
+# together once it does, and not before: a service holding plaintext mailbox
+# passwords should not run a line that is out of long-term support.
+
 # ---- Builder ------------------------------------------------------------
 # Full dependency set (incl. devDependencies) so the TypeScript compiler
 # is available. Nothing from this stage ships in the final image.
-FROM node:22-alpine AS builder
+FROM node:24-alpine AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -15,7 +21,7 @@ RUN npm run build
 
 # ---- Runtime --------------------------------------------------------------
 # Production dependencies only, no build tools, no TypeScript sources.
-FROM node:22-alpine AS runtime
+FROM node:24-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production

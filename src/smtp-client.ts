@@ -41,7 +41,16 @@ export interface SendResult {
   messageId: string;
   accepted: string[];
   rejected: string[];
-  response: string;
+  /**
+   * The server's final SMTP reply, when there was one.
+   *
+   * Optional because nodemailer types it that way from version 10 on, and its own
+   * types replaced the `@types/nodemailer` package that used to claim it was always
+   * present. Not every transport produces a reply line, so the honest mapping is to
+   * pass the absence through rather than substitute an empty string — the field is
+   * surfaced to the model, and an empty reply reads as a reply that was empty.
+   */
+  response?: string;
 }
 
 export class SmtpClient {
