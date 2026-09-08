@@ -8,3 +8,10 @@ dist/
 .vscode/
 coverage/
 *.tsbuildinfo
+
+# Mailbox credentials — accounts.json holds plaintext IMAP/SMTP/CalDAV
+# passwords. README.md and docs/DEPLOYMENT.md both tell operators to create
+# it *inside* a git checkout (repo root for local dev, ./data for the Docker
+# deployment), so both locations are ignored here. Already in .dockerignore.
+accounts.json
+data/
