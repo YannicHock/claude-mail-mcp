@@ -72,7 +72,7 @@ If you add an OAuth layer in front (not part of this repository — see [docs/HA
 
 ### Transport
 - TLS terminated by nginx, certificate from Let's Encrypt (90-day rotation by `certbot.timer`).
-- HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex` on every response, set at the nginx server level (see the reverse-proxy config in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
+- HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-Robots-Tag: noindex` on every response, set at the nginx server level (see the reverse-proxy config in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)). `Referrer-Policy` is set by the application itself — `same-origin`, because its CSRF checks read `Referer` when a browser omits `Origin` — and must not be overridden at the proxy.
 - Backend bound to `127.0.0.1` only; nginx is the only thing that can reach it from outside.
 
 ### Authentication

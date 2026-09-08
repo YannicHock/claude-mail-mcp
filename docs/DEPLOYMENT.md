@@ -237,7 +237,15 @@ server {
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
     add_header X-Content-Type-Options    "nosniff" always;
     add_header X-Frame-Options           "DENY" always;
-    add_header Referrer-Policy           "no-referrer" always;
+    # Deliberately NOT set here. The application sets its own Referrer-Policy —
+    # `same-origin` on every page that carries a form, because its CSRF checks
+    # read Referer as a fallback when Chrome omits Origin on a same-origin form
+    # POST. nginx's add_header *appends* rather than replacing a header the
+    # proxied response already carries, so re-adding a blanket "no-referrer"
+    # here would put two values on the wire, and the last one wins — silently
+    # reverting the application's choice and breaking every sign-in with
+    # "Request blocked". If you want a policy for endpoints that serve no HTML,
+    # add `proxy_hide_header Referrer-Policy;` first, in that location only.
     add_header X-Robots-Tag              "noindex" always;
 
     location /mcp {

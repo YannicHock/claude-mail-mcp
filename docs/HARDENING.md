@@ -43,7 +43,7 @@ This is the whole deployment as it ships: one process, bound to loopback, gated 
 | Layer | Property | Mechanism |
 |-------|----------|-----------|
 | Transport | TLS 1.3, auto-renewed | certbot + Let's Encrypt |
-| Transport | HSTS 2 years, frame-deny, nosniff, no-referrer, noindex | nginx `add_header … always`, server-level (see [DEPLOYMENT.md](DEPLOYMENT.md)) |
+| Transport | HSTS 2 years, frame-deny, nosniff, noindex | nginx `add_header … always`, server-level (see [DEPLOYMENT.md](DEPLOYMENT.md)). `Referrer-Policy` is the application's own — `same-origin` — and must not be re-added at the proxy, which appends rather than replaces |
 | Transport | Brute-force throttling on `/mcp` | nginx `limit_req zone=mailmcp_auth rate=120r/m burst=60 nodelay`, scoped to the `/mcp` location only — `/health` is not throttled |
 | Network | Backend never reachable from the public internet | bind 127.0.0.1 + UFW default-deny |
 | Process | No privilege escalation | `NoNewPrivileges` |

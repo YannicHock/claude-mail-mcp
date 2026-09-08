@@ -82,7 +82,11 @@ export const SETTINGS_HEADERS: Record<string, string> = {
   "X-Frame-Options": "DENY",
   "Content-Security-Policy":
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
-  "Referrer-Policy": "no-referrer",
+  // same-origin, mirroring the OAuth layer. These pages' forms resolve relative
+  // to the browser's own origin, and the OAuth layer's own guards read Referer as
+  // a fallback when Chrome omits Origin on a same-origin form POST. Keeping this
+  // at no-referrer would be a trap for anyone who later adds such a check here.
+  "Referrer-Policy": "same-origin",
 };
 
 const STYLE = `

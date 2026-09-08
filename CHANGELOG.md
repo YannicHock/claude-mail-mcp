@@ -2,6 +2,16 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.3] — 2026-09-09
+
+Both fixes below are the same defect as 0.6.1 and 0.6.2, found by auditing every security header this project emits against what a browser actually does with it, rather than against what the string says.
+
+### Fixed
+
+- **The reference nginx config would have silently reverted the 0.6.1 fix.** `docs/DEPLOYMENT.md` set `Referrer-Policy: no-referrer` with `add_header` at the server level, and the same document tells the operator to point that server block at the OAuth service. nginx's `add_header` *appends* rather than replacing a header the proxied response already carries, so a browser would receive two policies — the application's `same-origin` and nginx's `no-referrer` — and the last valid token wins. Any deployment following this repository's own hardening guidance would have reproduced the "Request blocked" sign-in failure with correct code underneath. The blanket header is gone, with an explanation and the `proxy_hide_header` remedy for anyone who wants a policy on non-HTML endpoints. `SECURITY.md`, `README.md` and `docs/HARDENING.md` claimed the same thing as shipped fact and are corrected.
+
+- **The connector's settings pages still sent `no-referrer`,** contradicting the comment directly above them claiming a byte-for-byte mirror of the OAuth layer's header set. Not exploitable today — the connector verifies CSRF against the proxied assertion's `csrf` claim and never reads `Origin` or `Referer` — but it was a trap for anyone who later adds such a check while trusting that comment.
+
 ## [0.6.2] — 2026-09-09
 
 ### Fixed
