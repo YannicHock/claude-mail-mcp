@@ -13,23 +13,23 @@ When you follow [DEPLOYMENT.md](DEPLOYMENT.md), you end up with:
 │ Internet → nginx (TLS, HSTS, security headers, rate-limit) │
 └──────┬─────────────────────────────────────────────────────┘
        │
-       │  proxy_pass http://127.0.0.1:3221  (OAuth shim)
-       │  proxy_pass http://127.0.0.1:3220  (/health only)
+       │  proxy_pass http://127.0.0.1:3220  (/mcp, Bearer-auth gated)
+       │  proxy_pass http://127.0.0.1:3220  (/health)
        ▼
-┌────────────────────────────────┐   ┌────────────────────────────────┐
-│ mcp-oauth-shim-mail.service    │   │ claude-mail-mcp.service         │
-│ user=mailmcp                   │   │ user=mailmcp                    │
-│ bound 127.0.0.1:3221           │   │ bound 127.0.0.1:3220            │
-│ NoNewPrivileges, ProtectSystem │   │ NoNewPrivileges, ProtectSystem  │
-│ ReadWritePaths=/var/lib/mail-… │   │ ReadWritePaths=/var/lib/mail-…  │
-│ IPAddressAllow=127.0.0.1/32    │   │ MemoryMax=512M                  │
-│ SystemCallFilter=@system-…     │   │ SystemCallFilter=@system-…      │
-└──────┬─────────────────────────┘   └────────────────────────────────┘
+┌────────────────────────────────┐
+│ claude-mail-mcp.service        │
+│ user=mailmcp                   │
+│ bound 127.0.0.1:3220           │
+│ NoNewPrivileges, ProtectSystem │
+│ ReadWritePaths=/var/lib/mail-… │
+│ MemoryMax=512M                 │
+│ SystemCallFilter=@system-…     │
+└──────┬─────────────────────────┘
        │
        ▼ reads /var/lib/mail-mcp/accounts.json (chmod 600, owner mailmcp)
-       ▼ shells out: /usr/bin/htpasswd -vb /etc/nginx/.htpasswd_connector
-                     (file chmod 640, group mailmcp)
 ```
+
+This is the whole deployment as it ships: one process, bound to loopback, gated by a single static Bearer token that it checks on every `/mcp` request. There is no separate OAuth/login process in front of it by default. If you need to expose this server to a remote client that requires OAuth 2.1 discovery (see "Optional: adding an OAuth layer" below), that layer is something you add yourself — it is not part of this repository, and there is currently no reference implementation to point you at. An earlier version of this document linked to one (`markusstoeger/mcp-oauth-shim`); that repository no longer exists.
 
 ### Properties this gives you
 
@@ -37,8 +37,8 @@ When you follow [DEPLOYMENT.md](DEPLOYMENT.md), you end up with:
 |-------|----------|-----------|
 | Transport | TLS 1.3, auto-renewed | certbot + Let's Encrypt |
 | Transport | HSTS 2 years, frame-deny, nosniff, no-referrer, noindex | nginx `add_header … always` |
-| Transport | Brute-force throttling on auth endpoints | nginx `limit_req zone=…auth rate=10r/m burst=5 nodelay` |
-| Network | Backend never reachable from the public internet | bind 127.0.0.1 + UFW default-deny + systemd `IPAddressAllow` |
+| Transport | Brute-force throttling at the edge | nginx `limit_req zone=…auth rate=10r/m burst=5 nodelay` |
+| Network | Backend never reachable from the public internet | bind 127.0.0.1 + UFW default-deny |
 | Process | No privilege escalation | `NoNewPrivileges` |
 | Process | Read-only filesystem except `/var/lib/mail-mcp` | `ProtectSystem=strict` + `ReadWritePaths=` |
 | Process | No access to other users' home dirs | `ProtectHome=true` |
@@ -47,11 +47,10 @@ When you follow [DEPLOYMENT.md](DEPLOYMENT.md), you end up with:
 | Process | Cannot make pages executable | `LockPersonality` |
 | Process | Limited syscall surface | `SystemCallFilter=@system-service ~@privileged @resources` |
 | Process | Resource caps | `MemoryMax=512M`, `TasksMax=128`, `LimitNOFILE=4096` |
-| Auth | OAuth 2.1 + DCR + PKCE | the shim |
-| Auth | JWT RS256, 1h access / 30d refresh | the shim |
-| Auth | CSRF guard on state-changing endpoints | Origin/Referer check |
-| Auth | Subprocess injection prevented | `execFile` + regex-gated username |
+| Auth | Static Bearer token gates `/mcp` | `AUTH_TOKEN` env var, checked on every request |
 | Storage | Credentials chmod 600, owned by service user | install script |
+
+OAuth 2.1, JWT-based sessions, CSRF guards and subprocess-hardened login checks would all belong to an OAuth layer placed in front of this server — none of that exists in this repository today. See "Optional: adding an OAuth layer" below for what such a layer would need to provide.
 
 ## What it does *not* give you
 
@@ -69,7 +68,7 @@ If you need (2), the cleanest approach is to put `/var/lib/mail-mcp` on a LUKS-e
 
 ### Backup strategy
 
-The service is stateful (state in `/var/lib/mail-mcp/`). Losing it means re-entering every account's credentials via the `/settings` UI. The OAuth signing key is also there; losing it invalidates all issued tokens (Claude.ai will re-OAuth on next use, no big deal).
+The service is stateful (state in `/var/lib/mail-mcp/`). Losing it means re-entering every account's credentials by hand-editing `accounts.json` (or through whatever account-management UI you've built or added — none ships with this repository). If you run an OAuth layer that stores its own signing key under this directory, losing it would also invalidate tokens *that layer* issued; that doesn't apply if you're only using the static `AUTH_TOKEN`.
 
 Recommendation: include `/var/lib/mail-mcp/` in your normal backup rotation **with encryption-at-rest** (e.g. `restic`, `borgbackup`, or a `tar | gpg` pipeline). Do not back up to a cloud bucket without encryption.
 
@@ -85,55 +84,26 @@ The backend speaks to your mailbox provider's IMAP, SMTP and CalDAV. We don't re
 
 ### Multi-operator scenarios
 
-v0.2 is single-tenant in the sense that there's one htpasswd-protected operator. All configured accounts are accessible to anyone who can complete the OAuth flow. If your use case has multiple humans, deploy multiple instances on different subdomains, each with its own htpasswd entry, or wait for v0.3 (multi-tenant on the roadmap).
+v0.2 is single-tenant: one shared `AUTH_TOKEN` grants access to every configured account, and this server has no per-user login of its own. If you add an OAuth layer in front for multi-user access, its login step becomes the real access-control boundary between humans — this server can't tell them apart. If your use case needs distinguishable humans, deploy multiple instances (each with its own `AUTH_TOKEN` and, if applicable, its own OAuth-layer login), or wait for v0.3 (multi-tenant on the roadmap).
 
 ## Recommended additions
 
 These improve the default but require operator action:
 
-### 1. fail2ban jail
-
-Add to `/etc/fail2ban/filter.d/mcp-oauth-shim.conf`:
-
-```ini
-[Definition]
-failregex = ^\[oauth-shim\] login fail .+ ip=<HOST>$
-            ^\[oauth-shim\] settings auth fail .+ ip=<HOST>$
-journalmatch = _SYSTEMD_UNIT=mcp-oauth-shim-mail.service
-```
-
-Add to `/etc/fail2ban/jail.local`:
-
-```ini
-[mcp-oauth-shim]
-enabled = true
-filter = mcp-oauth-shim
-backend = systemd
-maxretry = 5
-findtime = 600
-bantime = 3600
-```
-
-Then `systemctl reload fail2ban`. This bans an IP for 1h after 5 failed logins in 10 minutes.
-
-### 2. AUTH_TOKEN rotation
+### 1. AUTH_TOKEN rotation
 
 Rotate every 90 days (or after staff turnover):
 
 ```bash
 NEW=$(openssl rand -hex 32)
-# Update both files atomically
-echo -n "$NEW" > /var/lib/mail-mcp/token.tmp
-chown mailmcp:mailmcp /var/lib/mail-mcp/token.tmp
-chmod 600 /var/lib/mail-mcp/token.tmp
-mv /var/lib/mail-mcp/token.tmp /var/lib/mail-mcp/token
-
 sed -i "s/^AUTH_TOKEN=.*/AUTH_TOKEN=$NEW/" /var/www/mcp-mail.markusstoeger.com/.env
 
-systemctl restart claude-mail-mcp mcp-oauth-shim-mail
+systemctl restart claude-mail-mcp
 ```
 
-### 3. Outbound allowlist (optional, hardening++)
+If you run a separate OAuth layer in front that also holds a copy of this token (e.g. to inject it into the requests it forwards), update and restart that too. How you do so depends entirely on what you built or deployed, since it isn't part of this repository.
+
+### 2. Outbound allowlist (optional, hardening++)
 
 If you only ever talk to one mail provider, restrict egress:
 
@@ -146,23 +116,63 @@ IPAddressAllow=80.241.60.0/24   # mailbox.org range — replace with yours
 
 This catches the case where a (hypothetical) RCE in a dependency tries to exfiltrate to a foreign host.
 
-### 4. Application-layer logging to file
+### 3. Application-layer logging to file
 
 If you don't want to rely on journald (e.g. for SIEM ingestion), wire a syslog forwarder or pipe `journalctl -u claude-mail-mcp -f` to your log shipper.
 
+## Optional: adding an OAuth layer for remote/multi-client access
+
+Everything above describes the whole deployment as it ships: one process, bound to loopback, gated by a single static `AUTH_TOKEN`. That's sufficient for Claude Desktop and any MCP client that lets you set a custom `Authorization` header.
+
+claude.ai's web connector, however, only connects to remote MCP servers that advertise OAuth 2.1 discovery (`/.well-known/oauth-authorization-server`, Dynamic Client Registration, PKCE). To support that client you need a small proxy in front of this server that speaks OAuth on the outside and forwards Bearer-authenticated requests to `/mcp` on the inside.
+
+**This repository does not include that layer, and there is currently no reference implementation to point you at.** An earlier version of this document referenced `markusstoeger/mcp-oauth-shim`; that repository does not exist. If you build or adopt one, treat the following as a specification of what it should satisfy — not as a description of anything currently deployed:
+
+- Bind to loopback only, same as the backend, and sit behind the same nginx/TLS front door.
+- Implement OAuth 2.1 + Dynamic Client Registration (RFC 7591) + PKCE (S256).
+- Issue short-lived, signed access tokens (e.g. JWT, ~1h TTL) plus longer-lived refresh tokens, stored as hashes rather than plaintext.
+- Gate any human login (e.g. an account-settings UI) behind its own credential check, brute-force throttled at the edge (nginx `limit_req`) and by a fail2ban jail on its auth-fail log lines.
+- Protect any state-changing endpoint it exposes (e.g. a settings-save form) with a CSRF guard (Origin/Referer check).
+- Run as its own dedicated non-root user with the same systemd hardening (`NoNewPrivileges`, `ProtectSystem=strict`, syscall filtering, resource caps) applied to `claude-mail-mcp.service` above.
+- Never log or persist mailbox credentials itself — it should only ever handle the single `AUTH_TOKEN` it forwards.
+
+If you do stand up such a layer, its fail2ban filter, jail, and log format are yours to define to match what you built. For illustration only (not something this repo ships or assumes):
+
+```ini
+[Definition]
+failregex = ^\[your-oauth-layer\] login fail .+ ip=<HOST>$
+journalmatch = _SYSTEMD_UNIT=your-oauth-layer.service
+```
+
+```ini
+[your-oauth-layer]
+enabled = true
+filter = your-oauth-layer
+backend = systemd
+maxretry = 5
+findtime = 600
+bantime = 3600
+```
+
 ## Threat scenarios walked through
 
-### Scenario: brute force against the htpasswd login
+### Scenario: brute force against the Bearer token
 
-Path: attacker hits `POST /authorize` with guessed usernames + passwords.
-Mitigations: nginx `limit_req` (10 req/min per IP), htpasswd uses bcrypt by default, fail2ban (if installed).
-Residual risk: low. Attacker would need 10+ months at burst-limit to test even a small password list.
+Path: attacker hits `POST /mcp` with guessed tokens.
+Mitigations: `AUTH_TOKEN` is a 32-byte random hex string (128 bits of entropy) — not practically brute-forceable. nginx `limit_req` (if configured at the edge) further throttles request rate per IP.
+Residual risk: negligible, assuming the token was generated as documented (`openssl rand -hex 32`) and never leaked (logs, git history, screenshots).
 
-### Scenario: attacker tricks operator into visiting evil.example.com
+### Scenario: brute force against an OAuth layer's login (if you add one)
 
-Path: operator is logged into `/settings`, visits a malicious page that submits a hidden form to `/settings/save`.
-Mitigations: CSRF guard rejects any POST without `Origin: https://mcp-mail.…` header. Browsers set Origin on cross-origin form submissions; cannot be spoofed by JS.
-Residual risk: very low.
+Path: attacker hits that layer's login endpoint with guessed username/password.
+Mitigations: entirely dependent on what you build — see "Optional: adding an OAuth layer" above for what such a layer should provide (rate limiting, fail2ban, bcrypt-hashed passwords).
+Residual risk: not assessable here, since the layer isn't part of this repository.
+
+### Scenario: attacker tricks an operator into visiting evil.example.com (CSRF)
+
+This server has no browser-facing, cookie- or session-authenticated endpoints — `/mcp` requires an explicit `Authorization: Bearer` header that a cross-site form submission cannot supply, so classic CSRF doesn't apply to it today.
+
+If you add an OAuth layer with its own account-settings UI, that UI becomes a new CSRF surface and needs its own Origin/Referer guard on state-changing requests — see "Optional: adding an OAuth layer" above.
 
 ### Scenario: dependency compromise (`imapflow`, `nodemailer`)
 
@@ -172,7 +182,7 @@ Residual risk: medium. Pin dependency versions in `package-lock.json` (already d
 
 ### Scenario: MITM between Claude.ai and the connector
 
-Path: attacker on the network path forges responses or steals OAuth tokens.
+Path: attacker on the network path forges responses or steals the Bearer token (or any tokens issued by an OAuth layer, if you've added one).
 Mitigations: TLS with valid Let's Encrypt cert, HSTS, no fallback to HTTP.
 Residual risk: very low (would require breaking TLS or compromising the CA).
 
