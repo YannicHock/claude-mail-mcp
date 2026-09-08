@@ -212,6 +212,49 @@ describe("loadConfig", () => {
   });
 });
 
+describe("settings signing key", () => {
+  it("is absent by default", () => {
+    const config = loadConfig(baseEnv());
+    assert.equal(config.settingsSigningKey, null);
+  });
+
+  it("is read from SETTINGS_SIGNING_KEY", () => {
+    const key = "x".repeat(32);
+    const config = loadConfig(baseEnv({ SETTINGS_SIGNING_KEY: key }));
+    assert.deepEqual(config.settingsSigningKey, new TextEncoder().encode(key));
+  });
+
+  it("refuses a short settings signing key", () => {
+    assert.throws(
+      () => loadConfig(baseEnv({ SETTINGS_SIGNING_KEY: "too-short" })),
+      /at least 32 bytes/
+    );
+  });
+
+  it("trims an inline value, matching the connector's SETTINGS_SIGNING_KEY handling", () => {
+    // Both services must derive byte-identical keys from the same secret. A
+    // trailing newline pasted from `openssl rand -base64 48` output must not
+    // change the key on one side but not the other.
+    const key = "x".repeat(32);
+    const config = loadConfig(
+      baseEnv({ SETTINGS_SIGNING_KEY: `  ${key}  \n` })
+    );
+    assert.deepEqual(config.settingsSigningKey, new TextEncoder().encode(key));
+  });
+});
+
+describe("operator file", () => {
+  it("defaults next to the state file", () => {
+    const config = loadConfig(baseEnv({ STATE_FILE: "/data/oauth-state.json" }));
+    assert.equal(config.operatorFile, "/data/operator.json");
+  });
+
+  it("can be disabled", () => {
+    const config = loadConfig(baseEnv({ OPERATOR_FILE: "none" }));
+    assert.equal(config.operatorFile, null);
+  });
+});
+
 describe("trust proxy", () => {
   it("defaults to a single hop, not to trusting the whole chain", () => {
     // `trust proxy: true` would let a client pick its own req.ip through

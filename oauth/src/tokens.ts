@@ -143,6 +143,7 @@ export class TokenIssuer {
       token_use: "access" satisfies TokenUse,
       client_id: claims.clientId,
       scope: claims.scope,
+      epoch: this.#store.tokenEpoch,
     })
       .setProtectedHeader({ alg: ALGORITHM, typ: "JWT" })
       .setIssuer(this.#issuer)
@@ -193,6 +194,26 @@ export class TokenIssuer {
   ): Promise<VerifyResult<VerifiedAccessToken>> {
     const result = await this.#verify(token, "access", expectedAudience);
     if (!result.ok) return result;
+
+    // A stateless token cannot be withdrawn, so revocation is expressed as two
+    // comparisons instead. Without them "revoke" would mean "stops refreshing, keeps
+    // working for up to an hour", which is not what the button says.
+    const epoch = Number.isFinite(result.payload.epoch)
+      ? (result.payload.epoch as number)
+      : 0;
+    if (epoch < this.#store.tokenEpoch) {
+      return { ok: false, reason: "invalid_token" };
+    }
+    const client = this.#store.getClient(result.claims.clientId);
+    const issuedAt = result.payload.iat;
+    if (
+      client?.revokedAt !== undefined &&
+      typeof issuedAt === "number" &&
+      issuedAt < client.revokedAt
+    ) {
+      return { ok: false, reason: "invalid_token" };
+    }
+
     return { ok: true, claims: result.claims };
   }
 

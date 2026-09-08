@@ -6,9 +6,10 @@
  * 1. No token, password, code verifier or authorization code is ever logged, in
  *    any field. Identifiers that are safe to correlate on (`jti`, `sid`, client
  *    id) are logged instead.
- * 2. Failed logins log a single line in a fixed shape so the fail2ban filter in
- *    docs/HARDENING.md can match it. Changing that line's shape is a deployment
- *    change, not a cosmetic one — see {@link LOGIN_FAILURE_EVENT}.
+ * 2. Failed logins log a single line in a fixed shape, so an external
+ *    fail2ban-style jail can match on it. No filter ships with this repository;
+ *    an operator's own may already depend on the shape, which is why changing it
+ *    is a deployment change, not a cosmetic one — see {@link LOGIN_FAILURE_EVENT}.
  */
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -27,8 +28,10 @@ const LEVELS: Record<LogLevel, number> = {
 };
 
 /**
- * The message a failed login logs. The fail2ban filter documented in
- * docs/HARDENING.md matches on this string plus the `ip` field; keep them in sync.
+ * The message a failed login logs. This string plus the `ip` field is the
+ * deployment API for an external fail2ban-style jail (see docs/HARDENING.md,
+ * which documents the shape but ships no filter of its own) — an operator's
+ * jail may already be matching on it, so its shape must not change casually.
  */
 export const LOGIN_FAILURE_EVENT = "login failed";
 

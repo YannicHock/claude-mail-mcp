@@ -20,7 +20,9 @@ import type { Express } from "express";
 import { createApp } from "../../src/app.js";
 import type { OAuthConfig } from "../../src/config.js";
 import { silentLogger, type Logger } from "../../src/logger.js";
+import { OperatorRecord } from "../../src/operator.js";
 import { hashPassword } from "../../src/passwords.js";
+import { SESSION_COOKIE } from "../../src/session.js";
 import { Store } from "../../src/store.js";
 import { LoginThrottle } from "../../src/throttle.js";
 import { HOSTED_CLAUDE_REDIRECT_URIS } from "../../src/urls.js";
@@ -54,8 +56,11 @@ export interface Harness {
   baseUrl: string;
   config: OAuthConfig;
   store: Store;
+  operator: OperatorRecord;
   throttle: LoginThrottle;
   upstream: UpstreamStub;
+  /** Sign in as the test operator and return the session cookie's value. */
+  signIn(): Promise<string>;
   close(): Promise<void>;
 }
 
@@ -63,6 +68,12 @@ export interface HarnessOptions {
   log?: Logger;
   configOverrides?: Partial<OAuthConfig>;
   throttle?: LoginThrottle;
+  /**
+   * Backing file for the operator record. Omitted by default so most tests
+   * build an in-memory record and never touch the filesystem — only the tests
+   * that need `changePassword` or a persisted `bumpSessionEpoch` pass one.
+   */
+  operatorPath?: string;
 }
 
 export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> {
@@ -83,6 +94,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   // a local run, and the same string has to serve as issuer, audience and origin.
   const issuer = `http://localhost:${port}`;
 
+  const authPasswordHash = await hashPassword(TEST_PASSWORD, FAST_SCRYPT);
+
   const config: OAuthConfig = {
     port,
     host: "127.0.0.1",
@@ -93,8 +106,12 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     upstreamAuthToken: UPSTREAM_TOKEN,
     signingKey: new TextEncoder().encode("test-signing-key-at-least-32-bytes-long"),
     authUsername: TEST_USERNAME,
-    authPasswordHash: await hashPassword(TEST_PASSWORD, FAST_SCRYPT),
+    authPasswordHash,
     stateFile: null,
+    settingsSigningKey: new TextEncoder().encode(
+      "test-settings-signing-key-at-least-32-bytes-long"
+    ),
+    operatorFile: null,
     trustProxy: 1,
     accessTokenTtl: 3600,
     refreshTokenTtl: 2592000,
@@ -103,12 +120,19 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     ...opts.configOverrides,
   };
 
+  const log = opts.log ?? silentLogger;
   const store = await Store.open(null, silentLogger);
   const throttle = opts.throttle ?? new LoginThrottle();
+  const operator = await OperatorRecord.open(
+    opts.operatorPath ?? null,
+    { username: TEST_USERNAME, passwordHash: authPasswordHash },
+    log
+  );
   ({ app } = createApp({
     config,
     store,
-    log: opts.log ?? silentLogger,
+    operator,
+    log,
     throttle,
     proxyTimeoutMs: 5_000,
   }));
@@ -117,8 +141,23 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     baseUrl: issuer,
     config,
     store,
+    operator,
     throttle,
     upstream,
+    async signIn(): Promise<string> {
+      const res = await fetch(`${issuer}/settings/login`, {
+        method: "POST",
+        redirect: "manual",
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: issuer },
+        body: new URLSearchParams({ username: TEST_USERNAME, password: TEST_PASSWORD }),
+      });
+      const setCookie = res.headers.get("set-cookie") ?? "";
+      const match = new RegExp(`^${SESSION_COOKIE}=([^;]+)`).exec(setCookie);
+      if (!match) {
+        throw new Error(`signIn: no session cookie in the response (status ${res.status})`);
+      }
+      return match[1];
+    },
     async close() {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await upstream.close();
@@ -295,4 +334,110 @@ export async function completeAuthorizationFlow(
     body: (await token.json()) as Record<string, unknown>,
     clientId,
   };
+}
+
+// ---- Settings UI helpers ---------------------------------------------------
+
+/** POST to /settings/login with the given credentials, same-origin. */
+export async function signInWith(
+  harness: Harness,
+  username: string,
+  password: string
+): Promise<Response> {
+  return fetch(`${harness.baseUrl}/settings/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded", origin: harness.baseUrl },
+    body: new URLSearchParams({ username, password }),
+  });
+}
+
+/** GET /settings with the given session cookie, if any. */
+export async function getSettings(harness: Harness, cookie?: string): Promise<Response> {
+  return fetch(`${harness.baseUrl}/settings`, {
+    redirect: "manual",
+    headers: cookie ? { cookie: `${SESSION_COOKIE}=${cookie}` } : {},
+  });
+}
+
+/** Drive the OAuth sign-in form POST, the way completeAuthorizationFlow does. */
+export async function postAuthorizeForm(
+  harness: Harness,
+  username: string,
+  password: string
+): Promise<Response> {
+  const { baseUrl } = harness;
+  const registration = await registerClaudeClient(baseUrl);
+  const clientId = registration.body.client_id as string;
+  const { challenge } = makePkce();
+
+  const authorizeUrl = new URL(`${baseUrl}/authorize`);
+  authorizeUrl.searchParams.set("response_type", "code");
+  authorizeUrl.searchParams.set("client_id", clientId);
+  authorizeUrl.searchParams.set("redirect_uri", CLAUDE_CALLBACK);
+  authorizeUrl.searchParams.set("code_challenge", challenge);
+  authorizeUrl.searchParams.set("code_challenge_method", "S256");
+
+  const form = await fetch(authorizeUrl, { redirect: "manual" });
+  const requestToken = extractRequestToken(await form.text());
+  if (requestToken === null) throw new Error("no request token in sign-in form");
+
+  return fetch(`${baseUrl}/authorize`, {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Origin: baseUrl,
+    },
+    body: new URLSearchParams({ request: requestToken, username, password }),
+  });
+}
+
+/** Pull the CSRF token out of a rendered settings page. */
+export function extractCsrf(html: string): string {
+  return /name="_csrf" value="([^"]+)"/.exec(html)?.[1] ?? "";
+}
+
+/** GET /settings/clients with the given session cookie. */
+export async function getClients(harness: Harness, cookie?: string): Promise<Response> {
+  return fetch(`${harness.baseUrl}/settings/clients`, {
+    redirect: "manual",
+    headers: cookie ? { cookie: `${SESSION_COOKIE}=${cookie}` } : {},
+  });
+}
+
+/** POST a form-urlencoded body to a /settings/* path, authenticated with the given session cookie. */
+export async function postForm(
+  harness: Harness,
+  path: string,
+  cookie: string,
+  fields: Record<string, string>
+): Promise<Response> {
+  return fetch(`${harness.baseUrl}${path}`, {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin: harness.baseUrl,
+      cookie: `${SESSION_COOKIE}=${cookie}`,
+    },
+    body: new URLSearchParams(fields),
+  });
+}
+
+/** Redeem a refresh token at /token, the way Claude does to keep a connection alive. */
+export async function postTokenRefresh(
+  harness: Harness,
+  refreshToken: string,
+  clientId: string
+): Promise<Response> {
+  return fetch(`${harness.baseUrl}/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: clientId,
+    }),
+  });
 }

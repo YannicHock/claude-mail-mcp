@@ -53,7 +53,7 @@ export function registerMailTools(
         accounts: summaries,
         note:
           summaries.length === 0
-            ? "No accounts configured yet. Open the connector's /settings page to add one."
+            ? "No accounts configured yet. Add one under /settings/mailboxes on this deployment's public URL."
             : undefined,
       });
     }

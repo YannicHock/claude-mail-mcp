@@ -15,6 +15,7 @@
 
 import express, { type NextFunction, type Request, type Response } from "express";
 
+import { ASSERTION_HEADER, signAssertion } from "./assertion.js";
 import { registerClient } from "./clients.js";
 import { CodeStore } from "./codes.js";
 import type { OAuthConfig } from "./config.js";
@@ -33,21 +34,34 @@ import {
   protectedResourceMetadata,
   wwwAuthenticate,
 } from "./metadata.js";
+import type { OperatorRecord } from "./operator.js";
 import { constantTimeEquals, verifyPassword } from "./passwords.js";
 import { CODE_CHALLENGE_METHOD, isValidCodeChallenge, verifyChallenge } from "./pkce.js";
 import { createProxy } from "./proxy.js";
+import {
+  createSettingsRouter,
+  requireSession,
+  sessionOf,
+  type MailboxSummary,
+} from "./settings-routes.js";
 import { Store } from "./store.js";
 import { LoginThrottle } from "./throttle.js";
 import { TokenIssuer } from "./tokens.js";
 import { redirectUriAllowed, sameResource } from "./urls.js";
 
 export const SERVICE_NAME = "claude-mail-mcp-oauth";
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 
 export interface CreateAppOptions {
   config: OAuthConfig;
   store: Store;
   log?: Logger;
+  /**
+   * The live operator credential. Required for the settings UI to mount: see
+   * the settings-router block below. Absent in a configuration that has not
+   * opted into the settings UI at all.
+   */
+  operator?: OperatorRecord;
   /** Overrides for tests; production uses the defaults. */
   codeStore?: CodeStore;
   throttle?: LoginThrottle;
@@ -488,6 +502,80 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
     res.json({ status: "ok", service: SERVICE_NAME, version: VERSION });
   });
 
+  // ---- Settings UI ---------------------------------------------------------
+
+  // Mounted only when a settings signing key is configured and an operator
+  // record is available. Without both there is nothing the connector would
+  // accept for the mailbox pages, and a half-mounted UI that can list but not
+  // reach them is worse than no UI.
+  if (config.settingsSigningKey !== null && opts.operator) {
+    const settingsDeps = {
+      config,
+      store,
+      operator: opts.operator,
+      throttle,
+      log,
+      upstreamHealth: () => fetchUpstreamHealth(config, log),
+    };
+    const settingsSigningKey = config.settingsSigningKey;
+
+    app.use("/settings", createSettingsRouter(settingsDeps));
+
+    // The mailbox management UI itself is served by the connector, not this
+    // service — this is a pure proxy, the same shape as the /mcp one above, with
+    // two differences: it authenticates the caller with the operator's session
+    // cookie instead of a bearer token, and it replaces that cookie with a signed
+    // assertion rather than a static secret, since the claim being made is "this
+    // browser session, right now" rather than "any holder of this credential".
+    //
+    // Mounting requireSession directly ahead of the proxy handler — rather than
+    // going through createSettingsRouter — is what guarantees an unauthenticated
+    // request is answered locally (the sign-in form) and never reaches the
+    // connector at all.
+    //
+    // Note what is deliberately absent here: unlike every state-changing route
+    // in settings-routes.ts, there is no requireCsrf on this mount. That is not
+    // an oversight. This route has no body parser and forwards the request body
+    // to the connector as raw bytes (see proxy.ts's own header on why nothing
+    // here may consume the stream), so this service cannot read a `_csrf` field
+    // out of a form body without destroying exactly the byte-for-byte forwarding
+    // the proxy exists to preserve. CSRF protection for these requests happens
+    // one hop later: the assertion signed below carries this session's own
+    // `csrf` claim, and the connector's own settings router verifies a
+    // submitted `_csrf` field against it (constant-time) before acting on any
+    // state-changing mailbox request. See spec section 3.3.
+    const settingsUpstreamPath = (req: Request): string =>
+      `/settings/mailboxes${req.path === "/" ? "" : req.path}`;
+
+    const settingsProxy = createProxy({
+      upstreamUrl: config.upstreamMcpUrl,
+      upstreamAuthToken: config.upstreamAuthToken,
+      upstreamPath: settingsUpstreamPath,
+      extraHeaders: (req) => {
+        const session = sessionOf(req);
+        return {
+          [ASSERTION_HEADER]: signAssertion(
+            {
+              sub: session.sub,
+              sid: session.sid,
+              csrf: session.csrf,
+              method: req.method,
+              path: settingsUpstreamPath(req),
+            },
+            settingsSigningKey,
+            config.issuer
+          ),
+        };
+      },
+      log,
+      ...(opts.proxyTimeoutMs !== undefined ? { timeoutMs: opts.proxyTimeoutMs } : {}),
+    });
+
+    app.use("/settings/mailboxes", requireSession(settingsDeps), (req, res) => {
+      settingsProxy(req, res);
+    });
+  }
+
   app.use((req, res) => {
     res.status(404).json({
       error: "not_found",
@@ -593,6 +681,60 @@ function describeTokenFailure(reason: string): string {
       return "A refresh token cannot be used as a bearer credential.";
     default:
       return "The access token is invalid.";
+  }
+}
+
+/**
+ * Ask the connector how it is doing, for the settings overview.
+ *
+ * Never throws and never rejects: any failure — network error, timeout, a
+ * non-2xx status, an unparseable body — comes back as `reachable: false`, so
+ * the overview page says the connector is unreachable rather than the
+ * settings request itself erroring. Bounded to 3 seconds so an operator
+ * loading their own settings page is never left waiting on a connector that
+ * is down.
+ *
+ * The connector's /health reports mailboxes as `accounts: [{ id, label,
+ * default, ... }]` — note `default`, not `isDefault`; that field is renamed
+ * here to match what settings-pages.ts renders.
+ */
+async function fetchUpstreamHealth(
+  config: OAuthConfig,
+  log: Logger
+): Promise<{ reachable: boolean; version: string | null; mailboxes: MailboxSummary[] }> {
+  try {
+    const res = await fetch(`${config.upstreamMcpUrl}/health`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!res.ok) return { reachable: false, version: null, mailboxes: [] };
+
+    const body = (await res.json()) as {
+      version?: unknown;
+      accounts?: Array<{ id?: unknown; label?: unknown; default?: unknown }>;
+    };
+    const mailboxes: MailboxSummary[] = Array.isArray(body.accounts)
+      ? body.accounts
+          .filter(
+            (account): account is { id: string; label: string; default?: unknown } =>
+              typeof account.id === "string" && typeof account.label === "string"
+          )
+          .map((account) => ({
+            id: account.id,
+            label: account.label,
+            isDefault: account.default === true,
+          }))
+      : [];
+
+    return {
+      reachable: true,
+      version: typeof body.version === "string" ? body.version : null,
+      mailboxes,
+    };
+  } catch (err) {
+    log("warn", "upstream health check failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { reachable: false, version: null, mailboxes: [] };
   }
 }
 

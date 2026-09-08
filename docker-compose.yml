@@ -23,12 +23,16 @@ services:
       # Fixed container-side path; the actual credentials file is supplied
       # via the bind mount below and never baked into image or repo.
       ACCOUNTS_FILE: /data/accounts.json
+      SETTINGS_SIGNING_KEY_FILE: /run/secrets/settings_signing_key
+    secrets:
+      - settings_signing_key
     volumes:
-      # Read-only: no component in this repo writes accounts.json today
-      # (the OAuth shim's /settings UI, which would, doesn't exist yet).
-      # Edit the file on the host; fs.watch inside the container picks up
-      # the change without a restart.
-      - ./data:/data:ro
+      # Writable since the settings UI: the connector is the only process that
+      # writes accounts.json, and it is the one that already reads the
+      # credentials in it. The directory must be writable by uid 100 too, not
+      # just the file — saving renames a temp file into place. See
+      # docs/superpowers/specs/2026-09-08-settings-ui-design.md §10.
+      - ./data:/data
     # Healthcheck is inherited from the image's HEALTHCHECK instruction
     # (GET /health via a plain node http request — Alpine has no curl).
 
@@ -61,6 +65,7 @@ services:
       UPSTREAM_AUTH_TOKEN_FILE: /run/secrets/auth_token
       SIGNING_KEY_FILE: /run/secrets/oauth_signing_key
       AUTH_PASSWORD_HASH_FILE: /run/secrets/auth_password_hash
+      SETTINGS_SIGNING_KEY_FILE: /run/secrets/settings_signing_key
       STATE_FILE: /data/oauth-state.json
     env_file:
       # PUBLIC_URL, AUTH_USERNAME, LOG_LEVEL — copy from oauth/.env.example.
@@ -72,6 +77,7 @@ services:
       - auth_token
       - oauth_signing_key
       - auth_password_hash
+      - settings_signing_key
     volumes:
       # Registered clients and live refresh sessions. Writable, unlike the
       # connector's mount: losing it logs every Claude client out and forces
@@ -83,19 +89,24 @@ services:
 # only at /run/secrets/<name>, are not visible in `docker inspect`, and do not
 # end up in the process environment.
 #
-#   auth_token           the same value as AUTH_TOKEN in .env — the connector's
-#                        static token, which mail-oauth substitutes into every
-#                        proxied request and never sends to a client
-#   oauth_signing_key    openssl rand -base64 48
-#   auth_password_hash   read -rs PW && printf '%s\n' "$PW" | \
-#                          docker compose run --rm -T --entrypoint node \
-#                          mail-oauth dist/hash-password.js \
-#                          > secrets/auth_password_hash.txt; unset PW
+#   auth_token             the same value as AUTH_TOKEN in .env — the connector's
+#                          static token, which mail-oauth substitutes into every
+#                          proxied request and never sends to a client
+#   oauth_signing_key      openssl rand -base64 48
+#   auth_password_hash     read -rs PW && printf '%s\n' "$PW" | \
+#                            docker compose run --rm -T --entrypoint node \
+#                            mail-oauth dist/hash-password.js \
+#                            > secrets/auth_password_hash.txt; unset PW
 #
-#                        The --entrypoint override is required: the image's
-#                        ENTRYPOINT is `node dist/index.js`, so a trailing
-#                        command is appended to it as arguments and starts the
-#                        server instead of the hashing tool.
+#                          The --entrypoint override is required: the image's
+#                          ENTRYPOINT is `node dist/index.js`, so a trailing
+#                          command is appended to it as arguments and starts the
+#                          server instead of the hashing tool.
+#   settings_signing_key   openssl rand -base64 48. Mounted into *both*
+#                          services — it is what lets the connector trust a
+#                          /settings/mailboxes request as genuinely having come
+#                          through the OAuth layer's session and CSRF checks,
+#                          rather than directly from the network.
 secrets:
   auth_token:
     file: ./secrets/auth_token.txt
@@ -103,3 +114,5 @@ secrets:
     file: ./secrets/oauth_signing_key.txt
   auth_password_hash:
     file: ./secrets/auth_password_hash.txt
+  settings_signing_key:
+    file: ./secrets/settings_signing_key.txt

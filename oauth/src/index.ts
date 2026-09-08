@@ -9,6 +9,7 @@
 import { ConfigError, loadConfig } from "./config.js";
 import { createApp, SERVICE_NAME, VERSION } from "./app.js";
 import { createLogger } from "./logger.js";
+import { OperatorRecord } from "./operator.js";
 import { Store } from "./store.js";
 
 async function main(): Promise<void> {
@@ -27,7 +28,12 @@ async function main(): Promise<void> {
 
   const log = createLogger(config.logLevel);
   const store = await Store.open(config.stateFile, log);
-  const { app } = createApp({ config, store, log });
+  const operator = await OperatorRecord.open(
+    config.operatorFile,
+    { username: config.authUsername, passwordHash: config.authPasswordHash },
+    log
+  );
+  const { app } = createApp({ config, store, operator, log });
 
   const server = app.listen(config.port, config.host, () => {
     log("info", "listening", {
