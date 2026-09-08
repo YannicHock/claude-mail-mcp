@@ -9,11 +9,14 @@ on:
     branches: [main]
     tags: ['v*']
 
-# Two rapid pushes to main, or a main push racing a tag push, would
-# otherwise start two concurrent release jobs that both build multi-arch
-# and both push to GHCR. Queue them instead of cancelling: cancelling a
-# half-finished registry push would leave GHCR in a worse state than
-# just waiting for it to finish.
+# Per-ref group: rapid pushes to the same ref (e.g. two pushes to main)
+# serialize, and GitHub drops a superseded pending run in that case —
+# which is fine, it was already stale. A main push and a tag push land
+# in different groups and run concurrently on purpose: they publish
+# disjoint tag sets (latest+sha-... vs semver+sha-...), and serializing
+# them would risk GitHub cancelling a pending release run instead of a
+# stale main build. cancel-in-progress stays false so a half-finished
+# registry push is never interrupted.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
