@@ -1,0 +1,52 @@
+services:
+  mail-mcp:
+    image: ghcr.io/yannichock/claude-mail-mcp:latest
+    # PID 1 inside the container is a tiny init (tini, bundled with the
+    # Docker Engine) that reaps zombies and forwards signals — required so
+    # SIGTERM reaches node and triggers the graceful shutdown in src/index.ts.
+    init: true
+    restart: unless-stopped
+    # WARNING — loopback only. The image binds 0.0.0.0 *inside* the
+    # container (required for Docker's port publishing to work at all),
+    # so this host_ip is the only thing standing between the unauthenticated
+    # GET /health endpoint (leaks server name, version, account count,
+    # accounts_file path) and the public internet on a host like Hetzner.
+    # nginx terminates TLS in front of this — see docs/DEPLOYMENT.md.
+    # Never change this to "3220:3220" or "0.0.0.0:3220:3220".
+    ports:
+      - "127.0.0.1:3220:3220"
+    env_file:
+      # AUTH_TOKEN, PUBLIC_URL, LOG_LEVEL — copy from .env.docker.example.
+      # Never commit the resulting .env.
+      - .env
+    environment:
+      # Fixed container-side path; the actual credentials file is supplied
+      # via the bind mount below and never baked into image or repo.
+      ACCOUNTS_FILE: /data/accounts.json
+    volumes:
+      # Read-only: no component in this repo writes accounts.json today
+      # (the OAuth shim's /settings UI, which would, doesn't exist yet).
+      # Edit the file on the host; fs.watch inside the container picks up
+      # the change without a restart.
+      - ./data:/data:ro
+    # Healthcheck is inherited from the image's HEALTHCHECK instruction
+    # (GET /health via a plain node http request — Alpine has no curl).
+
+    # -------------------------------------------------------------------
+    # Future: OAuth shim attachment point (claude.ai requires OAuth 2.1 +
+    # DCR discovery; see docs/DEPLOYMENT.md, "Option B — claude.ai web").
+    # The shim doesn't exist yet — this is only the anchor for wiring it
+    # in later as a second service, e.g.:
+    #
+    # oauth-shim:
+    #   image: <shim image, once published>
+    #   restart: unless-stopped
+    #   depends_on:
+    #     - mail-mcp
+    #   ports:
+    #     - "127.0.0.1:8080:8080"
+    #   environment:
+    #     UPSTREAM_MCP_URL: http://mail-mcp:3220
+    #   env_file:
+    #     - .env.oauth-shim
+    # -------------------------------------------------------------------
