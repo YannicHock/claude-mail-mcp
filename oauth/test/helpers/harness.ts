@@ -397,3 +397,47 @@ export async function postAuthorizeForm(
 export function extractCsrf(html: string): string {
   return /name="_csrf" value="([^"]+)"/.exec(html)?.[1] ?? "";
 }
+
+/** GET /settings/clients with the given session cookie. */
+export async function getClients(harness: Harness, cookie?: string): Promise<Response> {
+  return fetch(`${harness.baseUrl}/settings/clients`, {
+    redirect: "manual",
+    headers: cookie ? { cookie: `${SESSION_COOKIE}=${cookie}` } : {},
+  });
+}
+
+/** POST a form-urlencoded body to a /settings/* path, authenticated with the given session cookie. */
+export async function postForm(
+  harness: Harness,
+  path: string,
+  cookie: string,
+  fields: Record<string, string>
+): Promise<Response> {
+  return fetch(`${harness.baseUrl}${path}`, {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin: harness.baseUrl,
+      cookie: `${SESSION_COOKIE}=${cookie}`,
+    },
+    body: new URLSearchParams(fields),
+  });
+}
+
+/** Redeem a refresh token at /token, the way Claude does to keep a connection alive. */
+export async function postTokenRefresh(
+  harness: Harness,
+  refreshToken: string,
+  clientId: string
+): Promise<Response> {
+  return fetch(`${harness.baseUrl}/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: clientId,
+    }),
+  });
+}

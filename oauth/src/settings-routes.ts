@@ -12,13 +12,19 @@
  * same window.
  */
 
-import express, { type Response } from "express";
+import express, { type Request, type Response } from "express";
 
 import type { OAuthConfig } from "./config.js";
 import { LOGIN_FAILURE_EVENT, type Logger } from "./logger.js";
 import { isSameOrigin, renderErrorPage } from "./login.js";
 import type { OperatorRecord } from "./operator.js";
-import { renderOverview, renderSettingsSignIn, SETTINGS_HEADERS } from "./settings-pages.js";
+import {
+  renderClients,
+  renderOverview,
+  renderPasswordChange,
+  renderSettingsSignIn,
+  SETTINGS_HEADERS,
+} from "./settings-pages.js";
 import {
   CSRF_FIELD,
   clearedSessionCookie,
@@ -131,6 +137,48 @@ export function requireCsrf(deps: SettingsDeps): express.RequestHandler {
   };
 }
 
+/**
+ * Read the session claims {@link requireSession} attached to this request.
+ *
+ * Only meaningful once that guard has run, which is always true where this is
+ * called: the settings proxy in app.ts mounts its own {@link requireSession}
+ * ahead of the proxy handler, and every route in this file's own router goes
+ * through `guardSession` first too. `req.res` is always the same response object
+ * Express is building for this request, so this is the same claims object
+ * `guardSession` put on `res.locals.session` — just read from the side that
+ * doesn't require passing `res` around everywhere it's needed.
+ */
+export function sessionOf(req: Request): SessionClaims {
+  return (req.res as Response).locals.session as SessionClaims;
+}
+
+/**
+ * Timestamp to stamp a revocation with.
+ *
+ * One second ahead of "now", not "now" itself. tokens.ts compares an access
+ * token's `iat` against this with strict `<`, and both are second-granularity —
+ * a token minted in the same wall-clock second as the click that revokes it
+ * would otherwise survive the comparison. The one-second margin costs nothing
+ * (nothing issued after this call can have an `iat` at or before it) and closes
+ * that race, which is what makes "revoke" mean "now" rather than "usually now".
+ */
+function revocationTimestamp(): number {
+  return Math.floor(Date.now() / 1000) + 1;
+}
+
+/** Best-effort host of a redirect URI, for display only. */
+function hostOf(uri: string): string {
+  try {
+    return new URL(uri).host;
+  } catch {
+    return uri;
+  }
+}
+
+function redirectToClients(res: Response): void {
+  res.status(303).set(SETTINGS_HEADERS).set("Location", "/settings/clients").end();
+}
+
 export function createSettingsRouter(deps: SettingsDeps): express.Router {
   const { config, store, operator, throttle, log, upstreamHealth } = deps;
   const key = config.settingsSigningKey;
@@ -143,8 +191,8 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
   const guardSession = requireSession(deps);
   const guardCsrf = requireCsrf(deps);
 
-  router.get("/", guardSession, async (_req, res) => {
-    const session = res.locals.session as SessionClaims;
+  router.get("/", guardSession, async (req, res) => {
+    const session = sessionOf(req);
     const health = await upstreamHealth();
     res
       .status(200)
@@ -221,6 +269,168 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
     if (body.all === "1") {
       await operator.bumpSessionEpoch();
     }
+    res
+      .status(303)
+      .set(SETTINGS_HEADERS)
+      .set("Set-Cookie", clearedSessionCookie())
+      .set("Location", "/settings")
+      .end();
+  });
+
+  // ---- Connected clients -------------------------------------------------
+
+  router.get("/clients", guardSession, (req, res) => {
+    const session = sessionOf(req);
+    const clients = Object.values(store.clients)
+      .sort((a, b) => b.client_id_issued_at - a.client_id_issued_at)
+      .map((client) => ({
+        id: client.client_id,
+        name: client.client_name ?? null,
+        issuedAt: client.client_id_issued_at,
+        redirectHosts: client.redirect_uris.map(hostOf),
+        revoked: client.revokedAt !== undefined,
+      }));
+    const sessions = Object.entries(store.sessions).map(([sid, refreshSession]) => ({
+      sid,
+      clientId: refreshSession.clientId,
+      scope: refreshSession.scope,
+      expiresAt: refreshSession.exp,
+    }));
+    res
+      .status(200)
+      .type("html")
+      .set(SETTINGS_HEADERS)
+      .send(renderClients({ csrf: session.csrf, clients, sessions }));
+  });
+
+  // One route per action, matching exactly the form actions settings-pages.ts
+  // renders — a client's own row, a session's own row, and "everything". There
+  // is deliberately no single dispatching endpoint that re-sniffs the body to
+  // pick one of these three apart: that would be a second place deciding which
+  // store call an action means, for no rendered page that would ever use it.
+  router.post("/clients/:id/revoke", formBody, guardSession, guardCsrf, (req, res) => {
+    store.revokeClient(String(req.params.id), revocationTimestamp());
+    redirectToClients(res);
+  });
+
+  router.post("/sessions/:sid/revoke", formBody, guardSession, guardCsrf, (req, res) => {
+    store.deleteSession(String(req.params.sid));
+    redirectToClients(res);
+  });
+
+  router.post("/clients/revoke-all", formBody, guardSession, guardCsrf, (req, res) => {
+    store.revokeEverything(revocationTimestamp());
+    redirectToClients(res);
+  });
+
+  // ---- Password change ----------------------------------------------------
+
+  router.get("/password", guardSession, (req, res) => {
+    const session = sessionOf(req);
+    res
+      .status(200)
+      .type("html")
+      .set(SETTINGS_HEADERS)
+      .send(
+        renderPasswordChange(
+          operator.canChangePassword
+            ? { csrf: session.csrf }
+            : { csrf: session.csrf, disabledReason: "OPERATOR_FILE is set to none" }
+        )
+      );
+  });
+
+  router.post("/password", formBody, guardSession, guardCsrf, async (req, res) => {
+    const session = sessionOf(req);
+    const ip = req.ip ?? "unknown";
+
+    // 1. A file-less operator record cannot be written to at all.
+    if (!operator.canChangePassword) {
+      res
+        .status(409)
+        .type("html")
+        .set(SETTINGS_HEADERS)
+        .send(
+          renderPasswordChange({
+            csrf: session.csrf,
+            disabledReason: "OPERATOR_FILE is set to none",
+          })
+        );
+      return;
+    }
+
+    // 2. Same budget as every other credential check on this service.
+    if (throttle.isBlocked(ip)) {
+      const retryAfter = throttle.retryAfter(ip);
+      log("warn", "login throttled", {
+        ip,
+        retry_after_s: retryAfter,
+        endpoint: "settings-password",
+      });
+      res.set("Retry-After", String(retryAfter));
+      res
+        .status(429)
+        .type("html")
+        .set(SETTINGS_HEADERS)
+        .send(
+          renderPasswordChange({
+            csrf: session.csrf,
+            error: `Too many failed attempts. Try again in ${Math.ceil(retryAfter / 60)} minute(s).`,
+          })
+        );
+      return;
+    }
+
+    const body = req.body as Record<string, unknown>;
+    const currentPassword = typeof body.current_password === "string" ? body.current_password : "";
+    const newPassword = typeof body.new_password === "string" ? body.new_password : "";
+    const confirmPassword =
+      typeof body.confirm_password === "string" ? body.confirm_password : "";
+
+    // 3. The current password goes through the same throttle as a sign-in
+    // failure: a wrong current password here is exactly that.
+    const currentOk = await operator.verify(operator.username, currentPassword);
+    if (!currentOk) {
+      throttle.recordFailure(ip);
+      // Fixed shape: the fail2ban filter in docs/HARDENING.md matches this line.
+      log("warn", LOGIN_FAILURE_EVENT, { ip, endpoint: "settings-password" });
+      res
+        .status(401)
+        .type("html")
+        .set(SETTINGS_HEADERS)
+        .send(renderPasswordChange({ csrf: session.csrf, error: "Incorrect current password." }));
+      return;
+    }
+
+    // 4. A mismatched confirmation or a short password is a typo, not an
+    // attack, so it costs nothing against the throttle.
+    if (newPassword !== confirmPassword || newPassword.length < 12) {
+      res
+        .status(400)
+        .type("html")
+        .set(SETTINGS_HEADERS)
+        .send(
+          renderPasswordChange({
+            csrf: session.csrf,
+            error:
+              "The new password and its confirmation must match, and be at least 12 characters.",
+          })
+        );
+      return;
+    }
+
+    // 5. Bumps sessionEpoch, which invalidates the cookie carrying this very
+    // request too — that is why the response below clears it explicitly rather
+    // than relying on the operator noticing it stopped working.
+    await operator.changePassword(newPassword);
+
+    // 6. Disconnecting Claude clients is opt-in: a password change on its own
+    // does not touch tokenEpoch, only the operator's own sessions.
+    if (body.disconnect_clients === "1") {
+      store.revokeEverything(revocationTimestamp());
+    }
+
+    // 7. Back to the sign-in form.
     res
       .status(303)
       .set(SETTINGS_HEADERS)

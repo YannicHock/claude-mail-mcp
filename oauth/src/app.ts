@@ -15,6 +15,7 @@
 
 import express, { type NextFunction, type Request, type Response } from "express";
 
+import { ASSERTION_HEADER, signAssertion } from "./assertion.js";
 import { registerClient } from "./clients.js";
 import { CodeStore } from "./codes.js";
 import type { OAuthConfig } from "./config.js";
@@ -37,7 +38,12 @@ import type { OperatorRecord } from "./operator.js";
 import { constantTimeEquals, verifyPassword } from "./passwords.js";
 import { CODE_CHALLENGE_METHOD, isValidCodeChallenge, verifyChallenge } from "./pkce.js";
 import { createProxy } from "./proxy.js";
-import { createSettingsRouter, type MailboxSummary } from "./settings-routes.js";
+import {
+  createSettingsRouter,
+  requireSession,
+  sessionOf,
+  type MailboxSummary,
+} from "./settings-routes.js";
 import { Store } from "./store.js";
 import { LoginThrottle } from "./throttle.js";
 import { TokenIssuer } from "./tokens.js";
@@ -503,17 +509,71 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
   // accept for the mailbox pages, and a half-mounted UI that can list but not
   // reach them is worse than no UI.
   if (config.settingsSigningKey !== null && opts.operator) {
-    app.use(
-      "/settings",
-      createSettingsRouter({
-        config,
-        store,
-        operator: opts.operator,
-        throttle,
-        log,
-        upstreamHealth: () => fetchUpstreamHealth(config, log),
-      })
-    );
+    const settingsDeps = {
+      config,
+      store,
+      operator: opts.operator,
+      throttle,
+      log,
+      upstreamHealth: () => fetchUpstreamHealth(config, log),
+    };
+    const settingsSigningKey = config.settingsSigningKey;
+
+    app.use("/settings", createSettingsRouter(settingsDeps));
+
+    // The mailbox management UI itself is served by the connector, not this
+    // service — this is a pure proxy, the same shape as the /mcp one above, with
+    // two differences: it authenticates the caller with the operator's session
+    // cookie instead of a bearer token, and it replaces that cookie with a signed
+    // assertion rather than a static secret, since the claim being made is "this
+    // browser session, right now" rather than "any holder of this credential".
+    //
+    // Mounting requireSession directly ahead of the proxy handler — rather than
+    // going through createSettingsRouter — is what guarantees an unauthenticated
+    // request is answered locally (the sign-in form) and never reaches the
+    // connector at all.
+    //
+    // Note what is deliberately absent here: unlike every state-changing route
+    // in settings-routes.ts, there is no requireCsrf on this mount. That is not
+    // an oversight. This route has no body parser and forwards the request body
+    // to the connector as raw bytes (see proxy.ts's own header on why nothing
+    // here may consume the stream), so this service cannot read a `_csrf` field
+    // out of a form body without destroying exactly the byte-for-byte forwarding
+    // the proxy exists to preserve. CSRF protection for these requests happens
+    // one hop later: the assertion signed below carries this session's own
+    // `csrf` claim, and the connector's own settings router verifies a
+    // submitted `_csrf` field against it (constant-time) before acting on any
+    // state-changing mailbox request. See spec section 3.3.
+    const settingsUpstreamPath = (req: Request): string =>
+      `/settings/mailboxes${req.path === "/" ? "" : req.path}`;
+
+    const settingsProxy = createProxy({
+      upstreamUrl: config.upstreamMcpUrl,
+      upstreamAuthToken: config.upstreamAuthToken,
+      upstreamPath: settingsUpstreamPath,
+      extraHeaders: (req) => {
+        const session = sessionOf(req);
+        return {
+          [ASSERTION_HEADER]: signAssertion(
+            {
+              sub: session.sub,
+              sid: session.sid,
+              csrf: session.csrf,
+              method: req.method,
+              path: settingsUpstreamPath(req),
+            },
+            settingsSigningKey,
+            config.issuer
+          ),
+        };
+      },
+      log,
+      ...(opts.proxyTimeoutMs !== undefined ? { timeoutMs: opts.proxyTimeoutMs } : {}),
+    });
+
+    app.use("/settings/mailboxes", requireSession(settingsDeps), (req, res) => {
+      settingsProxy(req, res);
+    });
   }
 
   app.use((req, res) => {
