@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { test } from "node:test";
+import type { Request, Response } from "express";
 
-import { verifyAssertion } from "../../src/settings-assertion.js";
+import {
+  ASSERTION_HEADER,
+  requireSettingsAssertion,
+  verifyAssertion,
+} from "../../src/settings-assertion.js";
 
-const KEY = new TextEncoder().encode("k".repeat(32));
+const KEY_STRING = "k".repeat(32);
+const KEY = new TextEncoder().encode(KEY_STRING);
+const OTHER_KEY = new TextEncoder().encode("z".repeat(32));
 const ISSUER = "https://mail-mcp.example.com";
 
 /** Build a token the way the OAuth layer will, so the test does not depend on it. */
@@ -77,5 +84,75 @@ test("a wrong issuer or audience is rejected", () => {
 test("malformed input returns null rather than throwing", () => {
   for (const bad of ["", ".", "a.b.c", "not-base64.$$$", "onlyonepart"]) {
     assert.equal(verifyAssertion(bad, KEY, ISSUER, "POST", "/x"), null);
+  }
+});
+
+/**
+ * Minimal stand-in for an Express Request. The guard only ever reads
+ * `.header()`, `.method`, `.path` and `.ip` — so that is all this provides.
+ */
+function fakeRequest(
+  headers: Record<string, string>,
+  method = "POST",
+  path = "/settings/mailboxes/work"
+): Request {
+  const lowered = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
+  return {
+    method,
+    path,
+    ip: "127.0.0.1",
+    header(name: string) {
+      return lowered.get(name.toLowerCase());
+    },
+  } as unknown as Request;
+}
+
+/** Minimal stand-in for an Express Response, recording what the guard sent. */
+function fakeResponse(): Response & { statusCode: number; body?: unknown } {
+  const res = {
+    locals: {},
+    statusCode: 200,
+    body: undefined as unknown,
+    status(code: number) {
+      res.statusCode = code;
+      return res;
+    },
+    type(_contentType: string) {
+      return res;
+    },
+    send(body: unknown) {
+      res.body = body;
+      return res;
+    },
+  };
+  return res as unknown as Response & { statusCode: number; body?: unknown };
+}
+
+test("the guard rejects a request with no assertion header", async () => {
+  const guard = requireSettingsAssertion({ key: "k".repeat(32), issuer: ISSUER, log: () => {} });
+  const res = fakeResponse();
+  let called = false;
+  await guard(fakeRequest({}), res, () => { called = true; });
+  assert.equal(called, false);
+  assert.equal(res.statusCode, 401);
+});
+
+test("the guard passes a good assertion and exposes its claims", async () => {
+  const guard = requireSettingsAssertion({ key: KEY_STRING, issuer: ISSUER, log: () => {} });
+  const res = fakeResponse();
+  const req = fakeRequest({ [ASSERTION_HEADER]: mint() }, "POST", "/settings/mailboxes/work");
+  let called = false;
+  await guard(req, res, () => { called = true; });
+  assert.equal(called, true);
+  assert.deepEqual(res.locals.assertion, { sub: "operator", sid: "session-1", csrf: "csrf-1" });
+});
+
+test("the guard never says why it refused", async () => {
+  const guard = requireSettingsAssertion({ key: KEY_STRING, issuer: ISSUER, log: () => {} });
+  for (const header of [mint({ exp: 1 }), mint({}, OTHER_KEY), "garbage"]) {
+    const res = fakeResponse();
+    await guard(fakeRequest({ [ASSERTION_HEADER]: header }), res, () => {});
+    assert.equal(res.statusCode, 401);
+    assert.equal(res.body, "Unauthorized", "one message for every failure mode");
   }
 });
