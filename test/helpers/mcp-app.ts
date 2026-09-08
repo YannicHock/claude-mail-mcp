@@ -69,6 +69,10 @@ export async function startMcpApp(opts: {
       pool,
       authToken: opts.authToken,
       accountsFile: opts.accountsFile,
+      // Placeholder: none of these MCP-protocol tests configure a settings
+      // signing key, so the settings routes never mount and this value is
+      // never checked against anything.
+      publicUrl: "http://localhost.invalid",
       // No `log`: createApp defaults to a no-op, keeping the test output clean.
       // src/index.ts passes its own structured logger here.
     });

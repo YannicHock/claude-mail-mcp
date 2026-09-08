@@ -32,6 +32,7 @@ import { AccountsStore } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
 import { registerMailTools } from "./tools-mail.js";
 import { registerCalendarTools } from "./tools-calendar.js";
+import { createSettingsRouter } from "./settings-routes.js";
 
 /** MCP `serverInfo.name` reported to clients, and the `server` field of `/health`. */
 export const SERVER_NAME = "claude-mail-mcp";
@@ -61,6 +62,20 @@ export interface CreateAppOptions {
    * silence the process-level logger `index.ts` passes in.
    */
   log?: Logger;
+  /**
+   * Shared HMAC key for verifying the settings assertion the OAuth layer attaches
+   * to a proxied `/settings` request — see settings-assertion.ts. The settings
+   * routes are mounted only when this is set; an empty/undefined value leaves this
+   * process behaving exactly as it did before those routes existed.
+   */
+  settingsSigningKey?: string;
+  /**
+   * This connector's own public URL, checked as the assertion's `iss` claim.
+   * Must equal the OAuth layer's `PUBLIC_URL` or every assertion fails closed —
+   * see docs/DEPLOYMENT.md. Required unconditionally (rather than only alongside
+   * `settingsSigningKey`) so it can't be added later and be missing by accident.
+   */
+  publicUrl: string;
 }
 
 /**
@@ -133,6 +148,24 @@ export function createApp(opts: CreateAppOptions): express.Express {
       }
     }
   });
+
+  // Scoped to the /settings prefix rather than applied globally — mounting
+  // bearerAuth at the app root would make an unrelated 404 into a 401 for
+  // every unknown path, a behaviour change nothing here calls for. The
+  // settings router itself mounts at "/" (not "/settings") so its routes
+  // keep their full path — requireSettingsAssertion depends on req.path
+  // matching the "htu" the OAuth layer signed; see settings-assertion.ts.
+  if (opts.settingsSigningKey) {
+    app.use("/settings", bearerAuth);
+    app.use(
+      createSettingsRouter({
+        store,
+        issuer: opts.publicUrl,
+        settingsKey: opts.settingsSigningKey,
+        log,
+      })
+    );
+  }
 
   app.use((req, res) => {
     res.status(404).json({
