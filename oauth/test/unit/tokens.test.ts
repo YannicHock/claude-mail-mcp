@@ -1,15 +1,20 @@
 import { strict as assert } from "node:assert";
 import { randomBytes } from "node:crypto";
-import { beforeEach, describe, it } from "node:test";
+import { beforeEach, describe, it, test } from "node:test";
 
 import { SignJWT } from "jose";
 
 import { silentLogger } from "../../src/logger.js";
-import { Store } from "../../src/store.js";
-import { TokenIssuer } from "../../src/tokens.js";
+import { Store, type ClientRecord } from "../../src/store.js";
+import {
+  TokenIssuer,
+  type AccessTokenClaims,
+  type TokenIssuerOptions,
+} from "../../src/tokens.js";
 
 const ISSUER = "https://mail.example.com";
 const RESOURCE = "https://mail.example.com/mcp";
+const KEY = new Uint8Array(randomBytes(32));
 
 const CLAIMS = {
   sub: "operator",
@@ -17,6 +22,32 @@ const CLAIMS = {
   scope: "mcp",
   resource: RESOURCE,
 } as const;
+
+/** Fixed-key issuer options, so a hand-signed token and the issuer agree on the key. */
+function issuerOptions(store: Store): TokenIssuerOptions {
+  return {
+    issuer: ISSUER,
+    signingKey: KEY,
+    accessTokenTtl: 3600,
+    refreshTokenTtl: 2592000,
+    store,
+  };
+}
+
+function accessClaims(overrides: Partial<AccessTokenClaims> = {}): AccessTokenClaims {
+  return { ...CLAIMS, ...overrides };
+}
+
+function clientRecord(id: string): ClientRecord {
+  return {
+    client_id: id,
+    client_id_issued_at: 1000,
+    redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+  };
+}
 
 async function makeIssuer(
   overrides: { accessTokenTtl?: number; refreshTokenTtl?: number } = {}
@@ -262,4 +293,60 @@ describe("TokenIssuer.rotate", () => {
     const result = await issuer.rotate("nonsense");
     assert.equal(result.ok, false);
   });
+});
+
+test("an access token stops verifying once the token epoch moves", async () => {
+  const store = await Store.open(null, silentLogger);
+  store.putClient(clientRecord("c1"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  const { accessToken } = await issuer.issue(accessClaims({ clientId: "c1" }));
+
+  assert.equal((await issuer.verifyAccessToken(accessToken, RESOURCE)).ok, true);
+  store.revokeEverything(Math.floor(Date.now() / 1000));
+  const after = await issuer.verifyAccessToken(accessToken, RESOURCE);
+  assert.equal(after.ok, false);
+});
+
+test("an access token stops verifying once its own client is revoked", async () => {
+  const store = await Store.open(null, silentLogger);
+  store.putClient(clientRecord("c1"));
+  store.putClient(clientRecord("c2"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  const first = await issuer.issue(accessClaims({ clientId: "c1" }));
+  const second = await issuer.issue(accessClaims({ clientId: "c2" }));
+
+  store.revokeClient("c1", Math.floor(Date.now() / 1000) + 1);
+
+  assert.equal((await issuer.verifyAccessToken(first.accessToken, RESOURCE)).ok, false);
+  assert.equal((await issuer.verifyAccessToken(second.accessToken, RESOURCE)).ok, true);
+});
+
+test("a token issued after a client was revoked and re-registered is accepted", async () => {
+  const store = await Store.open(null, silentLogger);
+  store.putClient(clientRecord("c1"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  store.revokeClient("c1", Math.floor(Date.now() / 1000) - 60);
+  store.putClient(clientRecord("c1"));
+  const { accessToken } = await issuer.issue(accessClaims({ clientId: "c1" }));
+  assert.equal((await issuer.verifyAccessToken(accessToken, RESOURCE)).ok, true);
+});
+
+test("a token minted before the epoch claim existed still verifies", async () => {
+  const store = await Store.open(null, silentLogger);
+  store.putClient(clientRecord("c1"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  const legacy = await new SignJWT({
+    token_use: "access",
+    client_id: "c1",
+    scope: "mcp",
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuer(ISSUER)
+    .setAudience(RESOURCE)
+    .setSubject("operator")
+    .setIssuedAt()
+    .setExpirationTime("1h")
+    .setJti("legacy")
+    .sign(KEY);
+  assert.equal((await issuer.verifyAccessToken(legacy, RESOURCE)).ok, true);
 });
