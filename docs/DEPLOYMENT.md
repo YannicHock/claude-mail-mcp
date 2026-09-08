@@ -439,6 +439,8 @@ to traverse it, and the directory name carries no secret. If `chown` reports
 
 `docker-compose.yml` bind-mounts `./data` read-only at `/data` inside the container. The backend picks up edits to `data/accounts.json` via `fs.watch` — no restart needed, same behavior as the systemd deployment's `accounts.json`.
 
+> Hot reload relies on inotify events crossing the bind mount, which they do on a Linux host — the deployment this document describes. They do **not** cross a Docker Desktop bind mount on Windows or macOS: the container reads the updated file correctly, but no watch event ever fires, so the running process keeps the accounts it started with. If you develop on one of those, `docker compose restart` after editing `accounts.json`.
+
 ### 4. Start it
 
 ```bash
