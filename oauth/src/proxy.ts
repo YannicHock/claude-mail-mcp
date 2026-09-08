@@ -44,6 +44,11 @@ const HOP_BY_HOP = new Set([
   "upgrade",
   "host",
   "content-length",
+  // Not hop-by-hop in the RFC sense, but never forwarded for the same practical
+  // reason: the operator's session cookie is scoped to Path=/ by the __Host- prefix
+  // and would otherwise be sent upstream. The connector authenticates settings
+  // requests by assertion alone and must never be able to read browser state.
+  "cookie",
 ]);
 
 export interface ProxyOptions {
@@ -55,8 +60,20 @@ export interface ProxyOptions {
    * from this service's own public `MCP_PATH`: the two are equal by default, but
    * changing where this service is reachable must not silently change where it
    * forwards to.
+   *
+   * A function is resolved once per request, which is how the settings proxy in
+   * app.ts derives the upstream path from the incoming request's own path (e.g.
+   * `/settings/mailboxes/foo`) instead of forwarding everything to one fixed route.
    */
-  upstreamPath?: string;
+  upstreamPath?: string | ((req: Request) => string);
+  /**
+   * Extra headers to add to the forwarded request, computed per request. Applied
+   * after the `Authorization` substitution below, so nothing it returns can take
+   * that header's place. This is how the settings proxy attaches its signed
+   * assertion — see app.ts — without proxy.ts needing to know anything about
+   * assertions itself.
+   */
+  extraHeaders?: (req: Request) => Record<string, string>;
   log: Logger;
   /** Milliseconds before an idle upstream connection is abandoned. */
   timeoutMs?: number;
@@ -76,7 +93,6 @@ export function createProxy(opts: ProxyOptions) {
   const isHttps = target.protocol === "https:";
   const requestFn = isHttps ? httpsRequest : httpRequest;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const upstreamPath = opts.upstreamPath ?? "/mcp";
 
   return function proxyToUpstream(req: Request, res: Response): void {
     const headers = forwardableRequestHeaders(req.headers);
@@ -85,6 +101,13 @@ export function createProxy(opts: ProxyOptions) {
     // been verified by the time this runs, and it means nothing upstream.
     headers.authorization = `Bearer ${opts.upstreamAuthToken}`;
     headers.host = target.host;
+
+    if (opts.extraHeaders) {
+      Object.assign(headers, opts.extraHeaders(req));
+    }
+
+    const upstreamPath =
+      typeof opts.upstreamPath === "function" ? opts.upstreamPath(req) : opts.upstreamPath ?? "/mcp";
 
     const upstream = requestFn(
       {
