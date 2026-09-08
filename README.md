@@ -145,17 +145,10 @@ Neither path includes an OAuth shim — see [Connecting from Claude.ai](#connect
 
 ## Connecting from Claude.ai
 
-The server speaks the **Streamable HTTP MCP transport**. To use it from Claude.ai (web), you need an OAuth 2.1 + DCR + PKCE layer in front because Claude.ai does not support raw Bearer auth.
+The server speaks the **Streamable HTTP MCP transport**, gated by a single static Bearer token (`AUTH_TOKEN`). That's everything this repository ships — no OAuth flow, no login UI, no per-user sessions.
 
-The recommended setup mirrors what [claude-meta-mcp](https://github.com/maxx3250/claude-meta-mcp) uses:
-
-1. Terminate TLS with nginx / Caddy on a public hostname (e.g. `mcp-mail.yourdomain.com`)
-2. Put a tiny **OAuth shim** in front that issues short-lived Bearer tokens after a basic-auth login
-3. Add the public URL as a Custom Connector in Claude.ai (Settings → Connectors → Add custom)
-
-See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the full nginx + systemd + shim recipe.
-
-For local testing without a shim, you can call `/mcp` directly with `Authorization: Bearer <AUTH_TOKEN>` from any MCP client that supports custom headers (Claude Desktop config, or a stdio bridge).
+- **Claude Desktop**, or any MCP client that lets you set a custom header, can call `/mcp` directly with `Authorization: Bearer <AUTH_TOKEN>` — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the config snippet. No extra layer needed.
+- **Claude.ai (web)** only connects to remote MCP servers that advertise OAuth 2.1 discovery (Dynamic Client Registration + PKCE), which this server doesn't implement. To use it from Claude.ai web you have to put an OAuth 2.1 layer in front yourself — **this repository does not include one, and there is currently no reference implementation to point you at.** See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) (Option B) and [`docs/HARDENING.md`](docs/HARDENING.md) for what such a layer would need to satisfy.
 
 ---
 
@@ -187,13 +180,13 @@ If your provider doesn't speak CalDAV, just omit the `caldav` block from that ac
 ## Architecture
 
 ```
-Claude.ai (web)
-    │  HTTPS + OAuth 2.1
+Claude Desktop / any Bearer-capable MCP client
+    │  HTTPS + Authorization: Bearer <AUTH_TOKEN>
     ▼
-nginx (TLS, /health passthrough)
+nginx (TLS termination, security headers, rate-limit on /mcp)
     │
-    ├──▶ /mcp/* ─▶ OAuth shim (Port 3212)  ──▶ Bearer ──▶ this server (Port 3220)
-    └──▶ /health ────────────────────────────────────────▶ this server (Port 3220)
+    ├──▶ /mcp    ─▶ this server (Port 3220, Bearer-auth gated)
+    └──▶ /health ─▶ this server (Port 3220)
 
 this server
     ├── ImapClient   ──▶  imapflow  ──▶  IMAP server (993/143)
@@ -203,23 +196,27 @@ this server
 
 Everything is one Node process. IMAP holds a single long-lived connection with per-call mailbox locks. SMTP and CalDAV are stateless per call.
 
+Claude.ai (web) isn't in this diagram: it needs an OAuth 2.1 layer between itself and nginx that this repository doesn't provide — see [Connecting from Claude.ai](#connecting-from-claudeai) above.
+
 ---
 
 ## Security model
 
 See **[SECURITY.md](SECURITY.md)** for the threat model and **[docs/HARDENING.md](docs/HARDENING.md)** for the full operator checklist.
 
-Defaults in one sentence: TLS via Let's Encrypt + HSTS + rate-limited htpasswd + OAuth 2.1 with CSRF guard + non-root systemd unit with `ProtectSystem=strict` + kernel-level loopback-only filter + credentials chmod 600 owned by a dedicated `mailmcp` user.
+Defaults in one sentence: TLS via Let's Encrypt + HSTS/security headers + a rate-limited static Bearer token + non-root systemd unit with `ProtectSystem=strict` + loopback-only binding + credentials chmod 600 owned by a dedicated `mailmcp` user. **No OAuth, no sessions, and no `/settings` route ship with this repository** — see below.
 
 ### Quick summary
 
-- **Transport:** TLS 1.3 (Let's Encrypt, auto-renew), HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex`.
-- **Auth:** OAuth 2.1 + DCR + PKCE + JWT (RS256, 1h access, 30d refresh) gated by htpasswd login. CSRF guard on `/settings` POST. Brute-force throttled at nginx (10 req/min on auth endpoints).
-- **Process:** Both services run as a dedicated non-root `mailmcp` system user (no shell). Full systemd hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `ProtectKernel*`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `RestrictNamespaces`, `LockPersonality`, `SystemCallFilter=@system-service ~@privileged @resources`, `MemoryMax=512M`.
-- **Network:** Backend + shim bound to `127.0.0.1` only. Shim also blocks non-loopback at kernel level (`IPAddressDeny=any`). UFW default-deny on the host.
-- **Storage:** Credentials chmod 600, owned by `mailmcp`, in `/var/lib/mail-mcp/`. htpasswd file chmod 640 (not world-readable). `.env` chmod 640 `root:mailmcp`.
+- **Transport:** TLS 1.3 (Let's Encrypt, auto-renew), HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex` — delivered by the nginx config in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- **Auth:** `/mcp` is gated by a single static Bearer token (`AUTH_TOKEN`), checked on every request — no OAuth, no per-user sessions, no token expiry. Rate-limited at nginx (10 req/min per IP on `/mcp`, `/health` is unthrottled).
+- **Process:** Runs as a dedicated non-root `mailmcp` system user (no shell). Full systemd hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `ProtectKernel*`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `RestrictNamespaces`, `LockPersonality`, `SystemCallFilter=@system-service ~@privileged @resources`, `MemoryMax=512M`.
+- **Network:** Backend bound to `127.0.0.1` only — nginx is the only thing that can reach it from outside. UFW default-deny on the host.
+- **Storage:** Credentials chmod 600, owned by `mailmcp`, in `/var/lib/mail-mcp/`. `.env` chmod 640 `root:mailmcp`.
 - **Output:** `list_accounts` returns id/label/From — never credentials. Logs never include passwords or Bearer tokens.
 - **Destructive tools** (`delete_message`) document irreversibility so Claude.ai surfaces a confirmation step. Prefer `move_message` to a Trash folder for reversibility.
+
+Remote or multi-client access (e.g. Claude.ai web) needs an OAuth 2.1 layer in front that is **not part of this repository** — see [Connecting from Claude.ai](#connecting-from-claudeai) above and [docs/HARDENING.md](docs/HARDENING.md#optional-adding-an-oauth-layer-for-remotemulti-client-access) for what that layer would need to provide.
 
 Full threat-model walkthrough and operator hardening checklist in [docs/HARDENING.md](docs/HARDENING.md). Reporting issues: see [SECURITY.md](SECURITY.md).
 
