@@ -2,6 +2,12 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] — 2026-09-09
+
+### Fixed
+
+- **The authorization flow could not complete in Chrome.** The consent screen served `form-action 'self'`, and submitting it redirects to the client's registered `redirect_uri`. Chrome enforces `form-action` against the **redirect target** as well as the action URL, so the hand-off to `https://claude.ai/...` was blocked and the flow died on its last step with nothing but a console error — the server had already issued the authorization code. The consent page's `form-action` now lists the origins of the registered redirect allowlist alongside `'self'`, which is exactly the set of destinations an authorization code could already legitimately be sent to. The settings pages, which never redirect off-origin, keep the tighter `'self'`.
+
 ## [0.6.1] — 2026-09-09
 
 ### Fixed

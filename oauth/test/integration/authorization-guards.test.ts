@@ -496,3 +496,38 @@ describe("login throttling cannot be sidestepped with X-Forwarded-For", () => {
     }
   });
 });
+
+describe("consent page CSP", () => {
+  it("allows a form redirect to the registered callback", async () => {
+  // form-action must not be plain 'self'. Submitting the consent form redirects to
+  // the client's redirect_uri, and Chrome enforces form-action against the redirect
+  // target too — 'self' alone blocks the hand-off to claude.ai and the flow dies on
+  // its last step with nothing but a console error.
+  const harness = await startHarness();
+  try {
+    const registration = await registerClaudeClient(harness.baseUrl);
+    const clientId = registration.body.client_id as string;
+    const { challenge } = makePkce();
+    const url = new URL(`${harness.baseUrl}/authorize`);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("redirect_uri", CLAUDE_CALLBACK);
+    url.searchParams.set("code_challenge", challenge);
+    url.searchParams.set("code_challenge_method", "S256");
+
+    const res = await fetch(url, { redirect: "manual" });
+    const csp = res.headers.get("content-security-policy") ?? "";
+    const formAction = /form-action ([^;]+)/.exec(csp)?.[1] ?? "";
+
+    assert.match(formAction, /'self'/, "same-origin submission must stay allowed");
+    assert.match(
+      formAction,
+      new RegExp(new URL(CLAUDE_CALLBACK).origin.replace(/[.]/g, "\.")),
+      "the registered callback's origin must be allowed, or Chrome blocks the redirect"
+    );
+    assert.ok(!/form-action 'self';/.test(csp), "must not be bare 'self'");
+  } finally {
+    await harness.close();
+  }
+});
+});

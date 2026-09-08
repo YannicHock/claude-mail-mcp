@@ -50,7 +50,7 @@ import { TokenIssuer } from "./tokens.js";
 import { redirectUriAllowed, sameResource } from "./urls.js";
 
 export const SERVICE_NAME = "claude-mail-mcp-oauth";
-export const VERSION = "0.6.1";
+export const VERSION = "0.6.2";
 
 export interface CreateAppOptions {
   config: OAuthConfig;
@@ -86,6 +86,35 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
     refreshTokenTtl: config.refreshTokenTtl,
     store,
   });
+
+  /**
+   * CSP for the consent screen.
+   *
+   * `form-action` cannot be plain 'self' here. Submitting this form redirects to
+   * the client's registered redirect_uri, and Chrome enforces form-action against
+   * the *redirect target* as well as the action URL — so 'self' alone blocks the
+   * hand-off to claude.ai and the flow dies on the last step with a console-only
+   * error. The allowlist is the same one a redirect_uri is validated against at
+   * registration, so this widens form-action to exactly the destinations the
+   * authorization code could already legitimately be sent to, and nothing else.
+   */
+  const loginFormActions = [
+    "'self'",
+    ...new Set(
+      config.redirectAllowlist
+        .map((uri) => {
+          try {
+            return new URL(uri).origin;
+          } catch {
+            return null;
+          }
+        })
+        .filter((origin): origin is string => origin !== null)
+    ),
+  ].join(" ");
+  const loginCsp =
+    `default-src 'none'; style-src 'unsafe-inline'; form-action ${loginFormActions}; ` +
+    `frame-ancestors 'none'`;
 
   const metadataOptions = { issuer: config.issuer, resource: config.resource };
   const resourceMetadataUrl = `${config.issuer}/.well-known/oauth-protected-resource${config.mcpPath}`;
@@ -263,7 +292,7 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
       requestToken,
       redirectHost: hostOf(redirectUri),
       clientName: client.client_name,
-    });
+    }, loginCsp);
   });
 
   app.post("/authorize", formBody, async (req, res) => {
@@ -306,7 +335,7 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
         redirectHost: hostOf(request.redirectUri),
         clientName: request.clientName,
         error: `Too many failed attempts. Try again in ${Math.ceil(retryAfter / 60)} minute(s).`,
-      });
+      }, loginCsp);
       return;
     }
 
@@ -326,7 +355,7 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
         redirectHost: hostOf(request.redirectUri),
         clientName: request.clientName,
         error: "Incorrect username or password.",
-      });
+      }, loginCsp);
       return;
     }
 
@@ -636,7 +665,8 @@ function respondWithErrorPage(
 function sendLoginPage(
   res: Response,
   status: number,
-  options: Parameters<typeof renderLoginPage>[0]
+  options: Parameters<typeof renderLoginPage>[0],
+  csp: string
 ): void {
   res
     .status(status)
@@ -645,10 +675,7 @@ function sendLoginPage(
     // be cached anywhere, and it has no reason to be framed by anything.
     .set("Cache-Control", "no-store")
     .set("X-Frame-Options", "DENY")
-    .set(
-      "Content-Security-Policy",
-      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
-    )
+    .set("Content-Security-Policy", csp)
     // same-origin rather than no-referrer: this page POSTs back to /authorize,
     // which checks isSameOrigin(). Chrome sends no Origin on a same-origin form
     // POST, so no-referrer left that check with nothing to read.
