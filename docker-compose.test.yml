@@ -20,7 +20,12 @@ services:
   #     integration tests log into. Log in with the local part (`alice`),
   #     not the full address.
   greenmail:
-    image: greenmail/standalone:latest
+    # Pinned to an exact digest, not `:latest`: this fixture gates every CI
+    # run, and an upstream release could otherwise break the pipeline on a day
+    # nobody touched the repository. The tag is carried alongside the digest
+    # for readability only — the digest is what Docker resolves.
+    # Bump deliberately; verify the integration suite still passes.
+    image: greenmail/standalone:2.1.13@sha256:3df66b7edd01c8a301343ca5e3601d8674760d4708655573560c24745e624fb2
     ports:
       - "3143:3143" # IMAP (plain — used by the tests)
       - "3993:3993" # IMAPS (unused: no STARTTLS on 3143 means there's no

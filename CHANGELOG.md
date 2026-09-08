@@ -30,6 +30,8 @@ Test foundation, Docker packaging and CI. No runtime behavior changes.
 - **`docs/DEPLOYMENT.md`'s `/health` sample** matched no real response (`caldav_enabled` is per account inside `accounts[]`, never top-level), and its backup note called the service stateless while `docs/HARDENING.md` called it stateful. Following the former would have lost every mailbox credential.
 - **`README.md`**: "one Node process per mailbox" and "credentials in a single `.env` file" were both wrong; the roadmap still claimed a browser setup flow that does not exist; and the security summary presented systemd-only properties as defaults of the Docker-first deployment.
 - **`docs/HARDENING.md`** rotated `AUTH_TOKEN` in `/var/www/mcp-mail.markusstoeger.com/.env` while `docs/DEPLOYMENT.md` installs to `/var/www/mail-mcp/`; the `sed -i` errored and the operator believed the token had rotated. `ecosystem.config.cjs` had the same stale path.
+- **`docker-compose.test.yml`** pins GreenMail to `2.1.13` by digest instead of `:latest`, so an upstream release cannot break CI on a day nobody touched the repository.
+- **`docs/DEPLOYMENT.md`**'s nginx vhost uses `listen 443 ssl;` plus `http2 on;` — `listen ... http2` has been deprecated since nginx 1.25.1.
 - **`docs/DEPLOYMENT.md`** no longer describes a "bundled OAuth shim" — none ships with this repository. The claude.ai web (Option B) section and the htpasswd note in the service-user setup now say plainly that the OAuth 2.1 + DCR + PKCE layer is a prerequisite the operator has to supply, not a shipped component, and no longer link to a reference implementation that doesn't exist (the previously linked repository 404s).
 
 ## [0.2.1] — 2026-05-21
