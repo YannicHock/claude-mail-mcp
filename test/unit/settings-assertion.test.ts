@@ -33,6 +33,15 @@ function mint(overrides: Record<string, unknown> = {}, key = KEY): string {
   return `${encoded}.${mac}`;
 }
 
+// Pinned as a literal string, not just a re-export check: the connector's own
+// tests import ASSERTION_HEADER as a constant, so renaming it here alone
+// would leave a green suite while breaking oauth/test/integration/
+// settings-proxy.test.ts, which pins the literal "x-settings-assertion"
+// independently and cannot import from this package.
+test("the assertion header name is the literal both packages agree on", () => {
+  assert.equal(ASSERTION_HEADER, "x-settings-assertion");
+});
+
 test("a well-formed assertion verifies", () => {
   const result = verifyAssertion(mint(), KEY, ISSUER, "POST", "/settings/mailboxes/work");
   assert.deepEqual(result, { sub: "operator", sid: "session-1", csrf: "csrf-1" });

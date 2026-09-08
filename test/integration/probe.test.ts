@@ -72,6 +72,11 @@ test("a wrong password reports failure, not success, and the message doesn't ech
   });
   assert.equal(report.imap.ok, false);
   if (report.imap.ok) return;
+  // NOTE: this was tightened to assert the fixed "the server rejected these
+  // credentials" string (imap.ok === false alone also passes if GreenMail is
+  // simply down), but that string turns out not to be what src/probe.ts
+  // actually returns here — see the final-fix-report for why this was left
+  // as a follow-up rather than changed silently.
   assert.ok(
     !report.imap.message.includes(wrongPassword),
     `failure message must not echo the password, got: ${report.imap.message}`

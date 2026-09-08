@@ -25,6 +25,7 @@ import { AccountsStore } from "../../src/accounts.js";
 import { ClientPool } from "../../src/client-pool.js";
 import { createApp } from "../../src/app.js";
 import { ASSERTION_HEADER } from "../../src/settings-assertion.js";
+import { SETTINGS_HEADERS } from "../../src/settings-pages.js";
 import { readStamp } from "../../src/accounts-writer.js";
 import { makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
 
@@ -259,6 +260,18 @@ test("a POST whose CSRF field disagrees with the assertion is refused", async ()
   }
 });
 
+test("settings pages carry the no-store/CSP/frame/referrer header set", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
+    for (const [name, value] of Object.entries(SETTINGS_HEADERS)) {
+      assert.equal(res.headers.get(name), value, `expected ${name} to be set on a settings page`);
+    }
+  } finally {
+    await close();
+  }
+});
+
 test("create, edit, make default and delete round-trip through the real app", async () => {
   const { url, accountsPath, close } = await startConnector();
   try {
@@ -296,6 +309,105 @@ test("the edit page shows no stored password even end to end", async () => {
       await get(url, "/settings/mailboxes/work", mint("GET", "/settings/mailboxes/work"))
     ).text();
     assert.ok(!page.includes("imap-secret"));
+  } finally {
+    await close();
+  }
+});
+
+test("emptying the CalDAV URL without ticking remove is refused and leaves the stored block intact", async () => {
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const created = await post(
+      url,
+      "/settings/mailboxes",
+      await withStamp(
+        accountsPath,
+        validForm({
+          id: "work",
+          "caldav.url": "https://caldav.example.invalid/work",
+          "caldav.user": "caldav-user",
+          "caldav.pass": "caldav-secret",
+        })
+      )
+    );
+    assert.equal(created.status, 303);
+    const beforeEdit = JSON.parse(await readFile(accountsPath, "utf8"));
+    assert.deepEqual(beforeEdit.accounts[0].caldav, {
+      url: "https://caldav.example.invalid/work",
+      user: "caldav-user",
+      pass: "caldav-secret",
+    });
+
+    // Clear the URL field but do not tick "Remove CalDAV" — this must be
+    // refused with a field error, not silently drop the stored credentials.
+    const edited = await post(
+      url,
+      "/settings/mailboxes/work",
+      await withStamp(
+        accountsPath,
+        validForm({
+          id: "work",
+          "imap.pass": "",
+          "smtp.pass": "",
+          "caldav.url": "",
+          "caldav.user": "caldav-user",
+        })
+      )
+    );
+    assert.equal(edited.status, 400);
+    assert.match(await edited.text(), /Remove CalDAV/);
+
+    const afterEdit = JSON.parse(await readFile(accountsPath, "utf8"));
+    assert.deepEqual(
+      afterEdit.accounts[0].caldav,
+      {
+        url: "https://caldav.example.invalid/work",
+        user: "caldav-user",
+        pass: "caldav-secret",
+      },
+      "the stored CalDAV block, including its credentials, must survive the refused edit"
+    );
+  } finally {
+    await close();
+  }
+});
+
+test("ticking remove_caldav does remove the stored CalDAV block", async () => {
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    await post(
+      url,
+      "/settings/mailboxes",
+      await withStamp(
+        accountsPath,
+        validForm({
+          id: "work",
+          "caldav.url": "https://caldav.example.invalid/work",
+          "caldav.user": "caldav-user",
+          "caldav.pass": "caldav-secret",
+        })
+      )
+    );
+
+    const edited = await post(
+      url,
+      "/settings/mailboxes/work",
+      await withStamp(
+        accountsPath,
+        validForm({
+          id: "work",
+          "imap.pass": "",
+          "smtp.pass": "",
+          "caldav.url": "",
+          "caldav.user": "",
+          remove_caldav: "1",
+        })
+      )
+    );
+    assert.equal(edited.status, 303);
+
+    const afterEdit = JSON.parse(await readFile(accountsPath, "utf8"));
+    assert.equal(afterEdit.accounts[0].caldav, undefined);
   } finally {
     await close();
   }

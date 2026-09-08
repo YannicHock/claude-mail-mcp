@@ -50,6 +50,49 @@ test("garbage is rejected rather than thrown on", async () => {
   }
 });
 
+// verifySession pins `algorithms: [ALGORITHM]` (HS256 only) when calling
+// jose's jwtVerify. Both tests below already pass today for exactly that
+// reason — they exist to fail a future edit that widens that array, not to
+// catch a bug that exists now.
+
+test("a token forged with alg: \"none\" and no signature is rejected", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const b64url = (value: Record<string, unknown>) =>
+    Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+  const header = b64url({ alg: "none", typ: "JWT" });
+  const payload = b64url({
+    sub: "operator",
+    sid: "forged-sid",
+    csrf: "forged-csrf",
+    epoch: 0,
+    iss: ISSUER,
+    aud: "settings-session",
+    iat: now,
+    exp: now + 3600,
+  });
+  const forged = `${header}.${payload}.`;
+  assert.equal(await verifySession(forged, KEY, ISSUER, 0), null);
+});
+
+test("a token whose header claims a different algorithm is rejected", async () => {
+  // An algorithm-swap forgery: take a genuinely signed token and change only
+  // what the header claims about its own algorithm. The signature bytes are
+  // untouched, so a verifier that skipped the allow-list and dispatched on
+  // the header's own `alg` field would still attempt (and could be tricked
+  // into accepting) it; pinning `algorithms: [ALGORITHM]` rejects it before
+  // the signature is even checked.
+  const token = await signSession(newSession("operator", 0), KEY, ISSUER);
+  const [header, payload, signature] = token.split(".");
+  const decodedHeader = JSON.parse(Buffer.from(header, "base64url").toString("utf8"));
+  assert.equal(decodedHeader.alg, "HS256", "precondition: the real token is HS256");
+  const swappedHeader = Buffer.from(
+    JSON.stringify({ ...decodedHeader, alg: "HS384" }),
+    "utf8"
+  ).toString("base64url");
+  const swapped = `${swappedHeader}.${payload}.${signature}`;
+  assert.equal(await verifySession(swapped, KEY, ISSUER, 0), null);
+});
+
 test("the cookie carries every attribute the design depends on", () => {
   const header = sessionCookie("TOKEN");
   assert.ok(header.startsWith(`${SESSION_COOKIE}=TOKEN;`));

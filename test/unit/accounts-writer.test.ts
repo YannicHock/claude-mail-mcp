@@ -131,6 +131,23 @@ test("a duplicate id is refused", async () => {
   }
 });
 
+test("a refused duplicate-id create leaves the file byte-identical", async () => {
+  const path = await tempAccounts();
+  const store = new AccountsStore(path);
+  await store.start();
+  try {
+    await store.create(sampleAccount("work"), await store.stamp());
+    const before = await readFile(path, "utf8");
+
+    await assert.rejects(async () => store.create(sampleAccount("work"), await store.stamp()), /work/);
+
+    assert.equal(await readFile(path, "utf8"), before, "the file must not be touched by a refused create");
+    assert.deepEqual(store.ids(), ["work"], "memory did not move either");
+  } finally {
+    store.stop();
+  }
+});
+
 // "new" and "test" collide with the settings UI's own single-segment routes
 // (GET /settings/mailboxes/new, POST /settings/mailboxes/test) — see
 // RESERVED_IDS in src/accounts.ts. create() is the one entry point every new
@@ -160,6 +177,23 @@ test("updating an unknown id is refused", async () => {
   await store.start();
   try {
     await assert.rejects(async () => store.update("ghost", sampleAccount("ghost"), await store.stamp()));
+  } finally {
+    store.stop();
+  }
+});
+
+test("removing an unknown id is refused and touches neither disk nor memory", async () => {
+  const path = await tempAccounts();
+  const store = new AccountsStore(path);
+  await store.start();
+  try {
+    await store.create(sampleAccount("work"), await store.stamp());
+    const before = await readFile(path, "utf8");
+
+    await assert.rejects(async () => store.remove("ghost", await store.stamp()));
+
+    assert.equal(await readFile(path, "utf8"), before, "the file must not be touched by a refused remove");
+    assert.deepEqual(store.ids(), ["work"], "memory did not move either");
   } finally {
     store.stop();
   }
