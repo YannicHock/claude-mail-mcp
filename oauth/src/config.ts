@@ -15,6 +15,10 @@
  */
 
 import { readFileSync } from "node:fs";
+// POSIX explicitly: this service only ever runs in a Linux container (see the
+// /data and /run/secrets paths below), so path math on those literals must stay
+// forward-slashed even when a contributor runs the test suite on Windows.
+import { dirname, join } from "node:path/posix";
 
 import type { LogLevel } from "./logger.js";
 import { isValidHashFormat } from "./passwords.js";
@@ -43,6 +47,19 @@ export interface OAuthConfig {
   authUsername: string;
   authPasswordHash: string;
   stateFile: string | null;
+  /**
+   * Key for the assertion the settings proxy sends to the connector. Null turns
+   * the settings UI off entirely: with no key there is nothing the connector
+   * would accept, so the routes are not mounted at all.
+   */
+  settingsSigningKey: Uint8Array | null;
+  /**
+   * Where the live operator record lives. AUTH_PASSWORD_HASH seeds it once; after
+   * that this file wins, because /run/secrets is mounted read-only and a password
+   * change has to be able to write somewhere. `OPERATOR_FILE=none` keeps the old
+   * behaviour — hash from the secret, password change disabled.
+   */
+  operatorFile: string | null;
   /**
    * Number of reverse-proxy hops in front of this service. Determines which
    * X-Forwarded-For entry becomes `req.ip`, and therefore which address the
@@ -185,6 +202,26 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
   const stateFileRaw = optional(env, "STATE_FILE", "/data/oauth-state.json");
   const stateFile = stateFileRaw === "" || stateFileRaw === "none" ? null : stateFileRaw;
 
+  const settingsKeyRaw = readSecret(env, "SETTINGS_SIGNING_KEY");
+  let settingsSigningKey: Uint8Array | null = null;
+  if (settingsKeyRaw !== undefined) {
+    settingsSigningKey = new TextEncoder().encode(settingsKeyRaw);
+    if (settingsSigningKey.length < MIN_SIGNING_KEY_BYTES) {
+      throw new ConfigError(
+        `SETTINGS_SIGNING_KEY must be at least ${MIN_SIGNING_KEY_BYTES} bytes; got ` +
+          `${settingsSigningKey.length}. Generate one with: openssl rand -base64 48`
+      );
+    }
+  }
+
+  const operatorFileRaw = optional(
+    env,
+    "OPERATOR_FILE",
+    stateFile === null ? "" : join(dirname(stateFile), "operator.json")
+  );
+  const operatorFile =
+    operatorFileRaw === "" || operatorFileRaw === "none" ? null : operatorFileRaw;
+
   return {
     port: integer(env, "PORT", 8080),
     host: optional(env, "HOST", "0.0.0.0"),
@@ -197,6 +234,8 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
     authUsername: optional(env, "AUTH_USERNAME", "operator"),
     authPasswordHash,
     stateFile,
+    settingsSigningKey,
+    operatorFile,
     trustProxy: trustProxyHops(env),
     accessTokenTtl: integer(env, "ACCESS_TOKEN_TTL", 3600),
     refreshTokenTtl: integer(env, "REFRESH_TOKEN_TTL", 30 * 24 * 3600),

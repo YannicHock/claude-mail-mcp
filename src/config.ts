@@ -6,6 +6,8 @@
  * accounts.json — see src/accounts.ts and README.md.
  */
 
+import { readFileSync } from "node:fs";
+
 function required(name: string): string {
   const value = process.env[name];
   if (!value || value.trim() === "") {
@@ -29,6 +31,29 @@ function int(name: string, fallback: number): number {
     throw new Error(`Environment variable ${name} must be an integer.`);
   }
   return parsed;
+}
+
+/**
+ * Read a value that may be given inline or as a path to a file holding it.
+ *
+ * `NAME_FILE` wins when both are set, and an unreadable `NAME_FILE` is fatal
+ * rather than a silent fallback to `NAME` — a typo in a secret mount should stop
+ * the process, not quietly downgrade it. Mirrors the same helper in
+ * oauth/src/config.ts.
+ */
+function secret(name: string, fallback: string): string {
+  const filePath = process.env[`${name}_FILE`];
+  if (filePath && filePath.trim() !== "") {
+    try {
+      return readFileSync(filePath.trim(), "utf8").trim();
+    } catch (err) {
+      throw new Error(
+        `Cannot read ${name}_FILE at ${filePath.trim()}: ` +
+          (err instanceof Error ? err.message : String(err))
+      );
+    }
+  }
+  return optional(name, fallback);
 }
 
 export const config = {
@@ -69,6 +94,13 @@ export const config = {
    */
   authToken: required("AUTH_TOKEN"),
   publicUrl: optional("PUBLIC_URL", "http://localhost:3220"),
+
+  /**
+   * Shared key for the settings assertion the OAuth layer sends with proxied
+   * /settings requests. Empty means the settings routes are not mounted and this
+   * process behaves exactly as it did before they existed.
+   */
+  settingsSigningKey: secret("SETTINGS_SIGNING_KEY", ""),
 } as const;
 
 export type Config = typeof config;
