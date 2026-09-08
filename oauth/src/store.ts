@@ -32,6 +32,8 @@ export interface ClientRecord {
   response_types: string[];
   token_endpoint_auth_method: "none";
   scope?: string;
+  /** Epoch seconds this client was revoked by the operator, if it has been. */
+  revokedAt?: number;
 }
 
 /**
@@ -53,6 +55,14 @@ export interface StoreData {
   version: number;
   clients: Record<string, ClientRecord>;
   sessions: Record<string, RefreshSession>;
+  /**
+   * Bumped whenever the operator revokes every connected client at once. Access
+   * tokens are stateless JWTs and carry the epoch that was current when they were
+   * issued; a token whose epoch is behind this one is rejected even though it has
+   * not expired on its own. See Task 8, which is what actually reads this to
+   * reject a token.
+   */
+  tokenEpoch: number;
 }
 
 const CURRENT_VERSION = 1;
@@ -66,7 +76,7 @@ const CURRENT_VERSION = 1;
 export const MAX_CLIENTS = 200;
 
 function emptyData(): StoreData {
-  return { version: CURRENT_VERSION, clients: {}, sessions: {} };
+  return { version: CURRENT_VERSION, clients: {}, sessions: {}, tokenEpoch: 0 };
 }
 
 export class Store {
@@ -129,6 +139,10 @@ export class Store {
     return this.#data.sessions;
   }
 
+  get tokenEpoch(): number {
+    return this.#data.tokenEpoch;
+  }
+
   getClient(clientId: string): ClientRecord | undefined {
     return this.#data.clients[clientId];
   }
@@ -137,6 +151,47 @@ export class Store {
     this.#data.clients[record.client_id] = record;
     this.#evictOldestClients();
     this.save();
+  }
+
+  /** Remove a client's registration and its sessions. Returns how many sessions went. */
+  deleteClient(clientId: string): number {
+    delete this.#data.clients[clientId];
+    const removed = this.#dropSessionsForClient(clientId);
+    this.save();
+    return removed;
+  }
+
+  /** Mark a client revoked and drop its sessions, leaving other clients untouched. */
+  revokeClient(clientId: string, at: number): void {
+    const record = this.#data.clients[clientId];
+    if (record) record.revokedAt = at;
+    this.#dropSessionsForClient(clientId);
+    this.save();
+  }
+
+  /**
+   * Revoke every connected client at once: bump the token epoch so already-issued
+   * access tokens stop working (Task 8 checks this), clear every refresh session,
+   * and mark every client record revoked.
+   */
+  revokeEverything(at: number): void {
+    this.#data.tokenEpoch += 1;
+    this.#data.sessions = {};
+    for (const record of Object.values(this.#data.clients)) {
+      record.revokedAt = at;
+    }
+    this.save();
+  }
+
+  #dropSessionsForClient(clientId: string): number {
+    let removed = 0;
+    for (const [sid, session] of Object.entries(this.#data.sessions)) {
+      if (session.clientId === clientId) {
+        delete this.#data.sessions[sid];
+        removed += 1;
+      }
+    }
+    return removed;
   }
 
   getSession(sid: string): RefreshSession | undefined {
@@ -244,10 +299,18 @@ function parseData(raw: string): StoreData | null {
   if (!isPlainObject(candidate.clients) || !isPlainObject(candidate.sessions)) {
     return null;
   }
+  // Missing on any file written before tokenEpoch existed. Read as zero rather
+  // than rejecting the file — quarantining it would log every connected Claude
+  // client out on upgrade.
+  const tokenEpoch =
+    typeof candidate.tokenEpoch === "number" && Number.isInteger(candidate.tokenEpoch)
+      ? candidate.tokenEpoch
+      : 0;
   return {
     version: CURRENT_VERSION,
     clients: candidate.clients as Record<string, ClientRecord>,
     sessions: candidate.sessions as Record<string, RefreshSession>,
+    tokenEpoch,
   };
 }
 

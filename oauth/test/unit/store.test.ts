@@ -28,7 +28,11 @@ function client(id: string, issuedAt = 1000): ClientRecord {
   };
 }
 
-function session(jti: string, exp: number): RefreshSession {
+function session(
+  jti: string,
+  exp: number,
+  overrides: Partial<RefreshSession> = {}
+): RefreshSession {
   return {
     jti,
     sub: "operator",
@@ -36,6 +40,7 @@ function session(jti: string, exp: number): RefreshSession {
     scope: "mcp",
     resource: "https://mail.example.com/mcp",
     exp,
+    ...overrides,
   };
 }
 
@@ -176,3 +181,55 @@ describe("Store in-memory mode", () => {
 function nowPlus(seconds: number): number {
   return Math.floor(Date.now() / 1000) + seconds;
 }
+
+describe("Store revocation", () => {
+  it("a fresh store starts at token epoch zero", async () => {
+    const store = await Store.open(null, silentLogger);
+    assert.equal(store.tokenEpoch, 0);
+  });
+
+  it("revoking a client drops its sessions and marks it", async () => {
+    const store = await Store.open(null, silentLogger);
+    store.putClient(client("c1"));
+    store.putSession("s1", session("jti-1", nowPlus(3600), { clientId: "c1" }));
+    store.putSession("s2", session("jti-2", nowPlus(3600), { clientId: "c2" }));
+
+    store.revokeClient("c1", 1757000000);
+
+    assert.equal(store.getClient("c1")?.revokedAt, 1757000000);
+    assert.equal(store.getSession("s1"), undefined);
+    assert.ok(store.getSession("s2"), "another client's session is untouched");
+  });
+
+  it("deleting a client removes the record and reports the sessions taken with it", async () => {
+    const store = await Store.open(null, silentLogger);
+    store.putClient(client("c1"));
+    store.putSession("s1", session("jti-1", nowPlus(3600), { clientId: "c1" }));
+    store.putSession("s2", session("jti-2", nowPlus(3600), { clientId: "c1" }));
+    assert.equal(store.deleteClient("c1"), 2);
+    assert.equal(store.getClient("c1"), undefined);
+    assert.equal(store.getSession("s1"), undefined);
+  });
+
+  it("revoking everything bumps the epoch and empties the sessions", async () => {
+    const store = await Store.open(null, silentLogger);
+    store.putClient(client("c1"));
+    store.putSession("s1", session("jti-1", nowPlus(3600), { clientId: "c1" }));
+    store.revokeEverything(1757000000);
+    assert.equal(store.tokenEpoch, 1);
+    assert.deepEqual(Object.keys(store.sessions), []);
+    assert.equal(store.getClient("c1")?.revokedAt, 1757000000);
+  });
+
+  it("a state file written before tokenEpoch existed still loads", async () => {
+    const path = join(await mkdtemp(join(tmpdir(), "store-")), "state.json");
+    await writeFile(
+      path,
+      JSON.stringify({ version: 1, clients: {}, sessions: {} }),
+      "utf8"
+    );
+    const store = await Store.open(path, silentLogger);
+    openStores.push(store);
+    assert.equal(store.tokenEpoch, 0, "missing means zero, not a corrupt file");
+  });
+});
