@@ -175,23 +175,6 @@ function hostOf(uri: string): string {
   }
 }
 
-/** Apply the revoke action named by a submitted form body. Unknown bodies are a no-op. */
-function applyRevocation(store: Store, body: Record<string, unknown>): void {
-  const clientId = typeof body.client_id === "string" ? body.client_id : undefined;
-  if (clientId !== undefined) {
-    store.revokeClient(clientId, revocationTimestamp());
-    return;
-  }
-  const sid = typeof body.sid === "string" ? body.sid : undefined;
-  if (sid !== undefined) {
-    store.deleteSession(sid);
-    return;
-  }
-  if (body.all === "1") {
-    store.revokeEverything(revocationTimestamp());
-  }
-}
-
 function redirectToClients(res: Response): void {
   res.status(303).set(SETTINGS_HEADERS).set("Location", "/settings/clients").end();
 }
@@ -208,8 +191,8 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
   const guardSession = requireSession(deps);
   const guardCsrf = requireCsrf(deps);
 
-  router.get("/", guardSession, async (_req, res) => {
-    const session = res.locals.session as SessionClaims;
+  router.get("/", guardSession, async (req, res) => {
+    const session = sessionOf(req);
     const health = await upstreamHealth();
     res
       .status(200)
@@ -296,8 +279,8 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
 
   // ---- Connected clients -------------------------------------------------
 
-  router.get("/clients", guardSession, (_req, res) => {
-    const session = res.locals.session as SessionClaims;
+  router.get("/clients", guardSession, (req, res) => {
+    const session = sessionOf(req);
     const clients = Object.values(store.clients)
       .sort((a, b) => b.client_id_issued_at - a.client_id_issued_at)
       .map((client) => ({
@@ -320,16 +303,11 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
       .send(renderClients({ csrf: session.csrf, clients, sessions }));
   });
 
-  // A single dispatching endpoint, keyed on whichever field is present in the
-  // submitted body — client_id revokes a client and its sessions, sid ends one
-  // session, all=1 revokes everything. The three routes below it exist because
-  // the rendered page (settings-pages.ts) links each row's own action, and each
-  // one simply supplies the same field the dispatcher already understands.
-  router.post("/clients/revoke", formBody, guardSession, guardCsrf, (req, res) => {
-    applyRevocation(store, req.body as Record<string, unknown>);
-    redirectToClients(res);
-  });
-
+  // One route per action, matching exactly the form actions settings-pages.ts
+  // renders — a client's own row, a session's own row, and "everything". There
+  // is deliberately no single dispatching endpoint that re-sniffs the body to
+  // pick one of these three apart: that would be a second place deciding which
+  // store call an action means, for no rendered page that would ever use it.
   router.post("/clients/:id/revoke", formBody, guardSession, guardCsrf, (req, res) => {
     store.revokeClient(String(req.params.id), revocationTimestamp());
     redirectToClients(res);
@@ -347,8 +325,8 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
 
   // ---- Password change ----------------------------------------------------
 
-  router.get("/password", guardSession, (_req, res) => {
-    const session = res.locals.session as SessionClaims;
+  router.get("/password", guardSession, (req, res) => {
+    const session = sessionOf(req);
     res
       .status(200)
       .type("html")
@@ -363,7 +341,7 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
   });
 
   router.post("/password", formBody, guardSession, guardCsrf, async (req, res) => {
-    const session = res.locals.session as SessionClaims;
+    const session = sessionOf(req);
     const ip = req.ip ?? "unknown";
 
     // 1. A file-less operator record cannot be written to at all.

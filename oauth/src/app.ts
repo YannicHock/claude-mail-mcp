@@ -532,6 +532,18 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
     // going through createSettingsRouter — is what guarantees an unauthenticated
     // request is answered locally (the sign-in form) and never reaches the
     // connector at all.
+    //
+    // Note what is deliberately absent here: unlike every state-changing route
+    // in settings-routes.ts, there is no requireCsrf on this mount. That is not
+    // an oversight. This route has no body parser and forwards the request body
+    // to the connector as raw bytes (see proxy.ts's own header on why nothing
+    // here may consume the stream), so this service cannot read a `_csrf` field
+    // out of a form body without destroying exactly the byte-for-byte forwarding
+    // the proxy exists to preserve. CSRF protection for these requests happens
+    // one hop later: the assertion signed below carries this session's own
+    // `csrf` claim, and the connector's own settings router verifies a
+    // submitted `_csrf` field against it (constant-time) before acting on any
+    // state-changing mailbox request. See spec section 3.3.
     const settingsUpstreamPath = (req: Request): string =>
       `/settings/mailboxes${req.path === "/" ? "" : req.path}`;
 

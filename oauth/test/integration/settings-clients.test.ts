@@ -26,9 +26,8 @@ test("revoking a client ends its session and its access token at once", async ()
     const cookie = await harness.signIn();
     const csrf = extractCsrf(await (await getClients(harness, cookie)).text());
 
-    const res = await postForm(harness, "/settings/clients/revoke", cookie, {
+    const res = await postForm(harness, `/settings/clients/${clientId}/revoke`, cookie, {
       _csrf: csrf,
-      client_id: clientId,
     });
     assert.equal(res.status, 303);
 
@@ -46,6 +45,12 @@ test("revoking a client ends its session and its access token at once", async ()
   }
 });
 
+// This checks three known strings rather than the general property. The real
+// guarantee is structural: the /clients route only ever hands renderClients
+// pre-scrubbed fields (id, name, issuedAt, redirectHosts, revoked, sid,
+// clientId, scope, expiresAt) — no token ever reaches that call in the first
+// place. Treat this test as a regression trip-wire, not as the source of
+// truth for that guarantee.
 test("the clients page lists nothing sensitive", async () => {
   const harness = await startHarness();
   try {
@@ -86,9 +91,8 @@ test("revoking one session leaves the other client's session alone", async () =>
     const [revokedSid, remainingSid] = sessions;
     const csrf = extractCsrf(await (await getClients(harness, cookie)).text());
 
-    const res = await postForm(harness, "/settings/clients/revoke", cookie, {
+    const res = await postForm(harness, `/settings/sessions/${revokedSid}/revoke`, cookie, {
       _csrf: csrf,
-      sid: revokedSid,
     });
     assert.equal(res.status, 303);
 
@@ -104,10 +108,37 @@ test("revoking a client requires the CSRF field", async () => {
   try {
     const { clientId } = await completeAuthorizationFlow(harness);
     const cookie = await harness.signIn();
-    const res = await postForm(harness, "/settings/clients/revoke", cookie, {
-      client_id: clientId,
-    });
+    const res = await postForm(harness, `/settings/clients/${clientId}/revoke`, cookie, {});
     assert.equal(res.status, 403);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("revoking everything ends every client's session and access token", async () => {
+  const harness = await startHarness();
+  try {
+    const first = await completeAuthorizationFlow(harness);
+    const second = await completeAuthorizationFlow(harness);
+    const cookie = await harness.signIn();
+    const csrf = extractCsrf(await (await getClients(harness, cookie)).text());
+
+    const res = await postForm(harness, "/settings/clients/revoke-all", cookie, {
+      _csrf: csrf,
+    });
+    assert.equal(res.status, 303);
+
+    for (const { body } of [first, second]) {
+      const mcp = await fetch(`${harness.baseUrl}/mcp`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${body.access_token as string}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      assert.equal(mcp.status, 401);
+    }
   } finally {
     await harness.close();
   }
