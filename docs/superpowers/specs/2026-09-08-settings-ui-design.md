@@ -141,9 +141,21 @@ described next carries the same `csrf` value.
 
 ## 4. The cross-service assertion
 
-Header `X-Settings-Assertion`: HS256, `aud: "mail-mcp-settings"`, `iss` the issuer,
-30-second lifetime, claims `sub`, `sid`, `csrf`, and the request's method and path so
-a GET assertion cannot be replayed as a POST.
+Header `X-Settings-Assertion`. **Not a JWT**: `<payload>.<mac>`, where `payload` is
+base64url-encoded JSON `{v, iss, aud, sub, sid, csrf, htm, htu, exp}` and `mac` is
+`HMAC-SHA256(key, payload)` over that exact string. Lifetime 30 seconds; `htm` and
+`htu` carry the request's method and path so a GET assertion cannot be replayed as a
+POST.
+
+A JWT would have meant either adding `jose` to the connector — which today depends on
+the MCP SDK, express, ical.js, imapflow, mailparser, nodemailer, tsdav and zod, and on
+no crypto library — or hand-writing JWT verification, which is where algorithm-confusion
+bugs live. An HMAC over the literal transmitted string has no algorithm field to
+confuse, no canonicalisation ambiguity, and needs only `node:crypto`. Verification
+recomputes the MAC over the received `payload` string, compares with `timingSafeEqual`,
+and only then parses the JSON.
+
+Neither package gains a runtime dependency anywhere in this design.
 
 **Its own key**, not the OAuth signing key: a new Docker secret
 `settings_signing_key` mounted into both containers. If the connector held the OAuth
@@ -262,15 +274,23 @@ referencing it; revoke-all clears both.
 **Access tokens are stateless JWTs with a one-hour lifetime**, so deleting a session
 stops refresh but leaves an issued access token usable until it expires. A revoke
 button that does not revoke for an hour is a lie, so `tokens.ts` gains an epoch check:
-a global `tokenEpoch` in the store, carried as a claim at issuance and compared at
-verification, incremented by revoke-all; and a per-client `revoked_at`, against which
-a token's `iat` is compared. Cost: one store field, one comparison in the verify path.
+a global `tokenEpoch` in `StoreData`, carried as an `epoch` claim at issuance and
+compared at verification, incremented by revoke-all; and a per-client `revokedAt`,
+against which a token's `iat` is compared. A token minted before the field existed
+carries no `epoch` and is read as 0, which matches the initial `tokenEpoch`, so the
+upgrade invalidates nothing on its own. Cost: two store fields and two comparisons in
+the verify path.
 
 ## 9. Operator password
 
 The live hash moves to `oauth-data/operator.json` — `{version, username, passwordHash,
-sessionEpoch, tokenEpoch}` — seeded on first start from `AUTH_PASSWORD_HASH(_FILE)`.
-The Docker secret becomes the initial value, not the live one.
+sessionEpoch}` — seeded on first start from `AUTH_PASSWORD_HASH(_FILE)`. The Docker
+secret becomes the initial value, not the live one.
+
+`sessionEpoch` lives here because it is about the operator's browser sessions;
+`tokenEpoch` from §8 lives in `oauth-state.json` instead, because it is about issued
+tokens and `TokenIssuer` already holds that store. Same principle as §2: state sits
+with whoever owns it.
 
 To keep that from surprising anyone, the service logs at startup which source is live,
 and warns by name when the secret file differs from the stored hash. `OPERATOR_FILE=none`
