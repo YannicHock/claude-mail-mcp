@@ -4,9 +4,11 @@ A typical production deployment behind nginx, running under a hardened systemd u
 
 ## Requirements
 
-- Node.js 20.19+ or 22.7+ — older releases cannot load the `tsdav`
-  dependency, which ships an ESM file inside a CommonJS package. The Docker
-  image ships Node 22.
+- Node.js 24 or newer — the active LTS line, which both Docker images ship
+  (`node:24-alpine`) and which CI runs the test suites on. Older releases are
+  not supported: nothing tests them, and Node 20 and 22 additionally could not
+  load the `tsdav` dependency below its 2.3 line, which shipped an ESM file
+  inside a CommonJS package.
 - A public DNS name pointing at your server (HTTPS is required by Claude.ai)
 - An IMAP + SMTP capable mailbox
 - Optionally a CalDAV endpoint
@@ -320,7 +322,7 @@ Once you have an OAuth shim of your own in front:
 ```bash
 # health
 curl https://mcp-mail.example.com/health
-# → {"status":"ok","server":"claude-mail-mcp","version":"0.4.0",
+# → {"status":"ok","server":"claude-mail-mcp","version":"0.5.0",
 #    "accounts":[{"id":"main","label":"Main","default":true,
 #                 "smtp_from":"you@example.com","imap_host":"imap.mailbox.org",
 #                 "caldav_enabled":false}],

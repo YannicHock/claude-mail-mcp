@@ -4,9 +4,9 @@ Self-hosted **IMAP / SMTP / CalDAV connector for Claude** with multi-account sup
 
 > Built because every other Claude email connector targets Gmail. This one is for the rest of us — Mailbox.org, Fastmail, iCloud, Mailcow, iRedMail, Migadu, Nextcloud, your own Postfix box. If your provider speaks IMAP, SMTP and CalDAV, this works. One connector, all your inboxes.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Node](https://img.shields.io/badge/node-20.19%2B_or_22.7%2B-brightgreen.svg)](https://nodejs.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Node](https://img.shields.io/badge/node-24%2B-brightgreen.svg)](https://nodejs.org)
 
-> **Node requirement:** `^20.19.0 || >=22.7.0` (see `engines` in [`package.json`](package.json)). Plain "Node 20" is not enough — Node 20.0–20.18 and 22.0–22.6 fail to load the compiled server (a `tsdav` packaging defect); see [`CHANGELOG.md`](CHANGELOG.md) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+> **Node requirement:** `>=24.0.0` (see `engines` in [`package.json`](package.json)). Node 24 is the active LTS line; both images are built on `node:24-alpine` and CI runs the suites on 24, so that is the only version this project claims to work on. Node 26 becomes LTS in October 2026 and is the intended next step.
 
 > **This is a maintained fork** of [maxx3250/claude-mail-mcp](https://github.com/maxx3250/claude-mail-mcp), living at [YannicHock/claude-mail-mcp](https://github.com/YannicHock/claude-mail-mcp). The Docker image, `docker-compose.yml`, the test suites and the CI/CD pipeline described below exist only in this fork, so clone from here, open issues here, and report security problems here — see [SECURITY.md](SECURITY.md).
 
@@ -97,7 +97,7 @@ Smoke test:
 
 ```bash
 curl http://localhost:3220/health
-# {"status":"ok","server":"claude-mail-mcp","version":"0.4.0","accounts":[{…}],…}
+# {"status":"ok","server":"claude-mail-mcp","version":"0.5.0","accounts":[{…}],…}
 ```
 
 ---
@@ -130,7 +130,7 @@ docker run -d \
   ghcr.io/yannichock/claude-mail-mcp:latest
 
 curl http://127.0.0.1:3220/health
-# {"status":"ok","server":"claude-mail-mcp","version":"0.4.0","accounts":[],"accounts_file":"/data/accounts.json"}
+# {"status":"ok","server":"claude-mail-mcp","version":"0.5.0","accounts":[],"accounts_file":"/data/accounts.json"}
 ```
 
 Always publish with an explicit loopback host IP, `-p 127.0.0.1:3220:3220` — **never a bare `-p 3220:3220`**. The image binds `0.0.0.0` *inside* the container out of necessity (that's how Docker's port publishing reaches it at all); the host-side exposure is controlled entirely by how you publish the port. A bare publish puts the unauthenticated `GET /health` endpoint — it leaks the server name, version, account count and `accounts_file` path — on every interface, including the public internet on a host like Hetzner. The `Dockerfile` carries the same warning inline.
@@ -267,9 +267,10 @@ Releases are cut by pushing a `v*` tag. That runs the same suite, re-runs the ve
 - **v0.2** ✅ — Multi-account per deployment. No browser setup flow: accounts are configured by editing `accounts.json` — see [Connecting from Claude.ai](#connecting-from-claudeai).
 - **v0.3** ✅ — Docker image on GHCR, test foundation (25 unit, 14 integration), CI and release pipeline
 - **v0.4** ✅ — OAuth 2.1 layer in `oauth/` for claude.ai web and Cowork: discovery, dynamic client registration, PKCE, refresh rotation, and an authenticated proxy in front of `/mcp`
-- **v0.5** — Browser settings UI: manage mailboxes, verify IMAP/SMTP/CalDAV credentials before saving, review and revoke connected Claude clients
-- **v0.6** — Threading-aware `list_threads` tool, attachment download as base64, calendar invitation (iMIP) sending
-- **v0.7** — CardDAV (contacts), JMAP support as an alternative to IMAP for Fastmail/Topicbox
+- **v0.5** ✅ — Node 24 and a dependency refresh across both packages; separate pipelines for branches and releases, with a version-consistency gate and build-provenance attestations
+- **v0.6** — Browser settings UI: manage mailboxes, verify IMAP/SMTP/CalDAV credentials before saving, review and revoke connected Claude clients
+- **v0.7** — Threading-aware `list_threads` tool, attachment download as base64, calendar invitation (iMIP) sending
+- **v0.8** — CardDAV (contacts), JMAP support as an alternative to IMAP for Fastmail/Topicbox
 - **v1.0** — Audit log, Prometheus metrics, rate limiting, hardened deployment guide
 
 ---

@@ -2,12 +2,37 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.0] — 2026-09-08
 
-Release pipeline. No runtime behavior changes.
+Runtime and dependency refresh, together with the release pipeline that is meant to keep it from drifting this far again. Not a patch release: the Node floor moves from 20/22 to 24, and four dependencies cross a major boundary.
+
+The only source change the whole refresh required was one type in `src/smtp-client.ts`. All 297 tests pass unchanged.
 
 ### Changed
 
+- **Node 24 is the only supported runtime.** `engines.node` becomes `>=24.0.0` in both packages, both Dockerfiles build on `node:24-alpine`, and CI runs the suites on 24. Node 24 is the active LTS line ("Krypton"), maintained into 2028. Node 26 already exists but does not become LTS until October 2026; the move happens then, in both Dockerfiles, both `engines` fields and `_test.yml` at once, and a note in `Dockerfile` says so. Previously the floor admitted Node 20.19 and 22.7 — versions nothing tested.
+- **Connector dependencies.** Four of these cross a major boundary; none of them needed a code change:
+
+  | | from | to |
+  | --- | --- | --- |
+  | `@modelcontextprotocol/sdk` | ^1.6.1 | ^1.30.0 |
+  | `express` | ^5.0.1 | ^5.2.1 |
+  | `ical.js` | ^2.1.0 | ^2.2.1 |
+  | `imapflow` | ^1.0.180 | **^2.0.0** |
+  | `mailparser` | ^3.7.2 | ^3.9.23 |
+  | `nodemailer` | ^8.0.7 | **^10.0.1** |
+  | `tsdav` | ^2.1.5 | ^2.3.3 |
+  | `zod` | ^3.23.8 | **^4.5.4** |
+  | `@types/express` | ^5.0.0 | ^5.0.6 |
+  | `@types/mailparser` | ^3.4.5 | ^3.4.6 |
+  | `@types/node` | ^22.10.0 | ^24.13.3 |
+  | `tsx` | ^4.23.1 | ^4.23.13 |
+  | `typescript` | ^5.7.2 | **^7.0.2** |
+
+  `zod` 4 is safe here because the MCP SDK declares `zod: "^3.25 || ^4.0"` — the connector's tool schemas and the SDK now agree on the same major.
+
+- **OAuth layer dependencies.** `@types/node` ^22.20.1 → ^24.13.3 and `typescript` ^5.9.3 → ^7.0.2. `express` and `jose` were already current.
+- **`SendResult.response` is optional.** nodemailer's own types, which replaced `@types/nodemailer`, declare the server's final SMTP reply as optional, because not every transport produces one. The absence is passed through rather than replaced with an empty string: the field reaches the model, and an empty reply reads as a reply that was empty.
 - **`main` and version tags now have separate pipelines.** `ci.yml` owns branches: it runs the suite and, on `main`, publishes both images tagged `sha-<short>` and nothing else. `release.yml` triggers only on `v*` and owns `X.Y.Z` and `latest`. Previously both workflows triggered on `main`, so every push ran the whole suite twice and built both images three times over — and `latest` tracked the last merge rather than the last release. `:latest` now always names a release; `sha-<short>` is how an unreleased commit is run.
 - **The `{{major}}` and `{{major}}.{{minor}}` image tags are gone.** They came from `docker/metadata-action`'s example configuration, which encodes the convention of the official base images: independent consumers tracking a minor line and receiving patches without editing anything. Nothing in this repository referred to them — `docker-compose.yml`, the README and `docs/DEPLOYMENT.md` all use `latest`. For a 0.x project `0` also claims a compatibility line SemVer explicitly withholds. And moving tags are the only tags an older release can overwrite: pushing `v0.3.0` and `v0.4.0` together once left `0` pointing wherever the race landed, because the concurrency group is keyed per ref.
 
@@ -16,7 +41,13 @@ Release pipeline. No runtime behavior changes.
 - **`scripts/check-versions.sh`** — fails when the eight places this repository states its version stop agreeing (`package.json`, `oauth/package.json`, both lockfiles at two positions each, and the `VERSION` constant in each `app.ts`). Given a tag it also requires the tree to match it and `CHANGELOG.md` to carry the matching `## [x.y.z]` section. Both workflows run it before anything is built; run it by hand before tagging.
 - **A GitHub release per tag**, with the matching CHANGELOG section as its body. Cut with the runner's preinstalled `gh` rather than a third-party action.
 - **Build provenance and an SBOM for every published image.** Provenance comes from `actions/attest-build-provenance` rather than buildx, which writes its attestations into the manifest index where registry interfaces show them as an `unknown/unknown` platform; verify with `gh attestation verify`.
-- **Every GitHub Action is pinned to a commit sha**, with the version in a trailing comment. A major-version tag is mutable by whoever controls the action's repository.
+- **Every GitHub Action is pinned to a commit sha**, with the version in a trailing comment, and every pin moved to its current major — the tree was between one and three majors behind on all seven. A major-version tag is mutable by whoever controls the action's repository.
+- **Dependabot now covers npm and Docker**, not just Actions. Its absence for npm is the direct reason the dependency set drifted far enough to need one large refresh instead of a stream of small ones. Major updates of the Node base image are ignored on purpose: which Node line this runs on is a decision about long-term support, not a number to chase.
+- **`.gitattributes`** keeping `*.sh` at LF. This repository is developed on Windows with `core.autocrlf=true`, and a shell script checked out with CRLF fails on Linux with `bash: \r: command not found` — including `scripts/check-versions.sh`, which now gates every release.
+
+### Removed
+
+- **`@types/nodemailer`** — nodemailer ships its own type definitions from version 10 on, and they are stricter than the community package they replace.
 
 ## [0.4.0] — 2026-09-08
 
