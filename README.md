@@ -215,7 +215,7 @@ Defaults in one sentence: TLS via Let's Encrypt + HSTS/security headers + a rate
 ### Quick summary
 
 - **Transport:** TLS 1.3 (Let's Encrypt, auto-renew), HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex` — delivered by the nginx config in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
-- **Auth:** `/mcp` is gated by a single static Bearer token (`AUTH_TOKEN`), checked on every request — no OAuth, no per-user sessions, no token expiry. Rate-limited at nginx (10 req/min per IP on `/mcp`, `/health` is unthrottled).
+- **Auth:** `/mcp` is gated by a single static Bearer token (`AUTH_TOKEN`), checked on every request — no OAuth, no per-user sessions, no token expiry. Rate-limited at nginx (120 req/min per IP on `/mcp`, `/health` is unthrottled) — sized for JSON-RPC, where each MCP message is a separate POST, rather than for a login form.
 - **Process:** Runs as a dedicated non-root `mailmcp` system user (no shell). Full systemd hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `ProtectKernel*`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `RestrictNamespaces`, `LockPersonality`, `SystemCallFilter=@system-service ~@privileged @resources`, `MemoryMax=512M`.
 - **Network:** Backend bound to `127.0.0.1` only — nginx is the only thing that can reach it from outside. UFW default-deny on the host.
 - **Storage:** Credentials chmod 600, owned by `mailmcp`, in `/var/lib/mail-mcp/`. `.env` chmod 640 `root:mailmcp`.

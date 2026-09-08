@@ -177,8 +177,22 @@ The repo ships `ecosystem.config.cjs` for `pm2 start ecosystem.config.cjs`. Not 
 
 ```nginx
 # /etc/nginx/conf.d/mail-mcp-limits.conf
-limit_req_zone $binary_remote_addr zone=mailmcp_auth:10m rate=10r/m;
+limit_req_zone $binary_remote_addr zone=mailmcp_auth:10m rate=120r/m;
 ```
+
+**Do not lower this to a login-form rate.** `/mcp` is a JSON-RPC endpoint, not a
+login form: `src/index.ts` runs the Streamable HTTP transport with
+`sessionIdGenerator: undefined` and `enableJsonResponse: true`, so **every
+JSON-RPC message is its own `POST /mcp`**. Simply connecting a client spends
+`initialize` + `notifications/initialized` + `tools/list` before the user has
+typed anything, and a request like "read my last four emails" spends several
+more. At 10r/m the connector starts returning 503 in the middle of a
+conversation, with nothing in the client to explain why.
+
+120r/m with a burst of 60 leaves normal use untouched while still capping a
+guessing loop at two attempts per second per IP. That cap is defence in depth
+rather than the actual defence: `AUTH_TOKEN` is 128 bits of entropy, so
+throttling changes a brute-force from infeasible to infeasible.
 
 Then the site itself:
 
@@ -220,8 +234,10 @@ server {
 
     location /mcp {
         # AUTH_TOKEN is the only thing gating this endpoint — throttle
-        # guessing attempts against it.
-        limit_req zone=mailmcp_auth burst=5 nodelay;
+        # guessing attempts against it. Sized for JSON-RPC, not for a login
+        # form: every MCP message is a separate POST here (see the note above
+        # the zone definition). Lowering this breaks live conversations.
+        limit_req zone=mailmcp_auth burst=60 nodelay;
 
         proxy_pass http://127.0.0.1:3220;
         proxy_http_version 1.1;

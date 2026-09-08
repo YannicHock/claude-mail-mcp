@@ -44,7 +44,7 @@ This is the whole deployment as it ships: one process, bound to loopback, gated 
 |-------|----------|-----------|
 | Transport | TLS 1.3, auto-renewed | certbot + Let's Encrypt |
 | Transport | HSTS 2 years, frame-deny, nosniff, no-referrer, noindex | nginx `add_header … always`, server-level (see [DEPLOYMENT.md](DEPLOYMENT.md)) |
-| Transport | Brute-force throttling on `/mcp` | nginx `limit_req zone=mailmcp_auth rate=10r/m burst=5 nodelay`, scoped to the `/mcp` location only — `/health` is not throttled |
+| Transport | Brute-force throttling on `/mcp` | nginx `limit_req zone=mailmcp_auth rate=120r/m burst=60 nodelay`, scoped to the `/mcp` location only — `/health` is not throttled |
 | Network | Backend never reachable from the public internet | bind 127.0.0.1 + UFW default-deny |
 | Process | No privilege escalation | `NoNewPrivileges` |
 | Process | Read-only filesystem except `/var/lib/mail-mcp` | `ProtectSystem=strict` + `ReadWritePaths=` |
@@ -166,7 +166,7 @@ bantime = 3600
 ### Scenario: brute force against the Bearer token
 
 Path: attacker hits `POST /mcp` with guessed tokens.
-Mitigations: `AUTH_TOKEN` is a 32-byte random hex string (128 bits of entropy) — not practically brute-forceable. The nginx recipe in [DEPLOYMENT.md](DEPLOYMENT.md) also throttles `/mcp` to 10 req/min per IP (`limit_req zone=mailmcp_auth burst=5 nodelay`).
+Mitigations: `AUTH_TOKEN` is a 32-byte random hex string (128 bits of entropy) — not practically brute-forceable. The nginx recipe in [DEPLOYMENT.md](DEPLOYMENT.md) also throttles `/mcp` to 120 req/min per IP (`limit_req zone=mailmcp_auth burst=60 nodelay`). That ceiling is deliberately well above a login form's: every MCP message is its own `POST /mcp`, so a login-form rate would cut live conversations off with a 503. It contributes almost nothing against guessing — the entropy does that work — and exists to bound the damage of a client stuck in a retry loop.
 Residual risk: negligible, assuming the token was generated as documented (`openssl rand -hex 32`) and never leaked (logs, git history, screenshots).
 
 ### Scenario: brute force against an OAuth layer's login (if you add one)
