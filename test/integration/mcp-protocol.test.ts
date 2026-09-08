@@ -20,8 +20,8 @@ import {
 } from "../helpers/fixtures.js";
 import {
   startMcpApp,
-  HARNESS_SERVER_NAME,
-  HARNESS_SERVER_VERSION,
+  SERVER_NAME,
+  VERSION,
   type McpTestApp,
 } from "../helpers/mcp-app.js";
 
@@ -100,8 +100,8 @@ test("initialize negotiates the expected protocolVersion and serverInfo", async 
     await client.connect(transport);
     assert.equal(transport.protocolVersion, LATEST_PROTOCOL_VERSION);
     assert.deepEqual(client.getServerVersion(), {
-      name: HARNESS_SERVER_NAME,
-      version: HARNESS_SERVER_VERSION,
+      name: SERVER_NAME,
+      version: VERSION,
     });
   } finally {
     await client.close();

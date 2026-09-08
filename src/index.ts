@@ -6,23 +6,23 @@
  *   - GET  /health        liveness probe + accounts summary
  *   - POST /mcp           MCP Streamable HTTP transport (Bearer-auth gated)
  *
+ * The routes themselves live in src/app.ts (`createApp`), which the test suite
+ * builds its server from too. This file owns only the process concerns: config,
+ * the AccountsStore/ClientPool lifecycle, binding the port and shutdown.
+ *
  * v0.2: multi-account per deployment. Credentials live in accounts.json
- * (managed by the OAuth shim's /settings UI), watched via fs.watch for
+ * (created by hand — see docs/DEPLOYMENT.md), watched via fs.watch for
  * hot-reload. Calendar tools are always registered; tools that require
  * CalDAV error friendly if the resolved account has none configured.
  */
 
-import express, { NextFunction, Request, Response } from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-
 import { config } from "./config.js";
 import { AccountsStore } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
-import { registerMailTools } from "./tools-mail.js";
-import { registerCalendarTools } from "./tools-calendar.js";
+import { createApp, VERSION } from "./app.js";
 
-const VERSION = "0.2.1";
+export { createApp, SERVER_NAME, VERSION } from "./app.js";
+export type { CreateAppOptions, Logger, LogLevel } from "./app.js";
 
 function log(
   level: "debug" | "info" | "warn" | "error",
@@ -38,23 +38,6 @@ function log(
     ...extra,
   };
   console.error(JSON.stringify(line));
-}
-
-function bearerAuth(req: Request, res: Response, next: NextFunction): void {
-  const header = req.header("authorization") ?? "";
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (!match || match[1] !== config.authToken) {
-    log("warn", "rejected unauthenticated MCP request", {
-      ip: req.ip,
-      path: req.path,
-    });
-    res.status(401).json({
-      error: "unauthorized",
-      message: "Missing or invalid Bearer token",
-    });
-    return;
-  }
-  next();
 }
 
 async function main(): Promise<void> {
@@ -77,57 +60,12 @@ async function main(): Promise<void> {
     ids: store.ids(),
   });
 
-  const mcp = new McpServer({
-    name: "claude-mail-mcp",
-    version: VERSION,
-  });
-  registerMailTools(mcp, pool, store);
-  registerCalendarTools(mcp, pool);
-
-  const app = express();
-  app.disable("x-powered-by");
-  app.set("trust proxy", true);
-  app.use(express.json({ limit: "5mb" }));
-
-  app.get("/health", (_req, res) => {
-    res.json({
-      status: "ok",
-      server: "claude-mail-mcp",
-      version: VERSION,
-      accounts: store.publicSummaries(),
-      accounts_file: config.accountsFile,
-    });
-  });
-
-  app.post("/mcp", bearerAuth, async (req, res) => {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true,
-    });
-    res.on("close", () => {
-      transport.close().catch(() => {});
-    });
-    try {
-      await mcp.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-    } catch (err) {
-      log("error", "MCP request failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      if (!res.headersSent) {
-        res.status(500).json({
-          error: "internal_error",
-          message: err instanceof Error ? err.message : "Unknown error",
-        });
-      }
-    }
-  });
-
-  app.use((req, res) => {
-    res.status(404).json({
-      error: "not_found",
-      message: `${req.method} ${req.path} is not a valid endpoint. Use GET /health or POST /mcp.`,
-    });
+  const app = createApp({
+    store,
+    pool,
+    authToken: config.authToken,
+    accountsFile: config.accountsFile,
+    log,
   });
 
   app.listen(config.port, config.host, () => {
