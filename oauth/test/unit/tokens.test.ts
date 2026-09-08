@@ -350,3 +350,30 @@ test("a token minted before the epoch claim existed still verifies", async () =>
     .sign(KEY);
   assert.equal((await issuer.verifyAccessToken(legacy, RESOURCE)).ok, true);
 });
+
+test("a legacy token missing the epoch claim is rejected once the store's epoch has moved", async () => {
+  const store = await Store.open(null, silentLogger);
+  // revokeEverything() runs before c1 is registered, so bumping tokenEpoch does
+  // not also stamp c1 with a revokedAt. That isolates this case to the epoch
+  // fallback specifically: if the `typeof` guard were dropped and a missing
+  // `epoch` stayed `undefined`, `undefined < tokenEpoch` is always false and the
+  // token would wrongly keep verifying, with no other check left to catch it.
+  store.revokeEverything(Math.floor(Date.now() / 1000));
+  store.putClient(clientRecord("c1"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  const legacy = await new SignJWT({
+    token_use: "access",
+    client_id: "c1",
+    scope: "mcp",
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuer(ISSUER)
+    .setAudience(RESOURCE)
+    .setSubject("operator")
+    .setIssuedAt()
+    .setExpirationTime("1h")
+    .setJti("legacy-after-revocation")
+    .sign(KEY);
+  const result = await issuer.verifyAccessToken(legacy, RESOURCE);
+  assert.equal(result.ok, false);
+});

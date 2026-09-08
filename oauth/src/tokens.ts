@@ -198,8 +198,9 @@ export class TokenIssuer {
     // A stateless token cannot be withdrawn, so revocation is expressed as two
     // comparisons instead. Without them "revoke" would mean "stops refreshing, keeps
     // working for up to an hour", which is not what the button says.
-    const epoch =
-      typeof result.payload.epoch === "number" ? result.payload.epoch : 0;
+    const epoch = Number.isFinite(result.payload.epoch)
+      ? (result.payload.epoch as number)
+      : 0;
     if (epoch < this.#store.tokenEpoch) {
       return { ok: false, reason: "invalid_token" };
     }
