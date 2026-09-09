@@ -1,6 +1,6 @@
-import { test } from "node:test";
+import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import type { Account } from "../../src/accounts.js";
+import { reservedIdNotice, type Account } from "../../src/accounts.js";
 import { renderMailboxList, renderMailboxForm, escapeHtml } from "../../src/settings-pages.js";
 
 function sampleAccount(id: string): Account {
@@ -157,4 +157,60 @@ test("no row notice renders when none applies", () => {
   const html = renderMailboxList({ csrf: "c", stamp: "1-2", accounts: [sampleAccount("work")] });
   // Not a bare "row-notice" search: the stylesheet names the class either way.
   assert.ok(!html.includes(`class="row-notice"`));
+});
+
+/**
+ * Fix round 2 (#45): #11 gave the mailbox list a per-row notice for an account
+ * stuck on a reserved id, but the edit form one page deeper still carried the
+ * probe panel's "Press Save to store them." — false in both halves for such an
+ * account, and the opposite of what the row notice had just told the operator.
+ * The form now repeats that notice verbatim (reservedIdNotice(), the same string
+ * the list row and the startup warning use, so the two pages cannot drift apart)
+ * and the probe panel stops promising a Save that cannot persist.
+ */
+describe("the edit form for a mailbox stuck on a reserved id", () => {
+  test("repeats the row notice's remedy instead of promising Save will store the values", () => {
+    const html = renderMailboxForm({
+      csrf: "c",
+      stamp: "1-2",
+      account: sampleAccount("test"),
+      probe: { imap: { ok: true }, smtp: { ok: true }, caldav: null },
+    });
+    assert.ok(
+      !/Press Save to store them/.test(html),
+      "the form must not claim Save will persist an account it cannot save"
+    );
+    assert.ok(
+      html.includes(escapeHtml(reservedIdNotice("test"))),
+      "the row notice's wording is repeated verbatim"
+    );
+    assert.match(html, /recreate it under a different id/, "and names the way out");
+  });
+
+  test("says so even before anything has been probed", () => {
+    const html = renderMailboxForm({ csrf: "c", stamp: "1-2", account: sampleAccount("test") });
+    assert.ok(html.includes(escapeHtml(reservedIdNotice("test"))));
+  });
+
+  test("an unaffected mailbox keeps the ordinary probe copy and gains no notice", () => {
+    const html = renderMailboxForm({
+      csrf: "c",
+      stamp: "1-2",
+      account: sampleAccount("work"),
+      probe: { imap: { ok: true }, smtp: { ok: true }, caldav: null },
+    });
+    assert.match(html, /Press Save to store them/);
+    assert.ok(!/reserved id/.test(html));
+  });
+
+  test("the create form is untouched — its Save really does persist", () => {
+    const html = renderMailboxForm({
+      csrf: "c",
+      stamp: "1-2",
+      account: null,
+      probe: { imap: { ok: true }, smtp: { ok: true }, caldav: null },
+    });
+    assert.match(html, /Press Save to store them/);
+    assert.ok(!/reserved id/.test(html));
+  });
 });

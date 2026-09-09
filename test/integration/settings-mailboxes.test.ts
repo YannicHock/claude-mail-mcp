@@ -510,6 +510,39 @@ test("an existing mailbox on a reserved id still loads and says why Save does no
 });
 
 /**
+ * Fix round 2 (#45): the operator who reads that row notice and opens the
+ * mailbox anyway used to be told the opposite one page deeper — the edit form
+ * renders for real (GET /settings/mailboxes/test hits the `:id` route; only the
+ * POST collides), and its probe panel promised that pressing Save would store
+ * the values. The form now carries the same notice the row does.
+ */
+test("the edit form for that mailbox repeats the notice instead of promising a Save", async () => {
+  const { url, close } = await startConnector([
+    makeAccount({ id: "work", label: "Work", default: true }),
+    makeAccount({ id: "test", label: "Old test mailbox" }),
+  ]);
+  try {
+    const res = await get(url, "/settings/mailboxes/test", mint("GET", "/settings/mailboxes/test"));
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /Old test mailbox/, "this really is that mailbox's edit form");
+    assert.match(html, /never persists/i, "the form says Save does not store anything");
+    assert.match(html, /recreate it under a different id/, "and names the way out");
+    assert.ok(
+      !/Press Save to store them/.test(html),
+      "and never claims the opposite of what the list row said"
+    );
+
+    // The unaffected mailbox's own form is untouched by all of this.
+    const ok = await get(url, "/settings/mailboxes/work", mint("GET", "/settings/mailboxes/work"));
+    assert.equal(ok.status, 200);
+    assert.ok(!/reserved id/.test(await ok.text()));
+  } finally {
+    await close();
+  }
+});
+
+/**
  * Fix round 1: express.urlencoded's 64kb limit on the settings routes calls
  * next(err) on an oversized body, which — with no error-handling middleware —
  * would fall through to Express 5's default handler and render an HTML page
