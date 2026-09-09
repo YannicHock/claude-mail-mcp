@@ -56,19 +56,30 @@ COPY --from=builder /app/dist ./dist
 #   docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
 # (gid 101, not 100: alpine already ships gid 100 as the "users" group.)
 #
-# `mailsecrets`, gid 105, is the one group this image shares with the OAuth
-# layer's image — the only reason either can read a secret the other wrote. Both
-# Dockerfiles pin the same number, and src/secrets.ts pins it a third time as
-# SHARED_SECRET_GID; a unit test compares all three, because a silent
-# disagreement here means one service crash-looping on EACCES against a file the
-# other created. 105 is free in node:24-alpine (100 is "users", 123 is "ntp").
-RUN addgroup -S -g 105 mailsecrets \
- && addgroup -S -g 101 mailmcp \
- && adduser -S -u 100 -G mailmcp mailmcp \
- && addgroup mailmcp mailsecrets
+# No group for the shared `secrets/` directory is baked in here, deliberately.
+# This image and the OAuth layer's do need one group in common — it is the only
+# reason either can read a secret the other wrote — but the group that decides
+# that is the one owning the directory on the *host*, and any gid compiled into
+# an image is only a guess about a host it has never seen. This image used to
+# pin `mailsecrets` at gid 105 and the deployment used to say `chgrp 105
+# secrets`: 105 is indeed free in node:24-alpine, and on Debian and Ubuntu it is
+# inside the 100–999 system range and usually already belongs to a real system
+# group with a daemon in it, which that chgrp then handed a writable secrets
+# directory to.
+#
+# So the group is supplied at run time instead: the operator creates one
+# (`groupadd --system mailsecrets`), owns `secrets/` with it, and passes its real
+# gid as SECRETS_GID, which docker-compose.yml applies to both services with
+# `group_add`. Nothing about it is a build-time constant — see docs/DEPLOYMENT.md
+# step 2. Do not reintroduce a numeric `mailsecrets` here: src/secrets.ts still
+# chowns created files to its own SHARED_SECRET_GID when the process happens to
+# be in that group, so an image-side 105 riding alongside a host-side
+# `group_add` would move each new secret into the *host's* group 105 — the very
+# group this change exists to keep away from them.
+RUN addgroup -S -g 101 mailmcp \
+ && adduser -S -u 100 -G mailmcp mailmcp
 LABEL com.claude-mail-mcp.runtime-uid="100" \
-      com.claude-mail-mcp.runtime-gid="101" \
-      com.claude-mail-mcp.secrets-gid="105"
+      com.claude-mail-mcp.runtime-gid="101"
 # Pre-create the ACCOUNTS_FILE directory so a bare `docker run` without any
 # volume mount gets a normal "file doesn't exist yet" startup (empty account
 # list) instead of EACCES from a root-only path. A real deployment bind-mounts

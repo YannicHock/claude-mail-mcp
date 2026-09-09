@@ -49,21 +49,24 @@ COPY --from=builder /app/dist ./dist
 # bookkeeping. Keep in sync with docs/DEPLOYMENT.md, and verify with:
 #   docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp-oauth:latest
 #
-# `mailsecrets`, gid 105, is the deliberate exception to that separation: it is
-# the only group these two images share, and the only reason this service can
-# read the auth_token and settings_signing_key the connector wrote (and vice
-# versa) without those files being world-readable. The number is pinned
-# identically in ../Dockerfile and a third time in src/secrets.ts as
-# SHARED_SECRET_GID, with a unit test comparing all three — a silent
-# disagreement means one service crash-looping on EACCES against a file the
-# other created.
-RUN addgroup -S -g 105 mailsecrets \
- && addgroup -S -g 103 mailoauth \
- && adduser -S -u 102 -G mailoauth mailoauth \
- && addgroup mailoauth mailsecrets
+# The shared `secrets/` directory is the deliberate exception to that
+# separation, and the group that governs it is *not* baked into this image. It
+# cannot usefully be: the directory lives on the host, and a gid compiled in here
+# is only a guess about a host the image has never seen. Both images used to pin
+# `mailsecrets` at gid 105 and the deployment used to say `chgrp 105 secrets`; on
+# Debian and Ubuntu 105 is inside the 100–999 system range and usually already
+# belongs to a real system group, which that chgrp then handed a writable secrets
+# directory to.
+#
+# The operator creates the group instead (`groupadd --system mailsecrets`), owns
+# `secrets/` with it, and passes its real gid as SECRETS_GID, which
+# docker-compose.yml applies to both services with `group_add`. See
+# docs/DEPLOYMENT.md step 2, and the longer note in ../Dockerfile on why an
+# image-side numeric `mailsecrets` must not come back alongside it.
+RUN addgroup -S -g 103 mailoauth \
+ && adduser -S -u 102 -G mailoauth mailoauth
 LABEL com.claude-mail-mcp-oauth.runtime-uid="102" \
-      com.claude-mail-mcp-oauth.runtime-gid="103" \
-      com.claude-mail-mcp-oauth.secrets-gid="105"
+      com.claude-mail-mcp-oauth.runtime-gid="103"
 
 # Pre-created so a bare `docker run` with no volume gets a normal empty-state
 # start instead of EACCES on the first client registration.

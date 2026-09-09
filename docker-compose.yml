@@ -16,9 +16,16 @@ services:
     ports:
       - "127.0.0.1:3220:3220"
     env_file:
-      # AUTH_TOKEN, PUBLIC_URL, LOG_LEVEL — copy from .env.docker.example.
-      # Never commit the resulting .env.
+      # AUTH_TOKEN, PUBLIC_URL, LOG_LEVEL, SECRETS_GID — copy from
+      # .env.docker.example. Never commit the resulting .env.
       - .env
+    # The host group that owns ./secrets, added as a supplementary group so this
+    # container can read and create files there. SECRETS_GID is a real gid on
+    # *your* host, from `groupadd --system mailsecrets` — see the secrets/ note
+    # at the bottom of this file. Compose reads it from ./.env; leave it unset
+    # and the stack refuses to start rather than silently running without it.
+    group_add:
+      - "${SECRETS_GID:?set SECRETS_GID in .env to the gid of the group that owns ./secrets — see docs/DEPLOYMENT.md step 2}"
     environment:
       # Fixed container-side path; the actual credentials file is supplied
       # via the bind mount below and never baked into image or repo.
@@ -81,6 +88,13 @@ services:
       # are visible in `docker inspect` and to anything that can read the
       # container's environment.
       - .env.oauth
+    # Same host group as mail-mcp above — that is the whole point of it: one
+    # group both containers are in, so each can read a secret the other wrote.
+    # The value comes from ./.env even though this service's env_file is
+    # .env.oauth: Compose interpolates `${...}` from the project's .env only, and
+    # a variable read from an env_file is never available for interpolation.
+    group_add:
+      - "${SECRETS_GID:?set SECRETS_GID in .env to the gid of the group that owns ./secrets — see docs/DEPLOYMENT.md step 2}"
     volumes:
       # Registered clients and live refresh sessions. Writable, unlike the
       # connector's mount: losing it logs every Claude client out and forces
@@ -126,19 +140,31 @@ services:
 # copied to /run/secrets/<name>.
 #
 # Both containers create files here and they run as different uids — 100 for the
-# connector, 102 for the OAuth layer — so both images put their runtime user in
-# one shared group, gid 105 (`mailsecrets`), pinned in both Dockerfiles. Give the
-# directory to that group, setgid so files created inside inherit it:
+# connector, 102 for the OAuth layer — so they need one group in common. Create
+# it on the host, give the directory to it setgid so files created inside inherit
+# it, and tell Compose its gid:
 #
-#   mkdir -p secrets && chgrp 105 secrets && chmod 2770 secrets
+#   sudo groupadd --system mailsecrets
+#   mkdir -p secrets
+#   sudo chgrp mailsecrets secrets && sudo chmod 2770 secrets
+#   echo "SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)" >> .env
+#
+# The `group_add` on both services above is what puts the container processes in
+# that group. Earlier versions of this file pinned the group at gid 105 in both
+# images and told you to `chgrp 105 secrets`; that number was verified free
+# inside node:24-alpine, but the chgrp runs on the *host*, where 100–999 is the
+# system range and 105 usually already belongs to a real system group. Where it
+# did, the instruction handed that group a writable secrets directory. Nothing in
+# either image pins a gid any more — the group is yours and its number is
+# whatever your host assigned.
 #
 # The setgid bit is not decoration: without it the connector's file lands in gid
-# 101 at mode 640 and the OAuth layer cannot read it. `2770` also means no other
-# account on the host can write here — which matters, because this file's
+# 101 at mode 640 and the OAuth layer cannot read it. `2770` also means no
+# account outside that group can write here — which matters, because this file's
 # precedence rule is "a present file wins", so anyone able to drop an
 # auth_token.txt into this directory before the first boot would own the
-# instance. An earlier draft used a world-writable directory and had exactly that
-# hole. See docs/DEPLOYMENT.md.
+# instance. That is exactly why the group has to be one you created for it and
+# not a system group that came with the distribution. See docs/DEPLOYMENT.md.
 #
 # You can still pre-create the four files by hand instead — nothing is generated
 # over a file that already exists, and the mount can then be read-only (`:ro`).
