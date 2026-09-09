@@ -17,6 +17,7 @@ import { Readable } from "node:stream";
 
 import {
   lookupMailboxSettings,
+  parseClientConfig,
   readCapped,
   isPublicIp,
   resolveSafeUrl,
@@ -519,4 +520,156 @@ test("a CalDAV redirect to a private address is refused, mail settings kept", as
   assert.ok(found);
   assert.equal(found.caldav, null);
   assert.equal(found.imap.host, "imap.example.com");
+});
+
+// -------------------------------------------- one tier's failure stays in it
+
+/**
+ * The cascade's whole shape is "if this tier finds nothing, try the next one",
+ * so a tier that *throws* rather than returning null is not a lesser failure —
+ * it takes every tier after it with it, and the operator is left with the same
+ * `null` a domain with no autoconfig at all produces. The tests below pin that
+ * property one tier at a time, using a payload any domain can serve: a numeric
+ * character reference above the Unicode maximum, which is a `RangeError` out
+ * of `String.fromCodePoint` rather than a parse failure (#84).
+ */
+const OVER_MAX = ["&#x110000;", "&#1114112;", "&#x7fffffff;", "&#2147483647;"];
+
+/** A clientConfig whose IMAP hostname is unusable, so the tier finds nothing. */
+function xmlWithEntityInHostname(entity: string): string {
+  return `<clientConfig version="1.1"><emailProvider id="example.com">
+    <incomingServer type="imap"><hostname>imap${entity}.example.com</hostname>
+    <port>993</port><socketType>SSL</socketType></incomingServer>
+    <outgoingServer type="smtp"><hostname>smtp.example.com</hostname>
+    <port>465</port><socketType>SSL</socketType></outgoingServer>
+  </emailProvider></clientConfig>`;
+}
+
+/** SRV records that let tier 4 answer, so tier 3's fall-through is visible. */
+const SRV_FALLBACK: Record<string, SrvRecord[]> = {
+  "_imaps._tcp.example.com": [{ name: "imap.example.com", port: 993, priority: 10, weight: 1 }],
+  "_submissions._tcp.example.com": [
+    { name: "smtp.example.com", port: 465, priority: 10, weight: 1 },
+  ],
+};
+
+/** Deps whose one named operation throws *synchronously* instead of rejecting. */
+function throwingDeps(
+  on: { fetch?: string; resolve?: string; srv?: string },
+  base: FakeOptions = {}
+): FakeDeps {
+  const inner = fakeDeps(base);
+  return {
+    fetched: inner.fetched,
+    resolved: inner.resolved,
+    resolveAddresses(hostname) {
+      if (hostname === on.resolve) throw new Error("the resolver came apart");
+      return inner.resolveAddresses(hostname);
+    },
+    httpsGet(url, addresses, timeoutMs) {
+      if (url.toString() === on.fetch) throw new Error("the transport came apart");
+      return inner.httpsGet(url, addresses, timeoutMs);
+    },
+    resolveSrv(name) {
+      if (name === on.srv) throw new Error("the SRV query came apart");
+      return inner.resolveSrv(name);
+    },
+  };
+}
+
+test("parseClientConfig returns null for an out-of-range entity rather than throwing", () => {
+  for (const entity of OVER_MAX) {
+    assert.equal(parseClientConfig(xmlWithEntityInHostname(entity), EMAIL), null, entity);
+  }
+});
+
+test("an entity above the Unicode maximum is left as text, like any other unknown one", () => {
+  const xml = `<clientConfig version="1.1"><emailProvider id="example.com">
+    <displayName>Example &#x110000; Co</displayName>
+    <incomingServer type="imap"><hostname>imap.example.com</hostname>
+    <port>993</port><socketType>SSL</socketType>
+    <username>%EMAILLOCALPART%&#1114112;</username></incomingServer>
+    <outgoingServer type="smtp"><hostname>smtp.example.com</hostname>
+    <port>465</port><socketType>SSL</socketType></outgoingServer>
+  </emailProvider></clientConfig>`;
+  const found = parseClientConfig(xml, EMAIL);
+
+  assert.ok(found, "an unusable entity must not cost the document its servers");
+  assert.equal(found.imap.host, "imap.example.com");
+  assert.equal(found.imap.user, "anna&#1114112;", "the raw text is kept, as for any unknown entity");
+});
+
+test("tier 1: an unparseable document lets tier 2 run", async () => {
+  for (const entity of OVER_MAX) {
+    const deps = fakeDeps({
+      pages: { [T1]: ok(xmlWithEntityInHostname(entity)), [T2]: ok(clientConfigXml()) },
+    });
+    const found = await lookupMailboxSettings(EMAIL, { deps });
+
+    assert.equal(found?.source, "autoconfig-well-known", entity);
+    assert.equal(found?.imap.host, "imap.example.com", entity);
+  }
+});
+
+test("tier 2: an unparseable document lets tier 3 run", async () => {
+  const deps = fakeDeps({
+    pages: { [T2]: ok(xmlWithEntityInHostname("&#x110000;")), [T3]: ok(clientConfigXml()) },
+  });
+  const found = await lookupMailboxSettings(EMAIL, { deps });
+
+  assert.equal(found?.source, "ispdb");
+  assert.ok(deps.fetched.includes(T3), "tier 3 must still be reached");
+});
+
+test("tier 3: an unparseable document lets tier 4 run", async () => {
+  const deps = fakeDeps({
+    pages: { [T3]: ok(xmlWithEntityInHostname("&#x110000;")) },
+    srv: SRV_FALLBACK,
+  });
+  const found = await lookupMailboxSettings(EMAIL, { deps });
+
+  assert.equal(found?.source, "dns-srv");
+  assert.equal(found?.smtp.socketType, "SSL");
+});
+
+test("every tier unparseable still reaches the SRV tier", async () => {
+  const bad = ok(xmlWithEntityInHostname("&#1114112;"));
+  const deps = fakeDeps({ pages: { [T1]: bad, [T2]: bad, [T3]: bad }, srv: SRV_FALLBACK });
+  const found = await lookupMailboxSettings(EMAIL, { deps });
+
+  assert.equal(found?.source, "dns-srv");
+  assert.deepEqual(deps.fetched.slice(0, 3), [T1, T2, T3], "no tier may be skipped");
+});
+
+test("tier 4: an SRV query that throws is not the end of the lookup", async () => {
+  const deps = throwingDeps({ srv: "_imaps._tcp.example.com" });
+  assert.equal(await lookupMailboxSettings(EMAIL, { deps }), null);
+});
+
+test("a tier whose transport throws outright still lets the next one run", async () => {
+  const fetchThrew = throwingDeps({ fetch: T1 }, { pages: { [T2]: ok(clientConfigXml()) } });
+  const afterFetch = await lookupMailboxSettings(EMAIL, { deps: fetchThrew });
+  assert.equal(afterFetch?.source, "autoconfig-well-known");
+
+  const resolveThrew = throwingDeps(
+    { resolve: "autoconfig.example.com" },
+    { pages: { [T2]: ok(clientConfigXml()) } }
+  );
+  const afterResolve = await lookupMailboxSettings(EMAIL, { deps: resolveThrew });
+  assert.equal(afterResolve?.source, "autoconfig-well-known");
+});
+
+test("CalDAV discovery cannot cost a lookup the mail settings it already found", async () => {
+  for (const on of [
+    { fetch: CALDAV_WELL_KNOWN },
+    { resolve: "example.com" },
+    { srv: "_caldavs._tcp.example.com" },
+  ]) {
+    const deps = throwingDeps(on, { pages: { [T1]: ok(clientConfigXml()) } });
+    const found = await lookupMailboxSettings(EMAIL, { deps });
+
+    assert.ok(found, JSON.stringify(on));
+    assert.equal(found.imap.host, "imap.example.com");
+    assert.equal(found.caldav, null);
+  }
 });

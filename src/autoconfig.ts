@@ -539,15 +539,28 @@ const ENTITIES: Record<string, string> = {
   apos: "'",
 };
 
+/**
+ * `String.fromCodePoint` *throws* on a code point past the Unicode maximum —
+ * `&#x110000;` is a `RangeError`, not a value it declines to produce — so the
+ * bound has to be checked here rather than caught later. A reference outside
+ * the range XML allows is left as the raw text it arrived as, which is what
+ * this function already does for every entity it does not recognise. Lone
+ * surrogates go the same way: they are not characters, XML forbids them, and
+ * one smuggled into a string that is later percent-encoded throws in turn.
+ */
+function fromCodePoint(code: number, raw: string): string {
+  if (!Number.isInteger(code) || code < 0 || code > 0x10ffff) return raw;
+  if (code >= 0xd800 && code <= 0xdfff) return raw;
+  return String.fromCodePoint(code);
+}
+
 function decodeEntities(text: string): string {
   return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, body: string) => {
     if (body.startsWith("#x") || body.startsWith("#X")) {
-      const code = parseInt(body.slice(2), 16);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+      return fromCodePoint(parseInt(body.slice(2), 16), match);
     }
     if (body.startsWith("#")) {
-      const code = parseInt(body.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+      return fromCodePoint(parseInt(body.slice(1), 10), match);
     }
     return ENTITIES[body.toLowerCase()] ?? match;
   });
@@ -783,6 +796,16 @@ async function findCalDav(
 
 // ------------------------------------------------------------- the cascade
 
+/**
+ * One tier, and the boundary that makes the tiers independent. The parser is
+ * fed a document from a host derived from what the operator typed, so a throw
+ * out of it has to end this tier rather than the cascade: the loop below reads
+ * `null` as "nothing here, try the next one", and anything that unwinds past
+ * it instead skips every remaining tier and returns the same empty answer a
+ * domain with no autoconfig at all returns. The `catch` is the property, not a
+ * patch on one bug in the parser — every fetch and resolve step already fails
+ * this way, and this was the one step that did not.
+ */
 async function fetchClientConfig(
   url: URL,
   address: Address,
@@ -791,7 +814,11 @@ async function fetchClientConfig(
 ): Promise<{ imap: SuggestedServer; smtp: SuggestedServer } | null> {
   const hop = await getGuarded(url, deps, budget, MAX_REDIRECTS);
   if (!hop || hop.status < 200 || hop.status >= 300) return null;
-  return parseClientConfig(hop.body, address.full);
+  try {
+    return parseClientConfig(hop.body, address.full);
+  } catch {
+    return null;
+  }
 }
 
 /**
