@@ -181,7 +181,9 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
   // wizard to build and no progress file to read.
   const wizard =
     bootstrap !== undefined && !bootstrap.bootstrapped
-      ? createSetupWizard({ config, log, notFound: sendNotFound })
+      ? // The same object the gate below reads per request: step 3's Finish
+        // completes it, and that is what opens /mcp mid-process.
+        createSetupWizard({ config, log, bootstrap, notFound: sendNotFound })
       : null;
   if (bootstrap !== undefined) {
     app.use((req, res, next) => {

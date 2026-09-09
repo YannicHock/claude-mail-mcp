@@ -9,7 +9,15 @@
  */
 
 import { strict as assert } from "node:assert";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -431,7 +439,7 @@ describe("accepts()", () => {
   });
 });
 
-describe("complete() — the seam issue #22 calls", () => {
+describe("complete() — what the wizard's Finish button does", () => {
   it("deletes the token and flips the state check", async () => {
     const dir = tempDir();
     const bootstrap = Bootstrap.open(configFor(dir), silentLogger);
@@ -471,6 +479,37 @@ describe("complete() — the seam issue #22 calls", () => {
     await assert.rejects(() => bootstrap.complete(), BootstrapError);
     assert.equal(bootstrap.bootstrapped, false);
     assert.equal(existsSync(join(dir, "claim-token.txt")), true, "the token is still live");
+  });
+
+  it("leaves the instance exactly as it was when the token cannot be deleted", async () => {
+    // The partial failure the wizard has to have an answer for: the operator
+    // record is written and the token will not go. The state must not flip on a
+    // half-done claim — a process that reported itself claimed with the token
+    // still on the volume would hand the next boot back to the claim token.
+    const dir = tempDir();
+    const bootstrap = Bootstrap.open(configFor(dir), silentLogger);
+    const token = readFileSync(join(dir, "claim-token.txt"), "utf8").trim();
+    writeOperatorRecord(join(dir, "operator.json"));
+
+    // A directory where the file was: unlink refuses it with something that is
+    // not ENOENT, which is what a read-only volume looks like from here.
+    rmSync(join(dir, "claim-token.txt"));
+    mkdirSync(join(dir, "claim-token.txt"));
+
+    await assert.rejects(
+      () => bootstrap.complete(),
+      (err: unknown) => {
+        assert.ok(err instanceof BootstrapError);
+        // The message is shown to the operator by step 3, so it has to name the
+        // file they are being asked to deal with.
+        assert.match(err.message, /claim-token\.txt/);
+        return true;
+      }
+    );
+
+    assert.equal(bootstrap.bootstrapped, false, "still unclaimed");
+    assert.equal(bootstrap.accepts(token), true, "and the setup link still works");
+    assert.notEqual(bootstrap.setupUrl, null);
   });
 
   it("is idempotent, so a retried request cannot fail on the second attempt", async () => {

@@ -267,8 +267,8 @@ export class Bootstrap {
   }
 
   /**
-   * Finish the claim. **This is the seam issue #22 calls** when the wizard's last
-   * step has written the operator record.
+   * Finish the claim. **The wizard's step 3 is the one caller**, from the Finish
+   * button, and by then step 1 has written the operator record.
    *
    * Ordering is the whole point and it is checked rather than documented: the
    * operator record must already exist. Deleting the token first and crashing
@@ -276,6 +276,13 @@ export class Bootstrap {
    * included — could ever claim, recoverable only by deleting the data volume. A
    * crash the other way round leaves a claimable instance for one more boot,
    * which is merely the state it was already in.
+   *
+   * **A failure leaves the state untouched.** Neither `#token` nor
+   * `#bootstrapped` moves unless the token file is gone, so a throw here means
+   * the instance is exactly as it was: still unclaimed, the setup link still
+   * live, and Finish still pressable once whatever the message names is fixed.
+   * The messages are written to be shown to an operator for that reason — step 3
+   * puts them on the screen rather than paraphrasing them.
    *
    * Idempotent: calling it on an already-claimed instance does nothing, so a
    * retried request cannot fail on the second attempt.

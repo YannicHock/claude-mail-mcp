@@ -104,29 +104,66 @@ button.secondary {
 }
 .probe-row.ok { border-left-color: color-mix(in srgb, #2a2 60%, CanvasText); }
 .probe-row.fail { border-left-color: color-mix(in srgb, #d33 60%, CanvasText); }
+h2 { font-size: 1rem; margin: 1.75rem 0 .5rem; }
+input.url {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: .95rem;
+}
+code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: .9em;
+}
+pre {
+  padding: .6rem .7rem; border-radius: 6px; overflow-x: auto; font-size: .9rem;
+  background: color-mix(in srgb, CanvasText 8%, Canvas);
+}
 `.trim();
 
-/** The shared wizard shell: one heading, one `Step N of 3` line, one body. */
-function wizardPage(step: SetupStep, body: string): string {
-  const title = STEP_TITLES[step];
-  const header = `Step ${stepNumber(step)} of ${SETUP_STEPS.length} · ${title}`;
+/** The page shell every screen shares: one heading, one subtitle, one body. */
+function page(documentTitle: string, subtitle: string, body: string): string {
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>${escapeHtml(`Set up claude-mail-mcp — ${title}`)}</title>
+<title>${escapeHtml(documentTitle)}</title>
 <style>${STYLE}</style>
 </head>
 <body>
 <main>
 <h1>Set up claude-mail-mcp</h1>
-<p class="sub">${escapeHtml(header)}</p>
+<p class="sub">${escapeHtml(subtitle)}</p>
 ${body}
 </main>
 </body>
 </html>`;
+}
+
+/** The shared wizard shell: the page shell plus a `Step N of 3` line. */
+function wizardPage(step: SetupStep, body: string): string {
+  const title = STEP_TITLES[step];
+  return page(
+    `Set up claude-mail-mcp — ${title}`,
+    `Step ${stepNumber(step)} of ${SETUP_STEPS.length} · ${title}`,
+    body
+  );
+}
+
+/**
+ * An address the operator has to get out of the page and into somewhere else.
+ *
+ * A readonly input rather than a `<code>` block, and rather than the copy button
+ * the design sketch drew: this service ships no client-side JavaScript, and the
+ * pages are served with `default-src 'none'`, so a copy button would be a script
+ * the browser refuses to run. An input is what a browser already knows how to
+ * select in one gesture, and readonly is what stops it being edited into
+ * something that looks official and is not.
+ */
+function urlField(id: string, label: string, url: string): string {
+  return `<label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
+<input id="${escapeHtml(id)}" class="url" type="text" value="${escapeHtml(url)}" readonly
+       spellcheck="false" autocapitalize="none">`;
 }
 
 /** Pull the message for one field out of the list, or the empty string. */
@@ -191,30 +228,6 @@ export function renderCredentialsStep(data: CredentialsPageData): string {
   </form>`;
 
   return wizardPage("credentials", body);
-}
-
-/**
- * A screen that is routed but not yet built — step 3, which issue #24 fills in.
- *
- * It exists rather than 404ing because step 1 has to lead somewhere, and because
- * a placeholder that says plainly what is missing is what an operator who gets
- * here needs: their claim token is good, their credential is saved, and the rest
- * of the wizard is not written yet. The manual path out is named, the way the
- * claim-token placeholder named it before this.
- */
-export function renderStepPlaceholder(data: { step: SetupStep; backHref: string }): string {
-  const body = `
-  <div class="notice">
-    This screen is not built yet. Everything before it is: your operator account
-    is saved, and this link keeps working across restarts until setup completes.
-  </div>
-  <p>
-    Until the remaining screens land, add a mailbox and connect Claude the
-    documented way, from the settings UI, once this instance is claimed.
-  </p>
-  <div class="actions"><a href="${escapeHtml(data.backHref)}">← Back</a><span></span></div>`;
-
-  return wizardPage(data.step, body);
 }
 
 // ---- Step 2 — the first mailbox -------------------------------------------
@@ -556,4 +569,195 @@ export function renderMailboxStep(data: MailboxPageData): string {
   <p><a href="${escapeHtml(data.backHref)}">← Back</a></p>`;
 
   return wizardPage("mailbox", body);
+}
+
+// ---- Step 3 — the MCP URL, PUBLIC_URL, and Finish -------------------------
+
+/** A mailbox the connector reports as configured. */
+export interface ConfiguredMailbox {
+  id: string;
+  label: string;
+}
+
+export interface ConnectPageData {
+  /** Where Finish posts: this screen's own URL under the claim token. */
+  action: string;
+  /** Step 2, for the Back link. */
+  backHref: string;
+  /** The address the operator pastes into claude.ai: `PUBLIC_URL` + `MCP_PATH`. */
+  mcpUrl: string;
+  /** `PUBLIC_URL` itself, which is the value being confirmed. */
+  publicUrl: string;
+  /** What the connector reports as configured, so a skipped step 2 is legible. */
+  mailboxes: ConfiguredMailbox[];
+  /** False when the connector did not answer. A remark, never a blocker. */
+  connectorReachable: boolean;
+  /** Show the "PUBLIC_URL is wrong" guidance, i.e. the operator answered No. */
+  showPublicUrlHelp?: boolean;
+  /** A message across the top of the screen: what happened, and to what. */
+  notice?: { kind: "error" | "info"; message: string };
+}
+
+/**
+ * What is configured on this instance, in one line.
+ *
+ * Step 2 hands over identically whether it saved a mailbox or was skipped —
+ * both paths are a 303 to this screen with the same recorded progress — so the
+ * answer is asked of the connector rather than inferred from the wizard's own
+ * notes. An unreachable connector is reported as an unknown, not as "none":
+ * telling an operator they have no mailbox when they may well have one is the
+ * one wrong thing this line could say.
+ */
+function mailboxSummary(
+  data: ConnectPageData | CompletePageData,
+  asides: { known: string; unknown: string }
+): string {
+  if (!data.connectorReachable) {
+    return `<p class="muted">The connector did not answer just now, so this screen cannot say
+      which mailboxes are configured. ${escapeHtml(asides.unknown)}</p>`;
+  }
+  const lead =
+    data.mailboxes.length === 0
+      ? "No mailbox is configured."
+      : `${data.mailboxes.length === 1 ? "One mailbox is" : `${data.mailboxes.length} mailboxes are`} ` +
+        `configured: ${data.mailboxes.map((mailbox) => escapeHtml(mailbox.label)).join(", ")}.`;
+  return `<p class="muted">${lead} ${escapeHtml(asides.known)}</p>`;
+}
+
+/**
+ * What to do about a wrong `PUBLIC_URL`.
+ *
+ * It is an environment variable, so there is deliberately nothing to edit here —
+ * offering a box would imply this page could change it. What the operator gets
+ * instead is the line to change, the command to run, and the one reassurance
+ * that matters: the link they are holding survives the restart, because the
+ * claim token is read back off the data volume rather than regenerated.
+ */
+function publicUrlHelp(publicUrl: string): string {
+  return `<div class="notice">
+    <p>
+      <strong>PUBLIC_URL is an environment variable and cannot be changed from here.</strong>
+      Set it to the address the outside world reaches this instance at — scheme and
+      host, no path, no trailing slash — then bring the stack back up:
+    </p>
+    <pre>PUBLIC_URL=${escapeHtml(publicUrl)}
+docker compose up -d</pre>
+    <p>
+      This setup link keeps working across that restart and resumes on this screen,
+      which will then show the new address. Nothing you have entered is lost.
+    </p>
+  </div>`;
+}
+
+/**
+ * Step 3 — the MCP URL, and the one value the container cannot check itself.
+ *
+ * `PUBLIC_URL` is confirmed rather than merely displayed because a wrong one
+ * breaks the OAuth redirect at claude.ai rather than here: the operator sees a
+ * sign-in failure in someone else's product, with nothing in this service's log
+ * to connect it to. Asking costs one radio button.
+ *
+ * The confirmation is `required` in the markup and checked again on the server,
+ * because a browser that skips the first is not a reason to claim the instance
+ * on an answer nobody gave.
+ */
+export function renderConnectStep(data: ConnectPageData): string {
+  const body = `
+  <p class="lead">
+    Add this address as a custom connector in claude.ai — select it and copy it.
+  </p>
+  ${noticeHtml(data.notice)}
+  ${urlField("mcp_url", "MCP URL", data.mcpUrl)}
+  <p class="muted">
+    In claude.ai: Settings → Connectors → Add custom connector, and paste it there.
+    Claude signs in against this same instance, with the operator account you
+    created in step 1.
+  </p>
+  ${mailboxSummary(data, {
+    known: "The mailbox list is on the settings page once you are signed in.",
+    unknown: "That does not stop you finishing, and it is not a sign of anything wrong here.",
+  })}
+
+  <form method="post" action="${escapeHtml(data.action)}">
+    <fieldset>
+    <legend>Is that the address you reach this instance at?</legend>
+    <p class="muted">
+      It is built from PUBLIC_URL, currently <code>${escapeHtml(data.publicUrl)}</code>.
+      That is the one value this container cannot check for itself, and a wrong one
+      breaks the sign-in Claude does — with an error that surfaces at claude.ai, not
+      here.
+    </p>
+    <div class="checkbox-row">
+      <input id="public_url_yes" type="radio" name="public_url_ok" value="yes" required>
+      <label for="public_url_yes">Yes, that is correct</label>
+    </div>
+    <div class="checkbox-row">
+      <input id="public_url_no" type="radio" name="public_url_ok" value="no">
+      <label for="public_url_no">No — show me how to fix it</label>
+    </div>
+    </fieldset>
+    ${data.showPublicUrlHelp === true ? publicUrlHelp(data.publicUrl) : ""}
+    <div class="actions">
+      <a href="${escapeHtml(data.backHref)}">← Back</a>
+      <button type="submit">Finish</button>
+    </div>
+  </form>`;
+
+  return wizardPage("connect", body);
+}
+
+// ---- The end of the wizard -------------------------------------------------
+
+export interface CompletePageData {
+  /** Repeated here so the last screen is enough on its own. */
+  mcpUrl: string;
+  /** Where the operator signs in with the account step 1 created. */
+  settingsUrl: string;
+  mailboxes: ConfiguredMailbox[];
+  connectorReachable: boolean;
+}
+
+/**
+ * The screen after Finish. Not a step, and it carries no `Step N of 3` line:
+ * the wizard is over and there is nowhere left to go inside it.
+ *
+ * It is rendered as the answer to the POST rather than redirected to, because by
+ * the time this is built there is no URL left to redirect to. `/setup/*` is 404
+ * from this instant on — the whole point of the button — and `/settings` is not
+ * mounted in this process yet, for the reason the second half of this page says
+ * out loud. A reload cannot re-submit anything either: the token is gone, so the
+ * gate answers the repeated POST with the same 404 as any other, which is a
+ * stronger guarantee than the redirect-after-POST it replaces.
+ */
+export function renderSetupComplete(data: CompletePageData): string {
+  const body = `
+  <div class="notice">
+    <strong>Setup is complete.</strong> The claim token has been deleted from the
+    data volume. This setup link, and every other <code>/setup</code> path, answers
+    404 from now on — on this boot and every one after it.
+  </div>
+  ${urlField("mcp_url", "MCP URL", data.mcpUrl)}
+  <p class="muted">
+    Add it as a custom connector in claude.ai. The MCP endpoint is answering
+    already and needs no restart.
+  </p>
+  ${mailboxSummary(data, {
+    known: "Mailboxes are managed from the settings page below.",
+    unknown: "Setup is finished either way; the mailbox list is on the settings page below.",
+  })}
+
+  <h2>The settings UI needs one restart</h2>
+  <p>
+    Sign in at <a href="${escapeHtml(data.settingsUrl)}">${escapeHtml(data.settingsUrl)}</a>
+    with the account you created in step 1. That page is mounted when the process
+    starts, and this process started before there was an operator account to mount
+    it against, so it answers 404 until the container comes back:
+  </p>
+  <pre>docker compose restart mail-oauth</pre>
+  <p class="muted">
+    Restarting is safe now: the instance is claimed, no new claim token is minted,
+    and no setup URL is printed again.
+  </p>`;
+
+  return page("claude-mail-mcp — setup complete", "Setup is complete", body);
 }

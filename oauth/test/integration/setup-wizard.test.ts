@@ -1,7 +1,16 @@
 /**
  * The setup wizard, against the real gate and the real middleware chain.
  *
- * Two things this file exists to hold in place.
+ * Three things this file exists to hold in place.
+ *
+ * **The way out.** The wizard's whole purpose is to leave the instance claimed,
+ * and until step 3 landed there was no code path in the service that called
+ * `Bootstrap.complete()` at all: an operator could finish both earlier screens
+ * and still be left with `/mcp` answering 503 for ever, the settings UI never
+ * mounted, and a full-control claim token re-printed to stdout on every boot.
+ * So Finish is driven here end to end — and then a **second app is started on
+ * the same data directory**, because "the live process flipped" and "the next
+ * boot agrees" are two different claims and only the second one is the promise.
  *
  * **The restart trap.** Step 1 writes the operator record with two screens still
  * to go. If the state check read that record alone, a container restarting at
@@ -29,7 +38,7 @@
  */
 
 import { strict as assert } from "node:assert";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -712,6 +721,294 @@ test("step 2 cannot be posted to before step 1 is done", async () => {
     assert.equal(res.status, 303);
     assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/credentials`);
     assert.deepEqual(harness.upstream.requests, []);
+  } finally {
+    await harness.close();
+  }
+});
+
+// ---- Step 3 — the MCP URL, PUBLIC_URL, and Finish -------------------------
+
+/**
+ * Answer the connector's `/health`, which is the only route step 3 uses.
+ *
+ * Step 3 asks it one question — which mailboxes are configured — because step 2
+ * hands over identically whether it saved one or was skipped, and the completion
+ * screen has to tell those apart.
+ */
+function stubHealth(harness: Harness, accounts: Array<{ id: string; label: string }>): void {
+  harness.upstream.respondWith((req, res) => {
+    if (req.method === "GET" && (req.url ?? "") === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", version: "0.6.3", accounts }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not stubbed");
+  });
+}
+
+/** Complete step 1 and skip step 2, which is the shortest way to step 3. */
+async function reachStep3(harness: Harness): Promise<void> {
+  await reachStep2(harness);
+  const skipped = await postSetupForm(harness, "/mailbox", { _action: "skip" });
+  assert.equal(skipped.status, 303, "step 2 is skippable");
+}
+
+test("step 3 shows the MCP URL and asks about PUBLIC_URL", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    stubHealth(harness, [{ id: "main", label: "Main mailbox" }]);
+    await reachStep3(harness);
+
+    const res = await getSetup(harness, "/connect");
+    assert.equal(res.status, 200);
+    const html = await res.text();
+
+    assert.match(html, /Step 3 of 3 · Connect Claude/);
+    // The URL an operator pastes into claude.ai: PUBLIC_URL + MCP_PATH.
+    assert.ok(
+      html.includes(`value="${harness.config.resource}"`),
+      "the MCP URL is on the page, ready to be copied"
+    );
+    // And the question the container cannot answer for itself.
+    assert.match(html, /PUBLIC_URL/);
+    assert.match(html, /name="public_url_ok" value="yes"/);
+    assert.match(html, /name="public_url_ok" value="no"/);
+    // No client-side JavaScript anywhere in this service, so no copy button.
+    assert.equal(/<script/i.test(html), false);
+    // A mailbox is configured on this instance, and the screen says which.
+    assert.match(html, /Main mailbox/);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("step 3 tells a skipped step 2 from a saved one", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    // Both paths arrive here with furthest === "connect", so the screen has to
+    // ask the connector rather than read the wizard's own progress note.
+    stubHealth(harness, []);
+    await reachStep3(harness);
+
+    const html = await (await getSetup(harness, "/connect")).text();
+    assert.match(html, /No mailbox is configured/i);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a connector that does not answer does not block finishing", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    harness.upstream.respondWith((_req, res) => {
+      res.writeHead(500, { "content-type": "text/plain" });
+      res.end("down");
+    });
+    await reachStep3(harness);
+
+    const html = await (await getSetup(harness, "/connect")).text();
+    assert.match(html, /did not answer/i);
+    assert.match(html, /does not stop you finishing/i);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("Finish claims the instance, and a restart still reads as bootstrapped", async () => {
+  // The criterion the security review added. `isBootstrapped` wants both halves —
+  // the operator record *and* the token's absence — and only complete() deletes
+  // the token, so a Finish that flipped the live process but left the file would
+  // hand the next boot a claimable instance and a setup URL in its log again.
+  const dir = dataDir();
+  const wizard = await startHarness({ unbootstrapped: true, dataDir: dir });
+  const token = wizard.claimToken ?? "";
+  try {
+    stubHealth(wizard, [{ id: "main", label: "Main mailbox" }]);
+    await reachStep3(wizard);
+
+    const res = await postSetupForm(wizard, "/connect", { public_url_ok: "yes" });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /Setup is complete/i);
+    assert.ok(html.includes(wizard.config.resource), "the MCP URL is repeated on the last screen");
+
+    // The live process: the token is gone from disk and from the object.
+    assert.equal(existsSync(join(dir, "claim-token.txt")), false, "the token file is deleted");
+    assert.equal(wizard.bootstrap.bootstrapped, true);
+    assert.equal(wizard.bootstrap.setupUrl, null);
+
+    // /mcp answers, and every /setup path is shut.
+    const mcp = await fetch(`${wizard.baseUrl}/mcp`, { method: "POST" });
+    assert.equal(mcp.status, 401, "a live endpoint again, not 503 not_configured");
+    assert.match(mcp.headers.get("www-authenticate") ?? "", /Bearer/);
+    assert.equal((await getSetup(wizard, "/connect")).status, 404);
+  } finally {
+    await wizard.close();
+  }
+
+  // The restart. Same data directory, second process, nothing else carried over.
+  const restarted = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    assert.equal(restarted.bootstrap.bootstrapped, true, "still claimed after a restart");
+    assert.equal(restarted.bootstrap.setupUrl, null, "and no setup URL is printed again");
+    assert.equal(existsSync(join(dir, "claim-token.txt")), false, "no token is minted again");
+
+    assert.equal((await fetch(`${restarted.baseUrl}/mcp`, { method: "POST" })).status, 401);
+    for (const path of ["", "/credentials", "/mailbox", "/connect", "/not-a-step"]) {
+      const res = await fetch(`${restarted.baseUrl}/setup/${token}${path}`, { redirect: "manual" });
+      assert.equal(res.status, 404, `/setup/<token>${path}`);
+    }
+  } finally {
+    await restarted.close();
+  }
+});
+
+test("every /setup path afterwards is the same 404 a wrong token gets, byte for byte", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    const token = harness.claimToken ?? "";
+    stubHealth(harness, []);
+
+    // What a wrong token gets while the instance is still claimable — the
+    // reference answer the claimed instance has to match. The body echoes the
+    // path the caller already knows and is otherwise the same object from the
+    // same responder, so that is what is compared.
+    const wrong = await fetch(`${harness.baseUrl}/setup/not-the-token/connect`, {
+      redirect: "manual",
+    });
+    assert.equal(wrong.status, 404);
+
+    await reachStep3(harness);
+    assert.equal((await postSetupForm(harness, "/connect", { public_url_ok: "yes" })).status, 200);
+
+    const after = await fetch(`${harness.baseUrl}/setup/${token}/connect`, { redirect: "manual" });
+    assert.equal(after.status, 404);
+    assert.equal(after.headers.get("content-type"), wrong.headers.get("content-type"));
+    assert.deepEqual(Object.keys((await after.json()) as object), ["error", "message"]);
+
+    // And the token that used to work is now indistinguishable from one that
+    // never did: same status, same headers, same shape.
+    const stillWrong = await fetch(`${harness.baseUrl}/setup/not-the-token/connect`, {
+      redirect: "manual",
+    });
+    assert.equal(stillWrong.status, 404);
+    assert.equal(stillWrong.headers.get("content-type"), after.headers.get("content-type"));
+  } finally {
+    await harness.close();
+  }
+});
+
+test("answering No explains PUBLIC_URL and leaves the wizard exactly where it was", async () => {
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    stubHealth(harness, []);
+    await reachStep3(harness);
+
+    const res = await postSetupForm(harness, "/connect", { public_url_ok: "no" });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    // It cannot be edited from a browser, so the screen says what to change instead.
+    assert.match(html, /PUBLIC_URL=/);
+    assert.match(html, /cannot be changed from here/i);
+    // Nothing was claimed: the token is still live and the link still works.
+    assert.equal(existsSync(join(dir, "claim-token.txt")), true);
+    assert.equal(harness.bootstrap.bootstrapped, false);
+    assert.equal((await getSetup(harness, "/connect")).status, 200);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("Finish without an answer refuses, and claims nothing", async () => {
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    stubHealth(harness, []);
+    await reachStep3(harness);
+
+    const res = await postSetupForm(harness, "/connect", {});
+
+    assert.equal(res.status, 400);
+    assert.match(await res.text(), /before finishing/i);
+    assert.equal(existsSync(join(dir, "claim-token.txt")), true);
+    assert.equal(harness.bootstrap.bootstrapped, false);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a cross-origin Finish is refused and claims nothing", async () => {
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    stubHealth(harness, []);
+    await reachStep3(harness);
+
+    const res = await postSetupForm(
+      harness,
+      "/connect",
+      { public_url_ok: "yes" },
+      {
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: "https://evil.example",
+        },
+      }
+    );
+
+    assert.equal(res.status, 403);
+    assert.equal(existsSync(join(dir, "claim-token.txt")), true, "the token is still live");
+    assert.equal(harness.bootstrap.bootstrapped, false);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("step 3 cannot be posted to before step 2 has been reached", async () => {
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    const res = await postSetupForm(harness, "/connect", { public_url_ok: "yes" });
+
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/credentials`);
+    assert.equal(existsSync(join(dir, "claim-token.txt")), true);
+    assert.equal(harness.bootstrap.bootstrapped, false);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a claim token that cannot be deleted is reported, and nothing is claimed", async () => {
+  // The partial failure the review asked about: the operator record is written,
+  // the token is not deleted. complete() throws rather than flipping the state,
+  // and the operator has to be told something they can act on — not a dead end.
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    stubHealth(harness, []);
+    await reachStep3(harness);
+
+    // Stand in for a read-only volume: replace the token file with a directory,
+    // which unlink refuses with something other than ENOENT.
+    const tokenFile = join(dir, "claim-token.txt");
+    rmSync(tokenFile);
+    mkdirSync(tokenFile);
+
+    const res = await postSetupForm(harness, "/connect", { public_url_ok: "yes" });
+
+    assert.equal(res.status, 500);
+    const html = await res.text();
+    assert.match(html, /claim-token\.txt/, "the file that has to go is named");
+    assert.match(html, /still unclaimed/i);
+    assert.match(html, /Finish/, "and the button to press again is still on the page");
+    // The state did not flip on a half-done claim.
+    assert.equal(harness.bootstrap.bootstrapped, false);
+    assert.equal((await fetch(`${harness.baseUrl}/mcp`, { method: "POST" })).status, 503);
   } finally {
     await harness.close();
   }
