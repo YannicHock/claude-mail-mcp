@@ -14,6 +14,13 @@
  * half of that rule on save — an empty submitted field keeps the stored value, a
  * non-empty one replaces it — but the browser never sees the old value either way.
  *
+ * The mailbox form's field names are not written here. They come from
+ * `MAILBOX_FIELDS` in settings-api.ts, which is also what `parseAccountForm`
+ * reads them back under and what the setup wizard builds its own form and its
+ * JSON drafts from — one table of names, so a rename is a compile error in
+ * every place that spells one rather than a field that silently goes missing
+ * (#69).
+ *
  * `escapeHtml` and the inline-CSS visual language (the `STYLE` constant, using
  * system colour keywords so both light and dark themes work without a media
  * query) are copied from `oauth/src/login.ts`. The two packages cannot share a
@@ -22,6 +29,7 @@
  */
 
 import { RESERVED_IDS, reservedIdNotice, type Account } from "./accounts.js";
+import { MAILBOX_FIELDS } from "./settings-api.js";
 
 /**
  * Mirrors `ProbeReport` from `./probe.ts`, which is not present in this file's
@@ -333,10 +341,10 @@ ${rows}
 export function renderMailboxForm(opts: MailboxFormData): string {
   const { account, values, errors } = opts;
   const isNew = account === null;
-  const idValue = fieldValue(values, "id", account?.id ?? "");
-  const labelValue = fieldValue(values, "label", account?.label ?? "");
+  const idValue = fieldValue(values, MAILBOX_FIELDS.id, account?.id ?? "");
+  const labelValue = fieldValue(values, MAILBOX_FIELDS.label, account?.label ?? "");
   const defaultChecked = values
-    ? values["default"] === "1"
+    ? values[MAILBOX_FIELDS.isDefault] === "1"
     : Boolean(account?.default);
 
   const imap = account?.imap;
@@ -367,19 +375,19 @@ export function renderMailboxForm(opts: MailboxFormData): string {
 <legend>CalDAV (optional)</legend>
 ${textField({
   id: "caldav_url",
-  name: "caldav.url",
+  name: MAILBOX_FIELDS.caldavUrl,
   label: "URL",
-  value: fieldValue(values, "caldav.url", caldav?.url ?? ""),
+  value: fieldValue(values, MAILBOX_FIELDS.caldavUrl, caldav?.url ?? ""),
   errors,
 })}
 ${textField({
   id: "caldav_user",
-  name: "caldav.user",
+  name: MAILBOX_FIELDS.caldavUser,
   label: "User",
-  value: fieldValue(values, "caldav.user", caldav?.user ?? ""),
+  value: fieldValue(values, MAILBOX_FIELDS.caldavUser, caldav?.user ?? ""),
   errors,
 })}
-${passwordField({ id: "caldav_pass", name: "caldav.pass", label: "Password", errors })}
+${passwordField({ id: "caldav_pass", name: MAILBOX_FIELDS.caldavPass, label: "Password", errors })}
 ${
   caldav
     ? checkboxField({
@@ -402,51 +410,51 @@ ${probeSectionHtml(opts.probe, !reserved)}
 
   ${textField({
     id: "id",
-    name: "id",
+    name: MAILBOX_FIELDS.id,
     label: "ID",
     value: idValue,
     readonly: !isNew,
     required: true,
     errors,
   })}
-  ${textField({ id: "label", name: "label", label: "Label", value: labelValue, required: true, errors })}
-  ${checkboxField({ id: "default", name: "default", label: "Default account", checked: defaultChecked })}
+  ${textField({ id: "label", name: MAILBOX_FIELDS.label, label: "Label", value: labelValue, required: true, errors })}
+  ${checkboxField({ id: "default", name: MAILBOX_FIELDS.isDefault, label: "Default account", checked: defaultChecked })}
 
   <fieldset>
   <legend>IMAP</legend>
   <div class="row">
     <div>${textField({
       id: "imap_host",
-      name: "imap.host",
+      name: MAILBOX_FIELDS.imapHost,
       label: "Host",
-      value: fieldValue(values, "imap.host", imap?.host ?? ""),
+      value: fieldValue(values, MAILBOX_FIELDS.imapHost, imap?.host ?? ""),
       required: true,
       errors,
     })}</div>
     <div>${textField({
       id: "imap_port",
-      name: "imap.port",
+      name: MAILBOX_FIELDS.imapPort,
       label: "Port",
       type: "number",
-      value: fieldValue(values, "imap.port", imap ? String(imap.port) : "993"),
+      value: fieldValue(values, MAILBOX_FIELDS.imapPort, imap ? String(imap.port) : "993"),
       required: true,
       errors,
     })}</div>
   </div>
   ${textField({
     id: "imap_user",
-    name: "imap.user",
+    name: MAILBOX_FIELDS.imapUser,
     label: "User",
-    value: fieldValue(values, "imap.user", imap?.user ?? ""),
+    value: fieldValue(values, MAILBOX_FIELDS.imapUser, imap?.user ?? ""),
     required: true,
     errors,
   })}
-  ${passwordField({ id: "imap_pass", name: "imap.pass", label: "Password", required: isNew, errors })}
+  ${passwordField({ id: "imap_pass", name: MAILBOX_FIELDS.imapPass, label: "Password", required: isNew, errors })}
   ${checkboxField({
     id: "imap_tls",
-    name: "imap.tls",
+    name: MAILBOX_FIELDS.imapTls,
     label: "Use TLS",
-    checked: values ? values["imap.tls"] === "1" : (imap?.tls ?? true),
+    checked: values ? values[MAILBOX_FIELDS.imapTls] === "1" : (imap?.tls ?? true),
   })}
   </fieldset>
 
@@ -455,36 +463,36 @@ ${probeSectionHtml(opts.probe, !reserved)}
   <div class="row">
     <div>${textField({
       id: "smtp_host",
-      name: "smtp.host",
+      name: MAILBOX_FIELDS.smtpHost,
       label: "Host",
-      value: fieldValue(values, "smtp.host", smtp?.host ?? ""),
+      value: fieldValue(values, MAILBOX_FIELDS.smtpHost, smtp?.host ?? ""),
       required: true,
       errors,
     })}</div>
     <div>${textField({
       id: "smtp_port",
-      name: "smtp.port",
+      name: MAILBOX_FIELDS.smtpPort,
       label: "Port",
       type: "number",
-      value: fieldValue(values, "smtp.port", smtp ? String(smtp.port) : "465"),
+      value: fieldValue(values, MAILBOX_FIELDS.smtpPort, smtp ? String(smtp.port) : "465"),
       required: true,
       errors,
     })}</div>
   </div>
   ${textField({
     id: "smtp_user",
-    name: "smtp.user",
+    name: MAILBOX_FIELDS.smtpUser,
     label: "User",
-    value: fieldValue(values, "smtp.user", smtp?.user ?? ""),
+    value: fieldValue(values, MAILBOX_FIELDS.smtpUser, smtp?.user ?? ""),
     required: true,
     errors,
   })}
-  ${passwordField({ id: "smtp_pass", name: "smtp.pass", label: "Password", required: isNew, errors })}
+  ${passwordField({ id: "smtp_pass", name: MAILBOX_FIELDS.smtpPass, label: "Password", required: isNew, errors })}
   ${checkboxField({
     id: "smtp_tls",
-    name: "smtp.tls",
+    name: MAILBOX_FIELDS.smtpTls,
     label: "Use TLS",
-    checked: values ? values["smtp.tls"] === "1" : (smtp?.tls ?? true),
+    checked: values ? values[MAILBOX_FIELDS.smtpTls] === "1" : (smtp?.tls ?? true),
   })}
   </fieldset>
 
@@ -492,31 +500,31 @@ ${probeSectionHtml(opts.probe, !reserved)}
   <legend>Mail defaults</legend>
   ${textField({
     id: "mail_from",
-    name: "mail.defaultFrom",
+    name: MAILBOX_FIELDS.mailDefaultFrom,
     label: "From address",
-    value: fieldValue(values, "mail.defaultFrom", mail?.defaultFrom ?? ""),
+    value: fieldValue(values, MAILBOX_FIELDS.mailDefaultFrom, mail?.defaultFrom ?? ""),
     required: true,
     errors,
   })}
   ${textField({
     id: "mail_from_name",
-    name: "mail.defaultFromName",
+    name: MAILBOX_FIELDS.mailDefaultFromName,
     label: "From name",
-    value: fieldValue(values, "mail.defaultFromName", mail?.defaultFromName ?? ""),
+    value: fieldValue(values, MAILBOX_FIELDS.mailDefaultFromName, mail?.defaultFromName ?? ""),
     errors,
   })}
   ${textField({
     id: "mail_drafts",
-    name: "mail.draftsFolder",
+    name: MAILBOX_FIELDS.mailDraftsFolder,
     label: "Drafts folder",
-    value: fieldValue(values, "mail.draftsFolder", mail?.draftsFolder ?? "Drafts"),
+    value: fieldValue(values, MAILBOX_FIELDS.mailDraftsFolder, mail?.draftsFolder ?? "Drafts"),
     errors,
   })}
   ${textField({
     id: "mail_sent",
-    name: "mail.sentFolder",
+    name: MAILBOX_FIELDS.mailSentFolder,
     label: "Sent folder",
-    value: fieldValue(values, "mail.sentFolder", mail ? (mail.sentFolder ?? "") : "Sent"),
+    value: fieldValue(values, MAILBOX_FIELDS.mailSentFolder, mail ? (mail.sentFolder ?? "") : "Sent"),
     errors,
   })}
   </fieldset>

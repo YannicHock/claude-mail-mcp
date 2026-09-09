@@ -41,6 +41,16 @@
  *   POST /settings/mailboxes       → the write, only once the probe has held
  * ```
  *
+ * Those three answer JSON when asked to — `Accept: application/json`, and a
+ * `{ _csrf, _stamp, mailbox }` body on the two that take one, where `mailbox`
+ * is a `MailboxDraft` from settings-api.ts. Until #69 they answered only in
+ * HTML, and this file picked the probe rows, the per-field rejections and the
+ * stamp back out of the markup with three regular expressions that a cosmetic
+ * edit to the connector's form could have broken silently. Those readers, and
+ * the test helper that mirrored the connector's markup verbatim, are gone; the
+ * field names come from `MAILBOX_FIELDS` rather than from a hand-kept list, so
+ * one renamed field no longer goes quietly missing on the way over.
+ *
  * The stamp is read twice when it has to be: once before the write, and again
  * when the write goes unanswered. An abort fires after the request has gone out,
  * so silence there is not evidence of anything — and the stamp is what turns
@@ -96,6 +106,18 @@ import type { Logger } from "./logger.js";
 import { isSameOrigin, renderErrorPage } from "./login.js";
 import { OperatorRecord, validateNewCredentials } from "./operator.js";
 import {
+  draftFromFields,
+  flattenDraft,
+  MAILBOX_SECRET_FIELDS,
+  parseErrorAnswer,
+  parseProbeAnswer,
+  parseStampAnswer,
+  type MailboxDraft,
+  type MailboxProbeOutcome,
+  type MailboxProbeReport,
+  type MailboxRequestBody,
+} from "./settings-api.js";
+import {
   renderConnectStep,
   renderCredentialsStep,
   renderMailboxStep,
@@ -103,6 +125,7 @@ import {
   type ConfiguredMailbox,
   type ConnectPageData,
   type MailboxPageData,
+  type MailboxProbeLine,
   type MailboxProbeView,
 } from "./setup-pages.js";
 import { sendPage as sendHtmlPage, sendRedirect } from "./settings-pages.js";
@@ -333,11 +356,11 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    const fields = collectMailboxFields(body);
-    const values = withoutSecrets(fields);
+    const draft = draftFromFields(body);
+    const values = formValues(draft);
 
-    const tested = await mailboxes.test(fields);
-    if (tested.kind !== "answer") {
+    const tested = await mailboxes.test(draft);
+    if (tested.kind === "unreachable") {
       log("warn", "setup step 2 could not reach the connector", { error: tested.error });
       page(502, {
         values,
@@ -351,14 +374,13 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    if (tested.status === 400) {
-      const errors = readFieldErrors(tested.body);
+    if (tested.kind === "rejected") {
       log("info", "setup step 2: the connector rejected the mailbox details", {
-        fields: Object.keys(errors).length,
+        fields: Object.keys(tested.errors).length,
       });
       page(400, {
         values,
-        errors,
+        errors: tested.errors,
         notice: {
           kind: "error",
           message:
@@ -368,7 +390,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    if (tested.status !== 200) {
+    if (tested.kind === "refused") {
       log("error", "setup step 2: the connector refused the connection test", {
         status: tested.status,
       });
@@ -376,8 +398,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    const probe = readProbeReport(tested.body);
-    if (probe === null) {
+    if (tested.kind === "unreadable") {
       // Fail closed. An answer this build cannot read is not evidence that the
       // mailbox works, and the one thing this step must never do is store
       // credentials it has no report for.
@@ -393,6 +414,8 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       });
       return;
     }
+
+    const probe = probeView(tested.value);
 
     // Booleans only. Nothing the operator typed is logged here, on any path.
     log("info", "setup step 2 tested a mailbox", {
@@ -447,8 +470,8 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    const created = await mailboxes.create(fields, stamp);
-    if (created.kind !== "answer") {
+    const created = await mailboxes.create(draft, stamp);
+    if (created.kind === "unreachable") {
       // The one call in this step whose outcome no answer settles. The probe
       // above can say "nothing was tested and nothing was saved" because it
       // writes nothing whatever happens to it; this request does, and by the
@@ -510,30 +533,39 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    if (created.status !== 303) {
-      const errors = readFieldErrors(created.body);
+    if (created.kind === "rejected") {
       log("error", "setup step 2: the connector refused to save the mailbox", {
         status: created.status,
-        fields: Object.keys(errors).length,
+        fields: Object.keys(created.errors).length,
       });
-      page(created.status === 400 || created.status === 409 ? 400 : 502, {
+      page(400, {
         values,
-        errors,
+        errors: created.errors,
         probe,
-        notice:
-          created.status === 400 || created.status === 409
-            ? {
-                kind: "error",
-                message:
-                  "The connection test passed, but the connector refused to store these " +
-                  "details, so this attempt added nothing. What it objected to is marked " +
-                  "below; fix that, retype the passwords and try again.",
-              }
-            : refusedNotice(created.status),
+        notice: {
+          kind: "error",
+          message:
+            "The connection test passed, but the connector refused to store these " +
+            "details, so this attempt added nothing. What it objected to is marked " +
+            "below; fix that, retype the passwords and try again.",
+        },
       });
       return;
     }
 
+    if (created.kind === "refused") {
+      log("error", "setup step 2: the connector refused to save the mailbox", {
+        status: created.status,
+        fields: 0,
+      });
+      page(502, { values, probe, notice: refusedNotice(created.status) });
+      return;
+    }
+
+    // "ok", or a 201 whose body this build could not read — and the status is
+    // what says the account is there. Reading an unreadable 201 as a failure is
+    // the other half of #82: it would send the operator into a retry the
+    // connector answers with "an account with id … already exists".
     log("info", "setup step 2 completed: a verified mailbox was saved", {});
     await state.advanceTo("connect");
     redirect(res, `${base}/connect`, 303);
@@ -807,36 +839,6 @@ const UPSTREAM_TEST = "/settings/mailboxes/test";
 const UPSTREAM_CREATE = "/settings/mailboxes";
 
 /**
- * The form fields forwarded upstream, under the connector's own names.
- *
- * A fixed list rather than "whatever was submitted": the body arrives from a
- * browser, and the bookkeeping fields the connector reads — `_csrf` and
- * `_stamp` — are minted here and must not be forgeable from the outside.
- */
-const MAILBOX_FIELDS = [
-  "id",
-  "label",
-  "default",
-  "mail.defaultFrom",
-  "imap.host",
-  "imap.port",
-  "imap.tls",
-  "imap.user",
-  "imap.pass",
-  "smtp.host",
-  "smtp.port",
-  "smtp.tls",
-  "smtp.user",
-  "smtp.pass",
-  "caldav.url",
-  "caldav.user",
-  "caldav.pass",
-] as const;
-
-/** Never echoed back into a page, never logged. */
-const SECRET_FIELDS = new Set(["imap.pass", "smtp.pass", "caldav.pass"]);
-
-/**
  * Who the assertion says is asking.
  *
  * Not an operator's session, because there is not one yet — the settings UI is
@@ -853,7 +855,7 @@ const PROBE_TIMEOUT_MS = 30_000;
  *
  * Weighed again for the save under #82, on the suspicion that 5 seconds was too
  * short for a probe-then-write. It is not one: `POST /settings/mailboxes` in the
- * connector parses the form, checks the stamp, writes `accounts.json` and
+ * connector parses the draft, checks the stamp, writes `accounts.json` and
  * renames it into place, and talks to no mail server at all. The probe is the
  * separate `/settings/mailboxes/test` call above, which already gets 30 seconds
  * — more than the 25 that `TOTAL_TIMEOUT_MS` in the connector's probe.ts allows
@@ -864,24 +866,43 @@ const PROBE_TIMEOUT_MS = 30_000;
  */
 const QUICK_TIMEOUT_MS = 5_000;
 
-type UpstreamAnswer =
-  | { kind: "answer"; status: number; body: string }
+/**
+ * What one call to the connector came back as.
+ *
+ * Five outcomes rather than a status code and a body, because step 2 acts
+ * differently on every one of them and the difference is the whole of #82:
+ * `rejected` is the connector saying no about a field, `refused` is it saying no
+ * about the request, `unreadable` is an answer this build cannot act on, and
+ * `unreachable` is no answer at all — which for a write is a question rather
+ * than a verdict.
+ */
+type ConnectorAnswer<T> =
+  | { kind: "ok"; value: T }
+  /** 400 or 409, with whatever it said about which field. */
+  | { kind: "rejected"; status: number; errors: Record<string, string> }
+  /** Any other status: not about the mailbox, about the request. */
+  | { kind: "refused"; status: number }
+  /** The expected status, in a shape this build does not understand. */
+  | { kind: "unreadable" }
   | { kind: "unreachable"; error: string };
+
+/** The 201 body is a courtesy; the status is the fact. See {@link handleMailbox}. */
+const STORED = "stored";
 
 interface MailboxClient {
   /** Probe without saving: the connector's own "Test connection" action. */
-  test(fields: URLSearchParams): Promise<UpstreamAnswer>;
+  test(draft: MailboxDraft): Promise<ConnectorAnswer<MailboxProbeReport>>;
   /**
-   * The current `accounts.json` stamp, read off the connector's own new-mailbox
-   * form. Also what an unanswered {@link MailboxClient.create} is settled by:
-   * asked a second time, a stamp that has moved is the write, landed.
+   * The current `accounts.json` stamp, as the connector states it. Also what an
+   * unanswered {@link MailboxClient.create} is settled by: asked a second time,
+   * a stamp that has moved is the write, landed.
    */
   stamp(): Promise<string | null>;
   /**
-   * Write the account. 303 means it is stored; anything else means it is not.
+   * Write the account. 201 means it is stored; anything else means it is not.
    * No answer at all means neither — see `handleMailbox`.
    */
-  create(fields: URLSearchParams, stamp: string): Promise<UpstreamAnswer>;
+  create(draft: MailboxDraft, stamp: string): Promise<ConnectorAnswer<typeof STORED>>;
 }
 
 /**
@@ -894,39 +915,61 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
   // above: the closures below outlive it, and one of them signs with this key.
   const key: Uint8Array = config.settingsSigningKey;
 
-  async function call(
-    method: "GET" | "POST",
-    path: string,
-    form: URLSearchParams | null,
-    timeoutMs: number
-  ): Promise<UpstreamAnswer> {
+  async function call<T>(opts: {
+    method: "GET" | "POST";
+    path: string;
+    /** The mailbox to send, or null for the read-only call. */
+    draft: MailboxDraft | null;
+    /** The stamp the write must still be against. Ignored without a draft. */
+    stamp: string;
+    timeoutMs: number;
+    /** The status that means the operation happened. */
+    okStatus: number;
+    /** Read the body of that status, or null if it is not in a shape we know. */
+    read: (payload: unknown) => T | null;
+  }): Promise<ConnectorAnswer<T>> {
     // Minted per request and thrown away with it, the way the settings proxy
     // mints one per proxied request. The `csrf` claim and the `_csrf` field are
     // the same value because the connector compares them — that check binds a
     // browser form to a session, and there is no browser on this hop.
     const csrf = randomBytes(24).toString("base64url");
     const assertion = signAssertion(
-      { sub: SETUP_SUBJECT, sid: randomUUID(), csrf, method, path },
+      { sub: SETUP_SUBJECT, sid: randomUUID(), csrf, method: opts.method, path: opts.path },
       key,
       config.issuer
     );
-    if (form !== null) form.set("_csrf", csrf);
+    const body: MailboxRequestBody | null =
+      opts.draft === null ? null : { _csrf: csrf, _stamp: opts.stamp, mailbox: opts.draft };
 
     try {
-      const res = await fetch(`${config.upstreamMcpUrl}${path}`, {
-        method,
+      const res = await fetch(`${config.upstreamMcpUrl}${opts.path}`, {
+        method: opts.method,
         redirect: "manual",
         headers: {
           authorization: `Bearer ${config.upstreamAuthToken}`,
           [ASSERTION_HEADER]: assertion,
-          ...(form === null
-            ? {}
-            : { "content-type": "application/x-www-form-urlencoded" }),
+          // The whole of the negotiation. Without this the connector answers
+          // the same routes with the page a browser would get.
+          accept: "application/json",
+          ...(body === null ? {} : { "content-type": "application/json" }),
         },
-        ...(form === null ? {} : { body: form.toString() }),
-        signal: AbortSignal.timeout(timeoutMs),
+        ...(body === null ? {} : { body: JSON.stringify(body) }),
+        signal: AbortSignal.timeout(opts.timeoutMs),
       });
-      return { kind: "answer", status: res.status, body: await res.text() };
+
+      const payload = await readJson(res);
+      if (res.status === opts.okStatus) {
+        const value = opts.read(payload);
+        return value === null ? { kind: "unreadable" } : { kind: "ok", value };
+      }
+      if (res.status === 400 || res.status === 409) {
+        return {
+          kind: "rejected",
+          status: res.status,
+          errors: parseErrorAnswer(payload).errors,
+        };
+      }
+      return { kind: "refused", status: res.status };
     } catch (err) {
       // The message only, and only from an Error: the request body on this hop
       // is a mailbox password, and a thrown object is not always as tidy.
@@ -935,119 +978,82 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
   }
 
   return {
-    test: (fields) => call("POST", UPSTREAM_TEST, fields, PROBE_TIMEOUT_MS),
-    create: (fields, stamp) => {
-      const form = new URLSearchParams(fields);
-      form.set("_stamp", stamp);
-      return call("POST", UPSTREAM_CREATE, form, QUICK_TIMEOUT_MS);
-    },
+    test: (draft) =>
+      call({
+        method: "POST",
+        path: UPSTREAM_TEST,
+        draft,
+        stamp: "",
+        timeoutMs: PROBE_TIMEOUT_MS,
+        okStatus: 200,
+        read: parseProbeAnswer,
+      }),
+    create: (draft, stamp) =>
+      call({
+        method: "POST",
+        path: UPSTREAM_CREATE,
+        draft,
+        stamp,
+        timeoutMs: QUICK_TIMEOUT_MS,
+        okStatus: 201,
+        // Not `parseCreatedAnswer`. The 201 is what says the account is there,
+        // and nothing on this screen depends on the id or the stamp it echoes.
+        read: () => STORED,
+      }),
     async stamp() {
       // Read immediately before the write rather than embedded in the wizard's
       // own form, so the connector's optimistic-concurrency check cannot fail
       // over the minutes an operator spends typing a mailbox in.
-      const answer = await call("GET", UPSTREAM_NEW, null, QUICK_TIMEOUT_MS);
-      if (answer.kind !== "answer" || answer.status !== 200) {
+      const answer = await call({
+        method: "GET",
+        path: UPSTREAM_NEW,
+        draft: null,
+        stamp: "",
+        timeoutMs: QUICK_TIMEOUT_MS,
+        okStatus: 200,
+        read: parseStampAnswer,
+      });
+      if (answer.kind !== "ok") {
         log("warn", "setup step 2 could not read the accounts stamp", {
-          status: answer.kind === "answer" ? answer.status : 0,
+          status: answer.kind === "rejected" || answer.kind === "refused" ? answer.status : 0,
         });
         return null;
       }
-      return readStamp(answer.body);
+      return answer.value;
     },
   };
 }
 
-/** The submitted fields the connector knows about, and nothing else. */
-function collectMailboxFields(body: Record<string, unknown>): URLSearchParams {
-  const form = new URLSearchParams();
-  for (const name of MAILBOX_FIELDS) {
-    const value = body[name];
-    if (typeof value === "string") form.set(name, value);
+/** The body, or undefined when there was not one this build could decode. */
+async function readJson(res: { json(): Promise<unknown> }): Promise<unknown> {
+  try {
+    return await res.json();
+  } catch {
+    return undefined;
   }
-  return form;
 }
 
-/** What may be put back into the page: everything except the passwords. */
-function withoutSecrets(fields: URLSearchParams): Record<string, string> {
-  const values: Record<string, string> = {};
-  for (const [name, value] of fields) {
-    if (SECRET_FIELDS.has(name)) continue;
-    values[name] = value;
-  }
+/** What may be put back into the page: everything the draft holds except passwords. */
+function formValues(draft: MailboxDraft): Record<string, string> {
+  const values = flattenDraft(draft);
+  for (const name of MAILBOX_SECRET_FIELDS) delete values[name];
   return values;
 }
 
-// ---- Reading the connector's answers --------------------------------------
-//
-// The connector renders HTML for a browser; it has no JSON form of these
-// routes, and adding one would be a change in a package this service cannot
-// import from and does not own. So these three readers pick out the three
-// facts step 2 needs, from markup that is mirrored below verbatim.
-//
-// **These patterns mirror `renderMailboxForm` in src/settings-pages.ts. If the
-// markup there changes, change them here in the same commit** — the same rule
-// assertion.ts already carries for the format it mirrors. Every one of them
-// fails closed: no match is read as "no result", which refuses the save, never
-// as "it passed".
-
-/** `probeRowHtml()` in src/settings-pages.ts. */
-const PROBE_ROW =
-  /<div class="probe-row (ok|fail)"><strong>([^<]*)<\/strong><span>([^<]*)<\/span><\/div>/g;
-
-/** `textField()` in src/settings-pages.ts: the input, then its own error line. */
-const FIELD_ERROR = /<input\b[^>]*\bname="([^"]+)"[^>]*>\s*<p class="field-error">([^<]*)<\/p>/g;
-
-/** The hidden field `renderMailboxForm()` puts the accounts.json stamp in. */
-const STAMP_FIELD = /name="_stamp" value="([^"]*)"/;
-
-/** The inverse of the `escapeHtml` both packages define identically. */
-function unescapeHtml(value: string): string {
-  return value
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&");
-}
-
 /**
- * The three services, read out of the connector's probe panel.
+ * The connector's report, in this screen's own terms.
  *
- * Null when IMAP or SMTP is missing from it — an answer without both is not a
- * report this step can act on, and the caller treats that as a refusal to save.
+ * The only difference is CalDAV: the connector says `null` for a block it was
+ * never given, and this screen has a third state for that — "not tested", which
+ * is neither a pass nor a failure and is what an operator who set up mail only
+ * should read.
  */
-export function readProbeReport(html: string): MailboxProbeView | null {
-  const lines = new Map<string, { tested: boolean; ok: boolean; message: string }>();
-  for (const match of html.matchAll(PROBE_ROW)) {
-    const ok = match[1] === "ok";
-    const status = unescapeHtml(match[3]);
-    lines.set(unescapeHtml(match[2]), {
-      tested: true,
-      ok,
-      message: ok ? "" : status.replace(/^failed:\s*/, ""),
-    });
-  }
-
-  const imap = lines.get("IMAP");
-  const smtp = lines.get("SMTP");
-  if (imap === undefined || smtp === undefined) return null;
-  // The connector omits the CalDAV row entirely when no CalDAV URL was given.
-  // That is "not tested", which this screen reports as its own third line
-  // rather than folding into either of the other two.
-  const caldav = lines.get("CalDAV") ?? { tested: false, ok: false, message: "" };
-  return { imap, smtp, caldav };
-}
-
-/** The connector's per-field rejections, keyed by the field name it rejected. */
-export function readFieldErrors(html: string): Record<string, string> {
-  const errors: Record<string, string> = {};
-  for (const match of html.matchAll(FIELD_ERROR)) {
-    errors[unescapeHtml(match[1])] = unescapeHtml(match[2]);
-  }
-  return errors;
-}
-
-export function readStamp(html: string): string | null {
-  const match = STAMP_FIELD.exec(html);
-  return match === null ? null : unescapeHtml(match[1]);
+function probeView(report: MailboxProbeReport): MailboxProbeView {
+  const line = (outcome: MailboxProbeOutcome | null): MailboxProbeLine => {
+    if (outcome === null) return { tested: false, ok: false, message: "" };
+    return outcome.ok
+      ? { tested: true, ok: true, message: "" }
+      : { tested: true, ok: false, message: outcome.message };
+  };
+  return { imap: line(report.imap), smtp: line(report.smtp), caldav: line(report.caldav) };
 }
