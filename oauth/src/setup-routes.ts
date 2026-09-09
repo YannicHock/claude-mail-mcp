@@ -16,7 +16,9 @@
  *   POST /setup/<token>/credentials   → writes the operator record, on to step 2
  *   GET  /setup/<token>/mailbox       → step 2
  *   POST /setup/<token>/mailbox       → tests a mailbox, stores it, or skips it
- *   GET  /setup/<token>/connect       → step 3  (issue #24)
+ *   GET  /setup/<token>/connect       → step 3
+ *   POST /setup/<token>/connect       → Finish: completes the claim, or explains
+ *                                       PUBLIC_URL and stays put
  *   anything else                     → the gate's own 404, byte for byte
  * ```
  *
@@ -63,29 +65,39 @@
  * settings forms use, which reads `Origin` and falls back to `Referer` because
  * Chrome sends no `Origin` on a same-origin form POST.
  *
- * ## The seam to the rest of the wizard
+ * ## Where the wizard ends
  *
- * Step 3's Finish is where `Bootstrap.complete()` is called — the operator record
- * exists by then, written here in step 1, so completing means deleting the claim
- * token and nothing else. Issue #24 owns that call; this module deliberately does
- * not make it, because an instance whose token was consumed at step 1 would have
- * no way back to steps 2 and 3.
+ * Step 3's Finish is the **only** call to `Bootstrap.complete()` in this service,
+ * and it is the last thing the wizard does. The operator record exists by then,
+ * written here in step 1, so completing means deleting the claim token and
+ * nothing else. It is deliberately not called any earlier: an instance whose
+ * token was consumed at step 1 would have no way back to steps 2 and 3, and a
+ * restart between them would find nothing to resume.
+ *
+ * The step is checked twice on the way there. `state.reached("connect")` is what
+ * stops a POST to `/connect` from an operator who has not been through step 1,
+ * and `complete()` itself refuses to delete the token before the operator record
+ * exists — so a claim needs both the wizard's own account of where the operator
+ * got to and the file that account implies.
  */
 
 import { randomBytes, randomUUID } from "node:crypto";
 import express, { type Request, type Response } from "express";
 
 import { ASSERTION_HEADER, signAssertion } from "./assertion.js";
-import { SETUP_PREFIX, type SetupRequest } from "./bootstrap.js";
+import { BootstrapError, SETUP_PREFIX, type Bootstrap, type SetupRequest } from "./bootstrap.js";
 import type { OAuthConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { isSameOrigin, renderErrorPage } from "./login.js";
 import { OperatorRecord, validateNewCredentials } from "./operator.js";
 import {
+  renderConnectStep,
   renderCredentialsStep,
   renderMailboxStep,
-  renderStepPlaceholder,
+  renderSetupComplete,
   SETUP_HEADERS,
+  type ConfiguredMailbox,
+  type ConnectPageData,
   type MailboxPageData,
   type MailboxProbeView,
 } from "./setup-pages.js";
@@ -94,6 +106,15 @@ import { isSetupStep, SetupState, type SetupStep } from "./setup-state.js";
 export interface SetupWizardDeps {
   config: OAuthConfig;
   log: Logger;
+  /**
+   * The live bootstrap state this wizard is running behind.
+   *
+   * Step 3's Finish is the only caller of {@link Bootstrap.complete} in the
+   * service, and it has to be *this* object rather than a fresh one: the gate in
+   * app.ts reads `bootstrapped` off it on every request, so completing here is
+   * what opens `/mcp` and closes `/setup` in the same breath, without a restart.
+   */
+  bootstrap: Bootstrap;
   /**
    * The gate's 404 responder, passed in rather than reimplemented. An unknown
    * sub-path under a *valid* token has to be indistinguishable from a wrong
@@ -111,7 +132,7 @@ export interface SetupWizard {
 const formBody = express.urlencoded({ extended: false, limit: "64kb" });
 
 export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
-  const { config, log, notFound } = deps;
+  const { bootstrap, config, log, notFound } = deps;
   const operatorFile = requireOperatorFile(config);
   const state = SetupState.open(config.wizardStateFile, log);
   const mailboxes = createMailboxClient(config, log);
@@ -141,7 +162,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       }
 
       if (req.method === "GET" || req.method === "HEAD") {
-        sendPage(res, 200, renderStep(step, base));
+        sendPage(res, 200, await renderStep(step, base));
         return;
       }
 
@@ -155,8 +176,12 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         return;
       }
 
-      // Step 3 has no POST handler until #24 writes one, and an unexpected
-      // method gets the same answer an unexpected path does.
+      if (req.method === "POST" && step === "connect") {
+        await handleConnect(req, res, base);
+        return;
+      }
+
+      // An unexpected method gets the same answer an unexpected path does.
       notFound(req, res);
     },
   };
@@ -455,7 +480,111 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     redirect(res, `${base}/connect`, 303);
   }
 
-  function renderStep(step: SetupStep, base: string): string {
+  /**
+   * Step 3 — the MCP URL, `PUBLIC_URL`, and the only Finish this service has.
+   *
+   * Two submissions arrive here, told apart by the confirmation radio. `no` is
+   * not a failure and not a refusal to continue: it renders the same screen with
+   * the guidance for changing an environment variable, and leaves the wizard
+   * exactly where it was, because a `PUBLIC_URL` fixed by editing `.env` and
+   * restarting must find this link still working.
+   *
+   * `yes` calls {@link Bootstrap.complete}, which deletes the claim token — and
+   * that is the whole transition. The operator record was written in step 1, so
+   * completing has nothing else left to do; `complete()` refuses to run before
+   * that record exists, which is the ordering guarantee this depends on rather
+   * than re-checks.
+   *
+   * The answer is the completion screen itself, not a redirect. See
+   * {@link renderSetupComplete} for why there is nowhere left to redirect to.
+   */
+  async function handleConnect(req: Request, res: Response, base: string): Promise<void> {
+    if (!isSameOrigin(req.headers, config.issuer)) {
+      sendForbidden(res);
+      return;
+    }
+
+    const page = async (status: number, data: Partial<ConnectPageData>): Promise<void> => {
+      sendPage(res, status, renderConnectStep({ ...(await connectPageData(base)), ...data }));
+    };
+
+    try {
+      await parseForm(req, res);
+    } catch {
+      await page(400, {
+        notice: { kind: "error", message: "That form could not be read. Try again." },
+      });
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const answer = stringField(body.public_url_ok);
+
+    if (answer === "no") {
+      log("info", "setup step 3: the operator says PUBLIC_URL is wrong", {});
+      await page(200, {
+        showPublicUrlHelp: true,
+        notice: {
+          kind: "info",
+          message:
+            "Nothing has been finished. Change PUBLIC_URL, bring the stack back up, " +
+            "and open this same link again.",
+        },
+      });
+      return;
+    }
+
+    if (answer !== "yes") {
+      // The radio is `required`, so this is a browser that skipped it or a
+      // hand-made submission. Neither is an answer, and an instance is not
+      // claimed on one.
+      await page(400, {
+        notice: {
+          kind: "error",
+          message: "Confirm the address above before finishing.",
+        },
+      });
+      return;
+    }
+
+    try {
+      await bootstrap.complete();
+    } catch (err) {
+      // The partial failure: the operator record is written and the token is
+      // still there. `complete()` leaves the state unflipped in that case, so
+      // the instance is exactly as it was — still unclaimed, this link still
+      // live — and the operator can fix what the message names and press Finish
+      // again. Its own message is the actionable half: it names the file and
+      // what the filesystem said about it.
+      const detail = err instanceof BootstrapError ? err.message : "Setup could not be completed.";
+      log("error", "setup step 3 could not complete the claim", { error: detail });
+      await page(500, {
+        notice: {
+          kind: "error",
+          message:
+            `${detail} This instance is still unclaimed and nothing you entered has been ` +
+            "lost, so this link still works: fix what is named above and press Finish again.",
+        },
+      });
+      return;
+    }
+
+    // Booleans and nothing else, as everywhere else in this wizard.
+    log("info", "setup completed: the instance is claimed and the claim token is gone", {});
+    const configured = await configuredMailboxes();
+    sendPage(
+      res,
+      200,
+      renderSetupComplete({
+        mcpUrl: config.resource,
+        settingsUrl: `${config.issuer}/settings`,
+        mailboxes: configured.mailboxes,
+        connectorReachable: configured.reachable,
+      })
+    );
+  }
+
+  async function renderStep(step: SetupStep, base: string): Promise<string> {
     if (step === "credentials") {
       return renderCredentialsStep({
         action: `${base}/credentials`,
@@ -472,7 +601,79 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         ...(mailboxes === null ? { unavailable: true } : {}),
       });
     }
-    return renderStepPlaceholder({ step, backHref: `${base}/mailbox` });
+    return renderConnectStep(await connectPageData(base));
+  }
+
+  /** Everything step 3 shows before a submission adds anything to it. */
+  async function connectPageData(base: string): Promise<ConnectPageData> {
+    const configured = await configuredMailboxes();
+    return {
+      action: `${base}/connect`,
+      backHref: `${base}/mailbox`,
+      // The canonical resource identifier is exactly the address a client is
+      // meant to name, so the URL on the screen and the `resource` the token
+      // endpoint validates against cannot drift apart.
+      mcpUrl: config.resource,
+      publicUrl: config.issuer,
+      mailboxes: configured.mailboxes,
+      connectorReachable: configured.reachable,
+    };
+  }
+
+  function configuredMailboxes(): Promise<{
+    reachable: boolean;
+    mailboxes: ConfiguredMailbox[];
+  }> {
+    return fetchConfiguredMailboxes(config.upstreamMcpUrl, log);
+  }
+}
+
+/**
+ * Which mailboxes the connector has, for step 3's summary line.
+ *
+ * Step 2 leaves the wizard in the same state whether it saved a mailbox or was
+ * skipped — the same 303, the same recorded progress — so step 3 asks rather
+ * than infers. The connector's own `/health` is the cheapest place to ask and
+ * the only route on it that needs no credentials at all, which is why this does
+ * not go through the signed client above.
+ *
+ * Reachability is reported rather than swallowed: an unreachable connector must
+ * not render as "no mailbox is configured", which would be a confident wrong
+ * answer to the one question this line exists to answer. It never throws, and
+ * never blocks Finish — the connector being down has nothing to do with whether
+ * this instance has been claimed.
+ */
+async function fetchConfiguredMailboxes(
+  upstreamMcpUrl: string,
+  log: Logger
+): Promise<{ reachable: boolean; mailboxes: ConfiguredMailbox[] }> {
+  try {
+    const res = await fetch(`${upstreamMcpUrl}/health`, {
+      signal: AbortSignal.timeout(QUICK_TIMEOUT_MS),
+    });
+    if (!res.ok) return { reachable: false, mailboxes: [] };
+
+    // `accounts: [{ id, label, ... }]`, the same shape app.ts reads off this
+    // route for the settings page.
+    const body = (await res.json()) as { accounts?: unknown };
+    const accounts = Array.isArray(body.accounts) ? body.accounts : [];
+    return {
+      reachable: true,
+      mailboxes: accounts
+        .filter(
+          (account): account is ConfiguredMailbox =>
+            typeof account === "object" &&
+            account !== null &&
+            typeof (account as ConfiguredMailbox).id === "string" &&
+            typeof (account as ConfiguredMailbox).label === "string"
+        )
+        .map((account) => ({ id: account.id, label: account.label })),
+    };
+  } catch (err) {
+    log("warn", "setup step 3 could not ask the connector which mailboxes exist", {
+      error: err instanceof Error ? err.message : "failed",
+    });
+    return { reachable: false, mailboxes: [] };
   }
 }
 

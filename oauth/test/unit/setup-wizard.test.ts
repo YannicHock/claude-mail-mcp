@@ -3,8 +3,10 @@
  *
  * What is here is everything the routes only compose: which credentials are
  * acceptable, what writing one leaves on disk, how far the wizard remembers the
- * operator got, and what the two rendered screens say. The route table itself is
- * pinned in test/integration/setup-wizard.test.ts, against the real gate.
+ * operator got, and what the rendered screens say — the three steps and the
+ * completion page that follows the last of them. The route table itself, and the
+ * claim this instance is finished with, are pinned in
+ * test/integration/setup-wizard.test.ts against the real gate.
  */
 
 import { strict as assert } from "node:assert";
@@ -22,9 +24,12 @@ import {
 } from "../../src/operator.js";
 import { verifyPassword } from "../../src/passwords.js";
 import {
+  renderConnectStep,
   renderCredentialsStep,
   renderMailboxStep,
-  renderStepPlaceholder,
+  renderSetupComplete,
+  type CompletePageData,
+  type ConnectPageData,
   type MailboxPageData,
   type MailboxProbeView,
 } from "../../src/setup-pages.js";
@@ -296,11 +301,114 @@ describe("the wizard's screens", () => {
     assert.match(html, /&quot;&gt;&lt;script&gt;/);
   });
 
-  it("a screen that is not built yet says so, and offers the way back", () => {
-    const html = renderStepPlaceholder({ step: "connect", backHref: "/setup/tok/mailbox" });
+});
+
+describe("the step 3 screen", () => {
+  function connectPage(data: Partial<ConnectPageData> = {}): string {
+    return renderConnectStep({
+      action: "/setup/tok/connect",
+      backHref: "/setup/tok/mailbox",
+      mcpUrl: "https://mail.example.com/mcp",
+      publicUrl: "https://mail.example.com",
+      mailboxes: [],
+      connectorReachable: true,
+      ...data,
+    });
+  }
+
+  it("shows the MCP URL to copy, and offers the way back", () => {
+    const html = connectPage({ mailboxes: [{ id: "main", label: "Main mailbox" }] });
+
     assert.match(html, /Step 3 of 3 · Connect Claude/);
-    assert.match(html, /not built yet/);
+    assert.match(html, /value="https:\/\/mail\.example\.com\/mcp"/);
     assert.match(html, /href="\/setup\/tok\/mailbox"/);
+    assert.match(html, /action="\/setup\/tok\/connect"/);
+    // The claimed-to-be-copyable field must not be editable into something else.
+    assert.match(html, /id="mcp_url"[^>]*readonly/);
+    // No client-side JavaScript anywhere in this service — so no copy button,
+    // and the CSP the page is served with would block one in any case.
+    assert.equal(/<script/i.test(html), false);
+  });
+
+  it("asks the operator to confirm PUBLIC_URL rather than merely printing it", () => {
+    const html = connectPage();
+
+    assert.match(html, /PUBLIC_URL/);
+    assert.match(html, /name="public_url_ok" value="yes"/);
+    assert.match(html, /name="public_url_ok" value="no"/);
+    // The reason it is asked at all: the failure surfaces at claude.ai, not here.
+    assert.match(html, /claude\.ai/);
+  });
+
+  it("says what to change when the operator answers No, and that a restart is needed", () => {
+    const html = connectPage({ showPublicUrlHelp: true });
+
+    assert.match(html, /cannot be changed from here/i);
+    assert.match(html, /PUBLIC_URL=https:\/\/mail\.example\.com/);
+    assert.match(html, /docker compose up -d/);
+    // And that the link they are holding survives that restart.
+    assert.match(html, /keeps working/i);
+  });
+
+  it("names the mailbox step 2 saved, or says plainly that there is none", () => {
+    assert.match(
+      connectPage({ mailboxes: [{ id: "main", label: "Main mailbox" }] }),
+      /Main mailbox/
+    );
+    assert.match(connectPage({ mailboxes: [] }), /No mailbox is configured/i);
+  });
+
+  it("treats an unreachable connector as a remark, not a blocker", () => {
+    const html = connectPage({ connectorReachable: false });
+    assert.match(html, /did not answer/i);
+    assert.match(html, /does not stop you finishing/i);
+    assert.match(html, /<button type="submit">Finish<\/button>/);
+  });
+
+  it("escapes a mailbox label rather than rendering it", () => {
+    const html = connectPage({
+      mailboxes: [{ id: "main", label: '"><script>alert(1)</script>' }],
+    });
+    assert.equal(html.includes("<script>alert(1)</script>"), false);
+    assert.match(html, /&quot;&gt;&lt;script&gt;/);
+  });
+});
+
+describe("the completion screen", () => {
+  function completePage(data: Partial<CompletePageData> = {}): string {
+    return renderSetupComplete({
+      mcpUrl: "https://mail.example.com/mcp",
+      settingsUrl: "https://mail.example.com/settings",
+      mailboxes: [],
+      connectorReachable: true,
+      ...data,
+    });
+  }
+
+  it("says setup is over, repeats the MCP URL, and says the link is dead", () => {
+    const html = completePage();
+
+    assert.match(html, /Setup is complete/i);
+    assert.match(html, /value="https:\/\/mail\.example\.com\/mcp"/);
+    // The two shipped strings this screen has to make true.
+    assert.match(html, /404/);
+    assert.match(html, /claim token/i);
+    assert.equal(/<script/i.test(html), false);
+  });
+
+  it("is honest that the settings UI needs one restart, and names the command", () => {
+    // The settings router is mounted at construction from an operator record
+    // that did not exist when this process started, so it is not there yet.
+    const html = completePage();
+
+    assert.match(html, /docker compose restart mail-oauth/);
+    assert.match(html, /https:\/\/mail\.example\.com\/settings/);
+    // /mcp, by contrast, is live immediately.
+    assert.match(html, /no restart/i);
+  });
+
+  it("does not carry a Step N of 3 line: there is no step 4", () => {
+    assert.equal(/Step \d of 3/.test(completePage()), false);
   });
 });
 
