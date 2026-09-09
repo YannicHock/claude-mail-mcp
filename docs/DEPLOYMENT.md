@@ -779,7 +779,7 @@ to its own log — the mechanism Jupyter uses. The whole route table:
 | `GET /setup/<token>` | the wizard | 404 |
 | `GET /setup/<anything else>` | 404 | 404 |
 | `GET /authorize`, `/token`, `/register`, `/.well-known/…` | 404 | normal |
-| `GET /settings/*` | not mounted → 404 | normal |
+| `GET /settings/*` | 404 — there is no operator yet | normal |
 
 `/mcp` answers 503 rather than 401 because an instance with no credentials cannot
 reject anything meaningfully. A wrong claim token gets the *same* 404 a claimed
@@ -838,19 +838,14 @@ deleting the OAuth layer's data volume — `docker compose down`, then
 
 ### After Finish
 
-**`/mcp` is answering already** and needs no restart. Go straight to
-[step 6](#6-add-to-claude).
+**Nothing needs a restart.** `/mcp` is answering already — go straight to
+[step 6](#6-add-to-claude) — and so is the settings UI at `/settings`, where you
+sign in with the account you created in step 1. Both open in the process that
+served the wizard: the claim state and the operator record are read per request,
+not captured when the container started.
 
-**The settings UI needs exactly one restart.** It is mounted when the process
-starts, and this process started before there was an operator account to mount it
-against, so it answers 404 until the container comes back:
-
-```bash
-docker compose restart mail-oauth
-```
-
-Restarting is safe now: the instance is claimed, no new claim token is minted, and
-no setup URL is printed again.
+If you do restart, that is safe too: the instance is claimed, no new claim token
+is minted, and no setup URL is printed again.
 
 ### An instance that is configured before it starts
 

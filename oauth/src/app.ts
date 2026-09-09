@@ -13,10 +13,12 @@
  * payload must reach the connector as bytes.
  */
 
+import { existsSync } from "node:fs";
+
 import express, { type NextFunction, type Request, type Response } from "express";
 
 import { ASSERTION_HEADER, signAssertion } from "./assertion.js";
-import { type Bootstrap, parseSetupPath } from "./bootstrap.js";
+import { type Bootstrap, operatorSeed, parseSetupPath } from "./bootstrap.js";
 import { registerClient } from "./clients.js";
 import { CodeStore } from "./codes.js";
 import type { OAuthConfig } from "./config.js";
@@ -35,7 +37,7 @@ import {
   protectedResourceMetadata,
   wwwAuthenticate,
 } from "./metadata.js";
-import type { OperatorRecord } from "./operator.js";
+import { OperatorRecord } from "./operator.js";
 import { constantTimeEquals, verifyPassword } from "./passwords.js";
 import { CODE_CHALLENGE_METHOD, isValidCodeChallenge, verifyChallenge } from "./pkce.js";
 import { createProxy } from "./proxy.js";
@@ -60,9 +62,13 @@ export interface CreateAppOptions {
   store: Store;
   log?: Logger;
   /**
-   * The live operator credential. Required for the settings UI to mount: see
-   * the settings-router block below. Absent in a configuration that has not
-   * opted into the settings UI at all.
+   * The live operator credential, when the caller already has one.
+   *
+   * Absent means *not yet*, not *never*: an instance that is still unclaimed has
+   * no record to pass, and the wizard writes one mid-process. So this is the
+   * starting value of a resolution rather than the whole of it — see
+   * `liveOperator` below, which opens the record from the data volume the first
+   * time one is needed and none was handed over.
    */
   operator?: OperatorRecord;
   /**
@@ -165,7 +171,7 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
   //   /setup/<token>   the wizard            404
   //   /setup/<other>   404                   404
   //   /mcp             503                   normal
-  //   /settings/*      not mounted           normal
+  //   /settings/*      404, no operator      normal
   //   everything else  404                   normal
   //
   // Two properties this table is built around. `/mcp` answers 503 rather than
@@ -223,6 +229,69 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
 
       sendNotFound(req, res);
     });
+  }
+
+  // ---- The live operator record ------------------------------------------
+
+  /**
+   * The operator credential, resolved when it is asked for rather than captured
+   * at construction.
+   *
+   * The same reasoning as the gate above, applied to the other thing
+   * `complete()` changes about a live process. While the instance is unclaimed
+   * there is no `OperatorRecord` to hand `createApp`, so everything that
+   * captured `opts.operator` — the settings mount, the mailbox proxy, the
+   * consent screen's own password check — was decided against `undefined` and
+   * stayed that way for the life of the process. The wizard's step 1 writes the
+   * record, step 3 flips the state, and nothing re-read either: hence
+   * `docker compose restart mail-oauth` for a page whose account had just been
+   * created two screens earlier (#121).
+   *
+   * **What this costs.** Nothing on any hot path and nothing per request. A
+   * process that starts claimed is handed its record by index.ts and this
+   * returns that same object every time, exactly as the captured value did.
+   * The disk is touched only by a process that watched the claim happen, once:
+   * the first `/settings` or `/authorize` request after Finish reads
+   * `operator.json`, and the promise for it is cached — the promise rather than
+   * its value, so two requests arriving together share the one read. `/mcp`
+   * never calls this at all.
+   *
+   * Null means there is no credential to resolve, which is a 404 for the
+   * settings mount and a refusal for the consent screen — never a lazily
+   * created one. Three ways to get it, and the middle one is the important
+   * one:
+   *
+   *  - no record was handed over and there is no live bootstrap state that could
+   *    have produced one mid-process — a caller that passed neither, which is
+   *    what the settings-only tests build;
+   *  - **still unclaimed**, so the record either does not exist or — after step
+   *    1 — belongs to a wizard the operator has not finished. Reading it here
+   *    would mount the settings UI in the middle of setup;
+   *  - claimed, but nothing to open: `OPERATOR_FILE=none`, or a volume that lost
+   *    the record after `complete()` had checked it was there. The `existsSync`
+   *    is what keeps this a pure read, because `OperatorRecord.open` would
+   *    otherwise *create* one, seeded from a hash that is no longer there.
+   */
+  let operatorRecord: Promise<OperatorRecord> | null =
+    opts.operator === undefined ? null : Promise.resolve(opts.operator);
+
+  function liveOperator(): Promise<OperatorRecord> | null {
+    if (operatorRecord !== null) return operatorRecord;
+    if (bootstrap === undefined || !bootstrap.bootstrapped) return null;
+    const path = config.operatorFile;
+    if (path === null || !existsSync(path)) return null;
+
+    const opened = OperatorRecord.open(path, operatorSeed(config), log);
+    operatorRecord = opened;
+    // A read that failed is not an answer, and caching it would make one
+    // transient EACCES permanent for the life of the process. The rejection
+    // still reaches whoever is awaiting it — this only stops it being the
+    // cached one — and attaching the handler here is also what keeps it from
+    // surfacing as an unhandled rejection.
+    void opened.catch(() => {
+      if (operatorRecord === opened) operatorRecord = null;
+    });
+    return opened;
   }
 
   // ---- Discovery ---------------------------------------------------------
@@ -450,7 +519,7 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
       codeChallenge: request.codeChallenge,
       scope: request.scope,
       resource: request.resource,
-      sub: operatorUsername,
+      sub: await operatorUsername(),
     });
 
     const target = new URL(request.redirectUri);
@@ -473,12 +542,21 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
    * record now in any case: since the claim-token gate the hash may legitimately
    * be absent, and after the setup wizard there is nothing else to check against.
    *
+   * Resolved per request rather than captured, for the reason `liveOperator`
+   * gives: the wizard creates that record in a process that started without one,
+   * and a captured `undefined` here left the instance it had just claimed
+   * refusing the password it had just been given — on the one screen that tells
+   * the operator `/mcp` needs no restart.
+   *
    * Both halves always run, so a wrong username and a wrong password cost the
    * same and neither can be told from the other by timing or by the message.
    */
-  const operatorUsername = opts.operator?.username ?? config.authUsername;
+  async function operatorUsername(): Promise<string> {
+    return (await liveOperator())?.username ?? config.authUsername;
+  }
   async function verifyOperator(username: string, password: string): Promise<boolean> {
-    if (opts.operator !== undefined) return opts.operator.verify(username, password);
+    const operator = await liveOperator();
+    if (operator !== null) return operator.verify(username, password);
     const nameOk = constantTimeEquals(username, config.authUsername);
     const hash = config.authPasswordHash;
     // No record and no hash: there is nothing to authenticate against. The gate
@@ -640,76 +718,140 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
 
   // ---- Settings UI ---------------------------------------------------------
 
-  // Mounted only when a settings signing key is configured and an operator
-  // record is available. Without both there is nothing the connector would
-  // accept for the mailbox pages, and a half-mounted UI that can list but not
-  // reach them is worse than no UI.
-  if (config.settingsSigningKey !== null && opts.operator) {
-    const settingsDeps = {
-      config,
-      store,
-      operator: opts.operator,
-      throttle,
-      log,
-      upstreamHealth: () => fetchUpstreamHealth(config, log),
-    };
+  // Open only when a settings signing key is configured *and* there is an
+  // operator record to authenticate against. Without both there is nothing the
+  // connector would accept for the mailbox pages, and a half-mounted UI that can
+  // list but not reach them is worse than no UI.
+  //
+  // The key is decided here, once — it comes from the environment and cannot
+  // change in a live process. The record is asked for per request, because it
+  // can: see `liveOperator` above. So the two mounts below are always registered
+  // when there is a key, and each one answers `sendNotFound` — the catch-all's
+  // own responder, byte for byte — until there is a record. That is the same 404
+  // an unmounted path used to fall through to, and it no longer depends on the
+  // claim-token gate in front to be true: an instance with no operator answers
+  // 404 here on its own account.
+  //
+  // What is built lazily is the router and the proxy, together and exactly once,
+  // on the first request that finds a record. Their other dependencies —
+  // `settingsSigningKey`, `throttle`, `log`, the store — are the same objects
+  // the rest of this factory uses, and `throttle` in particular *must* be: it is
+  // the shared bucket the OAuth sign-in above throttles into, and a second
+  // instance would give an attacker two budgets for one credential.
+  if (config.settingsSigningKey !== null) {
     const settingsSigningKey = config.settingsSigningKey;
 
-    app.use("/settings", createSettingsRouter(settingsDeps));
+    /** The two halves of the settings surface, which open together or not at all. */
+    interface SettingsMount {
+      router: express.RequestHandler;
+      mailboxes: express.RequestHandler;
+    }
 
-    // The mailbox management UI itself is served by the connector, not this
-    // service — this is a pure proxy, the same shape as the /mcp one above, with
-    // two differences: it authenticates the caller with the operator's session
-    // cookie instead of a bearer token, and it replaces that cookie with a signed
-    // assertion rather than a static secret, since the claim being made is "this
-    // browser session, right now" rather than "any holder of this credential".
-    //
-    // Mounting requireSession directly ahead of the proxy handler — rather than
-    // going through createSettingsRouter — is what guarantees an unauthenticated
-    // request is answered locally (the sign-in form) and never reaches the
-    // connector at all.
-    //
-    // Note what is deliberately absent here: unlike every state-changing route
-    // in settings-routes.ts, there is no requireCsrf on this mount. That is not
-    // an oversight. This route has no body parser and forwards the request body
-    // to the connector as raw bytes (see proxy.ts's own header on why nothing
-    // here may consume the stream), so this service cannot read a `_csrf` field
-    // out of a form body without destroying exactly the byte-for-byte forwarding
-    // the proxy exists to preserve. CSRF protection for these requests happens
-    // one hop later: the assertion signed below carries this session's own
-    // `csrf` claim, and the connector's own settings router verifies a
-    // submitted `_csrf` field against it (constant-time) before acting on any
-    // state-changing mailbox request. See spec section 3.3.
-    const settingsUpstreamPath = (req: Request): string =>
-      `/settings/mailboxes${req.path === "/" ? "" : req.path}`;
+    let mounted: SettingsMount | null = null;
+    const settingsFor = (operator: OperatorRecord): SettingsMount => {
+      mounted ??= buildSettings(operator);
+      return mounted;
+    };
 
-    const settingsProxy = createProxy({
-      upstreamUrl: config.upstreamMcpUrl,
-      upstreamAuthToken: config.upstreamAuthToken,
-      upstreamPath: settingsUpstreamPath,
-      extraHeaders: (req) => {
-        const session = sessionOf(req);
-        return {
-          [ASSERTION_HEADER]: signAssertion(
-            {
-              sub: session.sub,
-              sid: session.sid,
-              csrf: session.csrf,
-              method: req.method,
-              path: settingsUpstreamPath(req),
-            },
-            settingsSigningKey,
-            config.issuer
-          ),
-        };
-      },
-      log,
-      ...(opts.proxyTimeoutMs !== undefined ? { timeoutMs: opts.proxyTimeoutMs } : {}),
-    });
+    /**
+     * Answer with one half of the settings surface, or with the 404 of an
+     * instance that has no operator. Async only on the one request per process
+     * that has to read the record; every later one resolves an already-settled
+     * promise.
+     */
+    const openWhenClaimed =
+      (half: (mount: SettingsMount) => express.RequestHandler): express.RequestHandler =>
+      (req, res, next) => {
+        const operator = liveOperator();
+        if (operator === null) {
+          sendNotFound(req, res);
+          return;
+        }
+        operator.then((record) => half(settingsFor(record))(req, res, next)).catch(next);
+      };
 
-    app.use("/settings/mailboxes", requireSession(settingsDeps), (req, res) => {
-      settingsProxy(req, res);
-    });
+    app.use("/settings", openWhenClaimed((mount) => mount.router));
+    app.use("/settings/mailboxes", openWhenClaimed((mount) => mount.mailboxes));
+
+    function buildSettings(operator: OperatorRecord): SettingsMount {
+      const settingsDeps = {
+        config,
+        store,
+        operator,
+        throttle,
+        log,
+        upstreamHealth: () => fetchUpstreamHealth(config, log),
+      };
+
+      // The mailbox management UI itself is served by the connector, not this
+      // service — this is a pure proxy, the same shape as the /mcp one above, with
+      // two differences: it authenticates the caller with the operator's session
+      // cookie instead of a bearer token, and it replaces that cookie with a signed
+      // assertion rather than a static secret, since the claim being made is "this
+      // browser session, right now" rather than "any holder of this credential".
+      //
+      // Mounting requireSession directly ahead of the proxy handler — rather than
+      // going through createSettingsRouter — is what guarantees an unauthenticated
+      // request is answered locally (the sign-in form) and never reaches the
+      // connector at all.
+      //
+      // Note what is deliberately absent here: unlike every state-changing route
+      // in settings-routes.ts, there is no requireCsrf on this mount. That is not
+      // an oversight. This route has no body parser and forwards the request body
+      // to the connector as raw bytes (see proxy.ts's own header on why nothing
+      // here may consume the stream), so this service cannot read a `_csrf` field
+      // out of a form body without destroying exactly the byte-for-byte forwarding
+      // the proxy exists to preserve. CSRF protection for these requests happens
+      // one hop later: the assertion signed below carries this session's own
+      // `csrf` claim, and the connector's own settings router verifies a
+      // submitted `_csrf` field against it (constant-time) before acting on any
+      // state-changing mailbox request. See spec section 3.3.
+      const settingsUpstreamPath = (req: Request): string =>
+        `/settings/mailboxes${req.path === "/" ? "" : req.path}`;
+
+      const settingsProxy = createProxy({
+        upstreamUrl: config.upstreamMcpUrl,
+        upstreamAuthToken: config.upstreamAuthToken,
+        upstreamPath: settingsUpstreamPath,
+        extraHeaders: (req) => {
+          const session = sessionOf(req);
+          return {
+            [ASSERTION_HEADER]: signAssertion(
+              {
+                sub: session.sub,
+                sid: session.sid,
+                csrf: session.csrf,
+                method: req.method,
+                path: settingsUpstreamPath(req),
+              },
+              settingsSigningKey,
+              config.issuer
+            ),
+          };
+        },
+        log,
+        ...(opts.proxyTimeoutMs !== undefined ? { timeoutMs: opts.proxyTimeoutMs } : {}),
+      });
+
+      const guardSession = requireSession(settingsDeps);
+      return {
+        router: createSettingsRouter(settingsDeps),
+        // The same two handlers the mount used to register side by side, now
+        // chained by hand because they are handed over as one. An error from the
+        // guard goes to the error handler exactly as Express would have sent it;
+        // anything else it does — the sign-in page — ends the request here,
+        // without the connector ever being asked.
+        mailboxes: (req, res, next) => {
+          guardSession(req, res, (err?: unknown) => {
+            if (err !== undefined) {
+              next(err);
+              return;
+            }
+            settingsProxy(req, res);
+          });
+        },
+      };
+    }
   }
 
   app.use(sendNotFound);
