@@ -18,6 +18,12 @@
  * `isBootstrapped` at the foot of this file for why the token is the half of the
  * pair that decides.
  *
+ * Nor is it "no credential of any kind", quite: a data volume that has already
+ * served traffic and has *lost* its credential is a broken secrets mount rather
+ * than a first boot, and this refuses to start on one instead of minting a claim
+ * token for an instance somebody already configured. `assertFirstBoot` is that
+ * rule, and what counts as a used volume.
+ *
  * In that state the surface is `/health` and `/setup/<token>`, `/mcp` answers
  * 503, the settings UI is not mounted, and everything else — including
  * `/setup/<anything-else>` — is a 404. See {@link Bootstrap} and the gate in
@@ -36,8 +42,12 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { unlink } from "node:fs/promises";
+// The platform's own separator, unlike config.ts's deliberate posix import:
+// these paths are read back off a real filesystem, which on a contributor's
+// machine may be Windows.
+import { basename, dirname, join } from "node:path";
 
 import type { OAuthConfig } from "./config.js";
 import type { Logger } from "./logger.js";
@@ -341,15 +351,108 @@ function defaultWrite(chunk: string): void {
  * and {@link Bootstrap.complete} — which refuses to delete the token before the
  * record exists — is the single moment the two line up and the door shuts.
  *
- * Note what this deliberately does *not* change: an instance with neither a hash
- * nor a record is still a first boot here, whatever else is on the data volume.
- * That is issue #58's question and is left exactly as it was.
+ * The remaining case — neither a hash nor a record — is *not* a first boot on
+ * its own, which is issue #58: see {@link assertFirstBoot}. It is a first boot
+ * only on a data volume that shows no sign of ever having run.
+ *
+ * Throws {@link BootstrapError} rather than returning, in that one case.
  */
 function isBootstrapped(config: OAuthConfig): boolean {
   if (config.operatorFile === null) return true;
   if (config.authPasswordHash !== null) return true;
-  if (!existsSync(config.operatorFile)) return false;
+  if (!existsSync(config.operatorFile)) {
+    assertFirstBoot(config);
+    return false;
+  }
   return !claimTokenPresent(config);
+}
+
+/**
+ * Refuse to read a lost credential as a first boot.
+ *
+ * An instance whose operator never changed their password through the settings
+ * UI and never ran the wizard has **no operator record at all**: it authenticates
+ * from `AUTH_PASSWORD_HASH` alone. For that instance a secrets mount that breaks
+ * in a way yielding `ENOENT` — a renamed host directory, a volume that did not
+ * attach, a `secrets/` path typo after a host migration — looks from here exactly
+ * like a container that has never run. Before the claim-token gate that
+ * misconfiguration was a hard stop; without this check it becomes a boot, a
+ * freshly minted claim token and a setup URL in the log, which is a *storage*
+ * fault silently downgrading a configured instance to an unclaimed one.
+ *
+ * So the volume gets a say. If it holds anything that only a claimed instance
+ * could have put there, a missing hash and a missing record together are a fault
+ * and this refuses to start, naming the file that was expected — the whole point
+ * being that the operator reads a crash rather than a setup banner.
+ *
+ * ## What counts, and what deliberately does not
+ *
+ * The evidence is the **OAuth state file** (see {@link priorUseEvidence}), and
+ * the reason it can be trusted is its timing: nothing writes it at boot.
+ * `Store.open` reads it and, when it is absent, starts empty without creating
+ * anything; the first write comes from a client registration, a refresh session
+ * or a revocation. And `/register` is one of the paths the gate answers 404 to,
+ * so no unclaimed instance can produce one. A state file therefore means an
+ * instance that was claimed and that Claude actually connected to.
+ *
+ * The claim token and the wizard's progress file are the litter of an *unfinished*
+ * setup, not of an instance that has run, so neither counts — that is what keeps a
+ * half-finished wizard bootable. Nor does the claim token excuse prior use the
+ * other way round: an instance already downgraded by a boot under the old rule has
+ * both a token and a state file, and it is exactly the instance this exists for.
+ *
+ * The check is only as good as the volume. `STATE_FILE=none` keeps state in memory
+ * and leaves nothing to find, so such a deployment behaves as it did before.
+ */
+function assertFirstBoot(config: OAuthConfig): void {
+  const evidence = priorUseEvidence(config);
+  if (evidence === null) return;
+
+  const expected =
+    config.authPasswordHashFile == null
+      ? "AUTH_PASSWORD_HASH is not set"
+      : `AUTH_PASSWORD_HASH_FILE names ${config.authPasswordHashFile}, and nothing is there`;
+
+  throw new BootstrapError(
+    `This instance has no operator credential — there is no operator record at ` +
+      `${config.operatorFile}, and ${expected} — but ${evidence} shows the data volume ` +
+      `has been used before. Refusing to start: on a volume that has already served ` +
+      `traffic a missing password hash is a broken secrets mount, not a first boot, and ` +
+      `booting would print a claim-token setup URL for an instance that is already ` +
+      `configured. Restore the secret, or delete ${evidence} if you really do mean to ` +
+      `set this instance up from scratch.`
+  );
+}
+
+/**
+ * The first thing on the data volume that only a claimed instance could have
+ * written, or null on a volume that shows no sign of ever having run.
+ *
+ * The quarantine sibling is not a curiosity. index.ts opens the store *before* it
+ * opens this, and a state file the store cannot parse is renamed to
+ * `<path>.corrupt-<timestamp>` on the way past — so without looking for it, one
+ * unparseable byte would erase the evidence between those two calls and hand a
+ * configured instance back to the claim token.
+ */
+function priorUseEvidence(config: OAuthConfig): string | null {
+  const stateFile = config.stateFile;
+  if (stateFile === null) return null;
+  if (existsSync(stateFile)) return stateFile;
+  return quarantinedStateFile(stateFile);
+}
+
+function quarantinedStateFile(stateFile: string): string | null {
+  const directory = dirname(stateFile);
+  const prefix = `${basename(stateFile)}.corrupt-`;
+  let entries: string[];
+  try {
+    entries = readdirSync(directory);
+  } catch {
+    // No directory at all is the strongest possible evidence of an empty volume.
+    return null;
+  }
+  const found = entries.find((entry) => entry.startsWith(prefix));
+  return found === undefined ? null : join(directory, found);
 }
 
 /** A claim token on disk means setup was started and never finished. */
