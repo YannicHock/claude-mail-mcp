@@ -139,15 +139,9 @@ Three screens:
 2. **First mailbox** — type the address and its password; the settings for that domain are looked up and shown for you to confirm rather than silently applied. If nothing is found you get a provider list, and behind that the full IMAP/SMTP/CalDAV form. IMAP and SMTP are tested against the real server before anything is stored. *Skip for now* is on every one of these screens — mailboxes can be added later from the settings UI.
 3. **The MCP URL** — confirm it is the address the outside world reaches this instance at, and press **Finish**.
 
-Finish deletes the claim token and closes `/setup` permanently. Add the MCP URL as a custom connector in claude.ai — Settings → Connectors → Add custom connector — and it answers immediately; the MCP endpoint needs no restart.
+Finish deletes the claim token and closes `/setup` permanently. Add the MCP URL as a custom connector in claude.ai — Settings → Connectors → Add custom connector — and it answers immediately.
 
-The settings UI does need one. It is mounted when the process starts, and this process started before there was an operator account to mount it against:
-
-```bash
-docker compose restart mail-oauth
-```
-
-Then sign in at `https://<your domain>/settings` to add mailboxes, test credentials, and review or revoke connected Claude clients. The wizard's last screen says all of this too, so you do not need this page open while you work.
+So does the settings UI: nothing needs restarting. Sign in at `https://<your domain>/settings` to add mailboxes, test credentials, and review or revoke connected Claude clients. The wizard's last screen says all of this too, so you do not need this page open while you work.
 
 That is the whole of it. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) covers the reverse proxy in full, what lives on the two data volumes, backups and updating; [`docs/HARDENING.md`](docs/HARDENING.md) covers the threat model and the operator checklist.
 
