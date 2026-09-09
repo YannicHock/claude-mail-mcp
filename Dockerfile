@@ -56,7 +56,7 @@ COPY --from=builder /app/dist ./dist
 #   docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
 # (gid 101, not 100: alpine already ships gid 100 as the "users" group.)
 #
-# No group for the shared `secrets/` directory is baked in here, deliberately.
+# No group for the shared secrets directory is baked in here, deliberately.
 # This image and the OAuth layer's do need one group in common — it is the only
 # reason either can read a secret the other wrote — but the group that decides
 # that is the one owning the directory on the *host*, and any gid compiled into
@@ -68,14 +68,18 @@ COPY --from=builder /app/dist ./dist
 # directory to.
 #
 # So the group is supplied at run time instead: the operator creates one
-# (`groupadd --system mailsecrets`), owns `secrets/` with it, and passes its real
+# (`groupadd --system mailsecrets`), owns `secrets/shared/` and `secrets/oauth/`
+# with it, and passes its real
 # gid as SECRETS_GID, which docker-compose.yml applies to both services with
 # `group_add`. Nothing about it is a build-time constant — see docs/DEPLOYMENT.md
-# step 2. Do not reintroduce a numeric `mailsecrets` here: src/secrets.ts still
-# chowns created files to its own SHARED_SECRET_GID when the process happens to
-# be in that group, so an image-side 105 riding alongside a host-side
-# `group_add` would move each new secret into the *host's* group 105 — the very
-# group this change exists to keep away from them.
+# step 2. Do not reintroduce a numeric `mailsecrets` here: an image-side 105 riding
+# alongside a host-side `group_add` would put the container in the host's group
+# 105 as well — the very group this change exists to keep away from the secrets.
+#
+# (An earlier version of this comment also cited src/secrets.ts chowning created
+# files to its own SHARED_SECRET_GID. That is no longer true — #89 deleted both,
+# because the setgid bit on the directory is the mechanism. The rule above stands
+# on the host-gid argument alone.)
 RUN addgroup -S -g 101 mailmcp \
  && adduser -S -u 100 -G mailmcp mailmcp
 LABEL com.claude-mail-mcp.runtime-uid="100" \

@@ -49,7 +49,7 @@ COPY --from=builder /app/dist ./dist
 # bookkeeping. Keep in sync with docs/DEPLOYMENT.md, and verify with:
 #   docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp-oauth:latest
 #
-# The shared `secrets/` directory is the deliberate exception to that
+# The shared secrets directory is the deliberate exception to that
 # separation, and the group that governs it is *not* baked into this image. It
 # cannot usefully be: the directory lives on the host, and a gid compiled in here
 # is only a guess about a host the image has never seen. Both images used to pin
@@ -59,7 +59,8 @@ COPY --from=builder /app/dist ./dist
 # directory to.
 #
 # The operator creates the group instead (`groupadd --system mailsecrets`), owns
-# `secrets/` with it, and passes its real gid as SECRETS_GID, which
+# `secrets/shared/` and `secrets/oauth/` with it, and passes its real gid as
+# SECRETS_GID, which
 # docker-compose.yml applies to both services with `group_add`. See
 # docs/DEPLOYMENT.md step 2, and the longer note in ../Dockerfile on why an
 # image-side numeric `mailsecrets` must not come back alongside it.
