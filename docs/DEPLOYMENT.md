@@ -389,16 +389,17 @@ docker login ghcr.io   # only if the package isn't public for your account
 docker compose pull
 ```
 
-### 2. Configure `.env`
+### 2. Configure `.env` and the secrets directories
 
 ```bash
 cp .env.docker.example .env
 # edit .env: PUBLIC_URL, LOG_LEVEL
 
-# a group for these secrets and nothing else, and the directory it owns
+# a group for these secrets and nothing else, and the two directories it owns
 sudo groupadd --system mailsecrets
-mkdir -p secrets
-sudo chgrp mailsecrets secrets && sudo chmod 2770 secrets
+mkdir -p secrets/shared secrets/oauth
+sudo chgrp mailsecrets secrets/shared secrets/oauth
+sudo chmod 2770 secrets/shared secrets/oauth
 
 # fill in SECRETS_GID with the gid your host assigned
 sed -i "s/^SECRETS_GID=.*/SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)/" .env
@@ -411,20 +412,54 @@ grep '^SECRETS_GID=' .env
 container cannot discover its own external address, and it cannot know which gid
 your host handed the group you just made. The Bearer token clients send to
 `/mcp`, the OAuth signing key and the settings signing key are **generated on the
-first boot that finds them missing**, into `secrets/`. Read the token back
-afterwards with `cat secrets/auth_token.txt`, or set `AUTH_TOKEN` in `.env`
-before the first start to choose it yourself — either way, the file wins from
-then on and an upgrade never rotates a token out from under a connected client.
+first boot that finds them missing**. Read the token back afterwards with `cat
+secrets/shared/auth_token.txt`, or set `AUTH_TOKEN` in `.env` before the first
+start to choose it yourself — either way, the file wins from then on and an
+upgrade never rotates a token out from under a connected client.
+
+**Two directories, because the two services are not the same audience.** Each is
+mounted only the one it has business with:
+
+| file | lives in | mail-mcp | mail-oauth |
+|------|----------|----------|------------|
+| `auth_token.txt` | `secrets/shared/` | reads, creates | reads, creates |
+| `settings_signing_key.txt` | `secrets/shared/` | reads, creates | reads, creates |
+| `oauth_signing_key.txt` | `secrets/oauth/` | not mounted | reads, creates |
+| `auth_password_hash.txt` | `secrets/oauth/` | not mounted | reads |
+
+`docker-compose.yml` bind-mounts `./secrets/shared` into both services and
+`./secrets/oauth` into `mail-oauth` alone. Up to v0.6 there was one flat
+`./secrets` mounted read-write into both, and the connector's two environment
+variables named only the shared pair while the mount handed it all four: the
+OAuth signing key, which is enough to mint an access token for `/mcp`, and the
+operator's password hash, which is enough to attack offline and then sign in at
+`/authorize` and `/settings`. The connector is the process that parses MIME
+arriving from the public internet. The split is what puts those two out of its
+reach; nothing else in the stack changes.
+
+Confirm it on a running stack — the second command is the one that matters:
+
+```bash
+docker compose exec mail-mcp ls -ln /secrets /secrets/shared
+docker compose exec mail-mcp cat /secrets/oauth/oauth_signing_key.txt
+# → cat: can't open '/secrets/oauth/oauth_signing_key.txt': No such file or directory
+docker compose exec mail-oauth ls -ln /secrets/shared /secrets/oauth
+```
+
+Create both subdirectories yourself before the first `docker compose up`. Docker
+creates a missing bind-mount source on its own, but as `root:root`, mode `755`
+and without the setgid bit — neither container can write in it, and the first
+secret either tries to create fails with `EACCES`.
 
 **Why a group you create rather than a number this page picks.** Both containers
-create files in `secrets/` and they run as different non-root uids — 100 for the
-connector, 102 for the OAuth layer — so they need one group in common. `2770`
-gives that group `rwx` on the directory, and directory write permission is what
-permits `unlink`: every member of the owning group can delete `auth_token.txt`
-and put its own there. Since a present file always wins over a generated one,
-that planted token is the one both services adopt on the next restart. The files
-themselves land at `640` in the same group, so a member can simply read the token
-gating `POST /mcp` instead.
+create files in `secrets/shared` and they run as different non-root uids — 100
+for the connector, 102 for the OAuth layer — so they need one group in common.
+`2770` gives that group `rwx` on the directory, and directory write permission is
+what permits `unlink`: every member of the owning group can delete
+`auth_token.txt` and put its own there. Since a present file always wins over a
+generated one, that planted token is the one both services adopt on the next
+restart. The files themselves land at `640` in the same group, so a member can
+simply read the token gating `POST /mcp` instead.
 
 That is safe only when the group has no members but these two containers, which
 is what `groupadd --system mailsecrets` gives you and what a pre-existing group
@@ -451,19 +486,29 @@ The bare `docker run` shows no shared group at all — correct, and the reason
 `group_add` is not optional. Leave `SECRETS_GID` empty and `docker compose up`
 refuses to start rather than coming up without it.
 
+`secrets/oauth` is owned by the same group, for the same practical reason: the
+OAuth container has to be able to create files there. That group membership is
+*not* what keeps the connector out of it — the mount is. The connector has no
+path to that directory at all, whatever group it is in, which is why one group
+for both directories is enough and a second gid would only be a second thing to
+get wrong.
+
 The **setgid** bit — the `2` in `2770` — is what makes a file created by one
 service land in the directory's group rather than in the creator's own, which is
 what lets the other service read it. `chmod 770` without it leaves the
 connector's file in gid 101 at mode `640`, and the OAuth layer crash-loops on
-`EACCES`. Write the mode correctly: the setgid directory is the only thing
-providing this. The services still carry a best-effort `chown` as a second line
-of defence, but it targets the gid that used to be built into the images, so on a
-current build it never fires and nothing stands behind the setgid bit.
+`EACCES`. Write the mode correctly, on **both** directories: the setgid directory
+is the only thing providing this. The services still carry a best-effort `chown`
+as a second line of defence, but it targets the gid that used to be built into
+the images, so on a current build it never fires and nothing stands behind the
+setgid bit.
 
 `2770` equally means **no account outside that group can write here**, and that
 is not incidental — see the takeover path two paragraphs up. A world-writable
-`secrets/` is not an acceptable shortcut, and neither is reusing a group that
-came with the distribution.
+`secrets/shared` is not an acceptable shortcut, and neither is reusing a group
+that came with the distribution. `secrets/` itself is an ordinary directory owned
+by whoever made it; nothing is mounted from it and no container ever traverses
+it.
 
 Generated files land at mode `640`, owner and group only. `600` is the intuitive
 choice and the one that crash-loops both containers, because neither runtime uid
@@ -472,28 +517,74 @@ on the host the connector's Bearer token.
 
 If you would rather not manage the group at all, create the four files yourself
 instead — nothing is ever generated over a file that already exists, and the
-mount in `docker-compose.yml` can then be made read-only.
+connector's mount in `docker-compose.yml` can then be made read-only (`:ro`). The
+OAuth layer's cannot: it replaces a secret file somebody truncated to nothing,
+and telling "no password hash" from "hash unreadable" depends on that directory
+staying writable.
 
-**Upgrading an install that already ran `chgrp 105`.** Do it in this order, with
-the stack still up; nothing is regenerated and no token changes.
+**Upgrading an existing install.** Two things have changed since v0.6: the group
+is yours rather than gid 105, and `secrets/` is now two directories. Do both in
+this order, with the stack still up. Nothing is regenerated and no token changes.
 
 ```bash
+cd /opt/mail-mcp                       # wherever your docker-compose.yml lives
+
+# 1. the group, if you followed the old `chgrp 105 secrets`
 getent group 105                       # see who you gave the directory to
 sudo groupadd --system mailsecrets
 sudo chgrp -R mailsecrets secrets && sudo chmod 2770 secrets
 sudo chmod 640 secrets/*.txt
 sed -i "s/^SECRETS_GID=.*/SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)/" .env
 grep -q '^SECRETS_GID=' .env || echo "SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)" >> .env
+
+# 2. the split — directories first, then the files, then the restart
+mkdir -p secrets/shared secrets/oauth
+sudo chgrp mailsecrets secrets/shared secrets/oauth
+sudo chmod 2770 secrets/shared secrets/oauth
+for f in auth_token.txt settings_signing_key.txt; do
+  if [ -e "secrets/$f" ]; then sudo mv "secrets/$f" secrets/shared/; fi
+done
+for f in oauth_signing_key.txt auth_password_hash.txt; do
+  if [ -e "secrets/$f" ]; then sudo mv "secrets/$f" secrets/oauth/; fi
+done
+ls -ln secrets secrets/shared secrets/oauth   # mode 640, group mailsecrets, in the right halves
+
 docker compose pull && docker compose up -d
-docker compose exec mail-mcp id        # the new gid must appear in groups=
+docker compose exec mail-mcp id               # the new gid must appear in groups=
+docker compose logs --since 2m | grep '"secret'
+# every line must say "source":"file" — a "generated" here means a file was
+# left behind in the old flat directory and a fresh secret has just replaced it
 ```
+
+A `mv` within one filesystem keeps each file's owner, group and mode, so the four
+arrive in their new directories exactly as they were. Move them **before**
+restarting: a container that starts against an empty `secrets/shared` generates a
+new `auth_token`, and every Claude Desktop client holding the old one starts
+answering 401.
+
+Once the stack is healthy, delete anything still sitting in `secrets/` itself.
+Nothing mounts that directory any more, so a leftover `auth_token.txt` there is
+not the live token however much it looks like one.
 
 If `getent group 105` named a real group, treat the secrets in that directory as
 having been exposed to it: rotate them after the move by deleting
-`secrets/auth_token.txt`, `secrets/oauth_signing_key.txt` and
-`secrets/settings_signing_key.txt` and restarting, then re-enter the new
+`secrets/shared/auth_token.txt`, `secrets/oauth/oauth_signing_key.txt` and
+`secrets/shared/settings_signing_key.txt` and restarting, then re-enter the new
 `auth_token` in any Claude Desktop client. Every OAuth client is logged out and
 re-registers by itself.
+
+**If your host does not run this repository's `docker-compose.yml`** — a stack
+assembled by hand, or one behind a containerised reverse proxy with its own
+compose file — the same change is four environment values and three mount lines,
+applied to whatever file you do run. Make the directories and move the files as
+above, then, in your own compose file:
+
+- `mail-mcp`: replace the `./secrets:/secrets` mount with `./secrets/shared:/secrets/shared`, and repoint `AUTH_TOKEN_FILE` and `SETTINGS_SIGNING_KEY_FILE` at `/secrets/shared/...`
+- `mail-oauth`: replace `./secrets:/secrets` with `./secrets/shared:/secrets/shared` **and** `./secrets/oauth:/secrets/oauth`; repoint `UPSTREAM_AUTH_TOKEN_FILE` and `SETTINGS_SIGNING_KEY_FILE` at `/secrets/shared/...`, `SIGNING_KEY_FILE` and `AUTH_PASSWORD_HASH_FILE` at `/secrets/oauth/...`
+
+Both mounts stay writable, and `group_add` on both services stays as it is. The
+container-side paths are the only thing the images care about; nothing is baked
+into either of them.
 
 ### 3. Create `accounts.json`
 
@@ -574,21 +665,22 @@ The connector's own `/settings` routes are reachable only on the internal Docker
 network, and only with a signed assertion from the OAuth layer — so this step
 assumes the `mail-oauth` service above is running.
 
-**The shared signing key generates itself.** Both services mount the *same* file,
-`secrets/settings_signing_key.txt`, and it is what lets the connector trust that a
-settings request really came from the OAuth layer. Whichever service starts first
-creates it, at mode `640` in the `secrets/` directory's group; there is nothing
-to run.
+**The shared signing key generates itself.** It is one of the two files in
+`secrets/shared/` — the half of the secrets directory both services mount — and
+it is what lets the connector trust that a settings request really came from the
+OAuth layer. Whichever service starts first creates
+`secrets/shared/settings_signing_key.txt`, at mode `640` in that directory's
+group; there is nothing to run.
 
 To supply your own instead, write it before the first start — a file that is already
 there is always used as it stands:
 
 ```bash
-mkdir -p secrets
-sudo chgrp mailsecrets secrets && sudo chmod 2770 secrets   # as in step 2 above
-openssl rand -base64 48 > secrets/settings_signing_key.txt
-sudo chgrp mailsecrets secrets/settings_signing_key.txt
-chmod 640 secrets/settings_signing_key.txt
+mkdir -p secrets/shared
+sudo chgrp mailsecrets secrets/shared && sudo chmod 2770 secrets/shared   # as in step 2 above
+openssl rand -base64 48 > secrets/shared/settings_signing_key.txt
+sudo chgrp mailsecrets secrets/shared/settings_signing_key.txt
+chmod 640 secrets/shared/settings_signing_key.txt
 ```
 
 `chmod 600` here is the mistake that costs an evening: the file is read by two
@@ -598,7 +690,7 @@ error. `mailsecrets` is the group you created in step 2 and that
 `docker-compose.yml` adds to both containers through `SECRETS_GID`.
 
 `secrets/` is already in `.gitignore`. Never commit this file. `docker-compose.yml`
-wires it into both services as `SETTINGS_SIGNING_KEY_FILE=/secrets/settings_signing_key.txt`.
+wires it into both services as `SETTINGS_SIGNING_KEY_FILE=/secrets/shared/settings_signing_key.txt`.
 Unset it on both sides to turn the feature off: the connector then does not mount its
 settings routes and the OAuth layer does not mount the UI — off, not half-on.
 
@@ -606,8 +698,8 @@ Each service logs one line per secret at startup saying whether it read the file
 created it, which is the quickest way to confirm both are on the same one:
 
 ```
-{"level":"info","msg":"secret resolved","secret":"SETTINGS_SIGNING_KEY","source":"generated","path":"/secrets/settings_signing_key.txt"}
-{"level":"info","msg":"secret resolved","secret":"SETTINGS_SIGNING_KEY","source":"file","path":"/secrets/settings_signing_key.txt"}
+{"level":"info","msg":"secret resolved","secret":"SETTINGS_SIGNING_KEY","source":"generated","path":"/secrets/shared/settings_signing_key.txt"}
+{"level":"info","msg":"secret resolved","secret":"SETTINGS_SIGNING_KEY","source":"file","path":"/secrets/shared/settings_signing_key.txt"}
 ```
 
 **Make the data directory writable.** The connector now writes `accounts.json`:
