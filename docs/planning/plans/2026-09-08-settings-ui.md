@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript, Express 5, `jose` (OAuth layer only), `node:crypto`, `node:test` + `tsx`. Server-rendered HTML with inline CSS. No frontend framework, no build step, no JavaScript served to the browser.
 
-**Spec:** `docs/superpowers/specs/2026-09-08-settings-ui-design.md` — read it before Task 1 and keep it open. Every task below cites the section it implements.
+**Spec:** `docs/planning/specs/2026-09-08-settings-ui.md` — read it before Task 1 and keep it open. Every task below cites the section it implements.
 
 ## Global Constraints
 
@@ -3047,7 +3047,7 @@ Drop `:ro` from the connector's volume and explain why the direction reversed:
       # Writable since the settings UI: the connector is the only process that
       # writes accounts.json, and it is the one that already reads the credentials
       # in it. The directory must be writable by uid 100 too, not just the file —
-      # saving renames a temp file into place. See docs/superpowers/specs/
+      # saving renames a temp file into place. See docs/planning/specs/
       # 2026-09-08-settings-ui-design.md §10.
       - ./data:/data
 ```
