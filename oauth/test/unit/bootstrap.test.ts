@@ -21,7 +21,6 @@ import {
   generateClaimToken,
   operatorSeed,
   parseSetupPath,
-  renderSetupPlaceholder,
   setupBanner,
   setupUrlFor,
 } from "../../src/bootstrap.js";
@@ -56,6 +55,7 @@ function configFor(dir: string, overrides: Partial<OAuthConfig> = {}): OAuthConf
     settingsSigningKey: null,
     operatorFile: join(dir, "operator.json"),
     claimTokenFile: join(dir, "claim-token.txt"),
+    wizardStateFile: join(dir, "setup-wizard.json"),
     trustProxy: 1,
     accessTokenTtl: 3600,
     refreshTokenTtl: 2592000,
@@ -144,15 +144,36 @@ describe("what counts as unbootstrapped", () => {
     );
   });
 
-  it("deletes a claim token left on an instance that is already claimed", () => {
+  it("stays unbootstrapped while the claim token is still on the volume", () => {
+    // The trap this rule exists for. Wizard step 1 writes the operator record
+    // with two screens still to go; reading the record alone would mean a
+    // container that restarted at that moment came back deciding it was claimed,
+    // 404ing every /setup path and deleting the token as litter — locking the
+    // operator out of steps 2 and 3 with no way back in.
     const dir = tempDir();
+    const first = Bootstrap.open(configFor(dir), silentLogger);
     writeOperatorRecord(join(dir, "operator.json"));
+
+    const second = Bootstrap.open(configFor(dir), silentLogger);
+
+    assert.equal(second.bootstrapped, false);
+    assert.equal(second.setupUrl, first.setupUrl, "the same token, still live");
+    assert.equal(existsSync(join(dir, "claim-token.txt")), true);
+  });
+
+  it("deletes a claim token left on an instance that was never claimable", () => {
+    // Only the two configurations that are bootstrapped without ever having been
+    // claimed reach this: a configured hash, and OPERATOR_FILE=none. A token
+    // there can open nothing, but it is still a bearer credential in a file.
+    const dir = tempDir();
     const tokenFile = join(dir, "claim-token.txt");
     writeFileSync(tokenFile, "a-stale-bearer-credential\n");
     const { lines, log } = capturingLogger();
 
-    Bootstrap.open(configFor(dir), log);
+    Bootstrap.open(configFor(dir, { authPasswordHash: VALID_HASH }), log);
 
+    // The deletion itself is best-effort and asynchronous; the promise it says
+    // so on is the log line.
     assert.ok(
       lines.some((line) => line.message.includes("discarded the claim token")),
       "says so rather than deleting silently"
@@ -375,15 +396,6 @@ describe("operatorSeed", () => {
     const dir = tempDir();
     writeFileSync(join(dir, "operator.json"), "{ not json");
     assert.equal(operatorSeed(configFor(dir)).passwordHash, "");
-  });
-});
-
-describe("the setup placeholder", () => {
-  it("says the instance is unclaimed and that the wizard is not built yet", () => {
-    const html = renderSetupPlaceholder();
-    assert.match(html, /not been claimed yet/);
-    assert.match(html, /not implemented yet/);
-    assert.match(html, /noindex, nofollow/);
   });
 });
 

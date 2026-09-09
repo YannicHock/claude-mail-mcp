@@ -45,19 +45,25 @@ test("an unclaimed instance answers /health as usual", async () => {
   }
 });
 
-test("an unclaimed instance serves the setup page to the claim token", async () => {
+test("an unclaimed instance serves the wizard to the claim token", async () => {
   const harness = await startHarness({ unbootstrapped: true });
   try {
     assert.ok(harness.setupUrl, "the harness started unbootstrapped");
     assert.ok(harness.setupUrl.startsWith(`${harness.baseUrl}/setup/`));
 
-    const res = await fetch(harness.setupUrl, { redirect: "manual" });
+    // The bare setup URL resumes: it hands the operator whichever screen they
+    // had got to, which on a fresh instance is the first.
+    const entry = await fetch(harness.setupUrl, { redirect: "manual" });
+    assert.equal(entry.status, 302);
+    assert.equal(entry.headers.get("location"), `/setup/${harness.claimToken}/credentials`);
+
+    const res = await fetch(`${harness.setupUrl}/credentials`, { redirect: "manual" });
 
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /text\/html/);
     assert.equal(res.headers.get("cache-control"), "no-store");
     assert.equal(res.headers.get("x-frame-options"), "DENY");
-    assert.match(await res.text(), /not been claimed yet/);
+    assert.match(await res.text(), /Step 1 of 3/);
   } finally {
     await harness.close();
   }
@@ -138,22 +144,41 @@ test("a token that is a prefix or an extension of the real one is refused", asyn
     for (const candidate of [token.slice(0, -1), `${token}x`, token.toUpperCase()]) {
       assert.equal((await get(harness, `/setup/${candidate}`)).status, 404, candidate);
     }
-    assert.equal((await get(harness, `/setup/${token}`)).status, 200, "the real one still works");
+    assert.equal((await get(harness, `/setup/${token}`)).status, 302, "the real one still works");
   } finally {
     await harness.close();
   }
 });
 
-test("a sub-path under a valid token is a 404 until the wizard lands", async () => {
+test("a sub-path the wizard does not serve is the same 404 a wrong token gets", async () => {
+  // Byte for byte from the same responder: a valid token must not be detectable
+  // by the shape of the answer to a path it does not have.
   const harness = await startHarness({ unbootstrapped: true });
   try {
-    assert.equal((await get(harness, `/setup/${harness.claimToken}/mailbox`)).status, 404);
+    const mine = await get(harness, `/setup/${harness.claimToken}/not-a-step`);
+    const wrong = await get(harness, "/setup/definitely-not-the-token/not-a-step");
+
+    assert.equal(mine.status, 404);
+    assert.equal(wrong.status, 404);
+    assert.equal(mine.headers.get("content-type"), wrong.headers.get("content-type"));
+    // The body echoes the path the caller already knows and is otherwise the
+    // same object from the same responder.
+    assert.equal(((await mine.json()) as { error: string }).error, "not_found");
+    assert.equal(((await wrong.json()) as { error: string }).error, "not_found");
+
+    // The entry point resumes rather than accepting anything: it is a redirect
+    // for every method, and no form posts to it.
     const posted = await fetch(`${harness.baseUrl}/setup/${harness.claimToken}`, {
       method: "POST",
+      redirect: "manual",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: "",
     });
-    assert.equal(posted.status, 404, "the placeholder has no form to submit");
+    assert.equal(posted.status, 302);
+    assert.equal(
+      posted.headers.get("location"),
+      `/setup/${harness.claimToken}/credentials`
+    );
   } finally {
     await harness.close();
   }
@@ -170,7 +195,8 @@ test("the setup link survives a restart mid-wizard", async () => {
   const second = await startHarness({ unbootstrapped: true, dataDir: dir });
   try {
     assert.equal(second.claimToken, token);
-    assert.equal((await get(second, `/setup/${token}`)).status, 200);
+    assert.equal((await get(second, `/setup/${token}`)).status, 302);
+    assert.equal((await get(second, `/setup/${token}/credentials`)).status, 200);
   } finally {
     await second.close();
   }
@@ -181,7 +207,7 @@ test("completing setup closes /setup permanently and opens /mcp", async () => {
   const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
   try {
     const token = harness.claimToken ?? "";
-    assert.equal((await get(harness, `/setup/${token}`)).status, 200);
+    assert.equal((await get(harness, `/setup/${token}/credentials`)).status, 200);
     assert.equal((await fetch(`${harness.baseUrl}/mcp`, { method: "POST" })).status, 503);
 
     // What the wizard's last step does, in the order the design fixes: record

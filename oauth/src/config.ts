@@ -93,6 +93,19 @@ export interface OAuthConfig {
    */
   claimTokenFile: string | null;
   /**
+   * Where the setup wizard remembers how far the operator has got. Next to the
+   * claim token, on the same data volume and for the same reason: the operator
+   * may be interrupted between screens, by a reload or by a container restart,
+   * and must come back to the step they left rather than to the first one.
+   *
+   * It holds progress only — never a password, never a hash. Step 1 writes its
+   * credential straight to the operator record, so there is nothing in this file
+   * that would be worth reading. Null means the wizard keeps its progress in
+   * memory for the life of the process, which is what a deployment with no data
+   * volume gets.
+   */
+  wizardStateFile: string | null;
+  /**
    * Number of reverse-proxy hops in front of this service. Determines which
    * X-Forwarded-For entry becomes `req.ip`, and therefore which address the
    * login throttle buckets on and the fail2ban log line names.
@@ -368,6 +381,17 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
   const claimTokenFile =
     claimTokenFileRaw === "" || claimTokenFileRaw === "none" ? null : claimTokenFileRaw;
 
+  // Alongside both of those. The wizard's progress is worth no more than the
+  // claim token it belongs to and is discarded with it, but it has to outlive a
+  // reload and a restart or the operator starts over at step 1 every time.
+  const wizardStateFileRaw = optional(
+    env,
+    "WIZARD_STATE_FILE",
+    stateFile === null ? "" : join(dirname(stateFile), "setup-wizard.json")
+  );
+  const wizardStateFile =
+    wizardStateFileRaw === "" || wizardStateFileRaw === "none" ? null : wizardStateFileRaw;
+
   return {
     port: integer(env, "PORT", 8080),
     host: optional(env, "HOST", "0.0.0.0"),
@@ -383,6 +407,7 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
     settingsSigningKey,
     operatorFile,
     claimTokenFile,
+    wizardStateFile,
     trustProxy: trustProxyHops(env),
     accessTokenTtl: integer(env, "ACCESS_TOKEN_TTL", 3600),
     refreshTokenTtl: integer(env, "REFRESH_TOKEN_TTL", 30 * 24 * 3600),
