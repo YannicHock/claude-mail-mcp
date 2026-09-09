@@ -398,6 +398,40 @@ test("emptying the CalDAV URL without ticking remove is refused and leaves the s
   }
 });
 
+test("a blank CalDAV password comes back marked on its own field", async () => {
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    // The wizard's CalDAV block is optional and renders without `required`, so
+    // a URL and a user with an empty password reach the server routinely. The
+    // 400 has to say which of the eighteen fields is at fault. See issue #83.
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStamp(
+        accountsPath,
+        validForm({
+          id: "work",
+          "caldav.url": "https://caldav.example.invalid/work",
+          "caldav.user": "caldav-user",
+          "caldav.pass": "",
+        })
+      )
+    );
+    assert.equal(res.status, 400);
+
+    const page = await res.text();
+    const at = page.indexOf('name="caldav.pass"');
+    assert.notEqual(at, -1, "the CalDAV password field must be on the re-rendered form");
+    const afterInput = page.slice(page.indexOf(">", at) + 1).trimStart();
+    assert.ok(
+      afterInput.startsWith('<p class="field-error">'),
+      `the CalDAV password field must carry its error, got: ${afterInput.slice(0, 80)}`
+    );
+  } finally {
+    await close();
+  }
+});
+
 test("ticking remove_caldav does remove the stored CalDAV block", async () => {
   const { url, accountsPath, close } = await startConnector();
   try {
