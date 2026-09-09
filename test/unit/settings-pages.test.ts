@@ -129,3 +129,32 @@ test("no javascript: URL appears in any page", () => {
     assert.ok(!/javascript:/i.test(html));
   }
 });
+
+test("a row notice renders against its own row and leaves the others alone", () => {
+  const html = renderMailboxList({
+    csrf: "c",
+    stamp: "1-2",
+    accounts: [sampleAccount("work"), sampleAccount("test")],
+    rowNotices: { test: "Saving this mailbox never persists." },
+  });
+  assert.match(html, /Saving this mailbox never persists\./);
+  // One notice for one affected account, not one per row.
+  assert.equal((html.match(/class="row-notice"/g) ?? []).length, 1);
+});
+
+test("a row notice is escaped like every other value", () => {
+  const html = renderMailboxList({
+    csrf: "c",
+    stamp: "1-2",
+    accounts: [sampleAccount("test")],
+    rowNotices: { test: "<script>alert(1)</script>" },
+  });
+  assert.ok(!html.includes("<script>alert(1)</script>"));
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test("no row notice renders when none applies", () => {
+  const html = renderMailboxList({ csrf: "c", stamp: "1-2", accounts: [sampleAccount("work")] });
+  // Not a bare "row-notice" search: the stylesheet names the class either way.
+  assert.ok(!html.includes(`class="row-notice"`));
+});

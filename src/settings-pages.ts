@@ -54,6 +54,13 @@ export interface MailboxListData {
   stamp: string;
   accounts: Account[];
   notice?: string;
+  /**
+   * Per-account warnings, keyed by account id, rendered under that account's own
+   * row. Passed in rather than derived here so this module stays plain data in,
+   * HTML out — settings-routes.ts, which already knows which ids the routing
+   * cannot serve, decides what a row has to say.
+   */
+  rowNotices?: Record<string, string>;
 }
 
 /** Escape text for interpolation into HTML element content or an attribute. */
@@ -131,6 +138,12 @@ button[name="_action"][value="test"] {
 table { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; }
 th, td { text-align: left; padding: .5rem .4rem; border-bottom: 1px solid
   color-mix(in srgb, CanvasText 15%, transparent); font-size: .9rem; }
+/* A row's notice belongs to the row above it, so the rule between the two is
+   dropped where a browser can express that; where :has is unsupported the
+   notice merely reads as its own row, which is still legible. */
+tr:has(+ tr.row-notice) td { border-bottom: 0; }
+tr.row-notice td { padding-top: 0; font-size: .8rem;
+  color: color-mix(in srgb, #d33 60%, CanvasText); }
 .probe-row { display: flex; justify-content: space-between; gap: 1rem;
   padding: .5rem .7rem; border-radius: 6px; margin-bottom: .5rem; font-size: .9rem;
   background: color-mix(in srgb, CanvasText 6%, Canvas); }
@@ -239,6 +252,12 @@ export function renderMailboxList(opts: MailboxListData): string {
   const rows = opts.accounts
     .map((account) => {
       const editHref = `/settings/mailboxes/${encodeURIComponent(account.id)}`;
+      const rowNotice = opts.rowNotices?.[account.id];
+      // A second row spanning the table rather than a cell inside the first
+      // one: the notice is a sentence, and the four columns are all narrow.
+      const noticeRow = rowNotice
+        ? `\n<tr class="row-notice"><td colspan="4">${escapeHtml(rowNotice)}</td></tr>`
+        : "";
       return `<tr>
   <td>${escapeHtml(account.label)}</td>
   <td><code>${escapeHtml(account.id)}</code></td>
@@ -256,7 +275,7 @@ export function renderMailboxList(opts: MailboxListData): string {
       <button type="submit">Delete</button>
     </form>
   </td>
-</tr>`;
+</tr>${noticeRow}`;
     })
     .join("\n");
 
