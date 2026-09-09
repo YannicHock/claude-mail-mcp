@@ -32,7 +32,7 @@
  *
  * This module is duplicated verbatim as `oauth/src/secrets.ts` in the OAuth
  * layer — the two services are separate npm packages with no shared workspace,
- * the same way `secret()` here and `readSecret()` there already mirror each
+ * the same way `trackedSecret()` here and its namesake there already mirror each
  * other. Change one, change the other: the two must derive byte-identical values
  * from the same file or the settings assertion stops verifying.
  */
@@ -137,6 +137,20 @@ export interface ResolveOptions {
    * a misconfiguration, not something this process can invent.
    */
   generate: boolean;
+  /**
+   * Whether a `NAME_FILE` with nothing behind it is a misconfiguration.
+   * Defaults to true, which is what makes `generate: false` fatal.
+   *
+   * False for `AUTH_PASSWORD_HASH` since the OAuth layer's claim-token gate: a
+   * hash that is not there yet describes an instance nobody has claimed, and
+   * every compose file points `AUTH_PASSWORD_HASH_FILE` at a path in `secrets/`
+   * that a first boot simply has not written. Such a secret resolves to the
+   * inline `NAME`, or to nothing at all, and the caller decides what that means.
+   *
+   * Only for a secret whose absence is a *state*. A `NAME_FILE` that exists and
+   * cannot be read stays fatal under either setting.
+   */
+  required?: boolean;
 }
 
 /**
@@ -162,6 +176,12 @@ export interface ResolveOptions {
  * nothing in it to keep, but there was something there, and an operator who
  * truncated a live secret by accident has to be told rather than left to find
  * out from a token that no longer works.
+ *
+ * `{ generate: false, required: false }` is the one combination that ends at
+ * step 4 with a `NAME_FILE` still set: nothing to read and nothing to write, so
+ * the inline value stands, or nothing does. That is the claim-token gate's
+ * `AUTH_PASSWORD_HASH`, and it is an option here rather than a reader of its own
+ * because "`NAME_FILE` wins over `NAME`" is a rule this module states once.
  */
 export function resolveSecret(
   env: Env,
@@ -170,14 +190,13 @@ export function resolveSecret(
 ): ResolvedSecret {
   const path = trimmed(env[`${name}_FILE`]);
   const inline = trimmed(env[name]);
+  const fromEnvironment = (): ResolvedSecret => ({
+    value: inline,
+    source: inline === undefined ? undefined : "environment",
+    path: null,
+  });
 
-  if (path === undefined) {
-    return {
-      value: inline,
-      source: inline === undefined ? undefined : "environment",
-      path: null,
-    };
-  }
+  if (path === undefined) return fromEnvironment();
 
   const existing = readIfPresent(path, name);
   if (existing !== undefined) return { value: existing, source: "file", path };
@@ -187,6 +206,10 @@ export function resolveSecret(
   const blank = existsSync(path);
 
   if (!options.generate) {
+    // Absence is a state for this secret, and an empty file is an absent one —
+    // the rule at the top of this module, applied here rather than restated.
+    // Nothing is written: the file is the operator's to fill, or to leave.
+    if (options.required === false) return fromEnvironment();
     throw new SecretError(
       blank
         ? `${name}_FILE at ${path} is empty. This secret is never generated — ` +

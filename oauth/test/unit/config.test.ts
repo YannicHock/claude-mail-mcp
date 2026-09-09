@@ -138,6 +138,81 @@ describe("loadConfig", () => {
     });
   });
 
+  describe("a password hash file that holds nothing", () => {
+    // The one thing the layer's two readers disagreed about. The reader this
+    // module used to carry called an empty file "no hash" outright; resolveSecret
+    // calls it an absent file, which is what the rule in ./secrets.ts says and
+    // means the inline value still counts. There is one answer now.
+    it("is an unclaimed instance rather than a boot failure", () => {
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      const path = join(dir, "auth_password_hash.txt");
+      writeFileSync(path, "\n");
+
+      const config = loadConfig(
+        baseEnv({ AUTH_PASSWORD_HASH: undefined, AUTH_PASSWORD_HASH_FILE: path })
+      );
+
+      assert.equal(config.authPasswordHash, null);
+      assert.equal(config.authPasswordHashFile, path);
+      assert.equal(readFileSync(path, "utf8"), "\n", "and is never generated over");
+    });
+
+    it("still lets an inline hash through, exactly as an absent file does", () => {
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      const path = join(dir, "auth_password_hash.txt");
+      writeFileSync(path, "   \n");
+
+      const config = loadConfig(baseEnv({ AUTH_PASSWORD_HASH_FILE: path }));
+
+      assert.equal(config.authPasswordHash, VALID_HASH);
+      assert.equal(
+        config.secretReport.find((entry) => entry.name === "AUTH_PASSWORD_HASH")?.source,
+        "environment"
+      );
+    });
+  });
+
+  describe("plain settings are not secrets", () => {
+    // Routing `optional()` through a secret reader gave every plain setting an
+    // accidental `_FILE` twin: HOST_FILE, STATE_FILE_FILE, MCP_PATH_FILE and the
+    // rest were live, undocumented environment variables that nothing set and
+    // nothing meant. A path is not a secret and has no business being loadable
+    // from a secret file.
+    it("ignores the _FILE twin of a plain setting", () => {
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      const path = join(dir, "not-a-secret.txt");
+      writeFileSync(path, "10.0.0.1\n");
+
+      const config = loadConfig(
+        baseEnv({ HOST_FILE: path, STATE_FILE_FILE: path, MCP_PATH_FILE: path })
+      );
+
+      assert.equal(config.host, "0.0.0.0");
+      assert.equal(config.stateFile, "/data/oauth-state.json");
+      assert.equal(config.mcpPath, "/mcp");
+    });
+
+    it("does not read PUBLIC_URL out of a file either", () => {
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      const path = join(dir, "public-url.txt");
+      writeFileSync(path, "https://mail.example.com\n");
+
+      assert.throws(
+        () => loadConfig(baseEnv({ PUBLIC_URL: undefined, PUBLIC_URL_FILE: path })),
+        (err: unknown) => err instanceof ConfigError && err.message.includes("PUBLIC_URL")
+      );
+    });
+
+    it("names only the variable that is missing, not a file form that is not read", () => {
+      assert.throws(
+        () => loadConfig(baseEnv({ PUBLIC_URL: undefined })),
+        (err: unknown) =>
+          err instanceof ConfigError &&
+          err.message === "Missing required configuration: PUBLIC_URL. See oauth/.env.example."
+      );
+    });
+  });
+
   describe("secrets from files", () => {
     it("reads a value from NAME_FILE", () => {
       const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));

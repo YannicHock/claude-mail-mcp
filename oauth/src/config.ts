@@ -7,6 +7,11 @@
  * credentials out of `docker inspect` output and the process environment, and
  * gives the two services one file each to agree on.
  *
+ * Every *secret* — and nothing else. A port, a path or a log level is plain
+ * configuration, read from the environment and from nowhere else; see `plain()`
+ * below. The `NAME_FILE` rule itself is stated once, in ./secrets.ts, and this
+ * module reads secrets only through it.
+ *
  * Validation is strict and happens at startup. A service that sits in front of
  * live mailboxes should refuse to run misconfigured rather than discover it on
  * the first request.
@@ -20,7 +25,6 @@
  * `AUTH_PASSWORD_HASH` is never generated.
  */
 
-import { readFileSync } from "node:fs";
 // POSIX explicitly: this service only ever runs in a Linux container (see the
 // /data and /secrets paths below), so path math on those literals must stay
 // forward-slashed even when a contributor runs the test suite on Windows.
@@ -146,49 +150,41 @@ export class ConfigError extends Error {}
 type Env = Record<string, string | undefined>;
 
 /**
- * Read a value that may be given inline or as a file path.
+ * A plain configuration value, trimmed, or undefined when it is unset or blank.
  *
- * `NAME_FILE` wins when both are set, and an unreadable `NAME_FILE` is an error
- * rather than a silent fallback to `NAME` — a typo in a secret mount should stop
- * the service, not quietly downgrade it to whatever was in the environment.
+ * Reads the environment and nothing else. Routing these through a secret reader
+ * is what gave every optional setting an accidental `_FILE` twin — `HOST_FILE`,
+ * `STATE_FILE_FILE`, `MCP_PATH_FILE` and the rest were live, undocumented
+ * variables nothing set and nothing meant. A path is not a secret, and has no
+ * business being loadable from a secret file. Secrets go through
+ * {@link resolveSecret} instead, which is where the `NAME_FILE` rule lives.
  */
-function readSecret(env: Env, name: string): string | undefined {
-  const filePath = env[`${name}_FILE`];
-  if (filePath && filePath.trim() !== "") {
-    try {
-      return readFileSync(filePath.trim(), "utf8").trim();
-    } catch (err) {
-      throw new ConfigError(
-        `Cannot read ${name}_FILE at ${filePath.trim()}: ` +
-          (err instanceof Error ? err.message : String(err))
-      );
-    }
-  }
-  const inline = env[name];
-  return inline && inline.trim() !== "" ? inline.trim() : undefined;
+function plain(env: Env, name: string): string | undefined {
+  const value = env[name];
+  return value !== undefined && value.trim() !== "" ? value.trim() : undefined;
 }
 
 function required(env: Env, name: string): string {
-  const value = readSecret(env, name);
+  const value = plain(env, name);
   if (value === undefined) {
-    throw new ConfigError(
-      `Missing required configuration: ${name} (or ${name}_FILE). See oauth/.env.example.`
-    );
+    throw new ConfigError(`Missing required configuration: ${name}. See oauth/.env.example.`);
   }
   return value;
 }
 
 function optional(env: Env, name: string, fallback: string): string {
-  return readSecret(env, name) ?? fallback;
+  return plain(env, name) ?? fallback;
 }
 
 /**
  * Resolve a secret through {@link resolveSecret} and record where it came from.
  *
- * Unlike {@link readSecret} above, an absent `NAME_FILE` here is an instruction
- * to create it rather than an error. Only the three random secrets go through
- * this; everything else `optional()` reads is configuration, not key material,
- * and has nothing meaningful to generate.
+ * The one reader of `NAME_FILE` this module has. What varies between secrets is
+ * {@link ResolveOptions}, not the rule: by default an absent `NAME_FILE` is an
+ * instruction to create it, `generate: false` makes it a misconfiguration, and
+ * `generate: false, required: false` makes it a state the caller interprets.
+ * Everything `optional()` reads is configuration rather than key material and
+ * does not come through here at all.
  */
 function trackedSecret(
   env: Env,
@@ -222,54 +218,6 @@ function requiredSecret(
     );
   }
   return value;
-}
-
-/**
- * Read a secret that is allowed to be missing entirely.
- *
- * Deliberately not {@link trackedSecret} with `generate: false`: that treats an
- * absent `NAME_FILE` as a misconfiguration and throws, which is exactly right for
- * every caller it has and exactly wrong for `AUTH_PASSWORD_HASH` now that a
- * missing hash is a legitimate state rather than a mistake. Every deployment's
- * compose file points `AUTH_PASSWORD_HASH_FILE` at a path in `./secrets`, so on a
- * first boot the file simply is not there yet.
- *
- * Only ENOENT is tolerated. A `NAME_FILE` that exists but cannot be read stays
- * fatal, as it has always been — a permission error on a secret mount must stop
- * the service, not silently downgrade the instance to unclaimed.
- */
-function absentableSecret(
-  env: Env,
-  name: string,
-  report: SecretReportEntry[]
-): string | null {
-  const path = env[`${name}_FILE`]?.trim();
-  const inline = env[name]?.trim();
-
-  if (path !== undefined && path !== "") {
-    let raw: string;
-    try {
-      raw = readFileSync(path, "utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw new ConfigError(
-          `Cannot read ${name}_FILE at ${path}: ` +
-            (err instanceof Error ? err.message : String(err))
-        );
-      }
-      if (inline === undefined || inline === "") return null;
-      report.push({ name, source: "environment", path: null });
-      return inline;
-    }
-    const value = raw.trim();
-    if (value === "") return null;
-    report.push({ name, source: "file", path });
-    return value;
-  }
-
-  if (inline === undefined || inline === "") return null;
-  report.push({ name, source: "environment", path: null });
-  return inline;
 }
 
 function integer(env: Env, name: string, fallback: number): number {
@@ -346,10 +294,20 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
   // deployment, and the wizard sets it through OperatorRecord instead. Absent is
   // allowed and means "nobody has configured this instance yet" — see
   // bootstrap.ts. Present but malformed stays fatal: that is a typo, not a state.
-  const authPasswordHash = absentableSecret(env, "AUTH_PASSWORD_HASH", secretReport);
-  // Deliberately read straight from the environment rather than out of
-  // absentableSecret: what matters here is the path that was *configured*, which
-  // is exactly the thing that survives the file going away.
+  //
+  // `required: false` is what says so. `generate: false` on its own treats an
+  // absent `NAME_FILE` as a misconfiguration and throws, which is right for
+  // every other never-generated secret and wrong for this one: every compose
+  // file points AUTH_PASSWORD_HASH_FILE at a path in ./secrets that a first boot
+  // has not written yet. A file that exists and cannot be *read* is still fatal.
+  const authPasswordHash =
+    trackedSecret(env, "AUTH_PASSWORD_HASH", secretReport, {
+      generate: false,
+      required: false,
+    }) ?? null;
+  // Deliberately read straight from the environment rather than out of the
+  // resolver: what matters here is the path that was *configured*, which is
+  // exactly the thing that survives the file going away.
   const authPasswordHashFileRaw = env.AUTH_PASSWORD_HASH_FILE?.trim();
   const authPasswordHashFile =
     authPasswordHashFileRaw === undefined || authPasswordHashFileRaw === ""
@@ -501,13 +459,4 @@ function normaliseMcpPath(value: string): string {
   if (trimmed === "" || trimmed === "/") return "";
   const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
   return withLeadingSlash.replace(/\/+$/, "");
-}
-
-/**
- * The path segment appended to /.well-known/oauth-protected-resource for the
- * path-suffixed variant Claude probes first. Empty when the MCP endpoint sits at
- * the origin root, in which case only the bare well-known path applies.
- */
-export function wellKnownSuffix(mcpPath: string): string {
-  return mcpPath;
 }
