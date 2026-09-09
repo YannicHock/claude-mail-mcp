@@ -17,26 +17,49 @@ import { escapeHtml } from "./login.js";
 import { CSRF_FIELD } from "./session.js";
 
 /**
- * Response headers every settings page sets.
+ * The response headers every operator-facing HTML page in this service sets.
  *
- * The same set the sign-in page in login.ts uses, for the same reasons: these pages
- * carry a CSRF token and take a password, must not be cached anywhere, and have no
- * reason to be framed. The CSP allows inline styles and nothing else — in
- * particular no script, which is why every interaction here is a form submission.
+ * One function rather than one literal per page, because these pages differ in
+ * exactly one header and agree on the other three. The settings pages, the setup
+ * wizard and the /authorize consent screen all carry a CSRF token or a request
+ * token, all take a password, must none of them be cached anywhere, and have
+ * none of them any reason to be framed. Only the CSP differs — the consent
+ * screen has to widen `form-action` to the redirect allowlist, because
+ * submitting it hands off to the client — so the CSP is the parameter and the
+ * rest is fixed.
+ *
+ * Before this was a function the set was written out three times: here, in the
+ * connector's own src/settings-pages.ts, and inline in `sendLoginPage()` in
+ * app.ts. The consent screen's copy was outside every test, which is how it
+ * came to be the page 0.6.1 and 0.6.2 were both about.
  */
-export const SETTINGS_HEADERS: Record<string, string> = {
-  "Cache-Control": "no-store",
-  "X-Frame-Options": "DENY",
-  "Content-Security-Policy":
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
-  // same-origin, not no-referrer. These pages submit forms back to this origin,
-  // and the POST handlers verify the request came from here with isSameOrigin(),
-  // which reads Origin and falls back to Referer. Chrome does not send Origin on
-  // a same-origin form POST, so no-referrer left the check with neither header
-  // and refused every browser sign-in. same-origin still withholds the referrer
-  // from any cross-origin destination, which is the property that matters.
-  "Referrer-Policy": "same-origin",
-};
+export function pageHeaders(csp: string): Record<string, string> {
+  return {
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": csp,
+    // same-origin, not no-referrer. These pages submit forms back to this origin,
+    // and the POST handlers verify the request came from here with isSameOrigin(),
+    // which reads Origin and falls back to Referer. Chrome does not send Origin on
+    // a same-origin form POST, so no-referrer left the check with neither header
+    // and refused every browser sign-in. same-origin still withholds the referrer
+    // from any cross-origin destination, which is the property that matters.
+    "Referrer-Policy": "same-origin",
+  };
+}
+
+/**
+ * The CSP for a page whose forms only ever post back here.
+ *
+ * Allows inline styles and nothing else — in particular no script, which is why
+ * every interaction on these pages is a form submission. The consent screen
+ * builds its own instead; see `loginCsp` in app.ts.
+ */
+export const SETTINGS_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
+
+/** The header set the settings pages, and by extension the wizard, are served with. */
+export const SETTINGS_HEADERS: Record<string, string> = pageHeaders(SETTINGS_CSP);
 
 /** Hidden CSRF input. Every state-changing form gets exactly this. */
 function csrfField(csrf: string): string {

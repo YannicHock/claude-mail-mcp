@@ -2,12 +2,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  SETTINGS_CSP,
   SETTINGS_HEADERS,
+  pageHeaders,
   renderClients,
   renderOverview,
   renderPasswordChange,
   renderSettingsSignIn,
 } from "../../src/settings-pages.js";
+
+// These two cases read the constant, which proves only what the constant says.
+// That the values reach a browser is the subject of
+// test/integration/page-headers.test.ts, and the two are not interchangeable.
 
 test("every page declares the strict content security policy and no framing", () => {
   assert.equal(
@@ -20,6 +26,21 @@ test("every page declares the strict content security policy and no framing", ()
   // and Chrome sends no Origin header on a same-origin form POST. no-referrer
   // removed the only remaining signal and made browser sign-in impossible.
   assert.equal(SETTINGS_HEADERS["Referrer-Policy"], "same-origin");
+});
+
+test("pageHeaders varies the CSP and nothing else", () => {
+  // The property the consent screen depends on: it passes a wider form-action
+  // and must still get the same cache, framing and referrer rules as every
+  // other page. A `pageHeaders` that quietly relaxed one of those for a
+  // non-default CSP would be invisible to the case above.
+  const consent = pageHeaders("default-src 'none'; form-action 'self' https://claude.ai");
+
+  assert.equal(consent["Content-Security-Policy"], "default-src 'none'; form-action 'self' https://claude.ai");
+  for (const name of ["Cache-Control", "X-Frame-Options", "Referrer-Policy"]) {
+    assert.equal(consent[name], SETTINGS_HEADERS[name], `${name} must not depend on the CSP`);
+  }
+  assert.deepEqual(Object.keys(consent), Object.keys(SETTINGS_HEADERS));
+  assert.deepEqual(pageHeaders(SETTINGS_CSP), SETTINGS_HEADERS);
 });
 
 test("no page carries a script tag or an inline handler", () => {

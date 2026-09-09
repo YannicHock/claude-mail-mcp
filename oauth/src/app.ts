@@ -39,6 +39,7 @@ import type { OperatorRecord } from "./operator.js";
 import { constantTimeEquals, verifyPassword } from "./passwords.js";
 import { CODE_CHALLENGE_METHOD, isValidCodeChallenge, verifyChallenge } from "./pkce.js";
 import { createProxy } from "./proxy.js";
+import { pageHeaders } from "./settings-pages.js";
 import {
   createSettingsRouter,
   requireSession,
@@ -786,15 +787,13 @@ function sendLoginPage(
   res
     .status(status)
     .type("html")
-    // The sign-in page carries a request token and takes a password; it must not
-    // be cached anywhere, and it has no reason to be framed by anything.
-    .set("Cache-Control", "no-store")
-    .set("X-Frame-Options", "DENY")
-    .set("Content-Security-Policy", csp)
-    // same-origin rather than no-referrer: this page POSTs back to /authorize,
-    // which checks isSameOrigin(). Chrome sends no Origin on a same-origin form
-    // POST, so no-referrer left that check with nothing to read.
-    .set("Referrer-Policy", "same-origin")
+    // The same set the settings pages and the wizard are served with, differing
+    // only in the CSP the caller passes: the consent screen carries a request
+    // token and takes a password, must not be cached anywhere, and has no reason
+    // to be framed by anything. Written out inline here until #61 — which is how
+    // this page, the one the operator actually types a password into, ended up
+    // outside every guard covering the identical set next door.
+    .set(pageHeaders(csp))
     .send(renderLoginPage(options));
 }
 
