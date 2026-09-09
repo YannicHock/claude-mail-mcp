@@ -56,7 +56,14 @@ export type TokenFailure =
   | "invalid_token"
   | "expired_token"
   | "wrong_audience"
-  | "wrong_use";
+  | "wrong_use"
+  /**
+   * The refresh session this token was minted under has been revoked. Its own
+   * reason rather than a reuse of `invalid_token`, so the operator who pressed the
+   * button can see it working in the logs, and so a revoked session is never read
+   * as a stale epoch or a bad signature.
+   */
+  | "revoked_session";
 
 export type VerifyResult<T> =
   | { ok: true; claims: T }
@@ -144,6 +151,11 @@ export class TokenIssuer {
       client_id: claims.clientId,
       scope: claims.scope,
       epoch: this.#store.tokenEpoch,
+      // The same `sid` the refresh token carries, so verification can ask whether
+      // this token's session is still open. Rotation reuses the sid, so an access
+      // token minted by a refresh stays bound to the session the operator sees
+      // listed — and revokes — on /settings/clients.
+      sid,
     })
       .setProtectedHeader({ alg: ALGORITHM, typ: "JWT" })
       .setIssuer(this.#issuer)
@@ -195,9 +207,10 @@ export class TokenIssuer {
     const result = await this.#verify(token, "access", expectedAudience);
     if (!result.ok) return result;
 
-    // A stateless token cannot be withdrawn, so revocation is expressed as two
-    // comparisons instead. Without them "revoke" would mean "stops refreshing, keeps
-    // working for up to an hour", which is not what the button says.
+    // A stateless token cannot be withdrawn, so revocation is expressed as three
+    // comparisons instead — one per revoke button the settings UI offers. Without
+    // them "revoke" would mean "stops refreshing, keeps working for up to an hour",
+    // which is not what the buttons say.
     const epoch = Number.isFinite(result.payload.epoch)
       ? (result.payload.epoch as number)
       : 0;
@@ -213,6 +226,23 @@ export class TokenIssuer {
     ) {
       return { ok: false, reason: "invalid_token" };
     }
+
+    // Revoking one session deletes the session record and nothing else: no epoch
+    // bump, and no `revokedAt` on the client, because the client's other sessions
+    // have to survive. The `sid` claim is the only thing left to compare against.
+    const sid = result.payload.sid;
+    if (typeof sid === "string" && sid !== "") {
+      // In memory: the Store holds its whole state as one object and touches the
+      // disk only when it writes, so this is a property read on the verify path
+      // rather than a file read on every proxied MCP request.
+      if (this.#store.getSession(sid) === undefined) {
+        return { ok: false, reason: "revoked_session" };
+      }
+    }
+    // A token carrying no `sid` at all predates the claim, and is tolerated for
+    // the same reason a missing `epoch` is: refusing it would sign every connected
+    // client out on upgrade. The window is one access-token lifetime, after which
+    // no token without the claim can still be alive.
 
     return { ok: true, claims: result.claims };
   }

@@ -828,6 +828,8 @@ function describeTokenFailure(reason: string): string {
       return "The access token was not issued for this resource.";
     case "wrong_use":
       return "A refresh token cannot be used as a bearer credential.";
+    case "revoked_session":
+      return "The session this access token belongs to has been revoked.";
     default:
       return "The access token is invalid.";
   }
