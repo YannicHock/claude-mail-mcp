@@ -23,7 +23,8 @@ import {
   renderOverview,
   renderPasswordChange,
   renderSettingsSignIn,
-  SETTINGS_HEADERS,
+  sendPage,
+  sendRedirect,
 } from "./settings-pages.js";
 import {
   CSRF_FIELD,
@@ -59,26 +60,25 @@ export interface SettingsDeps {
   }>;
 }
 
+// Every response this file produces goes out through `sendPage` or
+// `sendRedirect` from settings-pages.ts. The header set used to be chained on by
+// hand at each of the thirteen sites below, which is the arrangement that let
+// the /authorize error page ship without it (#80).
+
 function sendSignIn(res: Response, status: number, error?: string): void {
-  res
-    .status(status)
-    .type("html")
-    .set(SETTINGS_HEADERS)
-    .send(renderSettingsSignIn(error !== undefined ? { error } : {}));
+  sendPage(res, status, renderSettingsSignIn(error !== undefined ? { error } : {}));
 }
 
 function sendForbidden(res: Response): void {
-  res
-    .status(403)
-    .type("html")
-    .set(SETTINGS_HEADERS)
-    .send(
-      renderErrorPage(
-        "Request blocked",
-        "This form submission did not come from this site, or its session is no longer valid. " +
-          "Start again from the beginning."
-      )
-    );
+  sendPage(
+    res,
+    403,
+    renderErrorPage(
+      "Request blocked",
+      "This form submission did not come from this site, or its session is no longer valid. " +
+        "Start again from the beginning."
+    )
+  );
 }
 
 /**
@@ -176,7 +176,7 @@ function hostOf(uri: string): string {
 }
 
 function redirectToClients(res: Response): void {
-  res.status(303).set(SETTINGS_HEADERS).set("Location", "/settings/clients").end();
+  sendRedirect(res, 303, "/settings/clients");
 }
 
 export function createSettingsRouter(deps: SettingsDeps): express.Router {
@@ -194,22 +194,20 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
   router.get("/", guardSession, async (req, res) => {
     const session = sessionOf(req);
     const health = await upstreamHealth();
-    res
-      .status(200)
-      .type("html")
-      .set(SETTINGS_HEADERS)
-      .send(
-        renderOverview({
-          csrf: session.csrf,
-          username: session.sub,
-          connectorReachable: health.reachable,
-          connectorVersion: health.version,
-          mailboxes: health.mailboxes,
-          clientCount: Object.keys(store.clients).length,
-          sessionCount: Object.keys(store.sessions).length,
-          canChangePassword: operator.canChangePassword,
-        })
-      );
+    sendPage(
+      res,
+      200,
+      renderOverview({
+        csrf: session.csrf,
+        username: session.sub,
+        connectorReachable: health.reachable,
+        connectorVersion: health.version,
+        mailboxes: health.mailboxes,
+        clientCount: Object.keys(store.clients).length,
+        sessionCount: Object.keys(store.sessions).length,
+        canChangePassword: operator.canChangePassword,
+      })
+    );
   });
 
   router.post("/login", formBody, async (req, res) => {
@@ -257,12 +255,8 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
     // defence. No cookie exists before this point in the flow.
     const claims = newSession(operator.username, operator.sessionEpoch);
     const token = await signSession(claims, key, config.issuer);
-    res
-      .status(303)
-      .set(SETTINGS_HEADERS)
-      .set("Set-Cookie", sessionCookie(token))
-      .set("Location", "/settings")
-      .end();
+    res.set("Set-Cookie", sessionCookie(token));
+    sendRedirect(res, 303, "/settings");
   });
 
   router.post("/logout", formBody, guardSession, guardCsrf, async (req, res) => {
@@ -270,12 +264,8 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
     if (body.all === "1") {
       await operator.bumpSessionEpoch();
     }
-    res
-      .status(303)
-      .set(SETTINGS_HEADERS)
-      .set("Set-Cookie", clearedSessionCookie())
-      .set("Location", "/settings")
-      .end();
+    res.set("Set-Cookie", clearedSessionCookie());
+    sendRedirect(res, 303, "/settings");
   });
 
   // ---- Connected clients -------------------------------------------------
@@ -297,11 +287,7 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
       scope: refreshSession.scope,
       expiresAt: refreshSession.exp,
     }));
-    res
-      .status(200)
-      .type("html")
-      .set(SETTINGS_HEADERS)
-      .send(renderClients({ csrf: session.csrf, clients, sessions }));
+    sendPage(res, 200, renderClients({ csrf: session.csrf, clients, sessions }));
   });
 
   // One route per action, matching exactly the form actions settings-pages.ts
@@ -328,17 +314,15 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
 
   router.get("/password", guardSession, (req, res) => {
     const session = sessionOf(req);
-    res
-      .status(200)
-      .type("html")
-      .set(SETTINGS_HEADERS)
-      .send(
-        renderPasswordChange(
-          operator.canChangePassword
-            ? { csrf: session.csrf }
-            : { csrf: session.csrf, disabledReason: "OPERATOR_FILE is set to none" }
-        )
-      );
+    sendPage(
+      res,
+      200,
+      renderPasswordChange(
+        operator.canChangePassword
+          ? { csrf: session.csrf }
+          : { csrf: session.csrf, disabledReason: "OPERATOR_FILE is set to none" }
+      )
+    );
   });
 
   router.post("/password", formBody, guardSession, guardCsrf, async (req, res) => {
@@ -347,16 +331,14 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
 
     // 1. A file-less operator record cannot be written to at all.
     if (!operator.canChangePassword) {
-      res
-        .status(409)
-        .type("html")
-        .set(SETTINGS_HEADERS)
-        .send(
-          renderPasswordChange({
-            csrf: session.csrf,
-            disabledReason: "OPERATOR_FILE is set to none",
-          })
-        );
+      sendPage(
+        res,
+        409,
+        renderPasswordChange({
+          csrf: session.csrf,
+          disabledReason: "OPERATOR_FILE is set to none",
+        })
+      );
       return;
     }
 
@@ -369,16 +351,14 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
         endpoint: "settings-password",
       });
       res.set("Retry-After", String(retryAfter));
-      res
-        .status(429)
-        .type("html")
-        .set(SETTINGS_HEADERS)
-        .send(
-          renderPasswordChange({
-            csrf: session.csrf,
-            error: `Too many failed attempts. Try again in ${Math.ceil(retryAfter / 60)} minute(s).`,
-          })
-        );
+      sendPage(
+        res,
+        429,
+        renderPasswordChange({
+          csrf: session.csrf,
+          error: `Too many failed attempts. Try again in ${Math.ceil(retryAfter / 60)} minute(s).`,
+        })
+      );
       return;
     }
 
@@ -396,11 +376,11 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
       // Fixed shape: this line is the deployment API for an external
       // fail2ban-style jail (see docs/HARDENING.md); do not change it casually.
       log("warn", LOGIN_FAILURE_EVENT, { ip, endpoint: "settings-password" });
-      res
-        .status(401)
-        .type("html")
-        .set(SETTINGS_HEADERS)
-        .send(renderPasswordChange({ csrf: session.csrf, error: "Incorrect current password." }));
+      sendPage(
+        res,
+        401,
+        renderPasswordChange({ csrf: session.csrf, error: "Incorrect current password." })
+      );
       return;
     }
 
@@ -430,11 +410,7 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
       confirmation: confirmPassword,
     }).filter((problem) => problem.field !== "username");
     if (problems.length > 0) {
-      res
-        .status(400)
-        .type("html")
-        .set(SETTINGS_HEADERS)
-        .send(renderPasswordChange({ csrf: session.csrf, problems }));
+      sendPage(res, 400, renderPasswordChange({ csrf: session.csrf, problems }));
       return;
     }
 
@@ -450,12 +426,8 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
     }
 
     // 7. Back to the sign-in form.
-    res
-      .status(303)
-      .set(SETTINGS_HEADERS)
-      .set("Set-Cookie", clearedSessionCookie())
-      .set("Location", "/settings")
-      .end();
+    res.set("Set-Cookie", clearedSessionCookie());
+    sendRedirect(res, 303, "/settings");
   });
 
   return router;

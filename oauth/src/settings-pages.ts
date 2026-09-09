@@ -7,11 +7,20 @@
  * oversight — see docs/HARDENING.md — and it is why these functions take plain data
  * and return a string, with no DOM, no template engine and no build step involved.
  *
- * These functions are pure: no I/O, no Express. The routes in settings-routes.ts
- * that call them are responsible for authentication, CSRF verification and
- * talking to the connector; this file only ever turns already-validated data
- * into markup.
+ * The render functions here are pure: no I/O, no state. The routes in
+ * settings-routes.ts that call them are responsible for authentication, CSRF
+ * verification and talking to the connector; those functions only ever turn
+ * already-validated data into markup.
+ *
+ * The exception, and the only one, is the pair at the top — `sendPage` and
+ * `sendRedirect`. They exist because "send an HTML page with this service's
+ * headers" had no home: the header set was chained onto `res` by hand at every
+ * send site in three route modules, and the one site that forgot was invisible
+ * (#80). They take Express's `Response` as a type only, so this module still
+ * imports nothing at runtime beyond its siblings.
  */
+
+import type { Response } from "express";
 
 import { escapeHtml } from "./login.js";
 import {
@@ -65,6 +74,45 @@ export const SETTINGS_CSP =
 
 /** The header set the settings pages, and by extension the wizard, are served with. */
 export const SETTINGS_HEADERS: Record<string, string> = pageHeaders(SETTINGS_CSP);
+
+/**
+ * Send an HTML page with this service's headers. The only way to send one.
+ *
+ * `pageHeaders()` gave the *values* one home in #61 and the defect it was aimed
+ * at survived it: `respondWithErrorPage()` in app.ts sat two lines above the
+ * function #61 fixed, chained `.status().type().send()` without the `.set()`,
+ * and served all six /authorize error pages with no cache, framing, CSP or
+ * referrer rule at all. A constant cannot be forgotten *at the send site*; a
+ * function that does the sending can only be forgotten by not calling it, which
+ * is a route that renders nothing.
+ *
+ * The CSP defaults to {@link SETTINGS_CSP}, the strict one. A page that needs a
+ * wider `form-action` passes it — today that is the /authorize consent screen
+ * and nothing else, because it is the only page whose form submits somewhere
+ * other than back here.
+ */
+export function sendPage(
+  res: Response,
+  status: number,
+  html: string,
+  csp: string = SETTINGS_CSP
+): void {
+  res.status(status).type("html").set(pageHeaders(csp)).send(html);
+}
+
+/**
+ * Send a redirect with the same headers.
+ *
+ * A 303 back to a page carries no body, but it does carry `Set-Cookie` at three
+ * of its call sites — a session issued, a session cleared — and `Cache-Control:
+ * no-store` on that response is the reason a shared cache cannot replay it.
+ * Anything else the route wants on the response (`Set-Cookie`, `Retry-After`)
+ * goes on with its own `res.set()` before this call; `.set()` merges, so order
+ * does not matter.
+ */
+export function sendRedirect(res: Response, status: number, location: string): void {
+  res.status(status).set(SETTINGS_HEADERS).set("Location", location).end();
+}
 
 /** Hidden CSRF input. Every state-changing form gets exactly this. */
 function csrfField(csrf: string): string {

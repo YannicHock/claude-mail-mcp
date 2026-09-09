@@ -20,18 +20,32 @@
  * submitting that form hands the browser off to the client. Everything else is
  * identical, and now identical by construction: all of it comes from
  * `pageHeaders()` in settings-pages.ts.
+ *
+ * #80 is why the second half of this file exists. #61 fixed `sendLoginPage()`
+ * and did not notice `respondWithErrorPage()` two lines above it — the same
+ * defect, in the same file, surviving the fix aimed at it — and nothing here
+ * could see that, because every case above reaches a page that renders a *form*.
+ * The six /authorize refusals render an error page instead; they went out with
+ * no `Cache-Control`, no `X-Frame-Options`, no CSP and no `Referrer-Policy`, and
+ * nothing in this package ever asked. So: one case per error-page entry point,
+ * written out by hand, so that a seventh added later has a visibly empty slot
+ * next to it.
  */
 
 import { strict as assert } from "node:assert";
 import { after, before, describe, it } from "node:test";
 
 import {
+  CLAUDE_CALLBACK,
   TEST_PASSWORD,
   TEST_USERNAME,
   getAuthorizePage,
   getClients,
   getSettings,
+  makePkce,
   postAuthorizeForm,
+  registerClaudeClient,
+  signInWith,
   startHarness,
   type Harness,
 } from "../helpers/harness.js";
@@ -150,5 +164,135 @@ describe("the consent screen and the settings pages differ only in the CSP", () 
       settings.headers.get("content-security-policy"),
       "the consent screen needs a wider form-action; if these are equal, one of them is wrong"
     );
+  });
+});
+
+// ---- The error pages ------------------------------------------------------
+
+/**
+ * GET /authorize with a valid PKCE pair and whatever else the caller says.
+ *
+ * An empty value deletes the parameter, which is how the two "missing" cases
+ * below are built: an absent `client_id` and an absent `redirect_uri` are
+ * separate refusals in separate branches, and a helper that always sent both
+ * would reach neither.
+ */
+async function getAuthorizeWith(params: Record<string, string>): Promise<Response> {
+  const url = new URL(`${harness.baseUrl}/authorize`);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("code_challenge", makePkce().challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  for (const [name, value] of Object.entries(params)) {
+    if (value === "") url.searchParams.delete(name);
+    else url.searchParams.set(name, value);
+  }
+  return fetch(url, { redirect: "manual" });
+}
+
+/** A client registered the way Claude's hosted surfaces register one. */
+async function registeredClientId(): Promise<string> {
+  const registration = await registerClaudeClient(harness.baseUrl);
+  return registration.body.client_id as string;
+}
+
+/**
+ * One case per way to reach `respondWithErrorPage()` in app.ts.
+ *
+ * They carry the *strict* CSP, not the consent screen's, and asserting that is a
+ * real claim rather than a formality. The consent screen widens `form-action` to
+ * the redirect allowlist because submitting it redirects the browser to the
+ * client and Chrome enforces `form-action` against the redirect target too;
+ * `renderErrorPage()` contains no `<form>` at all, so there is nothing for the
+ * wider value to permit. An error page arriving with `https://claude.ai` in its
+ * `form-action` would be granting a permission it has no use for, and `SELF_CSP`
+ * below fails on it.
+ *
+ * Each case matches the rendered title as well as the status, because four of
+ * the six are 400s out of the same handler and a 400 from the wrong branch would
+ * otherwise pass for the one under test.
+ */
+describe("every /authorize refusal that renders a page serves the whole header set", () => {
+  it("does on a missing client_id", async () => {
+    const res = await getAuthorizeWith({ redirect_uri: CLAUDE_CALLBACK });
+    assert.equal(res.status, 400);
+    assert.match(await res.text(), /Invalid request/);
+    assertHeaders(res, SELF_CSP, "the missing-client_id error page");
+  });
+
+  it("does on an unknown client", async () => {
+    const res = await getAuthorizeWith({
+      client_id: "never-registered",
+      redirect_uri: CLAUDE_CALLBACK,
+    });
+    assert.equal(res.status, 400);
+    assert.match(await res.text(), /Unknown client/);
+    assertHeaders(res, SELF_CSP, "the unknown-client error page");
+  });
+
+  it("does on a missing redirect_uri", async () => {
+    const res = await getAuthorizeWith({ client_id: await registeredClientId() });
+    assert.equal(res.status, 400);
+    assert.match(await res.text(), /Invalid request/);
+    assertHeaders(res, SELF_CSP, "the missing-redirect_uri error page");
+  });
+
+  it("does on a redirect_uri the client never registered", async () => {
+    // The refusal that must not redirect: sending an OAuth error to an
+    // unvalidated URI is the open redirect the ordering in app.ts exists to
+    // prevent, so this branch renders a page — and this is that page.
+    const res = await getAuthorizeWith({
+      client_id: await registeredClientId(),
+      redirect_uri: "https://evil.example.com/steal",
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.headers.get("location"), null);
+    assert.match(await res.text(), /Invalid redirect URI/);
+    assertHeaders(res, SELF_CSP, "the unregistered-redirect_uri error page");
+  });
+
+  it("does on a POST the origin check refuses", async () => {
+    const res = await postAuthorizeForm(harness, TEST_USERNAME, TEST_PASSWORD, {
+      headers: { Origin: "https://evil.example.com" },
+    });
+    assert.equal(res.status, 403);
+    assert.match(await res.text(), /Request blocked/);
+    assertHeaders(res, SELF_CSP, "the origin-check refusal");
+  });
+
+  it("does on a request token that is no longer valid", async () => {
+    // The one an operator reaches by leaving a tab open rather than by attacking
+    // anything, and it names the client they were connecting. `no-store` on it is
+    // what keeps that out of a shared cache.
+    const res = await fetch(`${harness.baseUrl}/authorize`, {
+      method: "POST",
+      redirect: "manual",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Origin: harness.baseUrl,
+      },
+      body: new URLSearchParams({
+        request: "not.a.real.token",
+        username: TEST_USERNAME,
+        password: TEST_PASSWORD,
+      }),
+    });
+    assert.equal(res.status, 400);
+    assert.match(await res.text(), /Session expired/);
+    assertHeaders(res, SELF_CSP, "the expired-request-token error page");
+  });
+});
+
+describe("the settings layer's error page serves it too", () => {
+  it("does on a sign-in POST the origin check refuses", async () => {
+    // The same `renderErrorPage()` output, reached through a different route
+    // module's send helper. It has always carried the set; asserting it here is
+    // what makes "every error page in this service, on the wire" a statement
+    // about the service rather than about one file in it.
+    const res = await signInWith(harness, TEST_USERNAME, TEST_PASSWORD, {
+      headers: { origin: "https://evil.example.com" },
+    });
+    assert.equal(res.status, 403);
+    assert.match(await res.text(), /Request blocked/);
+    assertHeaders(res, SELF_CSP, "the settings origin-check refusal");
   });
 });
