@@ -245,6 +245,37 @@ describe("loadConfig", () => {
       );
     });
 
+    it("replaces a blank auth_token.txt instead of proxying with an empty token", () => {
+      // UPSTREAM_AUTH_TOKEN has no length check to catch this, so "" reached the
+      // proxy intact and the connector rejected every forwarded request.
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      writeFileSync(join(dir, "auth_token.txt"), "");
+      writeFileSync(join(dir, "auth_password_hash.txt"), `${VALID_HASH}\n`);
+
+      const config = loadConfig(baseEnv(secretFiles(dir)));
+
+      assert.notEqual(config.upstreamAuthToken, "");
+      assert.equal(sources(config).UPSTREAM_AUTH_TOKEN, "replaced");
+      assert.equal(
+        readFileSync(join(dir, "auth_token.txt"), "utf8").trim(),
+        config.upstreamAuthToken
+      );
+    });
+
+    it("replaces a blank signing key instead of failing its own length check", () => {
+      // SIGNING_KEY was saved from the silent version of this defect by its
+      // 32-byte floor — as a fatal ConfigError, which is better than a quiet 401
+      // and still a service that will not boot until somebody edits a file.
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      writeFileSync(join(dir, "oauth_signing_key.txt"), "   \n");
+      writeFileSync(join(dir, "auth_password_hash.txt"), `${VALID_HASH}\n`);
+
+      const config = loadConfig(baseEnv(secretFiles(dir)));
+
+      assert.ok(config.signingKey.length >= 32);
+      assert.equal(sources(config).SIGNING_KEY, "replaced");
+    });
+
     it("keeps the present ones and generates only the rest", () => {
       const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
       writeFileSync(join(dir, "auth_token.txt"), "live-connector-token\n");

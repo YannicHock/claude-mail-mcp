@@ -123,6 +123,27 @@ test("an inline AUTH_TOKEN seeds the file rather than being replaced", async () 
   );
 });
 
+test("a blank auth_token.txt is replaced, not taken as an empty token", async () => {
+  // An interrupted `printf … > secrets/auth_token.txt`, a `touch` while reading
+  // the deployment guide, a restored backup that lost a file's contents. The
+  // file used to resolve to "" with source "file", requiredSecret accepted it,
+  // and every /mcp request 401d until somebody thought to look at the file.
+  const dir = workdir();
+  writeFileSync(join(dir, "auth_token.txt"), "");
+
+  const config = await loadConfig({
+    AUTH_TOKEN_FILE: join(dir, "auth_token.txt"),
+    SETTINGS_SIGNING_KEY_FILE: join(dir, "settings_signing_key.txt"),
+  });
+
+  assert.notEqual(config.authToken, "");
+  assert.deepEqual(sources(config), {
+    AUTH_TOKEN: "replaced",
+    SETTINGS_SIGNING_KEY: "generated",
+  });
+  assert.equal(readFileSync(join(dir, "auth_token.txt"), "utf8").trim(), config.authToken);
+});
+
 test("a second boot reads back what the first generated", async () => {
   const dir = workdir();
   const env = {
