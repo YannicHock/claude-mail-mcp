@@ -111,6 +111,7 @@ async function main(): Promise<void> {
     accountsFile: config.accountsFile,
     settingsSigningKey: config.settingsSigningKey,
     publicUrl: config.publicUrl,
+    trustProxy: config.trustProxy,
     log,
   });
 
