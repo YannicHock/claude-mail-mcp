@@ -71,6 +71,54 @@ function int(name: string, fallback: number): number {
   return parsed;
 }
 
+/**
+ * How many reverse-proxy hops sit in front of this process — the value Express
+ * takes as `trust proxy`, and therefore what decides which `X-Forwarded-For`
+ * entry becomes `req.ip`.
+ *
+ * **Never a boolean.** `trust proxy: true` trusts the entire X-Forwarded-For
+ * chain and takes its leftmost entry, and a reverse proxy only *appends* the
+ * address it saw — so the leftmost entry is whatever the client wrote. This
+ * connector has no login throttle for a forged address to sidestep, but `req.ip`
+ * is what its two rejection log lines carry (`rejected unauthenticated MCP
+ * request` in src/app.ts, `rejected settings request` in
+ * src/settings-assertion.ts), and the obvious use for those is a fail2ban jail.
+ * A jail reading a client-chosen field bans whatever the attacker names. A hop
+ * count makes Express skip exactly the proxies that are really there.
+ *
+ * The default, 1, matches a single reverse proxy terminating TLS — the shape
+ * every documented deployment has, including the one where the OAuth layer sits
+ * in between, since its proxy forwards `X-Forwarded-For` unchanged rather than
+ * appending to it (see `HOP_BY_HOP` in oauth/src/proxy.ts). Raise it only if
+ * there is genuinely another trusted hop in front, such as a CDN: setting it
+ * higher than the real chain reintroduces the same forgery. Use 0 when nothing
+ * proxies this process, which makes `req.ip` the socket address.
+ *
+ * Its own variable rather than one shared with the OAuth layer's `TRUST_PROXY`
+ * constant: the name is the same because the meaning is the same, and the two
+ * processes never read one environment — docker-compose.yml gives them `.env`
+ * and `.env.oauth`, and the pm2/systemd recipes give each its own env file — so
+ * a deployment that puts a different number of proxies in front of each can say
+ * so.
+ *
+ * Exported for the test suite. `config` below is evaluated once at import time,
+ * so every rejection case would otherwise need a process of its own — see the
+ * header of test/unit/config.defaults.test.ts for why the env constellations
+ * are split across files. The parser is pure and can be exercised directly.
+ */
+export function trustProxyHops(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.TRUST_PROXY;
+  if (raw === undefined || raw.trim() === "") return 1;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(
+      `TRUST_PROXY must be a non-negative integer — the number of reverse-proxy ` +
+        `hops in front of this service — got ${raw}. Use 0 when nothing proxies it.`
+    );
+  }
+  return parsed;
+}
+
 export const config = {
   port: int("PORT", 3220),
   /**
@@ -80,6 +128,14 @@ export const config = {
    * case you're on your own re. TLS, rate-limiting, etc.
    */
   host: optional("HOST", "127.0.0.1"),
+
+  /**
+   * Reverse-proxy hops in front of this process, handed to Express as
+   * `trust proxy` by src/app.ts. Default 1, never a boolean — see
+   * {@link trustProxyHops} for what a boolean would cost.
+   */
+  trustProxy: trustProxyHops(),
+
   logLevel: optional("LOG_LEVEL", "info") as
     | "debug"
     | "info"

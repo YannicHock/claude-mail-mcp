@@ -519,28 +519,38 @@ is its own POST, and a login-grade rate would cut live conversations off. Agains
 `app.set("trust proxy", …)` decides which `X-Forwarded-For` entry becomes `req.ip`,
 and therefore which address the throttle buckets on and the log line names.
 
-The OAuth layer takes a **hop count, never a boolean** (`TRUST_PROXY`, default 1;
-`oauth/src/config.ts`). `trust proxy: true` trusts the whole chain and takes its
-leftmost entry — which the client writes, because a reverse proxy only *appends*
-the address it saw. A client sending `X-Forwarded-For: <anything>` would then pick
-its own `req.ip`, land every attempt in a different bucket, and write an
-attacker-chosen address into the line a jail reads. A hop count makes Express skip
-exactly the proxies that are really there. Raise it above 1 only if there is
-genuinely another trusted hop, such as a CDN: setting it higher than the real chain
-reintroduces the same forgery.
+**Both services take a hop count, never a boolean** — `TRUST_PROXY`, default 1
+(`trustProxyHops` in `oauth/src/config.ts` and in `src/config.ts`).
+`trust proxy: true` trusts the whole chain and takes its leftmost entry — which the
+client writes, because a reverse proxy only *appends* the address it saw. A client
+sending `X-Forwarded-For: <anything>` would then pick its own `req.ip`, land every
+attempt in a different bucket, and write an attacker-chosen address into the line a
+jail reads. A hop count makes Express skip exactly the proxies that are really
+there. Raise it above 1 only if there is genuinely another trusted hop, such as a
+CDN: setting it higher than the real chain reintroduces the same forgery. Use 0
+where nothing proxies the service at all, which leaves `req.ip` the socket address.
+
+One name, two independent values. The two processes never read one environment —
+docker-compose.yml gives them `.env` and `.env.oauth` — so a deployment that puts
+a different number of proxies in front of each can say so. The OAuth layer standing between the
+terminator and the connector costs no hop, incidentally: its proxy forwards
+`X-Forwarded-For` unchanged rather than appending to it (`HOP_BY_HOP` in
+`oauth/src/proxy.ts`), so 1 is right for the connector whether it is reached
+straight through the terminator or through the OAuth layer.
+
+The connector has no throttle for a forged address to defeat, but `req.ip` is what
+both of its rejection log lines carry — the rejected `/mcp` request (`src/app.ts`)
+and the rejected settings request (`src/settings-assertion.ts`) — and the obvious
+use for those is a jail. It trusted the whole chain until #107, and those two
+fields were client-forgeable for as long as it did.
 
 Asserted by *"buckets on the address the reverse proxy observed, not one the client
-picked"* in `oauth/test/integration/authorization-guards.test.ts`, and by
-*"defaults to a single hop, not to trusting the whole chain"* / *"rejects a boolean
-or a negative value"* in `oauth/test/unit/config.test.ts`.
-
-> **Known inconsistency.** The connector sets `app.set("trust proxy", true)`
-> (`src/app.ts`) — the setting the OAuth layer argues at length against. It has no
-> throttle to defeat, but `req.ip` appears in two of its log lines: the rejected
-> `/mcp` request and the rejected settings request. Those two fields are therefore
-> client-forgeable. Do not point a banning jail at the connector's logs. No test
-> covers this; it is recorded here rather than fixed, because this document does not
-> change code.
+picked"* in `oauth/test/integration/authorization-guards.test.ts`, by *"defaults to
+a single hop, not to trusting the whole chain"* / *"rejects a boolean or a negative
+value"* in `oauth/test/unit/config.test.ts` and in
+`test/unit/config.trust-proxy.test.ts`, and — on a served request, which is the only
+place the setting has an effect — by *"logs the address the reverse proxy observed,
+not one the client picked"* in `test/unit/app-trust-proxy.test.ts`.
 
 ---
 
@@ -560,9 +570,10 @@ reference deployment in the OAuth layer's own logs and in the proxy's access log
 which records the bridge gateway for every request, including ones from outside the
 network.
 
-An nginx running on the host — the systemd recipe in
-[DEPLOYMENT.md](DEPLOYMENT.md) — does not have this problem: it sees the real
-source address, and everything the previous section claims holds as written.
+An nginx running on the host rather than in a container — the TLS recipe in
+[DEPLOYMENT.md](DEPLOYMENT.md), which terminates on the host — does not have this
+problem: it sees the real source address, and everything the previous section
+claims holds as written.
 
 Two consequences, and neither is theoretical:
 
@@ -735,7 +746,9 @@ not an hour later. This is the boundary the revocation work in #2 exists for.
 [SECURITY.md](../SECURITY.md) predates the OAuth layer and **contradicts this
 document in several places** — it describes the OAuth layer as "not part of this
 repository", frames the threat model around a single process gated by a static
-token, and lists `accounts.json` and `.env` paths from the systemd deployment only.
+token, and lists `accounts.json` and `.env` paths (`/var/lib/mail-mcp`,
+`mailmcp:mailmcp`) from a host install [DEPLOYMENT.md](DEPLOYMENT.md) no longer
+describes — there is no supported from-source production deployment.
 Where the two disagree, this document describes what ships. Bringing `SECURITY.md`
 forward is separate work.
 
