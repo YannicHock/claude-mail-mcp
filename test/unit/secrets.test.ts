@@ -325,6 +325,113 @@ describe("resolveSecret", () => {
     });
   });
 
+  describe("a secret that is allowed to be absent", () => {
+    // AUTH_PASSWORD_HASH since the claim-token gate: a `NAME_FILE` naming a path
+    // nothing has written yet is an unclaimed instance, not a typo, and must not
+    // stop the service. The OAuth layer used to answer that with a third reader
+    // of its own — and the answer drifted, because that reader called an empty
+    // file "no hash" while this module calls it an absent one. `required: false`
+    // settles it here, once, and the rule at the top of this module decides: a
+    // file holding nothing is not a present file, so it is treated as absent.
+    const absentable = { generate: false, required: false };
+
+    it("resolves to nothing rather than throwing, and writes nothing", () => {
+      const dir = workdir();
+      const path = join(dir, "auth_password_hash.txt");
+
+      const resolved = resolveSecret(
+        { AUTH_PASSWORD_HASH_FILE: path },
+        "AUTH_PASSWORD_HASH",
+        absentable
+      );
+
+      assert.equal(resolved.value, undefined);
+      assert.equal(resolved.source, undefined, "nothing to report about a secret nobody set");
+      assert.equal(existsSync(path), false);
+    });
+
+    it("falls back to the inline value when the file is not there", () => {
+      const dir = workdir();
+      const path = join(dir, "auth_password_hash.txt");
+
+      const resolved = resolveSecret(
+        { AUTH_PASSWORD_HASH: "inline-hash", AUTH_PASSWORD_HASH_FILE: path },
+        "AUTH_PASSWORD_HASH",
+        absentable
+      );
+
+      assert.equal(resolved.value, "inline-hash");
+      assert.equal(resolved.source, "environment");
+      assert.equal(existsSync(path), false, "and is never seeded into a file it cannot generate");
+    });
+
+    it("treats an empty file exactly as it treats an absent one", () => {
+      // The drift itself. One reader answered `null` for a file holding nothing
+      // while the other read the inline value for a file that was not there —
+      // two answers to one question, from two copies of one rule.
+      const dir = workdir();
+      const path = join(dir, "auth_password_hash.txt");
+      writeFileSync(path, "\n");
+
+      const resolved = resolveSecret(
+        { AUTH_PASSWORD_HASH: "inline-hash", AUTH_PASSWORD_HASH_FILE: path },
+        "AUTH_PASSWORD_HASH",
+        absentable
+      );
+
+      assert.equal(resolved.value, "inline-hash");
+      assert.equal(resolved.source, "environment");
+      // Left as it was found: a secret this process cannot refill is not one it
+      // may empty. Only the generating path clears a blank file.
+      assert.equal(readFileSync(path, "utf8"), "\n");
+    });
+
+    it("still lets a present file win over the inline value", () => {
+      const dir = workdir();
+      const path = join(dir, "auth_password_hash.txt");
+      writeFileSync(path, "hash-from-file\n");
+
+      const resolved = resolveSecret(
+        { AUTH_PASSWORD_HASH: "inline-hash", AUTH_PASSWORD_HASH_FILE: path },
+        "AUTH_PASSWORD_HASH",
+        absentable
+      );
+
+      assert.equal(resolved.value, "hash-from-file");
+      assert.equal(resolved.source, "file");
+      assert.equal(resolved.path, path);
+    });
+
+    it("still fails loudly on a file it cannot read", () => {
+      // Only ENOENT is a state. A permission error on a secret mount has to stop
+      // the service rather than quietly downgrade the instance to unclaimed.
+      const dir = workdir();
+
+      assert.throws(
+        () => resolveSecret({ AUTH_PASSWORD_HASH_FILE: dir }, "AUTH_PASSWORD_HASH", absentable),
+        (err: unknown) =>
+          err instanceof SecretError &&
+          err.message.startsWith(`Cannot read AUTH_PASSWORD_HASH_FILE at ${dir}: `)
+      );
+    });
+
+    it("still refuses to invent one when the caller says it is required", () => {
+      // `required: false` is the claim-token gate's business alone. Every other
+      // never-generated secret keeps the old answer: an absent file is a
+      // misconfiguration, and the service says so and stops.
+      const dir = workdir();
+
+      assert.throws(
+        () =>
+          resolveSecret({ K_FILE: join(dir, "k.txt") }, "K", {
+            generate: false,
+            required: true,
+          }),
+        (err: unknown) => err instanceof SecretError && err.message.includes("never generated")
+      );
+    });
+  });
+
   describe("a concurrent first boot", () => {
     // Both services generate the shared auth_token and settings_signing_key at
     // the same moment on a first `docker compose up`. The loser must adopt the
