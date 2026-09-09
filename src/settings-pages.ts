@@ -21,7 +21,7 @@
  * deliberate, not an oversight.
  */
 
-import type { Account } from "./accounts.js";
+import { RESERVED_IDS, reservedIdNotice, type Account } from "./accounts.js";
 
 /**
  * Mirrors `ProbeReport` from `./probe.ts`, which is not present in this file's
@@ -231,7 +231,14 @@ function probeRowHtml(name: string, result: ProbeResultView): string {
   )}</strong><span>${status}</span></div>`;
 }
 
-function probeSectionHtml(probe: ProbeReportView | undefined): string {
+/**
+ * The probe panel. `savable` is false for an account whose id is reserved: the
+ * form's Save posts to a route that is not its own (see RESERVED_IDS in
+ * accounts.ts), so the usual "Press Save to store them" would be a lie, and one
+ * the operator has already been told the opposite of on the list row. The
+ * remedy is not repeated here — the notice above the panel carries it.
+ */
+function probeSectionHtml(probe: ProbeReportView | undefined, savable: boolean): string {
   if (!probe) return "";
   const rows = [
     probeRowHtml("IMAP", probe.imap),
@@ -240,9 +247,12 @@ function probeSectionHtml(probe: ProbeReportView | undefined): string {
   ]
     .filter(Boolean)
     .join("\n");
+  const footer = savable
+    ? "These values were not saved. Press Save to store them."
+    : "These values were not saved, and Save will not store them either.";
   return `<div class="notice">
 ${rows}
-<p>These values were not saved. Press Save to store them.</p>
+<p>${escapeHtml(footer)}</p>
 </div>`;
 }
 
@@ -309,6 +319,22 @@ export function renderMailboxForm(opts: MailboxFormData): string {
   const mail = account?.mail;
   const caldav = account?.caldav;
 
+  // An account already stored under a reserved id cannot be edited in place:
+  // the form action built just below is a literal settings route, not this
+  // account's own. The list page already says so on that account's row; the
+  // form repeats it verbatim rather than letting the operator arrive here and
+  // read the opposite from the probe panel. See RESERVED_IDS in accounts.ts.
+  //
+  // Derived here rather than handed in the way the list page's rowNotices are:
+  // this function is the one that builds the colliding action, every route that
+  // renders an edit form reaches it (save, probe and validation-error paths
+  // included), and reservedIdNotice() is the same pure string builder the list
+  // row and the startup warning already use, so the two can never drift apart.
+  const reserved = account !== null && RESERVED_IDS.has(account.id);
+  const reservedNotice = reserved
+    ? `<div class="notice">${escapeHtml(reservedIdNotice(account.id))}</div>`
+    : "";
+
   const actionPath = isNew ? "/settings/mailboxes" : `/settings/mailboxes/${encodeURIComponent(account.id)}`;
   const testPath = isNew ? "/settings/mailboxes/test" : `/settings/mailboxes/${encodeURIComponent(account.id)}/test`;
 
@@ -343,7 +369,8 @@ ${
 
   const body = `<h1>${isNew ? "Add mailbox" : `Edit mailbox — ${escapeHtml(account.label)}`}</h1>
 <p class="sub">Password fields are always blank here. Leave one blank to keep the stored value.</p>
-${probeSectionHtml(opts.probe)}
+${reservedNotice}
+${probeSectionHtml(opts.probe, !reserved)}
 <form method="post" action="${escapeHtml(actionPath)}" autocomplete="off">
   <input type="hidden" name="_csrf" value="${escapeHtml(opts.csrf)}">
   <input type="hidden" name="_stamp" value="${escapeHtml(opts.stamp)}">
