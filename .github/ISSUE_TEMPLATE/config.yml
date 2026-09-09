@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/YannicHock/claude-mail-mcp/security/advisories/new
+    about: Report privately as a security advisory. Please do not open a public issue.
+  - name: Deployment guide
+    url: https://github.com/YannicHock/claude-mail-mcp/blob/main/docs/DEPLOYMENT.md
+    about: Running it behind a reverse proxy, with Docker Compose, or under systemd.
+  - name: Hardening guide
+    url: https://github.com/YannicHock/claude-mail-mcp/blob/main/docs/HARDENING.md
+    about: Exposing it to the internet safely.
