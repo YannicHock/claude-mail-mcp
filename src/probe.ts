@@ -16,6 +16,7 @@ import nodemailer from "nodemailer";
 import { createDAVClient } from "tsdav";
 
 import type { ImapCreds, SmtpCreds, CalDavCreds } from "./accounts.js";
+import { withTimeout } from "./timeout.js";
 
 export const PER_PROBE_TIMEOUT_MS = 10_000;
 export const TOTAL_TIMEOUT_MS = 25_000;
@@ -40,38 +41,6 @@ export interface ProbeReport {
   imap: ProbeResult;
   smtp: ProbeResult;
   caldav: ProbeResult | null;
-}
-
-/**
- * Race `promise` against a `ms`-millisecond timer, rejecting with a message that
- * names which probe timed out. The timer is always cleared, win or lose, so a
- * fast-resolving probe never leaves a dangling handle behind.
- *
- * `onTimeout`, when given, runs synchronously the moment the timer fires —
- * before the rejection — so a caller holding a client/socket tied to `promise`
- * can force it closed immediately. Racing a promise never cancels it: on its
- * own this function only stops *watching* the loser, it does not touch
- * whatever is still running underneath. See probeImap()/probeSmtp() for why
- * that distinction matters here.
- */
-async function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number,
-  label: string,
-  onTimeout?: () => void
-): Promise<T> {
-  let timer!: NodeJS.Timeout;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      onTimeout?.();
-      reject(new Error(`${label} timed out after ${ms}ms`));
-    }, ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**
