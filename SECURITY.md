@@ -1,121 +1,168 @@
 # Security Policy
 
+## What this is
+
+`claude-mail-mcp` is a self-hosted MCP server that gives an AI client IMAP, SMTP
+and CalDAV access to mailboxes you configure and run yourself. It ships as **two**
+services, both maintained here: `mail-mcp`, the connector, which parses
+attacker-supplied MIME off the public internet and holds every mailbox credential
+in `accounts.json`; and `mail-oauth`, an OAuth 2.1 layer, which holds the operator
+credential and the token signing key, issues and revokes the tokens that gate the
+connector, and serves the setup wizard, the consent screen and the settings UI to a
+browser.
+
+The two are separate images — `ghcr.io/yannichock/claude-mail-mcp` and
+`ghcr.io/yannichock/claude-mail-mcp-oauth`, built from `Dockerfile` and
+`oauth/Dockerfile` — deployed together by `docker-compose.yml`, running as
+different non-root users with a secrets directory split between them.
+`mail-oauth` is needed only by clients that cannot send a custom `Authorization`
+header and require OAuth 2.1 discovery instead (claude.ai web, Cowork); Claude
+Desktop talks to the connector directly with a static Bearer token. **Where it is
+deployed it is part of the attack surface**, and reports about it belong here.
+
 ## Supported versions
 
-Until v1.0, only the latest minor release is supported with security fixes.
+Releases are cut by pushing a `v*` tag. One workflow run
+(`.github/workflows/release.yml`) builds and publishes **both** images from that
+one commit, tagged in lockstep as the version, `latest` and `sha-<short>` — after
+`scripts/check-versions.sh` has confirmed that all eight version strings in the
+tree agree with the tag and that `CHANGELOG.md` has a section to make the release
+notes from. The two services do not carry separate versions, and a skew between
+them is not a supported configuration.
+
+There are no maintenance branches. A fix lands on `main` and ships as the next tag.
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | yes       |
-| 0.1.x   | no — upgrade to 0.2.1 (see [CHANGELOG.md](CHANGELOG.md)) |
+| The newest `v*` tag (the `0.6.x` line today) | yes — fixes ship as the next tag |
+| Any earlier tag | no — upgrade; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) → "Upgrading" and [CHANGELOG.md](CHANGELOG.md) |
+| `main` between tags | best effort. `ci.yml` publishes `sha-<short>` images from it; those are not releases |
+
+Run both images at the same version. `docker-compose.yml` pins both to `latest`,
+which the release workflow moves onto the newest tag.
 
 ## Reporting a vulnerability
 
-**Please do not open a public GitHub issue for security problems.**
+**Please do not open a public GitHub issue for a security problem.**
 
-Report it here, in this fork:
-
-1. **GitHub Private Vulnerability Reporting** — open a private advisory at
-   <https://github.com/YannicHock/claude-mail-mcp/security/advisories/new>
+Open a private advisory:
+<https://github.com/YannicHock/claude-mail-mcp/security/advisories/new>
 
 This repository is a fork of
 [maxx3250/claude-mail-mcp](https://github.com/maxx3250/claude-mail-mcp) and is
-maintained separately. The container image, `docker-compose.yml`, the nginx
-reverse-proxy recipe and the CI workflows exist **only here**, so a report about
-any of them has to come to this repository — the upstream maintainer cannot act
-on code that is not in their tree.
+maintained separately. The OAuth layer (`oauth/`), both container images,
+`docker-compose.yml`, the reverse-proxy recipe and the CI workflows were written
+here and exist **only here**, so a report about any of them has to come to this
+repository — the upstream maintainer cannot act on code that is not in their tree.
 
-If the issue is in code inherited from upstream and therefore affects that
-project too, please also report it there, via
+If the issue is in connector code inherited from upstream and therefore affects
+that project too, please also report it there, via
 <https://github.com/maxx3250/claude-mail-mcp/security/advisories/new> or
 **security@markusstoeger.com**.
 
-## What to include
+### What to include
 
-- A description of the issue and its impact
-- Steps to reproduce (or a proof of concept)
-- The affected version / commit
-- Whether the issue is already public anywhere
+- What the issue is, and what it lets an attacker do
+- Which part: the connector, the OAuth layer, `docker-compose.yml`, or the
+  reverse-proxy recipe in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+- Steps to reproduce, or a proof of concept
+- The version or commit you tested — both services report theirs at `/health`
+- Whether it is already public anywhere
 
-## Response timeline
+### What to expect
 
 - **Acknowledgement** within 48 hours
 - **Initial assessment** within 7 days
-- **Fix or status update** within 14 days
+- **A fix or a status update** within 14 days
 
-If the report is valid, a fix is published as a patch release and a GitHub Security Advisory with a CVE (where applicable) is opened. Reporters are credited unless they request otherwise.
+A valid report is fixed on `main` and published as a new tag, with a GitHub
+Security Advisory and a CVE where applicable. Reporters are credited unless they
+ask not to be.
 
-## Threat model
+## Scope
 
-**Assets we protect:**
-- Mailbox credentials (IMAP/SMTP/CalDAV passwords in `accounts.json`)
-- Email content (read access, write access, deletion)
-- Calendar data
-- The Bearer token gating `/mcp`
+### In scope
 
-If you add an OAuth layer in front of this server (see [docs/HARDENING.md](docs/HARDENING.md)) to serve remote clients like claude.ai web, that layer's own signing keys and any credentials it manages become additional assets — this document doesn't cover them, since that layer isn't part of this repository.
+Everything this repository ships — which is both services, and the deployment that
+puts them together.
 
-**Adversaries we consider:**
-- Random internet attacker (port scan, brute force against the Bearer token or the reverse proxy)
-- Compromised network path between an MCP client and the connector (MITM)
-- A compromised MCP client (malicious tool calls)
-- Local-system attacker (other processes on the same host)
+- **The connector** (`src/`, `Dockerfile`): parsing of attacker-supplied MIME and
+  calendar data, the MCP tools, the static Bearer check on `/mcp`, the HMAC
+  assertion required on `/settings/*`, autoconfig discovery, and the writing of
+  `accounts.json`.
+- **The OAuth layer** (`oauth/`, `oauth/Dockerfile`): the OAuth 2.1 flow, dynamic
+  client registration, token issuance, verification and revocation, the operator
+  login and its throttle, the same-origin and CSRF checks on every state-changing
+  POST, the browser-page header set, the setup wizard and its claim token, and the
+  proxy to the connector.
+- **The boundary between the two.** The connector mounts `secrets/shared/` and
+  nothing else; the token signing key and the operator's password hash live in
+  `secrets/oauth/`, which is mounted into the OAuth layer alone. Anything that lets
+  a compromised connector reach those, or that leaks the connector's static token
+  outward to a client, or the browser's session cookie inward, is a finding.
+- **The bootstrap gate.** An instance nobody has claimed yet is gated by a one-time
+  claim token. Anything that gets past that gate without the token, that
+  distinguishes a wrong token from a claimed instance, or that lets a data volume
+  which has already served traffic but lost its credential present itself as a
+  fresh instance, is a finding.
+- **Revocation.** Revoking a session or a client stops its access token on the next
+  request, not at expiry. A token that outlives its revocation is a finding — with
+  one documented exception, below.
+- **`docker-compose.yml` and the reverse-proxy recipe in
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).** These are the deployment, not
+  illustrations. The secrets mounts, the loopback-only published ports, the `640` /
+  `2770` file and directory modes, and the rate-limit zones are security properties,
+  and a wrong default in either is a vulnerability in this project.
+- **Credential disclosure** anywhere it can happen: logs, error pages, `/health`, an
+  MCP tool result, or the OAuth discovery documents.
 
-If you add an OAuth layer in front (not part of this repository — see [docs/HARDENING.md](docs/HARDENING.md)), it introduces its own adversary: a malicious page loaded in the operator's browser attempting CSRF against that layer's login or settings UI. This server has no browser-facing endpoints of its own, so that scenario doesn't apply today.
+### Out of scope
 
-**Out of scope:**
-- A root-level compromise of the host. With root, all credentials are recoverable from `/var/lib/mail-mcp/accounts.json` — same security boundary as `~/.ssh/id_rsa` or `/etc/shadow`. We do not attempt at-rest encryption that depends on a key also stored on the same host.
-- Compromise of the upstream mailbox provider.
-- Phishing of the operator's login credentials for any OAuth layer they've added in front (not part of this repository).
+- **Root on the host.** No control here survives it: every mailbox credential and
+  all four secret files are recoverable. Same boundary as `/etc/shadow`.
+- **Compromise of the upstream mailbox provider**, or of a mailbox credential you
+  configured.
+- **Phishing the operator's password.** Rate limiting and a refused-at-entry minimum
+  length are what this project does about credential guessing; it can do nothing
+  about a credential the operator hands over.
+- **Deliberate limitations, each with its reasoning written down** in
+  [docs/HARDENING.md](docs/HARDENING.md). These are decisions rather than
+  oversights; a report that restates one will be closed as such, and an issue
+  arguing the decision is more useful than an advisory:
+  - No at-rest encryption of `accounts.json` — it is plain JSON on the connector's
+    data volume
+  - No multi-tenancy: one operator credential, one set of mailboxes, one static
+    token to the connector
+  - The claim token neither expires nor is single-use, and is printed to stdout on
+    every boot until setup completes
+  - Per-IP rate limiting collapses to per-*gateway* behind a containerised TLS
+    terminator ([#15](https://github.com/YannicHock/claude-mail-mcp/issues/15)),
+    which is also why the log line a fail2ban jail would match should not have a ban
+    action armed against it yet
+  - An access token minted before the `sid` claim existed survives a revocation for
+    at most one access-token lifetime
+  - The connector's `/health` is unauthenticated and discloses the version, a
+    non-sensitive account summary and the path to `accounts.json`; that is why
+    `docker-compose.yml` publishes it on loopback only
+  - No dedicated audit log
+- **Findings that need a configuration the documentation tells you not to use** —
+  publishing the connector's port on `0.0.0.0`, a world-writable secrets directory,
+  `TRUST_PROXY` set above the real hop count, or a rate limit widened from
+  `location = /settings/login` to all of `/settings`. If the documentation is what
+  led you there, say so: that is a documentation bug and worth reporting.
+- **Upstream's own code**, except as it ships here — see above.
 
-## What this project does
+## Where the security reasoning lives
 
-### Transport
-- TLS terminated by nginx, certificate from Let's Encrypt (90-day rotation by `certbot.timer`).
-- HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-Robots-Tag: noindex` on every response, set at the nginx server level (see the reverse-proxy config in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)). `Referrer-Policy` is set by the application itself — `same-origin`, because its CSRF checks read `Referer` when a browser omits `Origin` — and must not be overridden at the proxy.
-- Backend bound to `127.0.0.1` only; nginx is the only thing that can reach it from outside.
+This document is deliberately short. It says what to report and how; it does not
+restate the posture.
 
-### Authentication
-- `/mcp` is gated by a single static Bearer token (`AUTH_TOKEN`), checked on every request. There is no per-user auth, no token expiry, and no OAuth flow in this repository — the whole deployment shares one secret.
-- `/mcp` is additionally rate-limited by nginx (`limit_req`, 120 req/min per IP with a burst of 60) — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The limit is sized for JSON-RPC traffic, where every MCP message is a separate `POST /mcp`, not for a login form; it caps a guessing loop at two attempts per second without cutting a live conversation off mid-way. Against 128 bits of token entropy it is defence in depth, not the primary defence. `/health` is deliberately not rate-limited, since uptime checkers poll it and it carries no credentials.
-- `/health` is unauthenticated by design (liveness probe + a non-sensitive account summary — no credentials).
-
-**If you expose this server to a remote MCP client over the public internet** — for example claude.ai web, which requires OAuth 2.1 discovery — you need to put an OAuth 2.1 layer in front that authenticates the human and forwards the Bearer token to this server on their behalf. **That layer is not part of this repository.** An earlier version of this document described it as already deployed and linked to a "reference implementation" (`markusstoeger/mcp-oauth-shim`); that repository does not exist, and no substitute is provided here. See [docs/HARDENING.md](docs/HARDENING.md) for what such a layer should satisfy if you build or adopt one — OAuth 2.1 + DCR + PKCE, short-lived signed tokens, a brute-force-throttled login, and a CSRF guard on any state-changing endpoint it exposes. Those are properties the *layer* needs, not properties this project has today.
-
-### Process isolation
-- The backend runs as the dedicated non-root `mailmcp` system user (no shell, no home directory).
-- systemd hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictRealtime`, `RestrictSUIDSGID`, `LockPersonality`, `SystemCallFilter=@system-service ~@privileged @resources`.
-- Writable filesystem limited to `/var/lib/mail-mcp` (state dir).
-- Memory and task caps via `MemoryMax`, `TasksMax`, `LimitNOFILE`.
-- If you add an OAuth layer in front, apply the same systemd hardening and dedicated non-root user to it — it isn't covered by this project's install steps.
-
-### Credentials at rest
-- `accounts.json` is owned by `mailmcp:mailmcp` and chmod 600, at `/var/lib/mail-mcp/accounts.json` — the `ACCOUNTS_FILE` default in `.env.example` and the path [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) step 4 creates. Under the container deployment in that same document it is `./data/accounts.json` on the host, mounted read-only at `/data/accounts.json` and owned by the container's uid 100 / gid 101.
-- `.env` (holds `AUTH_TOKEN` and, for single-account setups, mailbox credentials) is `root:mailmcp` 640 (root can edit, the service can read).
-- If you add an OAuth layer that keeps its own state (signing keys, refresh-token hashes, an htpasswd file), apply the same ownership/permission discipline to it — it isn't part of this project's code or install steps.
-
-### Input validation
-- Every MCP tool input validated with [Zod](https://zod.dev) schemas.
-- `accounts.json` schema-validated on every load (id pattern, port ranges, required fields).
-
-### Output filtering
-- `list_accounts` returns id/label/default/From/imap_host/caldav_enabled — never credentials.
-- `/health` shows the same public summary.
-- Server logs never include passwords or Bearer tokens.
-
-## Hardening checklist for operators
-
-These are not vulnerabilities in this project, but operators should:
-
-- [x] Run behind HTTPS with a valid certificate (the included nginx vhost + certbot does this).
-- [x] Bind the Node process to `127.0.0.1` and let nginx handle public traffic.
-- [x] Run the systemd unit as a dedicated non-root user.
-- [x] Use a host firewall (UFW or equivalent) with default-deny incoming.
-- [ ] Rotate `AUTH_TOKEN` periodically. Restart the service after rotation (and any OAuth layer you've added that caches a copy of the token).
-- [ ] Use app-specific passwords on providers that support them — never your main account password.
-- [ ] Restrict who can reach the connector at the network level (VPN, IP allowlist, or an OAuth/access-control layer you add in front — see [docs/HARDENING.md](docs/HARDENING.md); this is not included in the repository).
-- [ ] If you add an OAuth/login layer in front, run a fail2ban jail against its auth-fail log lines for additional brute-force protection — see [docs/HARDENING.md](docs/HARDENING.md).
-- [ ] Keep `accounts.json` out of any backups that leave the host unencrypted.
-- [ ] Subscribe to GitHub Security Advisories for this repo and the dependencies (`imapflow`, `nodemailer`, `tsdav`, `@modelcontextprotocol/sdk`).
-
-See [docs/HARDENING.md](docs/HARDENING.md) for the full operator checklist and threat-model walkthrough.
+- **[docs/HARDENING.md](docs/HARDENING.md)** — what an attacker reaches and why each
+  control exists: the trust boundary between the two services, the secret modes and
+  the group that makes them work, the bootstrap gate, authentication and revocation,
+  the browser-facing headers, rate limiting, and the residual risks stated exactly.
+  Every claim there names the code or the test that makes it true.
+- **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** — the topology: the two services, the
+  split secrets directories, the named data volumes, the reverse proxy and TLS, and
+  the steps that produce a claimed instance.
+- **[CHANGELOG.md](CHANGELOG.md)** — what changed in each release.
