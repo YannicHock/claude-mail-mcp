@@ -28,6 +28,7 @@ import { describe, it } from "node:test";
 import type { LogLevel } from "../../src/app.js";
 import {
   GENERATED_SECRET_MODE,
+  SHARED_SECRET_GID,
   SecretError,
   createExclusively,
   logSecretReport,
@@ -139,13 +140,16 @@ describe("resolveSecret", () => {
       assert.deepEqual(readdirSync(dir), ["k.txt"]);
     });
 
-    it("declares a mode readable outside the writing uid's own group", () => {
+    it("declares a mode the other image's uid can read, and nobody else", () => {
       // 0600 is the intuitive mode for a secret and the documented crash loop:
-      // the two images run as different non-root uids with no group in common,
-      // and both read the shared auth_token and settings_signing_key. Asserted
-      // on every platform, because the constant is the decision.
-      assert.equal(GENERATED_SECRET_MODE & 0o004, 0o004, "must be world-readable");
-      assert.equal(GENERATED_SECRET_MODE & 0o022, 0, "must not be world- or group-writable");
+      // the two images run as different non-root uids, and both read the shared
+      // auth_token and settings_signing_key. They read it through the group they
+      // share (see SHARED_SECRET_GID), which is why this is 0640 and not 0644 —
+      // a world-readable secret hands every account on the host the connector's
+      // token. Asserted on every platform, because the constant is the decision.
+      assert.equal(GENERATED_SECRET_MODE & 0o040, 0o040, "must be group-readable");
+      assert.equal(GENERATED_SECRET_MODE & 0o007, 0, "must be closed to other");
+      assert.equal(GENERATED_SECRET_MODE & 0o020, 0, "must not be group-writable");
     });
 
     it("writes that mode to disk", posixOnly, () => {
@@ -181,7 +185,9 @@ describe("resolveSecret", () => {
         (err: unknown) =>
           err instanceof SecretError &&
           err.message.includes("K_FILE") &&
-          err.message.includes("writable")
+          // and says what to do about it, since the usual cause is a secrets
+          // directory the shared group cannot write to
+          err.message.includes("chmod 2770")
       );
     });
 
@@ -296,4 +302,38 @@ describe("the two copies of this module", () => {
       "src/secrets.ts and oauth/src/secrets.ts have drifted — change one, change the other"
     );
   });
+});
+
+describe("the shared group contract", () => {
+  // SHARED_SECRET_GID is written down in three places: here, Dockerfile and
+  // oauth/Dockerfile. It is the only group the two images have in common, and a
+  // mode-640 secret written by one is unreadable to the other the moment those
+  // numbers disagree — as an EACCES crash loop at startup, in whichever service
+  // did not write the file. Nothing else in the build would notice.
+  const dockerfiles = {
+    "Dockerfile": new URL("../../Dockerfile", import.meta.url),
+    "oauth/Dockerfile": new URL("../../oauth/Dockerfile", import.meta.url),
+  };
+
+  for (const [name, url] of Object.entries(dockerfiles)) {
+    it(`${name} creates mailsecrets with gid ${SHARED_SECRET_GID}`, () => {
+      const dockerfile = readFileSync(url, "utf8");
+      assert.match(
+        dockerfile,
+        new RegExp(`addgroup -S -g ${SHARED_SECRET_GID} mailsecrets`),
+        `${name} must pin gid ${SHARED_SECRET_GID} for mailsecrets`
+      );
+    });
+
+    it(`${name} puts its runtime user in mailsecrets`, () => {
+      // Creating the group is not enough — the runtime user has to be *in* it.
+      const dockerfile = readFileSync(url, "utf8");
+      assert.match(dockerfile, /addgroup mail(mcp|oauth) mailsecrets/);
+    });
+
+    it(`${name} publishes the gid as a label`, () => {
+      const dockerfile = readFileSync(url, "utf8");
+      assert.match(dockerfile, new RegExp(`secrets-gid="${SHARED_SECRET_GID}"`));
+    });
+  }
 });

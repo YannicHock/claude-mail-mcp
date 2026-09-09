@@ -394,7 +394,8 @@ docker compose pull
 ```bash
 cp .env.docker.example .env
 # edit .env: PUBLIC_URL, LOG_LEVEL
-mkdir -p secrets && chmod 1777 secrets
+mkdir -p secrets
+sudo chgrp 105 secrets && sudo chmod 2770 secrets
 ```
 
 `HOST`, `PORT` and `ACCOUNTS_FILE` are fixed by the image and `docker-compose.yml` — they're not set in `.env` (see the comments in `.env.docker.example`).
@@ -407,14 +408,41 @@ finds them missing**, into `secrets/`. Read the token back afterwards with
 start to choose it yourself — either way, the file wins from then on and an
 upgrade never rotates a token out from under a connected client.
 
-`chmod 1777` because both containers write there and they run as different
-non-root uids (100 and 102) with no group in common; the sticky bit stops either
-from replacing the other's file. If you would rather not have a world-writable
-directory, create the files yourself instead — nothing is ever generated over a
-file that already exists, and the mount in `docker-compose.yml` can then be made
-read-only. Generated files land at mode `644`: `600` is the intuitive choice and
-the one that crash-loops both containers, because neither runtime uid owns a
-file the *other* service wrote.
+**`chgrp 105` and `chmod 2770` are both load-bearing.** Both containers create
+files in `secrets/` and they run as different non-root uids — 100 for the
+connector, 102 for the OAuth layer — so each image puts its runtime user in one
+shared group, `mailsecrets`, **gid 105**. That gid is pinned in both
+`Dockerfile`s and is part of their published contract; confirm it against the
+images you pulled with:
+
+```bash
+docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
+# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp),101(mailmcp),105(mailsecrets)
+docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp-oauth:latest
+# uid=102(mailoauth) gid=103(mailoauth) groups=103(mailoauth),103(mailoauth),105(mailsecrets)
+```
+
+The **setgid** bit — the `2` in `2770` — is what makes a file created by one
+service land in group 105 rather than in the creator's own group, which is what
+lets the other service read it. `chmod 770` without it leaves the connector's
+file in gid 101 at mode `640`, and the OAuth layer crash-loops on `EACCES`. The
+services also set the group explicitly when they can, so a forgotten setgid bit
+is survivable, but write the mode correctly and do not rely on that.
+
+`2770` equally means **no other account on the host can write here**, and that is
+not incidental. A present file always wins over a generated one, so any local
+user able to drop an `auth_token.txt` into this directory before the first boot
+would choose the token the connector then adopts — instance takeover with no
+exploit involved. A world-writable `secrets/` is not an acceptable shortcut.
+
+Generated files land at mode `640`, owner and group only. `600` is the intuitive
+choice and the one that crash-loops both containers, because neither runtime uid
+owns a file the *other* service wrote; `644` would work but hands every account
+on the host the connector's Bearer token.
+
+If you would rather not manage the group at all, create the four files yourself
+instead — nothing is ever generated over a file that already exists, and the
+mount in `docker-compose.yml` can then be made read-only.
 
 ### 3. Create `accounts.json`
 
@@ -424,7 +452,7 @@ contract; confirm them against the image you actually pulled with:
 
 ```bash
 docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
-# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp)
+# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp),101(mailmcp),105(mailsecrets)
 ```
 
 The credentials file has to be readable by that uid *and* unreadable to every
@@ -498,21 +526,23 @@ assumes the `mail-oauth` service above is running.
 **The shared signing key generates itself.** Both services mount the *same* file,
 `secrets/settings_signing_key.txt`, and it is what lets the connector trust that a
 settings request really came from the OAuth layer. Whichever service starts first
-creates it, at mode `644`; there is nothing to run.
+creates it, at mode `640` in group 105; there is nothing to run.
 
 To supply your own instead, write it before the first start — a file that is already
 there is always used as it stands:
 
 ```bash
-mkdir -p secrets && chmod 1777 secrets
+mkdir -p secrets
+sudo chgrp 105 secrets && sudo chmod 2770 secrets   # as in step 2 above
 openssl rand -base64 48 > secrets/settings_signing_key.txt
-chmod 644 secrets/settings_signing_key.txt
+sudo chgrp 105 secrets/settings_signing_key.txt
+chmod 640 secrets/settings_signing_key.txt
 ```
 
 `chmod 600` here is the mistake that costs an evening: the file is read by two
 containers running as *different* non-root uids, so the one that did not write it
 crash-loops on `EACCES` with nothing in `docker compose logs` but a permission
-error.
+error. Group 105 is `mailsecrets`, the one group both images share — see step 2.
 
 `secrets/` is already in `.gitignore`. Never commit this file. `docker-compose.yml`
 wires it into both services as `SETTINGS_SIGNING_KEY_FILE=/secrets/settings_signing_key.txt`.

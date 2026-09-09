@@ -113,7 +113,7 @@ services:
 #                             the server instead of the hashing tool.
 #
 # The first three generate themselves. Whichever service boots first writes the
-# file, mode 644, and the other reads it; a file that is already there is always
+# file, mode 640, and the other reads it; a file that is already there is always
 # used as it stands, so an upgrade never rotates a token out from under a
 # connected client. Only auth_password_hash.txt has to exist beforehand — it is
 # the one value with a meaning outside this deployment, and until the setup
@@ -125,14 +125,21 @@ services:
 # same ./secrets/*.txt files are simply mounted at /secrets instead of being
 # copied to /run/secrets/<name>.
 #
-# The directory has to be writable by *both* runtime uids — 100 for the
-# connector, 102 for the OAuth layer — and they share no group:
+# Both containers create files here and they run as different uids — 100 for the
+# connector, 102 for the OAuth layer — so both images put their runtime user in
+# one shared group, gid 105 (`mailsecrets`), pinned in both Dockerfiles. Give the
+# directory to that group, setgid so files created inside inherit it:
 #
-#   mkdir -p secrets && chmod 1777 secrets
+#   mkdir -p secrets && chgrp 105 secrets && chmod 2770 secrets
 #
-# The sticky bit stops either service from replacing the other's file. What
-# limits exposure is the deployment directory itself, not this mode; see
-# docs/DEPLOYMENT.md. If you would rather not have a world-writable directory,
-# pre-create the four files by hand as before — nothing is generated over a file
-# that already exists, and the mount can then be read-only (`:ro`).
+# The setgid bit is not decoration: without it the connector's file lands in gid
+# 101 at mode 640 and the OAuth layer cannot read it. `2770` also means no other
+# account on the host can write here — which matters, because this file's
+# precedence rule is "a present file wins", so anyone able to drop an
+# auth_token.txt into this directory before the first boot would own the
+# instance. An earlier draft used a world-writable directory and had exactly that
+# hole. See docs/DEPLOYMENT.md.
+#
+# You can still pre-create the four files by hand instead — nothing is generated
+# over a file that already exists, and the mount can then be read-only (`:ro`).
 # ---------------------------------------------------------------------------

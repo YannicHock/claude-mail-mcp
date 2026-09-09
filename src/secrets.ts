@@ -5,8 +5,9 @@
  * signing key and the settings signing key — are random bytes with no meaning
  * outside a single deployment. Requiring an operator to hand-roll them before
  * the first `docker compose up` bought nothing and cost a crash loop: `600` is
- * the intuitive mode for a secret and neither container's runtime uid can read
- * it. So they are generated here instead.
+ * the intuitive mode for a secret, and the service that did not write the file
+ * cannot read it. So they are generated here instead, at a mode and group both
+ * images agree on — see {@link GENERATED_SECRET_MODE}.
  *
  * The rule, and it is the whole of the design:
  *
@@ -31,29 +32,45 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chmodSync, linkSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, linkSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import type { Logger } from "./app.js";
 
 /**
- * Mode for a generated secret file.
+ * Mode for a generated secret file: readable by its owner and by the shared
+ * group, and by nobody else.
  *
- * World-readable, owner-writable. Not a lapse:
+ * The two images run as *different* non-root users — uid 100/gid 101 for the
+ * connector, uid 102/gid 103 for the OAuth layer — and both read the same
+ * `auth_token` and `settings_signing_key`. `600` is the documented trap:
+ * whichever service wrote the file would be the only one able to read it, and
+ * the other would crash-loop on EACCES with nothing in `docker compose logs` but
+ * a permission error. `644` would work and is what a first draft of this used,
+ * but it makes every secret readable to every user on the host, and the
+ * directory would have to be world-writable for both uids to create files in
+ * it — which would let any local user plant an `auth_token.txt` before first
+ * boot and have this code adopt it, precedence rule and all.
  *
- * - The two images run as *different* non-root users — uid 100/gid 101 for the
- *   connector, uid 102/gid 103 for this service — and both read the same
- *   `auth_token` and `settings_signing_key` files. `640` would need a group both
- *   belong to; no such group exists, and inventing one would put an
- *   image-contract change in the path of every upgrade.
- * - `600` is the documented trap. Whichever service wrote the file would be the
- *   only one able to read it, and the other would crash-loop on EACCES with
- *   nothing in `docker compose logs` but a permission error.
- *
- * What limits exposure is the directory, not the file: it lives inside the
- * deployment directory, and nothing but these two containers mounts it.
+ * So both images join one shared group instead. See {@link SHARED_SECRET_GID}.
  */
-export const GENERATED_SECRET_MODE = 0o644;
+export const GENERATED_SECRET_MODE = 0o640;
+
+/**
+ * The group both container images' runtime users belong to (`mailsecrets`).
+ *
+ * Pinned identically in Dockerfile, oauth/Dockerfile and here. That is three
+ * copies of one number, so a unit test reads the two Dockerfiles and compares
+ * them against this constant: if they ever disagree, one service starts
+ * crash-looping on EACCES against a file the other just created, which is a
+ * miserable thing to debug and an easy thing to check.
+ *
+ * A setgid `secrets/` directory (mode 2770, group 105) is what the deployment
+ * documents, and is enough on its own. This constant exists so the guarantee
+ * does not *depend* on the operator having remembered the setgid bit — see
+ * {@link adoptSharedGroup}.
+ */
+export const SHARED_SECRET_GID = 105;
 
 /**
  * 48 random bytes, matching the `openssl rand -base64 48` the docs used to ask
@@ -227,6 +244,7 @@ export function createExclusively(
     // writeFileSync's mode is masked by the process umask, which in a container
     // is whatever the base image set. Say it again explicitly.
     chmodSync(temp, GENERATED_SECRET_MODE);
+    adoptSharedGroup(temp);
     try {
       linkSync(temp, path);
     } catch (err) {
@@ -238,8 +256,9 @@ export function createExclusively(
     if (err instanceof SecretError) throw err;
     throw new SecretError(
       `Cannot create ${name}_FILE at ${path}: ${describe(err)}. ` +
-        `The directory must be writable by the container's runtime user ` +
-        `(uid 100 for the connector, uid 102 for the OAuth layer) — see docs/DEPLOYMENT.md.`
+        `The directory must be group-owned by gid ${SHARED_SECRET_GID} and mode 2770, ` +
+        `so both services can create files in it: ` +
+        `chgrp ${SHARED_SECRET_GID} secrets && chmod 2770 secrets — see docs/DEPLOYMENT.md.`
     );
   } finally {
     try {
@@ -248,6 +267,34 @@ export function createExclusively(
       // Never created, or already gone. Either way there is nothing to clean up
       // and nothing worth failing startup over.
     }
+  }
+}
+
+/**
+ * Give the file away to the shared group, when this process is in it.
+ *
+ * A setgid `secrets/` directory already does this — a file created there
+ * inherits the directory's group rather than the creator's — and that is what
+ * docs/DEPLOYMENT.md asks for. But `chmod 0770` without the setgid bit is an
+ * easy thing to type, and it would leave the connector's file in gid 101 at mode
+ * 640, which uid 102 cannot read: exactly the crash loop this whole change
+ * exists to remove, reintroduced by one missing digit. So the guarantee is made
+ * here as well, where nobody has to remember it.
+ *
+ * Deliberately best-effort. Outside a container — the systemd deployment, a
+ * developer's checkout, this repository's own tests — gid 105 means something
+ * else or nothing at all, and the process is not a member, so nothing happens.
+ * POSIX only: `getgroups`/`chown` do not apply on Windows, where the tests run
+ * too.
+ */
+function adoptSharedGroup(path: string): void {
+  if (process.platform === "win32") return;
+  try {
+    if (process.getgroups?.().includes(SHARED_SECRET_GID) !== true) return;
+    chownSync(path, process.getuid?.() ?? -1, SHARED_SECRET_GID);
+  } catch {
+    // Not a member after all, or a filesystem that will not have it. The setgid
+    // directory is the documented path; this was only the belt to its braces.
   }
 }
 

@@ -135,13 +135,16 @@ describe("resolveSecret", () => {
       assert.deepEqual(readdirSync(dir), ["k.txt"]);
     });
 
-    it("declares a mode readable outside the writing uid's own group", () => {
+    it("declares a mode the other image's uid can read, and nobody else", () => {
       // 0600 is the intuitive mode for a secret and the documented crash loop:
-      // the two images run as different non-root uids with no group in common,
-      // and both read the shared auth_token and settings_signing_key. Asserted
-      // on every platform, because the constant is the decision.
-      assert.equal(GENERATED_SECRET_MODE & 0o004, 0o004, "must be world-readable");
-      assert.equal(GENERATED_SECRET_MODE & 0o022, 0, "must not be world- or group-writable");
+      // the two images run as different non-root uids, and both read the shared
+      // auth_token and settings_signing_key. They read it through the group they
+      // share (see SHARED_SECRET_GID), which is why this is 0640 and not 0644 —
+      // a world-readable secret hands every account on the host the connector's
+      // token. Asserted on every platform, because the constant is the decision.
+      assert.equal(GENERATED_SECRET_MODE & 0o040, 0o040, "must be group-readable");
+      assert.equal(GENERATED_SECRET_MODE & 0o007, 0, "must be closed to other");
+      assert.equal(GENERATED_SECRET_MODE & 0o020, 0, "must not be group-writable");
     });
 
     it("writes that mode to disk", posixOnly, () => {
@@ -177,7 +180,9 @@ describe("resolveSecret", () => {
         (err: unknown) =>
           err instanceof SecretError &&
           err.message.includes("K_FILE") &&
-          err.message.includes("writable")
+          // and says what to do about it, since the usual cause is a secrets
+          // directory the shared group cannot write to
+          err.message.includes("chmod 2770")
       );
     });
 
