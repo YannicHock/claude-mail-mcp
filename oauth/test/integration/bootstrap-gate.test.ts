@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { Bootstrap, BootstrapError } from "../../src/bootstrap.js";
+import { silentLogger } from "../../src/logger.js";
 import { startHarness, type Harness } from "../helpers/harness.js";
 
 const VALID_HASH =
@@ -254,6 +256,79 @@ test("the token on disk is the one the setup URL carries", async () => {
   } finally {
     await harness.close();
   }
+});
+
+/** The state file, in the shape the store writes it. */
+function seedPriorUse(path: string): void {
+  writeFileSync(path, JSON.stringify({ version: 1, clients: {}, sessions: {}, tokenEpoch: 0 }));
+}
+
+test("an empty data volume still mints a token, prints the URL and serves the wizard", async () => {
+  // The other half of #58: STATE_FILE is configured and simply is not there yet,
+  // which is what a genuine first boot looks like. It must reach the operator.
+  const dir = dataDir();
+  const harness = await startHarness({
+    unbootstrapped: true,
+    dataDir: dir,
+    configOverrides: { stateFile: join(dir, "oauth-state.json") },
+  });
+  try {
+    const printed: string[] = [];
+    harness.bootstrap.announce((chunk) => printed.push(chunk));
+
+    assert.ok(harness.setupUrl);
+    assert.ok(printed.join("").includes(harness.setupUrl), "the banner carries the link");
+    assert.equal((await get(harness, `/setup/${harness.claimToken}/credentials`)).status, 200);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a restart mid-wizard still serves /setup, progress on the volume and all", async () => {
+  // The wizard's own artifacts — a live claim token, a progress note — are what
+  // an unfinished setup leaves behind, and neither may read as prior use.
+  const dir = dataDir();
+  const stateFile = join(dir, "oauth-state.json");
+  const first = await startHarness({
+    unbootstrapped: true,
+    dataDir: dir,
+    configOverrides: { stateFile },
+  });
+  const token = first.claimToken;
+  await first.close();
+  writeFileSync(
+    join(dir, "setup-wizard.json"),
+    JSON.stringify({ version: 1, furthest: "credentials" })
+  );
+
+  const second = await startHarness({
+    unbootstrapped: true,
+    dataDir: dir,
+    configOverrides: { stateFile },
+  });
+  try {
+    assert.equal(second.claimToken, token, "the same token, still live");
+    assert.equal((await get(second, `/setup/${token}/credentials`)).status, 200);
+  } finally {
+    await second.close();
+  }
+});
+
+test("a used volume that lost its credential never gets as far as a route table", async () => {
+  // The gate is decided before createApp is called at all, so the failure this
+  // asserts is the absence of a server rather than the shape of its 404s: an
+  // instance whose secrets mount vanished must crash, not serve a setup URL.
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  const stateFile = join(dir, "oauth-state.json");
+  const config = { ...harness.config, stateFile };
+  await harness.close();
+  seedPriorUse(stateFile);
+
+  assert.throws(
+    () => Bootstrap.open(config, silentLogger),
+    (err: unknown) => err instanceof BootstrapError && err.message.includes(stateFile)
+  );
 });
 
 test("a claimed instance is unchanged: no gate, no 503, no setup route", async () => {

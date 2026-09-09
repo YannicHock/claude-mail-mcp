@@ -105,6 +105,30 @@ describe("loadConfig", () => {
       assert.equal(config.authPasswordHash, null);
     });
 
+    it("remembers the AUTH_PASSWORD_HASH_FILE path even when nothing is there", () => {
+      // The expectation outlives the file. bootstrap.ts refuses to boot a used
+      // data volume whose hash has gone missing, and the one thing that message
+      // has to carry is the path the operator can go and look at.
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      const path = join(dir, "auth_password_hash.txt");
+
+      const config = loadConfig(
+        baseEnv({ AUTH_PASSWORD_HASH: undefined, AUTH_PASSWORD_HASH_FILE: path })
+      );
+
+      assert.equal(config.authPasswordHash, null, "nothing was read");
+      assert.equal(config.authPasswordHashFile, path);
+      assert.equal(existsSync(path), false, "and nothing was written either");
+    });
+
+    it("has no hash path to name when the hash was given inline or not at all", () => {
+      assert.equal(loadConfig(baseEnv()).authPasswordHashFile, null);
+      assert.equal(
+        loadConfig(baseEnv({ AUTH_PASSWORD_HASH: undefined })).authPasswordHashFile,
+        null
+      );
+    });
+
     it("still refuses a malformed AUTH_PASSWORD_HASH", () => {
       // Absent is a state; present-but-wrong is a typo, and stays fatal.
       assert.throws(

@@ -71,6 +71,19 @@ export interface OAuthConfig {
    * live credential and this is ignored; see operator.ts.
    */
   authPasswordHash: string | null;
+  /**
+   * The path `AUTH_PASSWORD_HASH_FILE` names, whether or not anything is there.
+   *
+   * Not a second copy of the secret and never read as one — `authPasswordHash`
+   * above is the value. This is the *expectation*, kept so that the one place
+   * that has to say a hash went missing can name the file it went missing from.
+   * A vanished secrets mount is the failure mode bootstrap.ts refuses to boot on,
+   * and "AUTH_PASSWORD_HASH is not set" is a much poorer thing to read in a
+   * container log than the path the operator can go and look at.
+   *
+   * Optional, and absent when the hash was supplied inline or not at all.
+   */
+  authPasswordHashFile?: string | null;
   stateFile: string | null;
   /**
    * Key for the assertion the settings proxy sends to the connector. Null turns
@@ -334,6 +347,14 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
   // allowed and means "nobody has configured this instance yet" — see
   // bootstrap.ts. Present but malformed stays fatal: that is a typo, not a state.
   const authPasswordHash = absentableSecret(env, "AUTH_PASSWORD_HASH", secretReport);
+  // Deliberately read straight from the environment rather than out of
+  // absentableSecret: what matters here is the path that was *configured*, which
+  // is exactly the thing that survives the file going away.
+  const authPasswordHashFileRaw = env.AUTH_PASSWORD_HASH_FILE?.trim();
+  const authPasswordHashFile =
+    authPasswordHashFileRaw === undefined || authPasswordHashFileRaw === ""
+      ? null
+      : authPasswordHashFileRaw;
   if (authPasswordHash !== null && !isValidHashFormat(authPasswordHash)) {
     throw new ConfigError(
       "AUTH_PASSWORD_HASH is not a valid scrypt hash. Generate one with: npm run hash-password"
@@ -403,6 +424,7 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
     signingKey,
     authUsername: optional(env, "AUTH_USERNAME", "operator"),
     authPasswordHash,
+    authPasswordHashFile,
     stateFile,
     settingsSigningKey,
     operatorFile,

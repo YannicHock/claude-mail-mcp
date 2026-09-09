@@ -181,6 +181,131 @@ describe("what counts as unbootstrapped", () => {
   });
 });
 
+describe("a data volume that has been used before is not a first boot", () => {
+  /**
+   * The state file, written the way the store writes it. Nothing creates this
+   * file at boot — `Store.open` reads it and, finding it absent, starts empty
+   * without writing anything — so its presence means a client registered or a
+   * refresh session was issued against this volume. That only happens on an
+   * instance somebody claimed: `/register` is a 404 while the gate is closed.
+   */
+  function seedPriorUse(dir: string): string {
+    const path = join(dir, "oauth-state.json");
+    writeFileSync(
+      path,
+      JSON.stringify({ version: 1, clients: {}, sessions: {}, tokenEpoch: 0 })
+    );
+    return path;
+  }
+
+  it("refuses to start when the hash vanished from a volume that has served traffic", () => {
+    // The corner #58 is about. An instance that authenticated from
+    // AUTH_PASSWORD_HASH alone and never wrote an operator record: a secrets
+    // mount that breaks with ENOENT — a renamed host directory, a volume that
+    // did not attach — used to leave it booting as an unclaimed instance and
+    // printing a setup URL to whoever can read the logs.
+    const dir = tempDir();
+    const stateFile = seedPriorUse(dir);
+    const hashFile = join(dir, "auth_password_hash.txt");
+
+    assert.throws(
+      () => Bootstrap.open(configFor(dir, { authPasswordHashFile: hashFile }), silentLogger),
+      (err: unknown) =>
+        err instanceof BootstrapError &&
+        err.message.includes(hashFile) &&
+        err.message.includes(join(dir, "operator.json")) &&
+        err.message.includes(stateFile)
+    );
+    assert.equal(existsSync(join(dir, "claim-token.txt")), false, "nothing was minted");
+  });
+
+  it("names the secret even when it was never given as a file path", () => {
+    const dir = tempDir();
+    seedPriorUse(dir);
+
+    assert.throws(
+      () => Bootstrap.open(configFor(dir), silentLogger),
+      (err: unknown) =>
+        err instanceof BootstrapError && err.message.includes("AUTH_PASSWORD_HASH")
+    );
+  });
+
+  it("counts a state file the store quarantined moments earlier", () => {
+    // index.ts opens the store before it opens this, and a state file the store
+    // cannot parse is renamed to <path>.corrupt-<ts> on the way. Without this,
+    // one unparseable byte would erase the evidence between the two calls and
+    // hand a configured instance back to the claim token.
+    const dir = tempDir();
+    writeFileSync(join(dir, "oauth-state.json.corrupt-1757000000000"), "{ not json");
+
+    assert.throws(() => Bootstrap.open(configFor(dir), silentLogger), BootstrapError);
+  });
+
+  it("still mints a claim token on a genuinely empty data volume", () => {
+    const dir = tempDir();
+
+    const bootstrap = Bootstrap.open(configFor(dir), silentLogger);
+
+    assert.equal(bootstrap.bootstrapped, false);
+    assert.ok(bootstrap.setupUrl, "the setup URL an operator is meant to receive");
+  });
+
+  it("still boots mid-wizard, before step 1 has written the operator record", () => {
+    // A live claim token and the wizard's own progress note are the litter of an
+    // unfinished setup, not of an instance that has run. Counting either would
+    // turn a half-finished wizard into a refusal to boot, which is the one thing
+    // the claim token was built to survive.
+    const dir = tempDir();
+    const first = Bootstrap.open(configFor(dir), silentLogger);
+    writeFileSync(
+      join(dir, "setup-wizard.json"),
+      JSON.stringify({ version: 1, furthest: "credentials" })
+    );
+
+    const second = Bootstrap.open(configFor(dir), silentLogger);
+
+    assert.equal(second.bootstrapped, false);
+    assert.equal(second.setupUrl, first.setupUrl, "the same token, still live");
+  });
+
+  it("refuses even with a claim token present, once the volume shows real traffic", () => {
+    // The instance a boot under the old rule has already downgraded: it minted a
+    // token and printed a setup URL. The token must not now excuse the fault it
+    // is a symptom of, or the fix would skip the only instances that need it.
+    const dir = tempDir();
+    writeFileSync(join(dir, "claim-token.txt"), "minted-by-an-earlier-boot\n");
+    seedPriorUse(dir);
+
+    assert.throws(() => Bootstrap.open(configFor(dir), silentLogger), BootstrapError);
+  });
+
+  it("leaves OPERATOR_FILE=none, a configured hash and a claimed volume alone", () => {
+    const dir = tempDir();
+    seedPriorUse(dir);
+
+    for (const overrides of [
+      { operatorFile: null, authPasswordHash: VALID_HASH },
+      { authPasswordHash: VALID_HASH },
+    ]) {
+      assert.equal(Bootstrap.open(configFor(dir, overrides), silentLogger).bootstrapped, true);
+    }
+
+    writeOperatorRecord(join(dir, "operator.json"));
+    assert.equal(Bootstrap.open(configFor(dir), silentLogger).bootstrapped, true);
+  });
+
+  it("has nothing to go on when STATE_FILE is none, and mints as before", () => {
+    // An in-memory deployment leaves no trace of prior use to find. Documented
+    // rather than worked around: the check is only ever as good as the volume.
+    const dir = tempDir();
+    seedPriorUse(dir);
+
+    const bootstrap = Bootstrap.open(configFor(dir, { stateFile: null }), silentLogger);
+
+    assert.equal(bootstrap.bootstrapped, false);
+  });
+});
+
 describe("the claim token", () => {
   it("is 32 random bytes, base64url", () => {
     const token = generateClaimToken();
