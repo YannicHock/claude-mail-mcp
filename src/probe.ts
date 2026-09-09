@@ -255,6 +255,91 @@ async function probeSmtp(creds: SmtpCreds, perProbeMs: number): Promise<ProbeRes
 }
 
 /**
+ * The prefix a CalDAV failure carries when the pre-flight below reached the
+ * server and was not refused, but tsdav's discovery failed anyway — a URL that
+ * is up, answering, and simply not a calendar. Declared here rather than
+ * beside CREDENTIAL_REJECTION_MESSAGE because it belongs to probeCalDav()
+ * alone; the IMAP and SMTP probes have no equivalent second stage.
+ *
+ * It exists so that the CalDAV probe's three outcomes stay three outcomes.
+ * Without it, "wrong password" and "not a CalDAV endpoint" both arrive as
+ * tsdav's `cannot find principalUrl` and the operator cannot act on either.
+ * Exported so the tests assert the classification rather than the wording.
+ */
+export const CALDAV_DISCOVERY_FAILURE_PREFIX =
+  "the server answered, but CalDAV discovery failed: ";
+
+/**
+ * Ask the configured URL one plain HTTP question, with the operator's
+ * credentials attached, and read the status code before tsdav ever runs.
+ * Returns a credential rejection when the server refuses those credentials,
+ * and `null` — "carry on" — for anything else. A server that cannot be
+ * reached at all throws out of here, exactly as the request underneath does,
+ * and stays a connectivity failure.
+ *
+ * Why a pre-flight at all. imapflow decorates its errors with what the server
+ * said (see isCredentialRejection above), so probeImap() can classify after
+ * the fact. tsdav cannot be classified after the fact: `createAccount()`
+ * (node_modules/tsdav/dist/tsdav.cjs.js, ~line 1372) walks a list of candidate
+ * root URLs — the discovered one, the configured `serverUrl`, and the origin's
+ * `/` — and keeps only the *last* error, so the `401` from the URL the
+ * operator actually typed is routinely overwritten by `cannot find
+ * principalUrl` from a candidate they never configured. Verified against a
+ * local endpoint answering `401` to everything: the failure that surfaced
+ * named `http://host/`, not the configured path. Even on the runs where the
+ * status does survive, it arrives as free-form prose, not as a field.
+ *
+ * Why `GET`, and why not more. This is the least CalDAV-aware request that
+ * still reaches the server's authentication layer — plain HTTP, no `PROPFIND`,
+ * no `Depth`, no XML. Issuing the discovery request ourselves would work too,
+ * and would answer more cases (see below), but it would put a second copy of
+ * this protocol's details in this repository, which is the thing tsdav is here
+ * to avoid. The body is cancelled unread: nothing here needs it, and leaving
+ * it dangling holds the connection open.
+ *
+ * What it deliberately does not answer:
+ *
+ *   - `403` is not treated as a rejection. It means the credentials were
+ *     understood and the resource is still off limits, which is a different
+ *     sentence than "wrong password" and would be a lie in this one.
+ *   - A server that serves its landing page anonymously and only demands
+ *     authentication deeper in still falls through to tsdav, and still reports
+ *     whatever tsdav makes of it. That is the pre-fix behaviour, unchanged —
+ *     this narrows the vague case, it does not claim to have removed it.
+ *   - Basic is the only scheme offered, matching `authMethod: "Basic"` below.
+ *     A server that wants Digest answers `401` and is reported as a rejection,
+ *     which is the right answer for a probe that cannot speak Digest either.
+ *
+ * `signal` is the same AbortController the discovery phase gets, so the
+ * pre-flight spends the same `perProbeMs` budget rather than adding to it.
+ */
+async function caldavPreflight(
+  creds: CalDavCreds,
+  signal: AbortSignal
+): Promise<ProbeResult | null> {
+  const basic = Buffer.from(`${creds.user}:${creds.pass}`, "utf8").toString("base64");
+  const response = await fetch(creds.url, {
+    method: "GET",
+    headers: { Authorization: `Basic ${basic}` },
+    signal,
+  });
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Best-effort: the body may already be gone, and it was never wanted.
+  }
+
+  if (response.status === 401) {
+    // Same fixed string probeImap() reports, on purpose. The operator is being
+    // told which of two things went wrong; which library was involved is not
+    // part of the answer, and the server's own wording is neither dependable
+    // nor guaranteed free of the credentials it is complaining about.
+    return { ok: false, message: CREDENTIAL_REJECTION_MESSAGE };
+  }
+  return null;
+}
+
+/**
  * tsdav has no timeout option of its own to configure the way imapflow and
  * nodemailer do above — it goes straight through the platform `fetch()`,
  * which has no default timeout at all. Left alone, `withTimeout()` here
@@ -307,22 +392,38 @@ async function probeSmtp(creds: SmtpCreds, perProbeMs: number): Promise<ProbeRes
 async function probeCalDav(creds: CalDavCreds, perProbeMs: number): Promise<ProbeResult> {
   const controller = new AbortController();
   try {
-    await withTimeout(
-      (async () => {
-        const client = await createDAVClient({
-          serverUrl: creds.url,
-          credentials: { username: creds.user, password: creds.pass },
-          authMethod: "Basic",
-          defaultAccountType: "caldav",
-          fetchOptions: { signal: controller.signal },
-        });
-        await client.fetchCalendars();
+    return await withTimeout(
+      (async (): Promise<ProbeResult> => {
+        const rejected = await caldavPreflight(creds, controller.signal);
+        if (rejected) return rejected;
+
+        try {
+          const client = await createDAVClient({
+            serverUrl: creds.url,
+            credentials: { username: creds.user, password: creds.pass },
+            authMethod: "Basic",
+            defaultAccountType: "caldav",
+            fetchOptions: { signal: controller.signal },
+          });
+          await client.fetchCalendars();
+        } catch (err) {
+          // Our own deadline firing is not a discovery failure — it is the
+          // timeout, and withTimeout is already rejecting with a message that
+          // says so. Rethrowing keeps that the answer rather than dressing an
+          // abort up as "the server answered".
+          if (controller.signal.aborted) throw err;
+          // Reached and not refused, but no calendar came back. `describe()`
+          // runs over the composed string, not just the library's half, so the
+          // whole message stays inside MAX_MESSAGE_LENGTH.
+          const detail = `${CALDAV_DISCOVERY_FAILURE_PREFIX}${describe(err)}`;
+          return { ok: false, message: describe(detail) };
+        }
+        return { ok: true };
       })(),
       perProbeMs,
       "CalDAV",
       () => controller.abort()
     );
-    return { ok: true };
   } catch (err) {
     return toFailure(err);
   }
