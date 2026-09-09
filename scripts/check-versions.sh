@@ -8,6 +8,10 @@
 # were both merged into main while package.json still read 0.2.1 and /health still
 # reported 0.2.1 to anyone who asked.
 #
+# It checks the Node requirement in the same pass. npm copies `engines` from each
+# package.json into its lockfile's root-package entry, so raising one without running
+# an install leaves the lockfile advertising Node versions the source has dropped.
+#
 # Run it by hand before tagging:
 #
 #     scripts/check-versions.sh            # do all eight strings agree?
@@ -49,6 +53,32 @@ json_version() {
     const value = where === "root" ? doc.version : doc?.packages?.[""]?.version;
     if (typeof value !== "string" || value === "") {
       process.stderr.write(`no version found at ${where} of ${file}\n`);
+      process.exit(1);
+    }
+    process.stdout.write(value);
+  ' "$file" "$where"
+}
+
+# The same, for the Node requirement: `engines.node`, either at the top of a
+# package.json or in the root-package entry of a lockfile.
+json_engines() {
+  local file="$1" where="$2"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the JavaScript below
+  # contains template literals whose ${...} must reach node, not the shell.
+  node -e '
+    const fs = require("node:fs");
+    const [file, where] = process.argv.slice(1);
+    let doc;
+    try {
+      doc = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch (err) {
+      process.stderr.write(`cannot read ${file}: ${err.message}\n`);
+      process.exit(1);
+    }
+    const entry = where === "root" ? doc : doc?.packages?.[""];
+    const value = entry?.engines?.node;
+    if (typeof value !== "string" || value === "") {
+      process.stderr.write(`no engines.node found at ${where} of ${file}\n`);
       process.exit(1);
     }
     process.stdout.write(value);
@@ -101,6 +131,26 @@ if [ "$mismatched" -ne 0 ]; then
   printf '\nBring them all to one value before tagging.\n' >&2
   exit 1
 fi
+
+# Every package whose Node requirement is written down twice. Adding a package is the
+# moment to add its pair here too — the lockfile half is the one that drifts, because
+# only npm writes it and only an install brings it back.
+manifests=(
+  "package.json"
+  "oauth/package.json"
+)
+lockfiles=(
+  "package-lock.json"
+  "oauth/package-lock.json"
+)
+
+for i in "${!manifests[@]}"; do
+  manifest_node="$(json_engines "${manifests[$i]}" root)"
+  lock_node="$(json_engines "${lockfiles[$i]}" packages)"
+  if [ "$manifest_node" != "$lock_node" ]; then
+    fail "${lockfiles[$i]} requires node ${lock_node}, but ${manifests[$i]} requires ${manifest_node}. Run \`npm install\` beside ${manifests[$i]} and commit the corrected lockfile."
+  fi
+done
 
 if [ -n "$expected" ] && [ "$version" != "$expected" ]; then
   fail "tag says $expected but the tree says $version. Tag the commit that carries the version, or correct the tree."
