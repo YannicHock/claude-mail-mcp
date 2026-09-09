@@ -21,6 +21,13 @@ export const PER_PROBE_TIMEOUT_MS = 10_000;
 export const TOTAL_TIMEOUT_MS = 25_000;
 export const MAX_MESSAGE_LENGTH = 200;
 
+/**
+ * The one message a probe reports when the server was reached and answered,
+ * and what it answered was "not with those credentials". Exported so the
+ * tests assert the classification rather than a copy of the wording.
+ */
+export const CREDENTIAL_REJECTION_MESSAGE = "the server rejected these credentials";
+
 export interface ProbeInput {
   imap: ImapCreds;
   smtp: SmtpCreds;
@@ -85,6 +92,66 @@ function toFailure(err: unknown): ProbeResult {
 }
 
 /**
+ * The fields imapflow decorates an IMAP command failure with. None of them
+ * are on `Error`, and imapflow's published types describe them only on the
+ * `AuthenticationFailure` subclass, so they are declared here and read
+ * defensively — every one of them is checked before it is trusted.
+ */
+interface ImapCommandError {
+  /** Set by imapflow's LOGIN/AUTHENTICATE handlers on any error escaping the
+   * authentication step (`dist/esm/commands/login.js`, `authenticate.js`). */
+  authenticationFailed?: unknown;
+  /** `"NO"` or `"BAD"` — present only when the server actually answered with a
+   * tagged rejection (`settleRequest()` in `dist/esm/imap-flow.js`). */
+  responseStatus?: unknown;
+  /** The RFC 5530 response code, e.g. `AUTHENTICATIONFAILED`, for servers that
+   * send one. GreenMail does not; Dovecot does. */
+  serverResponseCode?: unknown;
+}
+
+/**
+ * True when the IMAP server was reached, answered, and refused the login.
+ *
+ * imapflow throws its `AuthenticationFailure` class only in narrow cases it
+ * decides on its own (login disabled, no password configured, Exchange's
+ * authenticate-then-fail-NAMESPACE quirk). The ordinary wrong-password case —
+ * a server answering `LOGIN` with a tagged `NO` — is not one of them: imapflow
+ * raises a plain `Error("Command failed")` and hangs the interesting detail off
+ * it as properties. Reporting `err.message` there tells the operator "Command
+ * failed", which reads like a connectivity problem and is exactly the confusion
+ * this classification exists to prevent. Verified against GreenMail, which
+ * yields `authenticationFailed: true`, `responseStatus: "NO"`, `responseText:
+ * "LOGIN failed. Invalid login/password for user id alice"` and no
+ * `serverResponseCode` at all.
+ *
+ * Both halves of the final check matter, and neither is redundant:
+ *
+ *   - `authenticationFailed` alone is too broad. imapflow's LOGIN handler tags
+ *     it onto *anything* thrown out of the authentication step, including a
+ *     socket that dies mid-command — a connectivity failure that must keep
+ *     reading as one.
+ *   - `responseStatus` alone is too broad in the other direction: a tagged
+ *     `NO`/`BAD` says the server refused a command, not that it refused these
+ *     credentials.
+ *
+ * Together they are precisely "the server rejected the login", which is the
+ * claim the message makes. `serverResponseCode` is checked as well for the
+ * servers that do send RFC 5530's `AUTHENTICATIONFAILED`, so the classification
+ * does not rest solely on internal imapflow bookkeeping.
+ */
+function isCredentialRejection(err: unknown): boolean {
+  if (err instanceof AuthenticationFailure) return true;
+  if (!(err instanceof Error)) return false;
+
+  const fields = err as Error & ImapCommandError;
+  if (fields.serverResponseCode === "AUTHENTICATIONFAILED") return true;
+
+  const status =
+    typeof fields.responseStatus === "string" ? fields.responseStatus.toUpperCase() : "";
+  return fields.authenticationFailed === true && (status === "NO" || status === "BAD");
+}
+
+/**
  * `perProbeMs` is enforced twice here, deliberately:
  *
  * 1. As imapflow's own `connectionTimeout`/`greetingTimeout`. Without this,
@@ -116,8 +183,12 @@ async function probeImap(creds: ImapCreds, perProbeMs: number): Promise<ProbeRes
     await withTimeout(client.connect(), perProbeMs, "IMAP", () => client.close());
     return { ok: true };
   } catch (err) {
-    if (err instanceof AuthenticationFailure) {
-      return { ok: false, message: "the server rejected these credentials" };
+    if (isCredentialRejection(err)) {
+      // Deliberately a fixed string rather than the server's own text: the
+      // operator needs to know which of the two things went wrong, and the
+      // server's wording is neither dependable nor guaranteed free of the
+      // credentials it is complaining about.
+      return { ok: false, message: CREDENTIAL_REJECTION_MESSAGE };
     }
     return toFailure(err);
   } finally {

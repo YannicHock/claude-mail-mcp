@@ -2,6 +2,12 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A wrong password in the connection test reported `Command failed`.** Telling "these credentials are wrong" apart from "this host is unreachable" is the reason the connection test exists, and it got the common case backwards: the probe recognised only imapflow's `AuthenticationFailure`, which that library throws in a handful of narrow situations that do not include the ordinary rejection. A server answering `LOGIN` with a tagged `NO` — what a mistyped password actually looks like — surfaced as a generic `Command failed`, which reads like a connectivity problem. The probe now classifies on the authentication stage itself (imapflow's `authenticationFailed` together with a real `NO`/`BAD` from the server, or RFC 5530's `AUTHENTICATIONFAILED` response code) and reports "the server rejected these credentials". A connection that dies mid-login still reads as a connectivity failure, which is asserted in both directions. Closes the known limitation noted under 0.6.0.
+
 ## [0.6.3] — 2026-09-09
 
 Both fixes below are the same defect as 0.6.1 and 0.6.2, found by auditing every security header this project emits against what a browser actually does with it, rather than against what the string says.
