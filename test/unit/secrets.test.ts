@@ -206,6 +206,103 @@ describe("resolveSecret", () => {
 
   });
 
+  describe("an empty file is replaced, not adopted", () => {
+    // The defect this block exists for. A file that was there but held nothing
+    // resolved to "" with source "file", and `bearerAuth`'s /^Bearer\s+(.+)$/
+    // can never produce the empty string — so every /mcp and /settings request
+    // answered 401 for the life of the container, while the only line in the
+    // log said the secret had been read from its file.
+
+    it("generates a real secret over a file that holds nothing", () => {
+      const dir = workdir();
+      const path = join(dir, "auth_token.txt");
+      writeFileSync(path, "");
+
+      const resolved = resolveSecret({ AUTH_TOKEN_FILE: path }, "AUTH_TOKEN");
+
+      assert.notEqual(resolved.value, "");
+      assert.ok((resolved.value ?? "").length > 0);
+      assert.equal(resolved.source, "replaced");
+      assert.equal(readFileSync(path, "utf8").trim(), resolved.value);
+      // Replaced in place, not left beside a temp file or a second copy.
+      assert.deepEqual(readdirSync(dir), ["auth_token.txt"]);
+    });
+
+    it("treats a file of whitespace as empty", () => {
+      const dir = workdir();
+      const path = join(dir, "k.txt");
+      writeFileSync(path, "\n \t\n");
+
+      const resolved = resolveSecret({ K_FILE: path }, "K");
+
+      assert.ok((resolved.value ?? "").length > 0);
+      assert.equal(resolved.source, "replaced");
+    });
+
+    it("seeds the inline value into it rather than generating a second one", () => {
+      // A blank file must not cost an Option A upgrade its token: the OAuth
+      // layer reads this same file, and a generated value here would 401 every
+      // proxied request.
+      const dir = workdir();
+      const path = join(dir, "auth_token.txt");
+      writeFileSync(path, "\n");
+
+      const resolved = resolveSecret(
+        { AUTH_TOKEN: "token-from-dot-env", AUTH_TOKEN_FILE: path },
+        "AUTH_TOKEN"
+      );
+
+      assert.equal(resolved.value, "token-from-dot-env");
+      assert.equal(resolved.source, "replaced");
+      assert.equal(readFileSync(path, "utf8").trim(), "token-from-dot-env");
+    });
+
+    it("writes the replacement at the shared-group mode", posixOnly, () => {
+      // The file it replaces may well be a 600 one an operator created by hand.
+      const dir = workdir();
+      const path = join(dir, "k.txt");
+      writeFileSync(path, "", { mode: 0o600 });
+
+      resolveSecret({ K_FILE: path }, "K");
+
+      assert.equal(statSync(path).mode & 0o777, GENERATED_SECRET_MODE);
+    });
+
+    it("says the file is empty, not missing, for a secret that is never generated", () => {
+      // AUTH_PASSWORD_HASH is not invented by this process. "ENOENT: no such
+      // file or directory" would send the operator hunting for a file that is
+      // sitting right there.
+      const dir = workdir();
+      const path = join(dir, "auth_password_hash.txt");
+      writeFileSync(path, "\n");
+
+      assert.throws(
+        () =>
+          resolveSecret({ AUTH_PASSWORD_HASH_FILE: path }, "AUTH_PASSWORD_HASH", {
+            generate: false,
+          }),
+        (err: unknown) =>
+          err instanceof SecretError &&
+          err.message.includes("is empty") &&
+          !err.message.includes("ENOENT")
+      );
+      // And left alone: this process does not delete a file it cannot refill.
+      assert.equal(readFileSync(path, "utf8"), "\n");
+    });
+
+    it("reads the replacement back on the next boot rather than rotating again", () => {
+      const dir = workdir();
+      const path = join(dir, "k.txt");
+      writeFileSync(path, "");
+
+      const first = resolveSecret({ K_FILE: path }, "K");
+      const second = resolveSecret({ K_FILE: path }, "K");
+
+      assert.equal(second.value, first.value);
+      assert.equal(second.source, "file");
+    });
+  });
+
   describe("a concurrent first boot", () => {
     // Both services generate the shared auth_token and settings_signing_key at
     // the same moment on a first `docker compose up`. The loser must adopt the
@@ -222,6 +319,22 @@ describe("resolveSecret", () => {
       assert.equal(created.value, "written-by-the-other-service");
       assert.equal(readFileSync(path, "utf8"), "written-by-the-other-service\n");
       assert.deepEqual(readdirSync(dir), ["settings_signing_key.txt"]);
+    });
+
+    it("refuses an empty file rather than adopting it as the winner's value", () => {
+      // Nothing in this module ever links an empty file into place, so an empty
+      // target here was not written by the other service. Adopting it would gate
+      // both services behind a secret nobody can present — the same failure the
+      // empty-file rule above exists to stop, arriving by the other door.
+      const dir = workdir();
+      const path = join(dir, "auth_token.txt");
+      writeFileSync(path, "\n");
+
+      assert.throws(
+        () => createExclusively(path, "mine", "AUTH_TOKEN"),
+        (err: unknown) => err instanceof SecretError && err.message.includes("empty")
+      );
+      assert.deepEqual(readdirSync(dir), ["auth_token.txt"]);
     });
   });
 
@@ -270,6 +383,23 @@ describe("logSecretReport", () => {
     assert.equal(lines[0]?.level, "info");
     assert.equal(lines[0]?.extra?.path, "/secrets/auth_token.txt");
     assert.equal("path" in (lines[2]?.extra ?? {}), false);
+  });
+
+  it("warns, rather than reassures, when the file was found empty", () => {
+    // The line an operator who truncated a live secret by accident has to see:
+    // the old "secret resolved … source:file" said the opposite of what happened.
+    const lines: Array<{ level: LogLevel; message: string; extra?: Record<string, unknown> }> = [];
+
+    logSecretReport(
+      [{ name: "AUTH_TOKEN", source: "replaced", path: "/secrets/auth_token.txt" }],
+      (level, message, extra) => lines.push({ level, message, extra })
+    );
+
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0]?.level, "warn");
+    assert.equal(lines[0]?.extra?.source, "replaced");
+    assert.match(lines[0]?.message ?? "", /empty/);
+    assert.match(String(lines[0]?.extra?.note ?? ""), /restart both services/);
   });
 
   it("never logs the value itself", () => {

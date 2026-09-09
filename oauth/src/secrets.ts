@@ -13,6 +13,12 @@
  *
  *   **A present file wins. An absent one is generated.**
  *
+ * A file holding nothing is not a present file — that is the rule read exactly,
+ * not a hole in it. An empty file has no value to preserve, and adopting one is
+ * worse than useless: an `AUTH_TOKEN` of `""` answers 401 to every request for
+ * the life of the container while the startup log reports the secret as read
+ * from its file. So a blank file is cleared, replaced, and said out loud.
+ *
  * Existing deployments mount all four secrets as read-only Docker file-secrets.
  * If generation ever took priority over a present file — or if an existence
  * check misfired — a running instance would come back up with a fresh
@@ -32,7 +38,15 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chmodSync, chownSync, linkSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  chownSync,
+  existsSync,
+  linkSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import type { Logger } from "./logger.js";
@@ -88,7 +102,15 @@ export type SecretSource =
   /** Taken from the inline `NAME` and written to `NAME_FILE`, which was absent. */
   | "seeded"
   /** Not supplied anywhere; generated and written to `NAME_FILE`. */
-  | "generated";
+  | "generated"
+  /**
+   * `NAME_FILE` was there and held nothing. The empty file was removed and a
+   * fresh value — the inline `NAME`, or a generated one — written in its place.
+   * Kept separate from "generated" and "seeded" because it is the one source
+   * worth a `warn`: on anything but a first boot it means a secret the operator
+   * believed was set had been truncated.
+   */
+  | "replaced";
 
 export interface ResolvedSecret {
   /** Undefined only when neither `NAME` nor `NAME_FILE` was configured. */
@@ -127,7 +149,7 @@ export interface ResolveOptions {
 /**
  * Resolve one secret, in this order:
  *
- *  1. `NAME_FILE` is set and the file is there — read it. Always wins.
+ *  1. `NAME_FILE` is set and the file holds something — read it. Always wins.
  *  2. `NAME_FILE` is set, the file is absent, `NAME` is set — use the inline
  *     value and *write it to the file*. Seeding rather than merely using it is
  *     what keeps the two services agreeing: an operator upgrading from a
@@ -141,6 +163,12 @@ export interface ResolveOptions {
  * ENOENT reaches the generation branch, and a failure to create the file is
  * fatal too — a secret this process could not persist is one the other service
  * will not see.
+ *
+ * A file that exists and is *empty* takes step 2 or 3 as well, and is reported
+ * as `"replaced"` rather than as `"seeded"` or `"generated"`: there was
+ * nothing in it to keep, but there was something there, and an operator who
+ * truncated a live secret by accident has to be told rather than left to find
+ * out from a token that no longer works.
  */
 export function resolveSecret(
   env: Env,
@@ -161,12 +189,24 @@ export function resolveSecret(
   const existing = readIfPresent(path, name);
   if (existing !== undefined) return { value: existing, source: "file", path };
 
+  // `readIfPresent` says "undefined" for both an absent file and an empty one.
+  // They need different words in the log, and a different sentence below.
+  const blank = existsSync(path);
+
   if (!options.generate) {
     throw new SecretError(
-      `Cannot read ${name}_FILE at ${path}: ENOENT: no such file or directory. ` +
-        `This secret is never generated — supply it, or unset ${name}_FILE.`
+      blank
+        ? `${name}_FILE at ${path} is empty. This secret is never generated — ` +
+          `write the value into that file, or unset ${name}_FILE.`
+        : `Cannot read ${name}_FILE at ${path}: ENOENT: no such file or directory. ` +
+          `This secret is never generated — supply it, or unset ${name}_FILE.`
     );
   }
+
+  // `createExclusively` links a temp file into place and refuses to clobber, so
+  // an empty file has to be cleared before it can be replaced. Left in place it
+  // would take the EEXIST branch and be adopted, which is the whole defect.
+  if (blank) removeBlankFile(path, name);
 
   const created = createExclusively(path, inline ?? generateSecret(), name);
   // `raced` means another process created the file between the read above and
@@ -174,11 +214,9 @@ export function resolveSecret(
   // concurrently. Whoever lost reports "file", because that is what it is now
   // holding, and both end up with the same bytes.
   if (created.raced) return { value: created.value, source: "file", path };
-  return {
-    value: created.value,
-    source: inline === undefined ? "generated" : "seeded",
-    path,
-  };
+  let source: SecretSource = inline === undefined ? "generated" : "seeded";
+  if (blank) source = "replaced";
+  return { value: created.value, source, path };
 }
 
 /** 48 random bytes, base64url. Exported for this package's own tests. */
@@ -187,19 +225,37 @@ export function generateSecret(): string {
 }
 
 /**
- * One `info` line per secret, naming the source.
+ * One `info` line per secret, naming the source — or one `warn` line, for the
+ * secret whose file was found empty.
  *
  * Never the value, and never for a secret that was not configured at all. An
  * operator debugging a mismatched token needs to know which of the two services
  * generated it and which read it; that is the entire purpose of these lines.
+ *
+ * `"replaced"` is the one source that is not routine, and it is deliberately not
+ * phrased as good news: on a first boot it is a blank file somebody `touch`ed,
+ * and on any other boot it is a live secret that has just been rotated out from
+ * under whatever was holding it.
  */
 export function logSecretReport(report: SecretReportEntry[], log: Logger): void {
   for (const entry of report) {
-    log("info", "secret resolved", {
-      secret: entry.name,
-      source: entry.source,
-      ...(entry.path === null ? {} : { path: entry.path }),
-    });
+    const replaced = entry.source === "replaced";
+    log(
+      replaced ? "warn" : "info",
+      replaced ? "secret file was empty, replaced" : "secret resolved",
+      {
+        secret: entry.name,
+        source: entry.source,
+        ...(entry.path === null ? {} : { path: entry.path }),
+        ...(replaced
+          ? {
+              note:
+                "the file was present but held nothing, so a new secret was written to it. " +
+                "If this was not a first boot, restart both services so they read the same value.",
+            }
+          : {}),
+      }
+    );
   }
 }
 
@@ -210,11 +266,40 @@ function trimmed(value: string | undefined): string | undefined {
 }
 
 function readIfPresent(path: string, name: string): string | undefined {
+  let raw: string;
   try {
-    return readFileSync(path, "utf8").trim();
+    raw = readFileSync(path, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw new SecretError(`Cannot read ${name}_FILE at ${path}: ${describe(err)}`);
+  }
+  const value = raw.trim();
+  // An empty file is not a secret, and is reported as absent so the caller
+  // replaces it. The same rule oauth/src/bootstrap.ts already applies to the
+  // claim token — it is stated here so every secret gets it.
+  return value === "" ? undefined : value;
+}
+
+/**
+ * Clear an empty `NAME_FILE` so a real value can be linked into its place.
+ *
+ * ENOENT is fine: the other service got there first, and the EEXIST branch of
+ * {@link createExclusively} hands back whatever it wrote. Anything else is
+ * fatal, and this is the one place that failure can be explained — an empty
+ * secret file that cannot be replaced is a read-only mount pointing at a file
+ * somebody truncated, and every request the service would go on to serve would
+ * answer 401 with nothing in the log to say why.
+ */
+function removeBlankFile(path: string, name: string): void {
+  try {
+    unlinkSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new SecretError(
+      `${name}_FILE at ${path} is empty and cannot be replaced: ${describe(err)}. ` +
+        `An empty file authenticates nothing — write a value into it, or make it ` +
+        `writable so this service can generate one.`
+    );
   }
 }
 
@@ -249,7 +334,18 @@ export function createExclusively(
       linkSync(temp, path);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      return { value: readFileSync(path, "utf8").trim(), raced: true };
+      const winner = readFileSync(path, "utf8").trim();
+      // The winner writes the file in full before linking it, so an empty one
+      // here was not written by this module — and adopting it would gate the
+      // service behind a secret nobody can present, which is the thing this
+      // module exists to prevent. Refuse, and say which file to delete.
+      if (winner === "") {
+        throw new SecretError(
+          `Cannot create ${name}_FILE at ${path}: another process left it empty. ` +
+            `Delete that file and restart.`
+        );
+      }
+      return { value: winner, raced: true };
     }
     return { value, raced: false };
   } catch (err) {
