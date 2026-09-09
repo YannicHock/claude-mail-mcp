@@ -44,8 +44,8 @@
  *     resolve to something else between the check and the connect (DNS
  *     rebinding) — the check and the socket see the same answer.
  *   - At most one redirect, re-checked against exactly the same rules.
- *   - {@link PER_ATTEMPT_TIMEOUT_MS} per attempt (a redirect is another
- *     attempt), {@link TOTAL_TIMEOUT_MS} for the whole cascade.
+ *   - {@link AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS} per attempt (a redirect is another
+ *     attempt), {@link AUTOCONFIG_TOTAL_TIMEOUT_MS} for the whole cascade.
  *   - {@link MAX_RESPONSE_BYTES} of body, after which the socket is destroyed
  *     rather than the buffer grown.
  *
@@ -68,8 +68,10 @@ import net from "node:net";
 import type { LookupFunction } from "node:net";
 import type { Readable } from "node:stream";
 
-export const PER_ATTEMPT_TIMEOUT_MS = 3_000;
-export const TOTAL_TIMEOUT_MS = 10_000;
+import { withTimeout } from "./timeout.js";
+
+export const AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS = 3_000;
+export const AUTOCONFIG_TOTAL_TIMEOUT_MS = 10_000;
 export const MAX_RESPONSE_BYTES = 128 * 1024;
 export const MAX_REDIRECTS = 1;
 
@@ -266,6 +268,9 @@ export async function resolveSafeUrl(
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
   if (!hostname) return null;
   try {
+    // Stopping the wait is genuinely all there is here: `dns.lookup` cannot be
+    // cancelled (getaddrinfo runs on the threadpool), so the resolve keeps going
+    // after the deadline. It is bounded and inert, and the cascade has moved on.
     const addresses = await withTimeout(deps.resolveAddresses(hostname), timeoutMs);
     if (addresses.length === 0) return null;
     if (!addresses.every(isPublicIp)) return null;
@@ -385,26 +390,6 @@ export const defaultDeps: AutoconfigDeps = {
     }));
   },
 };
-
-/**
- * Stop waiting on `promise` after `ms`. As in `probe.ts`, this only stops
- * watching — the transport above enforces its own copy of the same deadline,
- * which is what actually tears the socket down. `dns.lookup` cannot be
- * cancelled at all (getaddrinfo runs on the threadpool), so for the resolve
- * step this is genuinely all there is; the work is bounded and inert, and the
- * cascade has already moved on.
- */
-async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timer!: NodeJS.Timeout;
-  const expiry = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
-  });
-  try {
-    return await Promise.race([promise, expiry]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 /**
  * The two deadlines from §5.3, in one object: a per-attempt slice, never
@@ -826,14 +811,17 @@ async function fetchClientConfig(
  * to show the operator for confirmation, or with `null` — which is not an
  * error and carries no reason, because the wizard's response to it is simply
  * the provider list. Never rejects, and never takes longer than `totalMs`
- * (default {@link TOTAL_TIMEOUT_MS}) plus the time to unwind.
+ * (default {@link AUTOCONFIG_TOTAL_TIMEOUT_MS}) plus the time to unwind.
  */
 export async function lookupMailboxSettings(
   email: string,
   opts: LookupOptions = {}
 ): Promise<MailboxSuggestion | null> {
   const deps = opts.deps ?? defaultDeps;
-  const budget = new Budget(opts.totalMs ?? TOTAL_TIMEOUT_MS, opts.perAttemptMs ?? PER_ATTEMPT_TIMEOUT_MS);
+  const budget = new Budget(
+    opts.totalMs ?? AUTOCONFIG_TOTAL_TIMEOUT_MS,
+    opts.perAttemptMs ?? AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS
+  );
 
   try {
     const address = parseAddress(email);
