@@ -581,8 +581,35 @@ describe("the step 2 screen", () => {
     }
   });
 
+  it("fills the password boxes in when an earlier screen carried one", () => {
+    // The other half of #120. "Never written back" is about a value read out of
+    // storage or echoed after a failed probe — a password that may well be the
+    // reason the probe failed. A password carried forward from the screen the
+    // operator typed it on is neither: it is their own submission, still in
+    // flight, and the screen that arrives empty is the one that asks twice.
+    const html = mailboxPage({
+      values: {
+        "imap.host": "imap.example.com",
+        "imap.pass": "hunter2",
+        "smtp.pass": "hunter2",
+      },
+    });
+
+    assert.match(html, /name="imap\.pass" type="password" value="hunter2"/);
+    assert.match(html, /name="smtp\.pass" type="password" value="hunter2"/);
+    // And the page says why they are not empty, in place of the line that says
+    // passwords are never written back — which on this path would be a lie.
+    assert.match(html, /carried over/i);
+    assert.equal(/never written back/i.test(html), false);
+  });
+
   it("escapes what the operator typed rather than rendering it", () => {
     const html = mailboxPage({ values: { "imap.host": '"><script>alert(1)</script>' } });
+    assert.equal(html.includes("<script>alert(1)</script>"), false);
+  });
+
+  it("escapes a carried password rather than rendering it", () => {
+    const html = mailboxPage({ values: { "imap.pass": '"><script>alert(1)</script>' } });
     assert.equal(html.includes("<script>alert(1)</script>"), false);
   });
 
@@ -835,6 +862,7 @@ describe("the confirmation screen", () => {
       domain: "example.com",
       sourceLabel: "Published by autoconfig.example.com.",
       values: values(),
+      password: "the-mailbox-password-itself",
       errors: {},
       ...data,
     });
@@ -892,11 +920,42 @@ describe("the confirmation screen", () => {
     assert.match(render(), /Edit these/);
   });
 
-  it("asks for the password again rather than hiding one in the page", () => {
-    const html = render();
+  it("carries the password it was given rather than asking for it twice", () => {
+    // #120. The operator typed it on the previous screen; this one is rendered
+    // from that same submission, so there is a password to carry and no reason
+    // to make them type it again. It travels in the form, in the browser, over
+    // the POST the rest of the draft is already travelling on — and nowhere
+    // near the wizard's state file, which still holds nothing but progress.
+    const html = render({ password: "hunter2" });
+    assert.match(
+      html,
+      new RegExp(`<input type="hidden" name="${SHARED_PASSWORD_FIELD}" value="hunter2">`)
+    );
+    assert.equal(/type="password"/.test(html), false, "there is still a box to fill in");
+  });
+
+  it("says the password is carried rather than carrying it invisibly", () => {
+    // A hidden field the operator cannot see is a screen that has silently
+    // acquired a credential: they cannot tell whether Continue is about to use
+    // the one they typed, and they cannot tell why the next screen is filled
+    // in. So the screen says both, and says where to change it.
+    const html = render({ password: "hunter2" });
+    assert.match(html, /carried/i);
+    assert.match(html, /Edit these/);
+  });
+
+  it("asks for one when the submission arrived without a password", () => {
+    // `required` on the address screen is the browser's promise, not this
+    // package's: a POST that skipped it still has to produce a usable screen.
+    const html = render({ password: "" });
     assert.match(html, new RegExp(`name="${SHARED_PASSWORD_FIELD}"[^>]*type="password"`));
     assert.match(html, /never written back into this page/i);
-    assert.equal(/type="hidden"[^>]*pass/i.test(html), false, html);
+    assert.equal(/type="hidden" name="password"/.test(html), false, html);
+  });
+
+  it("escapes a password on its way into the hidden field", () => {
+    const html = render({ password: '"><script>alert(1)</script>' });
+    assert.equal(html.includes("<script>"), false);
   });
 
   it("escapes a host the lookup brought back rather than rendering it", () => {
@@ -917,6 +976,7 @@ describe("tier 2 — the provider list", () => {
       domain: "",
       email: "",
       selected: "",
+      password: "",
       errors: {},
       ...data,
     });
@@ -967,6 +1027,27 @@ describe("tier 2 — the provider list", () => {
     assert.match(html, /value="anna@example\.com"/);
     assert.match(html, /value="posteo" checked/);
     assert.match(html, /Choose a provider, or pick Other\./);
+  });
+
+  it("carries a password the lookup was given, and shows none", () => {
+    // Reached from a lookup that found nothing, this screen has the password
+    // the address screen collected. It is on the way to the full form, so it
+    // carries it there rather than letting tier 2 ask for it a second time.
+    const html = render({ password: "hunter2" });
+    assert.match(
+      html,
+      new RegExp(`<input type="hidden" name="${SHARED_PASSWORD_FIELD}" value="hunter2">`)
+    );
+    assert.equal(/type="password"/.test(html), false);
+    assert.match(html, /carried/i);
+  });
+
+  it("has no password field at all when it was reached from its own link", () => {
+    // The other way in is the "Choose provider manually" link, where nobody has
+    // typed a password yet. There is nothing to carry and nothing to say.
+    const html = render();
+    assert.equal(/name="password"/.test(html), false);
+    assert.equal(/carried/i.test(html), false);
   });
 
   it("can be skipped, like every other screen in step 2", () => {

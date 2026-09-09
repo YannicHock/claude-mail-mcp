@@ -394,6 +394,14 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
 
     if (action === "lookup") {
       const email = stringField(body[ADDRESS_FIELD]).trim();
+      // The password the operator typed on the address screen. It is in this
+      // request, it is going to be needed by whichever screen comes next, and
+      // dropping it here is #120: the wizard asking for the same mailbox
+      // password a second time, with a screen in between that never mentioned
+      // the first. It travels on in the form and reaches no file: the wizard's
+      // state is still `{version, furthest}` and nothing about a mailbox is
+      // written anywhere until `save` has been through the connector's probe.
+      const password = stringField(body[SHARED_PASSWORD_FIELD]);
       if (domainOf(email) === "") {
         // This one *is* shown as an error, and it is not an autoconfig failure:
         // it is about what the operator typed, which they can see and fix. The
@@ -412,8 +420,9 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
 
       if (found === null) {
         // Not an error, and not reported as one. The domain published nothing
-        // this build could use, and the answer to that is the next tier.
-        providerPage(200, { email, domain: domainOf(email) });
+        // this build could use, and the answer to that is the next tier — with
+        // the password, because tier 2 leads to the same form tier 1 does.
+        providerPage(200, { email, domain: domainOf(email), password });
         return;
       }
 
@@ -425,6 +434,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
           domain: found.domain,
           sourceLabel: sourceLabel(found),
           values: suggestedValues(found),
+          password,
           errors: {},
         })
       );
@@ -434,18 +444,22 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     if (action === "provider") {
       const email = stringField(body[ADDRESS_FIELD]).trim();
       const chosen = stringField(body[PROVIDER_FIELD]);
+      // Empty when this screen was reached from its own link rather than from a
+      // lookup, which is the only difference the two routes make here.
+      const password = stringField(body[SHARED_PASSWORD_FIELD]);
 
       if (domainOf(email) === "") {
         providerPage(400, {
           email,
           selected: chosen,
+          password,
           errors: { [ADDRESS_FIELD]: "Enter a full email address, like anna@example.com." },
         });
         return;
       }
 
       if (chosen === PROVIDER_OTHER) {
-        page(200, { values: emptyMailboxValues(email) });
+        page(200, { values: carrying(emptyMailboxValues(email), password) });
         return;
       }
 
@@ -454,6 +468,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         providerPage(400, {
           email,
           selected: "",
+          password,
           errors: { [PROVIDER_FIELD]: "Choose a provider, or pick Other." },
         });
         return;
@@ -461,12 +476,13 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
 
       log("info", "setup step 2: a provider preset was chosen", { provider: provider.id });
       page(200, {
-        values: prefillFor(provider, email),
+        values: carrying(prefillFor(provider, email), password),
         notice: {
           kind: "info",
           message:
-            `${provider.label} settings have been filled in. Check them, add the ` +
-            "passwords, and test the connection before saving.",
+            `${provider.label} settings have been filled in. Check them` +
+            (password === "" ? ", add the passwords" : "") +
+            ", and test the connection before saving.",
         },
       });
       return;
@@ -475,9 +491,12 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     if (action === "edit") {
       // `Edit these` on the confirmation screen: the same values, in the form
       // that can change them. `formValues` is what strips the passwords, which
-      // is why this goes through a draft rather than echoing the body back.
+      // is why this goes through a draft rather than echoing the body back —
+      // and `carrying` then puts back the one the operator typed, which came in
+      // on this submission rather than out of anything the wizard stored.
+      const password = stringField(body[SHARED_PASSWORD_FIELD]);
       page(200, {
-        values: formValues(draftFromFields(body)),
+        values: carrying(formValues(draftFromFields(body)), password),
         notice: {
           kind: "info",
           message: "Nothing has been saved. Change whatever is wrong and test the connection.",
@@ -988,6 +1007,7 @@ function providerPageData(
     domain: "",
     email: "",
     selected: "",
+    password: "",
     errors: {},
     ...data,
   };
@@ -1015,8 +1035,12 @@ function sourceLabel(suggestion: MailboxSuggestion): string {
  * defaulted to — this screen renders explicit hidden inputs rather than relying
  * on the form's own defaults, so it has to state them.
  *
- * There is no password in it, and there is nowhere for one to come from: a
- * {@link MailboxSuggestion} has no password field at any depth.
+ * There is no password in it, and there is nowhere in a suggestion for one to
+ * come from: a {@link MailboxSuggestion} has hosts and ports and no password
+ * field at any depth. The one the operator typed is carried beside these rather
+ * than mixed into them — {@link MailboxSuggestionPageData.password} — so the
+ * rows this screen renders from the connector's own field names stay what they
+ * have always been.
  */
 function suggestedValues(suggestion: MailboxSuggestion): Record<string, string> {
   const values: Record<string, string> = {
@@ -1053,6 +1077,37 @@ function emptyMailboxValues(email: string): Record<string, string> {
     [MAILBOX_FIELDS.imapTls]: CHECKBOX_ON,
     [MAILBOX_FIELDS.smtpTls]: CHECKBOX_ON,
   };
+}
+
+/**
+ * The one password the operator typed, put into the form that is about to ask
+ * for three.
+ *
+ * The values twin of {@link withSharedPassword}, and deliberately the same
+ * rule: IMAP and SMTP get it, and CalDAV only when there is a CalDAV URL beside
+ * it, because a CalDAV block that is nothing but a password is a probe against
+ * a server that was never named.
+ *
+ * The difference is which direction it runs. `withSharedPassword` fills in a
+ * submission on its way to the connector; this fills in a page on its way to
+ * the operator, so that a form they are being sent to does not open by asking
+ * them for something they have already given it (#120). An empty password —
+ * tier 2 reached from its own link — leaves the boxes as they were.
+ */
+function carrying(values: Record<string, string>, password: string): Record<string, string> {
+  if (password === "") return values;
+
+  const filled = { ...values };
+  for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
+    if ((filled[name] ?? "") === "") filled[name] = password;
+  }
+  if (
+    (filled[MAILBOX_FIELDS.caldavUrl] ?? "") !== "" &&
+    (filled[MAILBOX_FIELDS.caldavPass] ?? "") === ""
+  ) {
+    filled[MAILBOX_FIELDS.caldavPass] = password;
+  }
+  return filled;
 }
 
 /**
