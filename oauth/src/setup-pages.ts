@@ -75,6 +75,35 @@ button {
 }
 .muted { opacity: .7; }
 a { color: LinkText; }
+input[type=number] {
+  width: 100%; box-sizing: border-box; padding: .6rem .7rem; margin-bottom: 1rem;
+  border: 1px solid color-mix(in srgb, CanvasText 30%, transparent);
+  border-radius: 6px; background: Canvas; color: CanvasText; font: inherit;
+}
+fieldset {
+  border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+  border-radius: 6px; padding: 1rem 1rem .25rem; margin: 0 0 1.25rem;
+}
+legend { font-size: .85rem; font-weight: 600; padding: 0 .35rem; }
+.row { display: flex; gap: 1rem; }
+.row > * { flex: 1; }
+.row > .narrow { flex: 0 0 8rem; }
+.checkbox-row { display: flex; align-items: center; gap: .5rem; margin-bottom: 1rem; }
+.checkbox-row input { margin: 0; }
+.checkbox-row label { margin: 0; }
+button.secondary {
+  background: transparent; color: CanvasText;
+  border: 1px solid color-mix(in srgb, CanvasText 35%, transparent);
+}
+.buttons { display: flex; gap: .5rem; }
+.probe-row {
+  display: flex; justify-content: space-between; gap: 1rem;
+  padding: .4rem .6rem; margin-bottom: .35rem; border-radius: 4px;
+  background: color-mix(in srgb, CanvasText 6%, Canvas);
+  border-left: 3px solid color-mix(in srgb, CanvasText 30%, transparent);
+}
+.probe-row.ok { border-left-color: color-mix(in srgb, #2a2 60%, CanvasText); }
+.probe-row.fail { border-left-color: color-mix(in srgb, #d33 60%, CanvasText); }
 `.trim();
 
 /** The shared wizard shell: one heading, one `Step N of 3` line, one body. */
@@ -165,8 +194,7 @@ export function renderCredentialsStep(data: CredentialsPageData): string {
 }
 
 /**
- * A screen that is routed but not yet built — steps 2 and 3, which issues #23
- * and #24 fill in.
+ * A screen that is routed but not yet built — step 3, which issue #24 fills in.
  *
  * It exists rather than 404ing because step 1 has to lead somewhere, and because
  * a placeholder that says plainly what is missing is what an operator who gets
@@ -187,4 +215,345 @@ export function renderStepPlaceholder(data: { step: SetupStep; backHref: string 
   <div class="actions"><a href="${escapeHtml(data.backHref)}">← Back</a><span></span></div>`;
 
   return wizardPage(data.step, body);
+}
+
+// ---- Step 2 — the first mailbox -------------------------------------------
+
+/**
+ * One service's line in the connection report.
+ *
+ * `tested: false` is not a failure. It is what CalDAV gets when the operator
+ * left the CalDAV fields blank, and saying so out loud is the difference between
+ * "we did not look" and "we looked and it was fine".
+ */
+export interface MailboxProbeLine {
+  tested: boolean;
+  ok: boolean;
+  /** What the connector reported. Empty when the service was not tested. */
+  message: string;
+}
+
+/**
+ * The three services, reported one by one.
+ *
+ * Deliberately not a single boolean. An operator whose IMAP works and whose
+ * CalDAV does not has a usable mailbox and a calendar to fix later; collapsing
+ * that into one pass/fail would hide both which half works and which half to go
+ * and look at.
+ */
+export interface MailboxProbeView {
+  imap: MailboxProbeLine;
+  smtp: MailboxProbeLine;
+  caldav: MailboxProbeLine;
+}
+
+export interface MailboxPageData {
+  /** Where the form posts: this screen's own URL under the claim token. */
+  action: string;
+  /** Step 1, for the Back link. */
+  backHref: string;
+  /**
+   * What to put back in the form after a rejected or failed submission.
+   * Password fields are never among them — see {@link renderMailboxStep}.
+   */
+  values: Record<string, string>;
+  /** Rejections from the connector, keyed by the field name it rejected. */
+  errors: Record<string, string>;
+  /** A message across the top of the screen: what happened, and to what. */
+  notice?: { kind: "error" | "info"; message: string };
+  /** The connection report, when one has been run. */
+  probe?: MailboxProbeView;
+  /**
+   * True when this build cannot reach the connector's mailbox routes at all —
+   * no settings signing key, so nothing here can be probed or stored. The form
+   * is not rendered in that state; only the way past it is.
+   */
+  unavailable?: boolean;
+}
+
+/**
+ * Pre-filled values, so the common case is a few boxes rather than a form.
+ *
+ * The keys are the connector's field names, not names of this screen's own:
+ * everything collected here is posted to `/settings/mailboxes` unchanged.
+ */
+const MAILBOX_DEFAULTS: Record<string, string> = {
+  id: "main",
+  label: "Main mailbox",
+  "imap.port": "993",
+  "smtp.port": "465",
+};
+
+function value(values: Record<string, string>, key: string): string {
+  const submitted = values[key];
+  if (submitted !== undefined) return submitted;
+  return MAILBOX_DEFAULTS[key] ?? "";
+}
+
+function checked(values: Record<string, string>, key: string): boolean {
+  // An empty `values` is a first render, where TLS is on. Once the operator has
+  // submitted anything, an absent checkbox means they unticked it — a browser
+  // sends nothing at all for one that is off.
+  if (Object.keys(values).length === 0) return true;
+  return values[key] === "1";
+}
+
+function textInput(opts: {
+  id: string;
+  name: string;
+  label: string;
+  values: Record<string, string>;
+  errors: Record<string, string>;
+  type?: "text" | "number" | "email";
+  required?: boolean;
+  hint?: string;
+}): string {
+  const message = opts.errors[opts.name] ?? "";
+  const attrs = [
+    `id="${escapeHtml(opts.id)}"`,
+    `name="${escapeHtml(opts.name)}"`,
+    `type="${opts.type ?? "text"}"`,
+    `value="${escapeHtml(value(opts.values, opts.name))}"`,
+    opts.required ? "required" : "",
+    'autocapitalize="none"',
+    'spellcheck="false"',
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return `<label for="${escapeHtml(opts.id)}">${escapeHtml(opts.label)}</label>
+<input ${attrs}${invalid(message)}>
+${fieldError(message)}${opts.hint === undefined ? "" : `<p class="muted">${escapeHtml(opts.hint)}</p>`}`;
+}
+
+/**
+ * A password box that is always empty.
+ *
+ * The connector's own mailbox form does the same, and this screen must not
+ * become the one place in the project that writes a mailbox password back into
+ * a page. The cost is a retype after a failed connection test; the alternative
+ * is a credential sitting in HTML, in the browser's back-forward cache, and in
+ * whatever the operator screenshots when they ask someone for help.
+ */
+function passwordInput(opts: {
+  id: string;
+  name: string;
+  label: string;
+  errors: Record<string, string>;
+  required?: boolean;
+}): string {
+  const message = opts.errors[opts.name] ?? "";
+  return `<label for="${escapeHtml(opts.id)}">${escapeHtml(opts.label)}</label>
+<input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="password" value=""
+       autocomplete="off"${opts.required === true ? " required" : ""}${invalid(message)}>
+${fieldError(message)}`;
+}
+
+function checkboxInput(opts: {
+  id: string;
+  name: string;
+  label: string;
+  values: Record<string, string>;
+}): string {
+  return `<div class="checkbox-row">
+  <input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="checkbox" value="1"${
+    checked(opts.values, opts.name) ? " checked" : ""
+  }>
+  <label for="${escapeHtml(opts.id)}">${escapeHtml(opts.label)}</label>
+</div>`;
+}
+
+function probeRow(name: string, line: MailboxProbeLine): string {
+  const status = !line.tested
+    ? "not tested"
+    : line.ok
+      ? "ok"
+      : `failed: ${line.message === "" ? "unknown error" : line.message}`;
+  const kind = !line.tested ? "" : line.ok ? " ok" : " fail";
+  return `<div class="probe-row${kind}"><strong>${escapeHtml(name)}</strong><span>${escapeHtml(
+    status
+  )}</span></div>`;
+}
+
+function probeSection(probe: MailboxProbeView | undefined): string {
+  if (probe === undefined) return "";
+  return `<div class="notice">
+${probeRow("IMAP", probe.imap)}
+${probeRow("SMTP", probe.smtp)}
+${probeRow("CalDAV", probe.caldav)}
+</div>`;
+}
+
+function noticeHtml(notice: MailboxPageData["notice"]): string {
+  if (notice === undefined) return "";
+  const cls = notice.kind === "error" ? "error" : "notice";
+  return `<div class="${cls}" role="alert">${escapeHtml(notice.message)}</div>`;
+}
+
+/**
+ * Step 2 — the first mailbox, verified before it is stored.
+ *
+ * The field names are the connector's own, verbatim, because the connector is
+ * what parses, probes and stores them. This screen supplies the wizard's chrome,
+ * a Skip button and sensible ports; everything it collects goes to the same
+ * `/settings/mailboxes` routes the settings UI posts to, and nothing about a
+ * mailbox is validated, probed or written on this side of that hop.
+ *
+ * Skip carries `formnovalidate` on purpose. Every credential field is
+ * `required`, which is what catches an incomplete form in the browser rather
+ * than a round trip later — and which would otherwise make "Skip for now"
+ * impossible to press, because a browser will not submit an empty form at all.
+ */
+export function renderMailboxStep(data: MailboxPageData): string {
+  const { values, errors } = data;
+
+  if (data.unavailable === true) {
+    const body = `
+  ${noticeHtml(data.notice)}
+  <p>
+    This instance has no settings signing key, so the wizard cannot reach the
+    connector to test or store a mailbox. Setup can still finish — add the
+    mailbox from the settings UI once a key is configured.
+  </p>
+  <form method="post" action="${escapeHtml(data.action)}">
+    <div class="actions">
+      <a href="${escapeHtml(data.backHref)}">← Back</a>
+      <button type="submit" name="_action" value="skip">Continue without a mailbox</button>
+    </div>
+  </form>`;
+    return wizardPage("mailbox", body);
+  }
+
+  const body = `
+  <p class="lead">
+    These credentials are tested against your mail server before anything is
+    stored. Nothing here is saved unless IMAP and SMTP both answer.
+  </p>
+  ${noticeHtml(data.notice)}
+  ${probeSection(data.probe)}
+  <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
+    <input type="hidden" name="default" value="1">
+    ${textInput({
+      id: "label",
+      name: "label",
+      label: "Name for this mailbox",
+      values,
+      errors,
+      required: true,
+    })}
+    ${textInput({
+      id: "mailbox_id",
+      name: "id",
+      label: "ID",
+      values,
+      errors,
+      required: true,
+      hint: "How the mail tools refer to this mailbox. Lowercase letters, digits, _ or -.",
+    })}
+    ${textInput({
+      id: "mail_from",
+      name: "mail.defaultFrom",
+      label: "Email address",
+      values,
+      errors,
+      type: "email",
+      required: true,
+    })}
+
+    <fieldset>
+    <legend>IMAP — reading mail</legend>
+    <div class="row">
+      <div>${textInput({
+        id: "imap_host",
+        name: "imap.host",
+        label: "Host",
+        values,
+        errors,
+        required: true,
+      })}</div>
+      <div class="narrow">${textInput({
+        id: "imap_port",
+        name: "imap.port",
+        label: "Port",
+        values,
+        errors,
+        type: "number",
+        required: true,
+      })}</div>
+    </div>
+    ${checkboxInput({ id: "imap_tls", name: "imap.tls", label: "TLS", values })}
+    ${textInput({
+      id: "imap_user",
+      name: "imap.user",
+      label: "Username",
+      values,
+      errors,
+      required: true,
+    })}
+    ${passwordInput({ id: "imap_pass", name: "imap.pass", label: "Password", errors, required: true })}
+    </fieldset>
+
+    <fieldset>
+    <legend>SMTP — sending mail</legend>
+    <div class="row">
+      <div>${textInput({
+        id: "smtp_host",
+        name: "smtp.host",
+        label: "Host",
+        values,
+        errors,
+        required: true,
+      })}</div>
+      <div class="narrow">${textInput({
+        id: "smtp_port",
+        name: "smtp.port",
+        label: "Port",
+        values,
+        errors,
+        type: "number",
+        required: true,
+      })}</div>
+    </div>
+    ${checkboxInput({ id: "smtp_tls", name: "smtp.tls", label: "TLS", values })}
+    ${textInput({
+      id: "smtp_user",
+      name: "smtp.user",
+      label: "Username",
+      values,
+      errors,
+      required: true,
+    })}
+    ${passwordInput({ id: "smtp_pass", name: "smtp.pass", label: "Password", errors, required: true })}
+    </fieldset>
+
+    <fieldset>
+    <legend>CalDAV — calendars (optional)</legend>
+    <p class="muted">
+      Leave blank to set up mail only. A CalDAV server that does not answer does
+      not stop the mailbox being stored; the calendar tools stay unavailable
+      until it does.
+    </p>
+    ${textInput({ id: "caldav_url", name: "caldav.url", label: "URL", values, errors })}
+    ${textInput({ id: "caldav_user", name: "caldav.user", label: "Username", values, errors })}
+    ${passwordInput({ id: "caldav_pass", name: "caldav.pass", label: "Password", errors })}
+    </fieldset>
+
+    <p class="muted">
+      Passwords are never written back into this page, so retype them if a test
+      sends you round again. Folder names and the rest of the account settings
+      can be changed once setup is finished.
+    </p>
+
+    <div class="actions">
+      <button type="submit" name="_action" value="skip" class="secondary" formnovalidate>
+        Skip for now
+      </button>
+      <span class="buttons">
+        <button type="submit" name="_action" value="test" class="secondary">Test connection</button>
+        <button type="submit" name="_action" value="save">Save and continue</button>
+      </span>
+    </div>
+  </form>
+  <p><a href="${escapeHtml(data.backHref)}">← Back</a></p>`;
+
+  return wizardPage("mailbox", body);
 }

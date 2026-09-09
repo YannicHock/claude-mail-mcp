@@ -21,8 +21,16 @@ import {
   validateNewCredentials,
 } from "../../src/operator.js";
 import { verifyPassword } from "../../src/passwords.js";
-import { renderCredentialsStep, renderStepPlaceholder } from "../../src/setup-pages.js";
+import {
+  renderCredentialsStep,
+  renderMailboxStep,
+  renderStepPlaceholder,
+  type MailboxPageData,
+  type MailboxProbeView,
+} from "../../src/setup-pages.js";
+import { readFieldErrors, readProbeReport, readStamp } from "../../src/setup-routes.js";
 import { SetupState } from "../../src/setup-state.js";
+import { mailboxFormPage } from "../helpers/connector-pages.js";
 
 const GOOD_PASSWORD = "correct horse battery staple";
 
@@ -289,9 +297,188 @@ describe("the wizard's screens", () => {
   });
 
   it("a screen that is not built yet says so, and offers the way back", () => {
-    const html = renderStepPlaceholder({ step: "mailbox", backHref: "/setup/tok/credentials" });
-    assert.match(html, /Step 2 of 3 · Add your first mailbox/);
+    const html = renderStepPlaceholder({ step: "connect", backHref: "/setup/tok/mailbox" });
+    assert.match(html, /Step 3 of 3 · Connect Claude/);
     assert.match(html, /not built yet/);
-    assert.match(html, /href="\/setup\/tok\/credentials"/);
+    assert.match(html, /href="\/setup\/tok\/mailbox"/);
+  });
+});
+
+describe("the step 2 screen", () => {
+  function mailboxPage(data: Partial<MailboxPageData> = {}): string {
+    return renderMailboxStep({
+      action: "/setup/tok/mailbox",
+      backHref: "/setup/tok/credentials",
+      values: {},
+      errors: {},
+      ...data,
+    });
+  }
+
+  function probe(overrides: Partial<MailboxProbeView> = {}): MailboxProbeView {
+    return {
+      imap: { tested: true, ok: true, message: "" },
+      smtp: { tested: true, ok: true, message: "" },
+      caldav: { tested: false, ok: false, message: "" },
+      ...overrides,
+    };
+  }
+
+  it("collects a mailbox under the connector's own field names", () => {
+    // The point of the exercise: no second form, no second set of names. What
+    // this screen submits is what /settings/mailboxes already parses.
+    const html = mailboxPage();
+
+    assert.match(html, /Step 2 of 3 · Add your first mailbox/);
+    for (const name of [
+      "id",
+      "label",
+      "mail.defaultFrom",
+      "imap.host",
+      "imap.port",
+      "imap.tls",
+      "imap.user",
+      "imap.pass",
+      "smtp.host",
+      "smtp.port",
+      "smtp.tls",
+      "smtp.user",
+      "smtp.pass",
+      "caldav.url",
+      "caldav.user",
+      "caldav.pass",
+    ]) {
+      assert.match(html, new RegExp(`name="${name.replace(".", "\\.")}"`), name);
+    }
+    assert.equal(/<script/i.test(html), false);
+  });
+
+  it("offers a way past it that does not need mail credentials to hand", () => {
+    const html = mailboxPage();
+    // formnovalidate, or the browser refuses to submit the empty required
+    // fields and Skip becomes a button that cannot be pressed.
+    assert.match(html, /name="_action" value="skip" class="secondary" formnovalidate/);
+  });
+
+  it("reports the three services on three lines, not as one verdict", () => {
+    const html = mailboxPage({
+      probe: probe({
+        smtp: { tested: true, ok: false, message: "the server rejected these credentials" },
+        caldav: { tested: true, ok: false, message: "404 Not Found" },
+      }),
+    });
+
+    assert.match(html, /<strong>IMAP<\/strong><span>ok<\/span>/);
+    assert.match(
+      html,
+      /<strong>SMTP<\/strong><span>failed: the server rejected these credentials<\/span>/
+    );
+    assert.match(html, /<strong>CalDAV<\/strong><span>failed: 404 Not Found<\/span>/);
+  });
+
+  it("says CalDAV was not tested rather than passing it off as a failure", () => {
+    const html = mailboxPage({ probe: probe() });
+    assert.match(html, /<strong>CalDAV<\/strong><span>not tested<\/span>/);
+    assert.equal(html.includes('class="probe-row fail"'), false);
+  });
+
+  it("keeps what was typed, except the passwords", () => {
+    const html = mailboxPage({
+      values: { "imap.host": "imap.example.com", "imap.user": "anna@example.com" },
+      errors: { "imap.host": "Required." },
+    });
+
+    assert.match(html, /value="imap\.example\.com"/);
+    assert.match(html, /value="anna@example\.com"/);
+    assert.match(html, /Required\./);
+    // Every password box comes back empty, the way the connector's own form
+    // renders one. Nothing here may write a mailbox password into a page.
+    for (const match of html.matchAll(/<input[^>]*type="password"[^>]*>/g)) {
+      assert.match(match[0], /value=""/);
+    }
+  });
+
+  it("escapes what the operator typed rather than rendering it", () => {
+    const html = mailboxPage({ values: { "imap.host": '"><script>alert(1)</script>' } });
+    assert.equal(html.includes("<script>alert(1)</script>"), false);
+  });
+
+  it("offers only the way onward when the connector cannot be reached at all", () => {
+    const html = mailboxPage({ unavailable: true });
+    assert.match(html, /no settings signing key/);
+    assert.match(html, /value="skip"/);
+    assert.equal(html.includes('name="imap.host"'), false);
+  });
+});
+
+describe("reading the connector's answers", () => {
+  it("reads one result per service out of the probe panel", () => {
+    const report = readProbeReport(
+      mailboxFormPage({
+        probe: {
+          imap: { ok: true },
+          smtp: { ok: false, message: "the server rejected these credentials" },
+          caldav: { ok: false, message: "404 Not Found" },
+        },
+      })
+    );
+
+    assert.deepEqual(report, {
+      imap: { tested: true, ok: true, message: "" },
+      smtp: { tested: true, ok: false, message: "the server rejected these credentials" },
+      caldav: { tested: true, ok: false, message: "404 Not Found" },
+    });
+  });
+
+  it("reads a missing CalDAV row as not tested, not as a failure", () => {
+    // The connector omits the row entirely when no CalDAV URL was submitted.
+    const report = readProbeReport(
+      mailboxFormPage({ probe: { imap: { ok: true }, smtp: { ok: true } } })
+    );
+    assert.deepEqual(report?.caldav, { tested: false, ok: false, message: "" });
+  });
+
+  it("un-escapes a failure message rather than showing the entities back", () => {
+    const report = readProbeReport(
+      mailboxFormPage({
+        probe: { imap: { ok: true }, smtp: { ok: false, message: 'no "route" to <host> & no reply' } },
+      })
+    );
+    assert.equal(report?.smtp.message, 'no "route" to <host> & no reply');
+  });
+
+  it("reads nothing at all as nothing, so a save cannot proceed on it", () => {
+    // Fail closed. An answer this build cannot read is not evidence that the
+    // mailbox works, and the caller refuses to store credentials without a
+    // report for them.
+    assert.equal(readProbeReport(mailboxFormPage()), null);
+    assert.equal(readProbeReport("<html><body>Unauthorized</body></html>"), null);
+    assert.equal(
+      readProbeReport(mailboxFormPage({ probe: { imap: { ok: true }, smtp: { ok: true } } }))?.imap
+        .ok,
+      true
+    );
+  });
+
+  it("reads each rejected field under the name the connector rejected", () => {
+    const errors = readFieldErrors(
+      mailboxFormPage({
+        errors: {
+          id: 'An account with id "main" already exists.',
+          "imap.port": "Must be a port number between 1 and 65535.",
+        },
+      })
+    );
+
+    assert.deepEqual(errors, {
+      id: 'An account with id "main" already exists.',
+      "imap.port": "Must be a port number between 1 and 65535.",
+    });
+  });
+
+  it("reads the accounts stamp the connector's own form was rendered from", () => {
+    assert.equal(readStamp(mailboxFormPage({ stamp: "412-1757000000000" })), "412-1757000000000");
+    assert.equal(readStamp(mailboxFormPage()), "absent");
+    assert.equal(readStamp("<html><body>Unauthorized</body></html>"), null);
   });
 });
