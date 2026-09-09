@@ -138,7 +138,7 @@ claude.ai's web connector, however, only connects to remote MCP servers that adv
 - Bind to loopback only, same as the backend, and sit behind the same nginx/TLS front door.
 - Implement OAuth 2.1 + Dynamic Client Registration (RFC 7591) + PKCE (S256).
 - Issue short-lived, signed access tokens (e.g. JWT, ~1h TTL) plus longer-lived refresh tokens, stored as hashes rather than plaintext.
-- Gate any human login (e.g. an account-settings UI) behind its own credential check, brute-force throttled at the edge (nginx `limit_req`) and by a fail2ban jail on its auth-fail log lines.
+- Gate any human login (e.g. an account-settings UI) behind its own credential check, brute-force throttled at the edge (nginx `limit_req`) and by a fail2ban jail on its auth-fail log lines. Scope that edge limit to the login POST itself and never to the whole settings prefix — [DEPLOYMENT.md](DEPLOYMENT.md) carries a worked recipe for `POST /settings/login` and `POST /settings/password`, and the reason a prefix-wide limit is an outage rather than a stricter setting.
 - Protect any state-changing endpoint it exposes (e.g. a settings-save form) with a CSRF guard (Origin/Referer check).
 - Run as its own dedicated non-root user with the same systemd hardening (`NoNewPrivileges`, `ProtectSystem=strict`, syscall filtering, resource caps) applied to `claude-mail-mcp.service` above.
 - Never log or persist mailbox credentials itself — it should only ever handle the single `AUTH_TOKEN` it forwards.
