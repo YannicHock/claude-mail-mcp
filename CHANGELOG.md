@@ -10,9 +10,21 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
   **A present file always wins**, which is what makes this safe for an instance that is already running: an upgrade reads the secrets it already has and rotates nothing. An inline `AUTH_TOKEN` with no file yet is written to the file rather than replaced, so an install that kept its token in `.env` keeps that token and hands the OAuth layer the same one.
 
+- **An instance nobody has configured yet is claimable only from its own logs.** The OAuth layer now recognises a state it never had before — *unbootstrapped*: no operator record on the data volume and no `AUTH_PASSWORD_HASH`. In that state it answers `/health`, serves a setup page at `/setup/<token>`, returns **503** at `/mcp`, leaves the settings UI unmounted, and 404s everything else. First boot generates a claim token — 32 random bytes, base64url — writes it to `/data/claim-token.txt` and prints the complete setup URL, built from `PUBLIC_URL`, so the operator copies a link rather than assembling one. The token is compared in constant time and is **not** regenerated on restart: a container that comes back up while its operator is halfway through setup must not invalidate the tab they still have open. Completing setup deletes the token and closes `/setup` permanently; there is no route back in, and starting over means deleting the data volume.
+
+  The reasoning is Jupyter's, and so is the trade. `/mcp` answers 503 rather than 401 because an instance with no credentials cannot reject anything meaningfully, and a 401 would invite guessing against a service that has nothing to guess at. A wrong or absent token gets the same 404 a claimed instance serves, byte for byte from the same responder, so scanning cannot tell the two apart — a 401 there would announce "there is a token, and this is not it".
+
+  **This reduces takeover to "an attacker can read your container logs",** who has already won by other means. It does not defend against an operator who pastes the setup URL somewhere public before using it: the token is a bearer credential, and the printed banner says so in as many words rather than pretending otherwise.
+
+  The wizard itself is still to come (#19). `/setup/<token>` currently serves a placeholder that says what state the instance is in and that the screens are not built yet.
+
 - **A shared group, `mailsecrets` (gid 105), in both images.** The connector runs as uid 100/gid 101 and the OAuth layer as uid 102/gid 103, deliberately sharing nothing; this one group is the exception, and it is what lets each read a secret the other wrote without those files being world-readable. The gid is pinned in both `Dockerfile`s and published as a `secrets-gid` label; a unit test compares the two against the constant in the code.
 
 ### Changed
+
+- **`AUTH_PASSWORD_HASH` is optional.** A missing hash used to stop the OAuth layer from starting; it is now a *state* — an instance nobody has claimed — rather than a misconfiguration, which is what the claim-token gate above exists to make safe. Nothing changes for a deployment that has one: an instance with a configured hash, or with an operator record already on its volume, is configured, is never gated, and boots exactly as before. A hash that is present but malformed is still fatal, and a hash file that exists but cannot be read is still fatal, because those are typos rather than states.
+
+- **The OAuth consent screen authenticates against the operator record.** It had kept checking `AUTH_PASSWORD_HASH` directly, so a password changed in the settings UI left the sign-in at `/authorize` still accepting the old one — the record has been the live credential since 0.6.0, which is the whole reason it exists. It has to be the record in any case now that the hash may legitimately be absent. `OPERATOR_FILE=none` is unaffected and still checks the secret.
 
 - **`docker-compose.yml` mounts `./secrets` as a directory** instead of declaring four Docker file-secrets. Compose refuses to start a stack whose file-secret does not exist, which is exactly the state a first boot is in. The same `secrets/*.txt` files are used, now at `/secrets/<name>.txt` rather than `/run/secrets/<name>`; existing deployments keep their values.
 

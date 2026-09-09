@@ -15,10 +15,12 @@ import { test } from "node:test";
 
 import {
   TEST_PASSWORD,
+  TEST_USERNAME,
   UPSTREAM_TOKEN,
   completeAuthorizationFlow,
   extractCsrf,
   getSettings,
+  postAuthorizeForm,
   postForm,
   startHarness,
 } from "../helpers/harness.js";
@@ -172,6 +174,31 @@ test("the password page never renders a token", async () => {
     ).text();
     assert.ok(!pageBody.includes(accessToken));
     assert.ok(!pageBody.includes(UPSTREAM_TOKEN));
+  } finally {
+    await harness.close();
+  }
+});
+
+test("the OAuth consent screen follows the password change, not the seeding secret", async () => {
+  // The operator record has been the live credential since 0.6.0, but /authorize
+  // kept verifying against AUTH_PASSWORD_HASH, so a password changed here left
+  // the Claude sign-in still accepting the old one. It has to be the record in
+  // any case now that the hash is allowed to be absent entirely.
+  const harness = await startHarness({ operatorPath: await tempOperatorFile() });
+  try {
+    assert.ok(harness.operator);
+    await harness.operator.changePassword("the password the operator just chose");
+
+    const stale = await postAuthorizeForm(harness, TEST_USERNAME, TEST_PASSWORD);
+    assert.equal(stale.status, 401, "the seeding secret is no longer a way in");
+
+    const current = await postAuthorizeForm(
+      harness,
+      TEST_USERNAME,
+      "the password the operator just chose"
+    );
+    assert.equal(current.status, 302);
+    assert.match(current.headers.get("location") ?? "", /[?&]code=/);
   } finally {
     await harness.close();
   }
