@@ -168,6 +168,21 @@ function isCredentialRejection(err: unknown): boolean {
  *    top of (1): `client.close()` ("Closes TCP connection without notifying
  *    the server", imap-flow.d.ts) is synchronous and always available, so
  *    there is no reason to depend on the two deadlines racing in our favor.
+ *
+ * The `'error'` listener below is not diagnostics — it is what keeps this
+ * function's "always resolves" contract from being a lie one tick later.
+ * imapflow reports a connection lost mid-command *twice*: once by rejecting
+ * the in-flight command (which is what `connect()` throws here, and what the
+ * operator is told about), and again as an `'error'` event on the client
+ * itself, emitted from its socket handlers after that rejection has already
+ * been settled and reported. `ImapFlow` is an `EventEmitter`, and an emitter
+ * with no `'error'` listener rethrows: Node has nowhere to deliver the second
+ * report and raises it as an uncaught exception, killing the process. That is
+ * reachable from the settings UI by anyone who can sign in, against any host
+ * address they type, so the listener covers the client's whole lifetime rather
+ * than only the awaited window. There is nothing to do with the event — the
+ * failure it describes has already been returned — so it is deliberately a
+ * no-op sink. See the mid-LOGIN-drop case in test/unit/probe.test.ts.
  */
 async function probeImap(creds: ImapCreds, perProbeMs: number): Promise<ProbeResult> {
   const client = new ImapFlow({
@@ -179,6 +194,7 @@ async function probeImap(creds: ImapCreds, perProbeMs: number): Promise<ProbeRes
     connectionTimeout: perProbeMs,
     greetingTimeout: perProbeMs,
   });
+  client.on("error", () => {});
   try {
     await withTimeout(client.connect(), perProbeMs, "IMAP", () => client.close());
     return { ok: true };
