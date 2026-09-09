@@ -584,6 +584,27 @@ describe("reading the connector's answers", () => {
     });
   });
 
+  it("reads a rejected password back, now that the connector renders one", () => {
+    // #83 gave the password fields an error line of their own; the reader here
+    // matches any input, and its `[^>]*` has to keep spanning the newline the
+    // connector's `passwordField()` puts inside the tag. Nothing asserted that
+    // until now, so a reader that only ever saw single-line text inputs would
+    // have looked fine (#92).
+    const errors = readFieldErrors(
+      mailboxFormPage({
+        errors: {
+          "imap.pass": "Required.",
+          "smtp.pass": "A password is needed when a user is given.",
+        },
+      })
+    );
+
+    assert.deepEqual(errors, {
+      "imap.pass": "Required.",
+      "smtp.pass": "A password is needed when a user is given.",
+    });
+  });
+
   it("reads the accounts stamp the connector's own form was rendered from", () => {
     assert.equal(readStamp(mailboxFormPage({ stamp: "412-1757000000000" })), "412-1757000000000");
     assert.equal(readStamp(mailboxFormPage()), "absent");

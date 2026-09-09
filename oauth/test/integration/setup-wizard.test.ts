@@ -371,6 +371,9 @@ function mailboxFields(overrides: Record<string, string> = {}): Record<string, s
   };
 }
 
+/** What `GET /settings/mailboxes/new` reports before anything has been written. */
+const STAMP_BEFORE = "412-1757000000000";
+
 interface ConnectorBehaviour {
   probe?: StubProbeReport;
   /** Status for `POST /settings/mailboxes/test`. 200 unless a test says otherwise. */
@@ -379,10 +382,30 @@ interface ConnectorBehaviour {
   /** Status for `POST /settings/mailboxes`. 303 is what a stored account looks like. */
   createStatus?: number;
   createBody?: string;
+  /**
+   * Answer the save with no answer at all.
+   *
+   * `"hang"` is the case issue #82 is about: the request is written, the
+   * connector acts on it, and the wizard's 5-second budget runs out before the
+   * response comes back. `"reset"` is the same branch reached in a fraction of
+   * the time — the client sees a dropped connection rather than an abort, and
+   * the wizard has exactly as little to go on either way. Tests that are not
+   * about the budget itself use `"reset"` so the suite does not sit out five
+   * seconds proving `AbortSignal.timeout` works.
+   */
+  createAnswer?: "hang" | "reset";
+  /**
+   * What `accounts.json` looks like once the save has arrived — the fact that
+   * settles whether an unanswered save landed. Unchanged unless a test says so.
+   */
+  stampAfterCreate?: string;
+  /** Status for `GET /settings/mailboxes/new` once the save has arrived. */
+  newStatusAfterCreate?: number;
 }
 
 /** Answer the three connector routes step 2 uses, and nothing else. */
 function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): void {
+  let saveArrived = false;
   harness.upstream.respondWith((req, res) => {
     const url = req.url ?? "";
     if (req.method === "POST" && url === "/settings/mailboxes/test") {
@@ -397,11 +420,25 @@ function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): vo
       return;
     }
     if (req.method === "GET" && url === "/settings/mailboxes/new") {
-      res.writeHead(200, { "content-type": "text/html" });
-      res.end(mailboxFormPage({ stamp: "412-1757000000000" }));
+      const status = saveArrived ? (behaviour.newStatusAfterCreate ?? 200) : 200;
+      res.writeHead(status, { "content-type": "text/html" });
+      if (status !== 200) {
+        res.end("<html><body>Service Unavailable</body></html>");
+        return;
+      }
+      const stamp = saveArrived ? (behaviour.stampAfterCreate ?? STAMP_BEFORE) : STAMP_BEFORE;
+      res.end(mailboxFormPage({ stamp }));
       return;
     }
     if (req.method === "POST" && url === "/settings/mailboxes") {
+      saveArrived = true;
+      // The stored-but-unacknowledged case: the account is written, and the
+      // answer saying so never reaches the wizard.
+      if (behaviour.createAnswer === "hang") return;
+      if (behaviour.createAnswer === "reset") {
+        res.destroy();
+        return;
+      }
       const status = behaviour.createStatus ?? 303;
       res.writeHead(
         status,
@@ -415,6 +452,11 @@ function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): vo
     res.writeHead(404, { "content-type": "text/plain" });
     res.end("not stubbed");
   });
+}
+
+/** How many times the wizard asked the connector what `accounts.json` looks like. */
+function stampReads(harness: Harness): number {
+  return harness.upstream.requests.filter((r) => r.url === "/settings/mailboxes/new").length;
 }
 
 /** Complete step 1, which is how step 2 becomes reachable at all. */
@@ -608,6 +650,122 @@ test("a verified mailbox is probed first, then stored, with the credentials the 
       furthest: "connect",
     });
     assert.equal(progress.includes(MAILBOX_PASSWORD), false, "no mailbox password near it");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a save the connector never answers is settled by the stamp, not called a failure", async () => {
+  // Issue #82. The 5-second budget on the save aborts a request that has
+  // already been written, so the connector may well have stored the mailbox and
+  // simply not have answered in time. Every earlier build read that silence as
+  // proof nothing happened and said so — and the retry it invited came back
+  // "an account with id \"main\" already exists", blaming credentials that were
+  // fine, about a mailbox that was already stored.
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { createAnswer: "hang", stampAfterCreate: "530-1757000009999" });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+
+    // accounts.json moved under the only request writing to it. That is the
+    // mailbox stored, and step 3 is where a stored mailbox leads.
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
+    // Read once before the write and once to settle it — the second read is
+    // the whole of the fix.
+    assert.equal(stampReads(harness), 2);
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(dir, "setup-wizard.json"), "utf8")) as Record<string, unknown>,
+      { version: 1, furthest: "connect" }
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a save that never landed still says plainly that nothing was stored", async () => {
+  // The other half of the same check: an unchanged stamp means the write did
+  // not happen, and the old message was true all along for this case.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { createAnswer: "reset" });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+
+    assert.equal(res.status, 502);
+    assert.match(await res.text(), /Nothing was stored/);
+    assert.equal(stampReads(harness), 2);
+    // And the wizard has not moved on, because nothing was stored.
+    const entry = await getSetup(harness);
+    assert.equal(entry.headers.get("location"), `/setup/${harness.claimToken}/mailbox`);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a save it cannot settle is reported as unknown rather than as a failure", async () => {
+  // The connector drops the save and is then in no state to be asked what it
+  // did with it. There is no fact to report here, and the one thing this screen
+  // must not do is invent one in either direction.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { createAnswer: "reset", newStatusAfterCreate: 503 });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+
+    assert.equal(res.status, 502);
+    const html = await res.text();
+    assert.match(html, /may or may not have been saved/);
+    // Not this. It is exactly the claim this build cannot make.
+    assert.equal(/Nothing was stored/.test(html), false);
+    // And the operator is told what a second attempt will do rather than being
+    // left to invent a different ID.
+    assert.match(html, /refused by its ID/);
+    assert.equal(stampReads(harness), 2);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a save the connector refuses does not blame the passwords for it", async () => {
+  // A stored mailbox reached by a save this wizard never saw acknowledged comes
+  // back as "an account with id … already exists" on the next attempt. That is
+  // the connector's answer, and it belongs against the field it names — the
+  // notice above it may not read as "your credentials were wrong".
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      createStatus: 400,
+      createBody: mailboxFormPage({
+        errors: { id: 'An account with id "main" already exists.' },
+      }),
+    });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+
+    assert.equal(res.status, 400);
+    const html = await res.text();
+    assert.match(html, /An account with id &quot;main&quot; already exists\./);
+    assert.match(html, /refused to store these details/);
+    assert.equal(/these details were refused/.test(html), false);
   } finally {
     await harness.close();
   }

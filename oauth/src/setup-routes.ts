@@ -41,6 +41,11 @@
  *   POST /settings/mailboxes       → the write, only once the probe has held
  * ```
  *
+ * The stamp is read twice when it has to be: once before the write, and again
+ * when the write goes unanswered. An abort fires after the request has gone out,
+ * so silence there is not evidence of anything — and the stamp is what turns
+ * "unknown" back into a fact rather than a guess. See `handleMailbox`.
+ *
  * Not through `createProxy`. That module streams the upstream response straight
  * back to the browser, which is precisely what this step cannot do: the whole
  * requirement is a *decision* taken on the connector's answer — save, or refuse
@@ -266,6 +271,12 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
    * The order is the whole point of the screen. A probe that ran after the write
    * would leave an operator finishing setup over credentials that were already
    * known not to work.
+   *
+   * The two calls fail differently, and #82 is what happens when they are read
+   * as if they did not. Nothing this screen says may claim an outcome it has not
+   * established: the probe writes nothing, so silence from it is a fact; the
+   * write does, so silence from it is a question, and the answer is one more
+   * read of the stamp.
    */
   async function handleMailbox(req: Request, res: Response, base: string): Promise<void> {
     if (!isSameOrigin(req.headers, config.issuer)) {
@@ -438,15 +449,62 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
 
     const created = await mailboxes.create(fields, stamp);
     if (created.kind !== "answer") {
-      log("warn", "setup step 2 could not reach the connector to save", { error: created.error });
+      // The one call in this step whose outcome no answer settles. The probe
+      // above can say "nothing was tested and nothing was saved" because it
+      // writes nothing whatever happens to it; this request does, and by the
+      // time the signal fires it has already gone out. The connector may have
+      // stored the mailbox and merely lost the answer on the way back.
+      //
+      // So this asks instead of asserting. `accounts.json` is the thing the
+      // write moves, its stamp is the fact the connector will state about it,
+      // and nothing else is writing to that file while the settings UI is
+      // unmounted — a stamp that has moved is the write, landed. That also
+      // covers the refusals that reach this branch without a request ever being
+      // delivered (a reset, a connector that is not listening): those leave the
+      // stamp exactly where it was, which is the answer they deserve.
+      log("warn", "setup step 2 got no answer to the save", { error: created.error });
+      const after = await mailboxes.stamp();
+
+      if (after !== null && after !== stamp) {
+        log("info", "setup step 2 completed: the save went unanswered, but the mailbox is there", {
+          error: created.error,
+        });
+        await state.advanceTo("connect");
+        redirect(res, `${base}/connect`, 303);
+        return;
+      }
+
+      if (after === null) {
+        // Unreachable twice over. There is no fact to report, so the screen
+        // says that rather than picking the reassuring half of it — and points
+        // at the retry, which the connector answers safely either way: an
+        // account whose id is taken is refused, not stored a second time.
+        log("error", "setup step 2 cannot say whether the mailbox was stored", {});
+        page(502, {
+          values,
+          probe,
+          notice: {
+            kind: "error",
+            message:
+              "The connection test passed, but the connector did not answer when asked to " +
+              "save, and could not be asked afterwards what it did — so this may or may not " +
+              "have been saved. Get the connector answering again, then press Save and " +
+              "continue once more: a mailbox that is already stored is refused by its ID " +
+              "rather than stored twice.",
+          },
+        });
+        return;
+      }
+
+      log("warn", "setup step 2: the save went unanswered and accounts.json did not move", {});
       page(502, {
         values,
         probe,
         notice: {
           kind: "error",
           message:
-            "The connection test passed, but the connector did not answer when asked to save. " +
-            "Nothing was stored. Try again.",
+            "The connection test passed, but the connector did not answer when asked to save, " +
+            "and its account file is unchanged. Nothing was stored. Try again.",
         },
       });
       return;
@@ -467,8 +525,9 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
             ? {
                 kind: "error",
                 message:
-                  "The connection test passed, but these details were refused, so nothing " +
-                  "was saved. Retype the passwords and try again.",
+                  "The connection test passed, but the connector refused to store these " +
+                  "details, so this attempt added nothing. What it objected to is marked " +
+                  "below; fix that, retype the passwords and try again.",
               }
             : refusedNotice(created.status),
       });
@@ -789,7 +848,20 @@ const SETUP_SUBJECT = "setup-wizard";
 
 /** Longer than the connector's own 25-second probe budget, and not much longer. */
 const PROBE_TIMEOUT_MS = 30_000;
-/** Everything else upstream is a file read and a render. */
+/**
+ * Everything else upstream is a file read and a render — the write included.
+ *
+ * Weighed again for the save under #82, on the suspicion that 5 seconds was too
+ * short for a probe-then-write. It is not one: `POST /settings/mailboxes` in the
+ * connector parses the form, checks the stamp, writes `accounts.json` and
+ * renames it into place, and talks to no mail server at all. The probe is the
+ * separate `/settings/mailboxes/test` call above, which already gets 30 seconds
+ * — more than the 25 that `TOTAL_TIMEOUT_MS` in the connector's probe.ts allows
+ * itself. So the budget stays: raising it would only hold an operator in front
+ * of a blank screen for half a minute when the connector is genuinely wedged,
+ * and what actually hurt here was never the length of the wait but what the
+ * screen claimed at the end of it.
+ */
 const QUICK_TIMEOUT_MS = 5_000;
 
 type UpstreamAnswer =
@@ -799,9 +871,16 @@ type UpstreamAnswer =
 interface MailboxClient {
   /** Probe without saving: the connector's own "Test connection" action. */
   test(fields: URLSearchParams): Promise<UpstreamAnswer>;
-  /** The current `accounts.json` stamp, read off the connector's own new-mailbox form. */
+  /**
+   * The current `accounts.json` stamp, read off the connector's own new-mailbox
+   * form. Also what an unanswered {@link MailboxClient.create} is settled by:
+   * asked a second time, a stamp that has moved is the write, landed.
+   */
   stamp(): Promise<string | null>;
-  /** Write the account. 303 means it is stored. */
+  /**
+   * Write the account. 303 means it is stored; anything else means it is not.
+   * No answer at all means neither — see `handleMailbox`.
+   */
   create(fields: URLSearchParams, stamp: string): Promise<UpstreamAnswer>;
 }
 

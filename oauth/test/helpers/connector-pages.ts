@@ -67,6 +67,21 @@ function textField(name: string, value: string, errors: Record<string, string>):
 ${message ? `<p class="field-error">${escapeHtml(message)}</p>` : ""}`;
 }
 
+/**
+ * `passwordField()`: the same shape, with the input spread over two lines and
+ * never carrying a value.
+ *
+ * Its error line only started being rendered in #83 — before that a rejected
+ * password had nowhere to be shown, so nothing on this side had ever seen one.
+ */
+function passwordField(name: string, errors: Record<string, string>): string {
+  const message = errors[name];
+  return `<label for="${escapeHtml(name)}">${escapeHtml(name)}</label>
+<input id="${escapeHtml(name)}" name="${escapeHtml(name)}" type="password" value=""
+       placeholder="unchanged" autocomplete="new-password" required>
+${message ? `<p class="field-error">${escapeHtml(message)}</p>` : ""}`;
+}
+
 export interface StubFormOptions {
   /** What `AccountsStore.stamp()` reported when the page was rendered. */
   stamp?: string;
@@ -81,9 +96,12 @@ export interface StubFormOptions {
  */
 export function mailboxFormPage(opts: StubFormOptions = {}): string {
   const errors = opts.errors ?? {};
-  const fields = ["id", "label", "imap.host", "imap.port", "imap.user", "smtp.host"]
-    .map((name) => textField(name, "", errors))
-    .join("\n");
+  const fields = [
+    ...["id", "label", "imap.host", "imap.port", "imap.user", "smtp.host"].map((name) =>
+      textField(name, "", errors)
+    ),
+    ...["imap.pass", "smtp.pass"].map((name) => passwordField(name, errors)),
+  ].join("\n");
   return `<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Add mailbox</title></head>
