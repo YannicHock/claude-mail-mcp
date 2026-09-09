@@ -1,0 +1,79 @@
+name: Setup & deployment help
+description: It will not start, will not connect, or Claude will not attach to it
+labels: ["question", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For getting it running, rather than for something that is broken in the
+        code. Worth checking first:
+        [README](https://github.com/YannicHock/claude-mail-mcp/blob/main/README.md) ·
+        [Deployment](https://github.com/YannicHock/claude-mail-mcp/blob/main/docs/DEPLOYMENT.md) ·
+        [Hardening](https://github.com/YannicHock/claude-mail-mcp/blob/main/docs/HARDENING.md)
+
+        Never paste passwords, `AUTH_TOKEN`, or the contents of `accounts.json`.
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where does it stop
+      options:
+        - The container or process will not start
+        - It starts, but /health is not reachable
+        - Claude.ai will not connect to the MCP endpoint
+        - Sign-in to the settings UI fails
+        - A mailbox will not connect (IMAP/SMTP/CalDAV credentials)
+        - Calendar discovery finds nothing
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What you are trying to do, and what happens instead
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "0.6.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it
+      options:
+        - Docker Compose (both images)
+        - Docker, connector only
+        - npm start / node directly
+        - systemd
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: proxy
+    attributes:
+      label: What sits in front of it
+      description: TLS termination and reverse proxy, if any. This is where most connection problems live.
+      placeholder: "Nginx Proxy Manager / Caddy / Traefik / plain nginx / nothing"
+    validations:
+      required: true
+
+  - type: input
+    id: provider
+    attributes:
+      label: Mail provider
+      placeholder: "Mailbox.org / Fastmail / iCloud / Mailcow / Migadu / own stack …"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and error messages
+      description: Redact addresses, tokens and host names first.
+      render: text

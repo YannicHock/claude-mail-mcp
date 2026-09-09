@@ -1,0 +1,106 @@
+name: Bug report
+description: Something is broken or behaves incorrectly
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do **not** report security problems here — see
+        [SECURITY.md](https://github.com/YannicHock/claude-mail-mcp/blob/main/SECURITY.md)
+        and open a private advisory instead.
+
+        This connector talks to arbitrary mail servers, so which provider and
+        which protocol you are on is usually the difference between a
+        reproducible bug and a guess. Please fill in the fields below.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Ask Claude to "…"
+        2. …
+        3. The tool returns …
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: 'The `version` field of `GET /health`, or your image tag.'
+      placeholder: "0.6.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Connector (mail-mcp)
+        - OAuth layer (mail-oauth)
+        - Settings UI
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it
+      options:
+        - Docker Compose (both images)
+        - Docker, connector only
+        - npm start / node directly
+        - systemd
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: Which protocol is involved
+      multiple: true
+      options:
+        - IMAP (reading, folders, search)
+        - SMTP (sending)
+        - CalDAV (calendar)
+        - MCP transport / OAuth
+        - Settings UI (browser)
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: provider
+    attributes:
+      label: Mail provider
+      description: Which server the failing account talks to. Self-hosted counts — say which stack.
+      placeholder: "Mailbox.org / Fastmail / iCloud / Mailcow / Migadu / own Postfix + Dovecot …"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant server output. **Redact before pasting** — logs can contain
+        mail addresses, subjects, tokens and host names.
+      render: text
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Reverse proxy in front of it, unusual network, anything you already ruled out.
