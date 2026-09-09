@@ -4,6 +4,20 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## [Unreleased]
 
+### Added
+
+- **The three random secrets generate themselves on first boot.** `auth_token`, `oauth_signing_key` and `settings_signing_key` are read from their configured `*_FILE` path if it is there, and created at that path if it is not — mode `640`, in the group both images share. `PUBLIC_URL` and the operator's password hash are the only values left to supply by hand, and the hash goes away with the setup wizard. Each service logs one `secret resolved` line per secret saying whether it read the file or created it. The connector gained `AUTH_TOKEN_FILE` for this; it previously took `AUTH_TOKEN` inline only.
+
+  **A present file always wins**, which is what makes this safe for an instance that is already running: an upgrade reads the secrets it already has and rotates nothing. An inline `AUTH_TOKEN` with no file yet is written to the file rather than replaced, so an install that kept its token in `.env` keeps that token and hands the OAuth layer the same one.
+
+- **A shared group, `mailsecrets` (gid 105), in both images.** The connector runs as uid 100/gid 101 and the OAuth layer as uid 102/gid 103, deliberately sharing nothing; this one group is the exception, and it is what lets each read a secret the other wrote without those files being world-readable. The gid is pinned in both `Dockerfile`s and published as a `secrets-gid` label; a unit test compares the two against the constant in the code.
+
+### Changed
+
+- **`docker-compose.yml` mounts `./secrets` as a directory** instead of declaring four Docker file-secrets. Compose refuses to start a stack whose file-secret does not exist, which is exactly the state a first boot is in. The same `secrets/*.txt` files are used, now at `/secrets/<name>.txt` rather than `/run/secrets/<name>`; existing deployments keep their values.
+
+  The directory must be group-owned by gid 105 and **setgid**: `chgrp 105 secrets && chmod 2770 secrets`. The setgid bit is what makes a file created by one service land in the shared group instead of the creator's own. `2770` also keeps other accounts on the host out — with "a present file wins", a directory anyone could write to would let a local user choose the `auth_token` the connector adopts. Pre-creating the files by hand and mounting `./secrets` read-only remains an option.
+
 ### Fixed
 
 - **A mailbox already configured as `new` or `test` now says why editing it does nothing.** Those two ids are literal segments in the settings routes, so an account under one of them cannot be edited in place — the edit form for `test` posts to the create form's connection probe and silently never persists, and `new` opens the "Add mailbox" form instead. Creating such an account has been refused since 0.6.0, but one that already exists keeps loading on purpose (refusing the file would take every other mailbox down with it), and nothing told its operator what was wrong. The server now warns once at startup, naming the account, and the mailbox list page repeats it on that account's own row. Delete and "Make default" are unaffected and remain the way out: delete the mailbox and recreate it under another id.

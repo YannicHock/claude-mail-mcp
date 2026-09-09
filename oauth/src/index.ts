@@ -10,6 +10,7 @@ import { ConfigError, loadConfig } from "./config.js";
 import { createApp, SERVICE_NAME, VERSION } from "./app.js";
 import { createLogger } from "./logger.js";
 import { OperatorRecord } from "./operator.js";
+import { logSecretReport } from "./secrets.js";
 import { Store } from "./store.js";
 
 async function main(): Promise<void> {
@@ -27,6 +28,10 @@ async function main(): Promise<void> {
   }
 
   const log = createLogger(config.logLevel);
+  // First thing in the log, before anything that might fail on a secret: which
+  // of them were read and which this boot created. On a shared secret an
+  // operator otherwise has no way to tell which of the two services wrote it.
+  logSecretReport(config.secretReport, log);
   const store = await Store.open(config.stateFile, log);
   const operator = await OperatorRecord.open(
     config.operatorFile,

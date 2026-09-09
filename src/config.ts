@@ -4,15 +4,53 @@
  * In v0.2, only transport-level settings live here (port, auth token,
  * accounts file path, log level). Mailbox credentials moved to
  * accounts.json — see src/accounts.ts and README.md.
+ *
+ * Every secret can be supplied inline (`NAME`) or as a path to a file holding it
+ * (`NAME_FILE`). A present file always wins; an absent one is created. That rule
+ * and its consequences live in src/secrets.ts.
  */
 
-import { readFileSync } from "node:fs";
+import {
+  resolveSecret,
+  type ResolveOptions,
+  type SecretReportEntry,
+} from "./secrets.js";
 
-function required(name: string): string {
-  const value = process.env[name];
-  if (!value || value.trim() === "") {
+/**
+ * Where each configured secret came from — read from its file, taken from the
+ * environment, or generated on this boot. Logged one line per secret by
+ * src/index.ts; this module is evaluated at import time, before any logger
+ * exists, so it collects rather than prints.
+ */
+const secretReport: SecretReportEntry[] = [];
+
+/**
+ * Resolve a secret and record its source.
+ *
+ * `NAME_FILE` wins when both are set, an absent one is an instruction to create
+ * the file, and a `NAME_FILE` that is there but unreadable stays fatal — see
+ * src/secrets.ts for the whole rule. Values are trimmed on both paths, because
+ * SETTINGS_SIGNING_KEY has to come out byte-identical here and in the OAuth
+ * layer for the assertion's HMAC to verify, and a trailing newline pasted from
+ * `openssl rand -base64 48` must not survive on one side but not the other.
+ *
+ * Only key material goes through this. `optional()` still reads plain
+ * configuration such as ACCOUNTS_FILE, PUBLIC_URL, HOST and LOG_LEVEL, which
+ * deliberately preserve incidental whitespace as-is.
+ */
+function trackedSecret(name: string, options?: ResolveOptions): string | undefined {
+  const resolved = resolveSecret(process.env, name, options);
+  if (resolved.source !== undefined) {
+    secretReport.push({ name, source: resolved.source, path: resolved.path });
+  }
+  return resolved.value;
+}
+
+function requiredSecret(name: string, options?: ResolveOptions): string {
+  const value = trackedSecret(name, options);
+  if (value === undefined) {
     throw new Error(
-      `Missing required environment variable: ${name}. See .env.example.`
+      `Missing required environment variable: ${name} (or ${name}_FILE). See .env.example.`
     );
   }
   return value;
@@ -31,37 +69,6 @@ function int(name: string, fallback: number): number {
     throw new Error(`Environment variable ${name} must be an integer.`);
   }
   return parsed;
-}
-
-/**
- * Read a value that may be given inline or as a path to a file holding it.
- *
- * `NAME_FILE` wins when both are set, and an unreadable `NAME_FILE` is fatal
- * rather than a silent fallback to `NAME` — a typo in a secret mount should stop
- * the process, not quietly downgrade it. Mirrors the same helper in
- * oauth/src/config.ts.
- *
- * Both the inline and the file-sourced path are trimmed. A secret like this one
- * has to come out byte-identical on both services for an HMAC to verify, so
- * incidental whitespace (a trailing newline pasted from `openssl rand -base64
- * 48` output) must not survive on one path but not the other. Trimming is
- * scoped to this helper rather than folded into `optional()`, which other
- * call sites (ACCOUNTS_FILE, PUBLIC_URL, HOST, LOG_LEVEL) rely on to preserve
- * incidental whitespace as-is.
- */
-function secret(name: string, fallback: string): string {
-  const filePath = process.env[`${name}_FILE`];
-  if (filePath && filePath.trim() !== "") {
-    try {
-      return readFileSync(filePath.trim(), "utf8").trim();
-    } catch (err) {
-      throw new Error(
-        `Cannot read ${name}_FILE at ${filePath.trim()}: ` +
-          (err instanceof Error ? err.message : String(err))
-      );
-    }
-  }
-  return optional(name, fallback).trim();
 }
 
 export const config = {
@@ -97,10 +104,16 @@ export const config = {
 
   /**
    * Bearer token a client must present in the Authorization header when
-   * calling /mcp — the only thing gating that endpoint. Required: the process
-   * refuses to start without it.
+   * calling /mcp — the only thing gating that endpoint.
+   *
+   * Set `AUTH_TOKEN_FILE` and the token is read from that file, or generated
+   * into it on the first boot that finds it absent — the same file the OAuth
+   * layer reads as its `UPSTREAM_AUTH_TOKEN`. With neither `AUTH_TOKEN` nor
+   * `AUTH_TOKEN_FILE` the process still refuses to start: there is no path to
+   * write a generated token to, and a token only this process knows would gate
+   * nothing anyone could get through.
    */
-  authToken: required("AUTH_TOKEN"),
+  authToken: requiredSecret("AUTH_TOKEN"),
   // Trimmed and stripped of a trailing slash so this matches the OAuth layer's
   // own normalisation of the same URL (see normalisePublicUrl() in
   // oauth/src/urls.ts). The two values are compared as the assertion's `iss`
@@ -112,8 +125,15 @@ export const config = {
    * Shared key for the settings assertion the OAuth layer sends with proxied
    * /settings requests. Empty means the settings routes are not mounted and this
    * process behaves exactly as it did before they existed.
+   *
+   * Generated into `SETTINGS_SIGNING_KEY_FILE` when that path is configured and
+   * absent, so a container deployment gets a working settings UI without the
+   * operator generating a key by hand. Leave both unset to keep it off.
    */
-  settingsSigningKey: secret("SETTINGS_SIGNING_KEY", ""),
+  settingsSigningKey: trackedSecret("SETTINGS_SIGNING_KEY") ?? "",
+
+  /** @see secretReport */
+  secretReport,
 } as const;
 
 export type Config = typeof config;

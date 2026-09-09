@@ -393,12 +393,56 @@ docker compose pull
 
 ```bash
 cp .env.docker.example .env
-# generate the Bearer token clients will send to /mcp
-echo "AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
 # edit .env: PUBLIC_URL, LOG_LEVEL
+mkdir -p secrets
+sudo chgrp 105 secrets && sudo chmod 2770 secrets
 ```
 
 `HOST`, `PORT` and `ACCOUNTS_FILE` are fixed by the image and `docker-compose.yml` — they're not set in `.env` (see the comments in `.env.docker.example`).
+
+`PUBLIC_URL` is the only value you have to supply: the container cannot discover
+its own external address. The Bearer token clients send to `/mcp`, the OAuth
+signing key and the settings signing key are **generated on the first boot that
+finds them missing**, into `secrets/`. Read the token back afterwards with
+`cat secrets/auth_token.txt`, or set `AUTH_TOKEN` in `.env` before the first
+start to choose it yourself — either way, the file wins from then on and an
+upgrade never rotates a token out from under a connected client.
+
+**`chgrp 105` and `chmod 2770` are both load-bearing.** Both containers create
+files in `secrets/` and they run as different non-root uids — 100 for the
+connector, 102 for the OAuth layer — so each image puts its runtime user in one
+shared group, `mailsecrets`, **gid 105**. That gid is pinned in both
+`Dockerfile`s and is part of their published contract; confirm it against the
+images you pulled with:
+
+```bash
+docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
+# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp),101(mailmcp),105(mailsecrets)
+docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp-oauth:latest
+# uid=102(mailoauth) gid=103(mailoauth) groups=103(mailoauth),103(mailoauth),105(mailsecrets)
+```
+
+The **setgid** bit — the `2` in `2770` — is what makes a file created by one
+service land in group 105 rather than in the creator's own group, which is what
+lets the other service read it. `chmod 770` without it leaves the connector's
+file in gid 101 at mode `640`, and the OAuth layer crash-loops on `EACCES`. The
+services also set the group explicitly when they can, so a forgotten setgid bit
+is survivable, but write the mode correctly and do not rely on that.
+
+`2770` equally means **no other account on the host can write here**, and that is
+not incidental. A present file always wins over a generated one, so any local
+user able to drop an `auth_token.txt` into this directory before the first boot
+would choose the token the connector then adopts — instance takeover with no
+exploit involved. A world-writable `secrets/` is not an acceptable shortcut.
+
+Generated files land at mode `640`, owner and group only. `600` is the intuitive
+choice and the one that crash-loops both containers, because neither runtime uid
+owns a file the *other* service wrote; `644` would work but hands every account
+on the host the connector's Bearer token.
+
+If you would rather not manage the group at all, create the four files yourself
+instead — nothing is ever generated over a file that already exists, and the
+mount in `docker-compose.yml` can then be made read-only.
 
 ### 3. Create `accounts.json`
 
@@ -408,7 +452,7 @@ contract; confirm them against the image you actually pulled with:
 
 ```bash
 docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
-# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp)
+# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp),101(mailmcp),105(mailsecrets)
 ```
 
 The credentials file has to be readable by that uid *and* unreadable to every
@@ -479,19 +523,39 @@ The connector's own `/settings` routes are reachable only on the internal Docker
 network, and only with a signed assertion from the OAuth layer — so this step
 assumes the `mail-oauth` service above is running.
 
-**Generate the shared signing key.** Both services mount the *same* file. It is what
-lets the connector trust that a settings request really came from the OAuth layer:
+**The shared signing key generates itself.** Both services mount the *same* file,
+`secrets/settings_signing_key.txt`, and it is what lets the connector trust that a
+settings request really came from the OAuth layer. Whichever service starts first
+creates it, at mode `640` in group 105; there is nothing to run.
+
+To supply your own instead, write it before the first start — a file that is already
+there is always used as it stands:
 
 ```bash
 mkdir -p secrets
+sudo chgrp 105 secrets && sudo chmod 2770 secrets   # as in step 2 above
 openssl rand -base64 48 > secrets/settings_signing_key.txt
-chmod 600 secrets/settings_signing_key.txt
+sudo chgrp 105 secrets/settings_signing_key.txt
+chmod 640 secrets/settings_signing_key.txt
 ```
 
+`chmod 600` here is the mistake that costs an evening: the file is read by two
+containers running as *different* non-root uids, so the one that did not write it
+crash-loops on `EACCES` with nothing in `docker compose logs` but a permission
+error. Group 105 is `mailsecrets`, the one group both images share — see step 2.
+
 `secrets/` is already in `.gitignore`. Never commit this file. `docker-compose.yml`
-wires it into both services as `SETTINGS_SIGNING_KEY_FILE=/run/secrets/settings_signing_key`.
-Without it the connector does not mount its settings routes and the OAuth layer does
-not mount the UI — the feature is off, not half-on.
+wires it into both services as `SETTINGS_SIGNING_KEY_FILE=/secrets/settings_signing_key.txt`.
+Unset it on both sides to turn the feature off: the connector then does not mount its
+settings routes and the OAuth layer does not mount the UI — off, not half-on.
+
+Each service logs one line per secret at startup saying whether it read the file or
+created it, which is the quickest way to confirm both are on the same one:
+
+```
+{"level":"info","msg":"secret resolved","secret":"SETTINGS_SIGNING_KEY","source":"generated","path":"/secrets/settings_signing_key.txt"}
+{"level":"info","msg":"secret resolved","secret":"SETTINGS_SIGNING_KEY","source":"file","path":"/secrets/settings_signing_key.txt"}
+```
 
 **Make the data directory writable.** The connector now writes `accounts.json`:
 
@@ -521,8 +585,8 @@ keeps working — which is what makes this one hard to spot.
 
 **Know where the operator password lives now.** `AUTH_PASSWORD_HASH` (or
 `AUTH_PASSWORD_HASH_FILE`) *seeds* the operator record once, on first start. After
-that the live value lives in `oauth-data/operator.json`, because `/run/secrets` is
-mounted read-only and a password change has to be able to write somewhere.
+that the live value lives in `oauth-data/operator.json`, because a password change
+has to be able to write somewhere the secret file may not be.
 
 The consequence worth knowing before it costs you an evening: **editing the secret
 later has no effect.** The service logs which source is live at startup and warns by

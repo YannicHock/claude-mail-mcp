@@ -48,9 +48,22 @@ COPY --from=builder /app/dist ./dist
 # The connector's /data holds mailbox credentials; this one's holds only OAuth
 # bookkeeping. Keep in sync with docs/DEPLOYMENT.md, and verify with:
 #   docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp-oauth:latest
-RUN addgroup -S -g 103 mailoauth && adduser -S -u 102 -G mailoauth mailoauth
+#
+# `mailsecrets`, gid 105, is the deliberate exception to that separation: it is
+# the only group these two images share, and the only reason this service can
+# read the auth_token and settings_signing_key the connector wrote (and vice
+# versa) without those files being world-readable. The number is pinned
+# identically in ../Dockerfile and a third time in src/secrets.ts as
+# SHARED_SECRET_GID, with a unit test comparing all three — a silent
+# disagreement means one service crash-looping on EACCES against a file the
+# other created.
+RUN addgroup -S -g 105 mailsecrets \
+ && addgroup -S -g 103 mailoauth \
+ && adduser -S -u 102 -G mailoauth mailoauth \
+ && addgroup mailoauth mailsecrets
 LABEL com.claude-mail-mcp-oauth.runtime-uid="102" \
-      com.claude-mail-mcp-oauth.runtime-gid="103"
+      com.claude-mail-mcp-oauth.runtime-gid="103" \
+      com.claude-mail-mcp-oauth.secrets-gid="105"
 
 # Pre-created so a bare `docker run` with no volume gets a normal empty-state
 # start instead of EACCES on the first client registration.

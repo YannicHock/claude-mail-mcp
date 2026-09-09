@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -47,8 +47,22 @@ test("SETTINGS_SIGNING_KEY_FILE wins over the inline value and is trimmed", asyn
 });
 
 test("an unreadable SETTINGS_SIGNING_KEY_FILE is fatal, not a silent fallback", async () => {
+  // A directory where a file was expected. An absent file is generated (see
+  // config.secrets.test.ts); one that is *there* and cannot be read is still a
+  // typo in a secret mount, and must stop the process rather than quietly
+  // produce a replacement for a key the other service already has.
+  const dir = mkdtempSync(join(tmpdir(), "mailmcp-"));
+  const path = join(dir, "not-a-file");
+  mkdirSync(path);
+  await assert.rejects(
+    () => loadConfig({ SETTINGS_SIGNING_KEY_FILE: path }),
+    /Cannot read SETTINGS_SIGNING_KEY_FILE/
+  );
+});
+
+test("a SETTINGS_SIGNING_KEY_FILE that cannot be created is fatal too", async () => {
   await assert.rejects(
     () => loadConfig({ SETTINGS_SIGNING_KEY_FILE: "/nonexistent/key" }),
-    /Cannot read SETTINGS_SIGNING_KEY_FILE/
+    /Cannot create SETTINGS_SIGNING_KEY_FILE/
   );
 });

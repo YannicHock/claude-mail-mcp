@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -112,6 +112,149 @@ describe("loadConfig", () => {
         (err: unknown) =>
           err instanceof ConfigError && err.message.includes("UPSTREAM_AUTH_TOKEN_FILE")
       );
+    });
+  });
+
+  describe("secrets that generate themselves", () => {
+    /** The four secret files a deployment mounts, as env pointing at `dir`. */
+    function secretFiles(dir: string) {
+      return {
+        UPSTREAM_AUTH_TOKEN: undefined,
+        UPSTREAM_AUTH_TOKEN_FILE: join(dir, "auth_token.txt"),
+        SIGNING_KEY: undefined,
+        SIGNING_KEY_FILE: join(dir, "oauth_signing_key.txt"),
+        AUTH_PASSWORD_HASH: undefined,
+        AUTH_PASSWORD_HASH_FILE: join(dir, "auth_password_hash.txt"),
+        SETTINGS_SIGNING_KEY_FILE: join(dir, "settings_signing_key.txt"),
+      };
+    }
+
+    function sources(config: { secretReport: { name: string; source: string }[] }) {
+      return Object.fromEntries(config.secretReport.map((e) => [e.name, e.source]));
+    }
+
+    it("boots with an empty secrets directory, generating the three random ones", () => {
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      // Only the password hash is supplied by hand; it is never generated.
+      writeFileSync(join(dir, "auth_password_hash.txt"), `${VALID_HASH}\n`);
+
+      const config = loadConfig(baseEnv(secretFiles(dir)));
+
+      assert.deepEqual(sources(config), {
+        UPSTREAM_AUTH_TOKEN: "generated",
+        SIGNING_KEY: "generated",
+        AUTH_PASSWORD_HASH: "file",
+        SETTINGS_SIGNING_KEY: "generated",
+      });
+      assert.ok(config.upstreamAuthToken.length > 0);
+      assert.ok(config.signingKey.length >= 32);
+      assert.ok(config.settingsSigningKey);
+      assert.equal(
+        readFileSync(join(dir, "auth_token.txt"), "utf8").trim(),
+        config.upstreamAuthToken
+      );
+    });
+
+    it("uses all four files unchanged when they are all present, writing nothing", () => {
+      // The upgrade path. A new AUTH_TOKEN here drops every connected Claude
+      // client at once, so this is the test that matters most in this file.
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      writeFileSync(join(dir, "auth_token.txt"), "live-connector-token\n");
+      writeFileSync(join(dir, "oauth_signing_key.txt"), `${"s".repeat(48)}\n`);
+      writeFileSync(join(dir, "auth_password_hash.txt"), `${VALID_HASH}\n`);
+      writeFileSync(join(dir, "settings_signing_key.txt"), `${"t".repeat(48)}\n`);
+      const before = readdirSync(dir).map((name) => [name, statSync(join(dir, name)).mtimeMs]);
+
+      const config = loadConfig(baseEnv(secretFiles(dir)));
+
+      assert.equal(config.upstreamAuthToken, "live-connector-token");
+      assert.deepEqual(new TextDecoder().decode(config.signingKey), "s".repeat(48));
+      assert.deepEqual(
+        new TextDecoder().decode(config.settingsSigningKey ?? new Uint8Array()),
+        "t".repeat(48)
+      );
+      assert.deepEqual(sources(config), {
+        UPSTREAM_AUTH_TOKEN: "file",
+        SIGNING_KEY: "file",
+        AUTH_PASSWORD_HASH: "file",
+        SETTINGS_SIGNING_KEY: "file",
+      });
+      assert.deepEqual(
+        readdirSync(dir).map((name) => [name, statSync(join(dir, name)).mtimeMs]),
+        before
+      );
+    });
+
+    it("keeps the present ones and generates only the rest", () => {
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      writeFileSync(join(dir, "auth_token.txt"), "live-connector-token\n");
+      writeFileSync(join(dir, "auth_password_hash.txt"), `${VALID_HASH}\n`);
+
+      const config = loadConfig(baseEnv(secretFiles(dir)));
+
+      assert.equal(config.upstreamAuthToken, "live-connector-token");
+      assert.deepEqual(sources(config), {
+        UPSTREAM_AUTH_TOKEN: "file",
+        SIGNING_KEY: "generated",
+        AUTH_PASSWORD_HASH: "file",
+        SETTINGS_SIGNING_KEY: "generated",
+      });
+    });
+
+    it("reads back what the previous boot generated, rather than rotating it", () => {
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      writeFileSync(join(dir, "auth_password_hash.txt"), `${VALID_HASH}\n`);
+      const env = baseEnv(secretFiles(dir));
+
+      const first = loadConfig(env);
+      const second = loadConfig(env);
+
+      assert.equal(second.upstreamAuthToken, first.upstreamAuthToken);
+      assert.deepEqual(second.signingKey, first.signingKey);
+      assert.deepEqual(sources(second), {
+        UPSTREAM_AUTH_TOKEN: "file",
+        SIGNING_KEY: "file",
+        AUTH_PASSWORD_HASH: "file",
+        SETTINGS_SIGNING_KEY: "file",
+      });
+    });
+
+    it("never generates the password hash", () => {
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      assert.throws(
+        () => loadConfig(baseEnv(secretFiles(dir))),
+        (err: unknown) =>
+          err instanceof ConfigError &&
+          err.message.includes("AUTH_PASSWORD_HASH_FILE") &&
+          err.message.includes("never generated")
+      );
+      assert.equal(existsSync(join(dir, "auth_password_hash.txt")), false);
+    });
+
+    it("seeds the file from an inline UPSTREAM_AUTH_TOKEN rather than generating one", () => {
+      // Upgrading an install that carried the token in .env only: the OAuth layer
+      // must keep that token, and write it where the connector will read it.
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+      writeFileSync(join(dir, "auth_password_hash.txt"), `${VALID_HASH}\n`);
+
+      const config = loadConfig(
+        baseEnv({ ...secretFiles(dir), UPSTREAM_AUTH_TOKEN: "token-from-dot-env" })
+      );
+
+      assert.equal(config.upstreamAuthToken, "token-from-dot-env");
+      assert.equal(sources(config).UPSTREAM_AUTH_TOKEN, "seeded");
+      assert.equal(
+        readFileSync(join(dir, "auth_token.txt"), "utf8").trim(),
+        "token-from-dot-env"
+      );
+    });
+
+    it("reports nothing for a secret that is not configured at all", () => {
+      // SETTINGS_SIGNING_KEY is optional: absent means the settings UI is off,
+      // not that something needs generating.
+      const config = loadConfig(baseEnv());
+      assert.equal(config.settingsSigningKey, null);
+      assert.equal(sources(config).SETTINGS_SIGNING_KEY, undefined);
     });
   });
 

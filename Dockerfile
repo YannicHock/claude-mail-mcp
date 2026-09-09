@@ -55,9 +55,20 @@ COPY --from=builder /app/dist ./dist
 # keep them in sync with docs/DEPLOYMENT.md and verify with:
 #   docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
 # (gid 101, not 100: alpine already ships gid 100 as the "users" group.)
-RUN addgroup -S -g 101 mailmcp && adduser -S -u 100 -G mailmcp mailmcp
+#
+# `mailsecrets`, gid 105, is the one group this image shares with the OAuth
+# layer's image — the only reason either can read a secret the other wrote. Both
+# Dockerfiles pin the same number, and src/secrets.ts pins it a third time as
+# SHARED_SECRET_GID; a unit test compares all three, because a silent
+# disagreement here means one service crash-looping on EACCES against a file the
+# other created. 105 is free in node:24-alpine (100 is "users", 123 is "ntp").
+RUN addgroup -S -g 105 mailsecrets \
+ && addgroup -S -g 101 mailmcp \
+ && adduser -S -u 100 -G mailmcp mailmcp \
+ && addgroup mailmcp mailsecrets
 LABEL com.claude-mail-mcp.runtime-uid="100" \
-      com.claude-mail-mcp.runtime-gid="101"
+      com.claude-mail-mcp.runtime-gid="101" \
+      com.claude-mail-mcp.secrets-gid="105"
 # Pre-create the ACCOUNTS_FILE directory so a bare `docker run` without any
 # volume mount gets a normal "file doesn't exist yet" startup (empty account
 # list) instead of EACCES from a root-only path. A real deployment bind-mounts
