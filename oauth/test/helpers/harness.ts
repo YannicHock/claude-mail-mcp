@@ -338,16 +338,35 @@ export async function completeAuthorizationFlow(
 
 // ---- Settings UI helpers ---------------------------------------------------
 
-/** POST to /settings/login with the given credentials, same-origin. */
+/**
+ * Which of `Origin` and `Referer` a form POST arrives with.
+ *
+ * `fetch` always sets `Origin`, which is convenient and is what every caller
+ * here wants by default — but it is not what a browser does. Chrome sends no
+ * `Origin` on a *same-origin* form POST, only `Referer`, and that combination
+ * is what the origin check has to survive. Pass this to drive the other rows
+ * of that matrix; omit it and the request is same-origin via `Origin`, exactly
+ * as before.
+ */
+export interface SubmissionOptions {
+  /** Replaces the default `{ origin: baseUrl }` wholesale. */
+  headers?: Record<string, string>;
+}
+
+/** POST to /settings/login with the given credentials, same-origin by default. */
 export async function signInWith(
   harness: Harness,
   username: string,
-  password: string
+  password: string,
+  options: SubmissionOptions = {}
 ): Promise<Response> {
   return fetch(`${harness.baseUrl}/settings/login`, {
     method: "POST",
     redirect: "manual",
-    headers: { "content-type": "application/x-www-form-urlencoded", origin: harness.baseUrl },
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      ...(options.headers ?? { origin: harness.baseUrl }),
+    },
     body: new URLSearchParams({ username, password }),
   });
 }
@@ -360,11 +379,16 @@ export async function getSettings(harness: Harness, cookie?: string): Promise<Re
   });
 }
 
-/** Drive the OAuth sign-in form POST, the way completeAuthorizationFlow does. */
+/**
+ * Drive the OAuth sign-in form POST, the way completeAuthorizationFlow does.
+ *
+ * Same-origin via `Origin` unless {@link SubmissionOptions} says otherwise.
+ */
 export async function postAuthorizeForm(
   harness: Harness,
   username: string,
-  password: string
+  password: string,
+  options: SubmissionOptions = {}
 ): Promise<Response> {
   const { baseUrl } = harness;
   const registration = await registerClaudeClient(baseUrl);
@@ -387,10 +411,28 @@ export async function postAuthorizeForm(
     redirect: "manual",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      Origin: baseUrl,
+      ...(options.headers ?? { Origin: baseUrl }),
     },
     body: new URLSearchParams({ request: requestToken, username, password }),
   });
+}
+
+/**
+ * GET /authorize the way a client starts the flow, and hand back the response
+ * so a test can read both the rendered form and the headers it was served with.
+ */
+export async function getAuthorizePage(harness: Harness): Promise<Response> {
+  const registration = await registerClaudeClient(harness.baseUrl);
+  const { challenge } = makePkce();
+
+  const url = new URL(`${harness.baseUrl}/authorize`);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", registration.body.client_id as string);
+  url.searchParams.set("redirect_uri", CLAUDE_CALLBACK);
+  url.searchParams.set("code_challenge", challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+
+  return fetch(url, { redirect: "manual" });
 }
 
 /** Pull the CSRF token out of a rendered settings page. */
