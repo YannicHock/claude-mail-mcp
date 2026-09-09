@@ -6,7 +6,7 @@
  * verifies these tokens, so there is no second party needing a public key, and
  * publishing a JWKS document would add a moving part with no consumer. That is a
  * deliberate departure from the endpoint list this repository inherited, which
- * named /jwks.json — see docs/superpowers/specs/2026-09-08-oauth-layer-design.md.
+ * named /jwks.json — see docs/planning/specs/2026-09-08-oauth-layer.md.
  *
  * Two things here are load-bearing:
  *

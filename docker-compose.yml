@@ -31,7 +31,7 @@ services:
       # writes accounts.json, and it is the one that already reads the
       # credentials in it. The directory must be writable by uid 100 too, not
       # just the file — saving renames a temp file into place. See
-      # docs/superpowers/specs/2026-09-08-settings-ui-design.md §10.
+      # docs/planning/specs/2026-09-08-settings-ui.md §10.
       - ./data:/data
     # Healthcheck is inherited from the image's HEALTHCHECK instruction
     # (GET /health via a plain node http request — Alpine has no curl).

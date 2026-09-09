@@ -9,7 +9,7 @@
  * /.well-known/oauth-authorization-server, /authorize, /token, /register and
  * /jwks.json. It omitted protected resource metadata (RFC 9728), which the MCP
  * specification makes a MUST for the resource server, and it named /jwks.json,
- * which nothing consumes. See docs/superpowers/specs/2026-09-08-oauth-layer-design.md.
+ * which nothing consumes. See docs/planning/specs/2026-09-08-oauth-layer.md.
  */
 
 import { CODE_CHALLENGE_METHOD } from "./pkce.js";
