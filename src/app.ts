@@ -76,6 +76,16 @@ export interface CreateAppOptions {
    * `settingsSigningKey`) so it can't be added later and be missing by accident.
    */
   publicUrl: string;
+  /**
+   * Reverse-proxy hops in front of this process, handed to Express as
+   * `trust proxy`. A count, never a boolean — see the call site below and
+   * `trustProxyHops` in src/config.ts, which reads it from `TRUST_PROXY`.
+   *
+   * Defaults to 1, matching the single TLS-terminating reverse proxy every
+   * documented deployment has, so a caller that says nothing still never
+   * trusts the whole chain.
+   */
+  trustProxy?: number;
 }
 
 /**
@@ -111,7 +121,22 @@ export function createApp(opts: CreateAppOptions): express.Express {
 
   const app = express();
   app.disable("x-powered-by");
-  app.set("trust proxy", true);
+  // A hop count, never `true`.
+  //
+  // `trust proxy: true` trusts the whole X-Forwarded-For chain and takes its
+  // leftmost entry as req.ip — and that entry is supplied by the client, because
+  // a reverse proxy only *appends* the address it saw. There is no login
+  // throttle here for that to defeat, but req.ip is what the rejected `/mcp`
+  // request logs below and what a rejected settings request logs in
+  // settings-assertion.ts, and the obvious use for those two lines is a fail2ban
+  // jail. A jail reading a client-chosen field bans whatever the attacker names.
+  //
+  // With a hop count, Express skips exactly that many trusted entries from the
+  // socket outward, so req.ip is the address the outermost trusted proxy
+  // actually observed. Default 1, for the single reverse proxy in front — the
+  // OAuth layer in between, where there is one, forwards X-Forwarded-For
+  // unchanged rather than appending to it, so it costs no hop.
+  app.set("trust proxy", opts.trustProxy ?? 1);
   app.use(express.json({ limit: "5mb" }));
 
   app.get("/health", (_req, res) => {
