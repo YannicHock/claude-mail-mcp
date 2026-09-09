@@ -14,6 +14,11 @@
  */
 
 import { escapeHtml } from "./login.js";
+import {
+  MIN_PASSWORD_LENGTH,
+  type CredentialField,
+  type CredentialProblem,
+} from "./operator.js";
 import { CSRF_FIELD } from "./session.js";
 
 /**
@@ -66,6 +71,29 @@ function csrfField(csrf: string): string {
   return `<input type="hidden" name="${CSRF_FIELD}" value="${escapeHtml(csrf)}">`;
 }
 
+/**
+ * Pull the message for one field out of the list, or the empty string.
+ *
+ * These three helpers are deliberately the same three the setup wizard renders
+ * its credentials step with, class names included, so that a rejected password
+ * looks and reads the same whichever page it was set from. They are duplicated
+ * rather than shared because setup-pages.ts owns the wizard's copy; a third
+ * page needing them is the moment to lift them into one module.
+ */
+function messageFor(problems: CredentialProblem[], field: CredentialField): string {
+  return problems.find((problem) => problem.field === field)?.message ?? "";
+}
+
+function fieldError(message: string): string {
+  return message === ""
+    ? ""
+    : `<p class="field-error" role="alert">${escapeHtml(message)}</p>`;
+}
+
+function invalid(message: string): string {
+  return message === "" ? "" : ` class="invalid" aria-invalid="true"`;
+}
+
 /** Render a timestamp, in seconds since the epoch, as an ISO string. */
 function renderTimestamp(seconds: number): string {
   return new Date(seconds * 1000).toISOString();
@@ -88,6 +116,7 @@ input[type=text], input[type=password] {
   border: 1px solid color-mix(in srgb, CanvasText 30%, transparent);
   border-radius: 6px; background: Canvas; color: CanvasText; font: inherit;
 }
+input.invalid { border-color: #d33; margin-bottom: .25rem; }
 input[type=checkbox] { margin-right: .4rem; }
 button {
   padding: .5rem .9rem; border: 0; border-radius: 6px; font: inherit;
@@ -98,6 +127,7 @@ form.inline { display: inline; }
   padding: .6rem .7rem; margin-bottom: 1rem; border-radius: 6px; font-size: .9rem;
   background: color-mix(in srgb, #d33 15%, Canvas); color: CanvasText;
 }
+.field-error { font-size: .85rem; margin: 0 0 1rem; color: #d33; }
 .notice {
   padding: .6rem .7rem; margin-bottom: 1rem; border-radius: 6px; font-size: .9rem;
   background: color-mix(in srgb, AccentColor 15%, Canvas); color: CanvasText;
@@ -311,14 +341,35 @@ export function renderClients(opts: ClientsData): string {
   return page("Connected clients", body);
 }
 
-/** Render the password-change form, or the reason it is unavailable. */
+/**
+ * Render the password-change form, or the reason it is unavailable.
+ *
+ * Two kinds of rejection reach this page and they are not interchangeable.
+ * `error` is about the request as a whole — a wrong current password, a
+ * throttle lockout — and belongs in a banner. `problems` comes back from
+ * `validateNewCredentials`, the same function the setup wizard's first step
+ * calls, and belongs next to the input it is about: an operator who mistyped
+ * the confirmation should not have to work out which of three boxes to look at.
+ *
+ * A problem whose field this form has no input for — `username`, which is
+ * fixed here and only reachable if the stored record itself breaks a rule —
+ * falls back to the banner rather than being dropped on the floor.
+ */
 export function renderPasswordChange(opts: {
   csrf: string;
   error?: string;
+  problems?: CredentialProblem[];
   disabledReason?: string;
 }): string {
-  const error = opts.error
-    ? `<div class="error" role="alert">${escapeHtml(opts.error)}</div>`
+  const problems = opts.problems ?? [];
+  const passwordError = messageFor(problems, "password");
+  const confirmationError = messageFor(problems, "confirmation");
+  const unplaced = problems
+    .filter((problem) => problem.field !== "password" && problem.field !== "confirmation")
+    .map((problem) => problem.message);
+  const banner = [opts.error, ...unplaced].filter((line) => Boolean(line)).join(" ");
+  const error = banner
+    ? `<div class="error" role="alert">${escapeHtml(banner)}</div>`
     : "";
 
   if (opts.disabledReason) {
@@ -340,10 +391,14 @@ export function renderPasswordChange(opts: {
            autocomplete="current-password" required>
     <label for="new_password">New password</label>
     <input id="new_password" name="new_password" type="password"
-           autocomplete="new-password" required>
+           autocomplete="new-password" minlength="${MIN_PASSWORD_LENGTH}"
+           required${invalid(passwordError)}>
+    ${fieldError(passwordError)}
     <label for="confirm_password">Confirm new password</label>
     <input id="confirm_password" name="confirm_password" type="password"
-           autocomplete="new-password" required>
+           autocomplete="new-password" required${invalid(confirmationError)}>
+    ${fieldError(confirmationError)}
+    <p class="muted">At least ${MIN_PASSWORD_LENGTH} characters, and not the same as the username.</p>
     <label>
       <input type="checkbox" name="disconnect_clients" value="1">
       Also disconnect every connected Claude client

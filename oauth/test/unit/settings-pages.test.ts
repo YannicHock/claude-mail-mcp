@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { MIN_PASSWORD_LENGTH, validateNewCredentials } from "../../src/operator.js";
 import {
   SETTINGS_CSP,
   SETTINGS_HEADERS,
@@ -124,4 +125,53 @@ test("the password form is rendered disabled with a reason when changes are off"
   const page = renderPasswordChange({ csrf: "c", disabledReason: "OPERATOR_FILE is set to none" });
   assert.match(page, /OPERATOR_FILE is set to none/);
   assert.ok(!/<input[^>]*type="password"[^>]*name="new_password"/.test(page));
+});
+
+test("the password form states the minimum rather than repeating the number", () => {
+  // The route used to compare against a literal 12 with the figure written out
+  // in prose beside it, so raising MIN_PASSWORD_LENGTH would have moved neither.
+  const page = renderPasswordChange({ csrf: "c" });
+  assert.match(page, new RegExp(`minlength="${MIN_PASSWORD_LENGTH}"`));
+  assert.match(page, new RegExp(`At least ${MIN_PASSWORD_LENGTH} characters`));
+});
+
+test("each credential problem is rendered next to the field it is about", () => {
+  const page = renderPasswordChange({
+    csrf: "c",
+    problems: validateNewCredentials({
+      username: "operator",
+      password: "short",
+      confirmation: "different",
+    }),
+  });
+
+  assert.match(page, /new_password[^>]*aria-invalid="true"/);
+  assert.match(page, /confirm_password[^>]*aria-invalid="true"/);
+  assert.match(page, new RegExp(`Use at least ${MIN_PASSWORD_LENGTH} characters\\.`));
+  assert.match(page, /The two passwords do not match\./);
+  // The current-password box was not the one at fault and must not be flagged.
+  assert.ok(!/current_password[^>]*aria-invalid/.test(page));
+});
+
+test("a problem this form has no input for still reaches the operator", () => {
+  // The username is fixed on this page, so a username problem can only come
+  // from a stored record that itself breaks a rule. Rare is not the same as
+  // never, and silently dropping it would leave a 400 with no stated reason.
+  const page = renderPasswordChange({
+    csrf: "c",
+    problems: [{ field: "username", message: "A username cannot contain spaces." }],
+  });
+  assert.match(page, /class="error" role="alert">A username cannot contain spaces\./);
+});
+
+test("a problem message is escaped rather than echoed as markup", () => {
+  const page = renderPasswordChange({
+    csrf: "c",
+    problems: [{ field: "password", message: "<b>no</b>" }],
+    error: "<i>also no</i>",
+  });
+  assert.ok(!page.includes("<b>no</b>"));
+  assert.ok(!page.includes("<i>also no</i>"));
+  assert.match(page, /&lt;b&gt;no/);
+  assert.match(page, /&lt;i&gt;also no/);
 });

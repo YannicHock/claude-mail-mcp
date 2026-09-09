@@ -17,7 +17,7 @@ import express, { type Request, type Response } from "express";
 import type { OAuthConfig } from "./config.js";
 import { LOGIN_FAILURE_EVENT, type Logger } from "./logger.js";
 import { isSameOrigin, renderErrorPage } from "./login.js";
-import type { OperatorRecord } from "./operator.js";
+import { validateNewCredentials, type OperatorRecord } from "./operator.js";
 import {
   renderClients,
   renderOverview,
@@ -404,20 +404,37 @@ export function createSettingsRouter(deps: SettingsDeps): express.Router {
       return;
     }
 
-    // 4. A mismatched confirmation or a short password is a typo, not an
-    // attack, so it costs nothing against the throttle.
-    if (newPassword !== confirmPassword || newPassword.length < 12) {
+    // 4. The same rules the setup wizard applies, from the same function, so
+    // that "what is an acceptable operator password" has one answer on this
+    // instance rather than one per page. A mismatched confirmation or a
+    // password the rules refuse is a typo, not an attack, so it still costs
+    // nothing against the throttle — note that this check sits after the
+    // current-password verification above and does not call recordFailure.
+    //
+    // It sits before changePassword() as well, which is the only place this
+    // route hashes the new password. That order is what makes
+    // MAX_PASSWORD_LENGTH mean anything: the bound exists so a submitted form
+    // cannot choose how much CPU scrypt spends here, and a bound checked after
+    // the hash would have already spent it.
+    //
+    // The username is passed in because the "not the same as the username"
+    // rule needs it, but a complaint *about* the username is dropped: this
+    // form has no username box, and `AUTH_USERNAME` is an unvalidated
+    // environment variable, so an instance deployed as `AUTH_USERNAME="two
+    // words"` would otherwise be refused every password change it ever
+    // attempted — a rule about the old credential standing in the way of
+    // replacing the one thing it can still change.
+    const problems = validateNewCredentials({
+      username: operator.username,
+      password: newPassword,
+      confirmation: confirmPassword,
+    }).filter((problem) => problem.field !== "username");
+    if (problems.length > 0) {
       res
         .status(400)
         .type("html")
         .set(SETTINGS_HEADERS)
-        .send(
-          renderPasswordChange({
-            csrf: session.csrf,
-            error:
-              "The new password and its confirmation must match, and be at least 12 characters.",
-          })
-        );
+        .send(renderPasswordChange({ csrf: session.csrf, problems }));
       return;
     }
 
