@@ -74,27 +74,45 @@ export function escapeHtml(value: string): string {
 }
 
 /**
- * Response headers every settings page sets.
+ * The response headers every settings page sets, with the CSP as the parameter.
  *
- * Mirrors `SETTINGS_HEADERS` in oauth/src/settings-pages.ts byte-for-byte. The
- * two packages have separate Docker build contexts and cannot share a module,
- * so this duplication is required, not an oversight — if you change one,
- * change both. These pages carry a CSRF token and a mailbox password field,
- * must not be cached anywhere, and have no reason to be framed; the CSP
- * allows inline styles and nothing else, matching the no-JavaScript rule
- * that governs every settings page.
+ * Mirrors `pageHeaders` and `SETTINGS_CSP` in oauth/src/settings-pages.ts
+ * byte-for-byte. The two packages have separate Docker build contexts and
+ * cannot share a module, so this one duplication is required, not an oversight
+ * — if you change one, change both, and test/unit/settings-headers.test.ts
+ * fails if you forget. Every other copy of this set has been removed: inside
+ * the OAuth layer the wizard and the /authorize consent screen both call its
+ * `pageHeaders`, so this is the last pair left.
+ *
+ * The CSP is a parameter because the OAuth layer's consent screen needs a wider
+ * `form-action` than a page that only posts back to itself. Nothing here needs
+ * that, and nothing here should grow a second CSP: the connector's pages are
+ * served through the OAuth proxy and post to their own origin.
+ *
+ * These pages carry a CSRF token and a mailbox password field, must not be
+ * cached anywhere, and have no reason to be framed; the CSP allows inline
+ * styles and nothing else, matching the no-JavaScript rule that governs every
+ * settings page.
  */
-export const SETTINGS_HEADERS: Record<string, string> = {
-  "Cache-Control": "no-store",
-  "X-Frame-Options": "DENY",
-  "Content-Security-Policy":
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
-  // same-origin, mirroring the OAuth layer. These pages' forms resolve relative
-  // to the browser's own origin, and the OAuth layer's own guards read Referer as
-  // a fallback when Chrome omits Origin on a same-origin form POST. Keeping this
-  // at no-referrer would be a trap for anyone who later adds such a check here.
-  "Referrer-Policy": "same-origin",
-};
+export function pageHeaders(csp: string): Record<string, string> {
+  return {
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": csp,
+    // same-origin, mirroring the OAuth layer. These pages' forms resolve relative
+    // to the browser's own origin, and the OAuth layer's own guards read Referer as
+    // a fallback when Chrome omits Origin on a same-origin form POST. Keeping this
+    // at no-referrer would be a trap for anyone who later adds such a check here.
+    "Referrer-Policy": "same-origin",
+  };
+}
+
+/** The CSP for a page whose forms only ever post back to their own origin. */
+export const SETTINGS_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
+
+/** The header set every settings response carries. */
+export const SETTINGS_HEADERS: Record<string, string> = pageHeaders(SETTINGS_CSP);
 
 const STYLE = `
 :root { color-scheme: light dark; }

@@ -1,11 +1,14 @@
 /**
  * The security headers the connector's own settings pages serve, pinned.
  *
- * `SETTINGS_HEADERS` lives twice — once here in src/settings-pages.ts and once in
+ * The set lives twice — once here in src/settings-pages.ts and once in
  * oauth/src/settings-pages.ts — because the two packages have separate Docker
- * build contexts and cannot share a module. The OAuth layer's copy has been
- * pinned by a header matrix since #14; this copy was pinned by nothing but a
- * comment saying "change one, change both".
+ * build contexts and cannot share a module. Twice is the floor, not a tolerance:
+ * every copy that could be removed by an import has been (#61), so within the
+ * OAuth layer the settings pages, the setup wizard and the /authorize consent
+ * screen now all read one `pageHeaders`. The OAuth layer's copy has been pinned
+ * by a header matrix since #14; this copy was pinned by nothing but a comment
+ * saying "change one, change both".
  *
  * `Referrer-Policy` is the entry that matters most and the one with a history.
  * `no-referrer` here is not a lint-level nit: these pages are served through the
@@ -155,28 +158,46 @@ test("a plain-text settings response carries them too", async () => {
   }
 });
 
-test("the two copies of SETTINGS_HEADERS are identical", () => {
-  // Nothing in the build stops this copy and the OAuth layer's from drifting,
-  // and both are served on pages of the same browser session: a header the two
-  // disagree about is a header whose effect depends on which service answered.
-  const literal = (url: URL): string => {
-    const source = readFileSync(url, "utf8")
-      // Line endings first — on a CRLF checkout every regex below would
-      // otherwise be matching against `\r\n` and the comparison fails on
-      // whitespace rather than on drift.
-      .replace(/\r\n/g, "\n");
-    const match = /export const SETTINGS_HEADERS: Record<string, string> = \{[\s\S]*?\n\};/.exec(
-      source
-    );
-    assert.ok(match, `no SETTINGS_HEADERS literal found in ${url.pathname}`);
+/**
+ * The two declarations that together define the header set, pulled out of a
+ * file as source text.
+ *
+ * Source text rather than an import: `src/` and `oauth/src/` are separate npm
+ * packages with separate `node_modules`, and nothing under `test/` may import
+ * across that line. Reading the file is the only way to compare them.
+ */
+function headerSource(url: URL): string {
+  const source = readFileSync(url, "utf8")
+    // Line endings first — on a CRLF checkout every regex below would
+    // otherwise be matching against `\r\n` and the comparison fails on
+    // whitespace rather than on drift.
+    .replace(/\r\n/g, "\n");
+
+  const declarations = [
+    /export function pageHeaders\(csp: string\): Record<string, string> \{[\s\S]*?\n\}/,
+    /export const SETTINGS_CSP =[\s\S]*?;\n/,
+  ].map((pattern) => {
+    const match = pattern.exec(source);
+    assert.ok(match, `${pattern} found nothing in ${url.pathname}`);
     // The comments inside differ on purpose: each one explains the rule in the
     // terms of its own package. The header values are what must match.
     return match[0].replace(/^[ \t]*\/\/.*\n/gm, "");
-  };
+  });
 
+  return declarations.join("\n");
+}
+
+test("the two surviving copies of the header set are identical", () => {
+  // Two copies are left, and only two: this one and the OAuth layer's. Within
+  // the OAuth layer the settings pages, the setup wizard and the /authorize
+  // consent screen all go through its `pageHeaders`, so a real import covers
+  // them. Across the package boundary nothing in the build stops these two from
+  // drifting, and both are served on pages of the same browser session: a header
+  // the two disagree about is a header whose effect depends on which service
+  // answered.
   assert.equal(
-    literal(new URL("../../src/settings-pages.ts", import.meta.url)),
-    literal(new URL("../../oauth/src/settings-pages.ts", import.meta.url)),
-    "SETTINGS_HEADERS in src/settings-pages.ts and oauth/src/settings-pages.ts have drifted — change one, change the other"
+    headerSource(new URL("../../src/settings-pages.ts", import.meta.url)),
+    headerSource(new URL("../../oauth/src/settings-pages.ts", import.meta.url)),
+    "the header set in src/settings-pages.ts and oauth/src/settings-pages.ts has drifted — change one, change the other"
   );
 });

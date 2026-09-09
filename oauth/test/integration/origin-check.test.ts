@@ -13,8 +13,20 @@
  * So these tests take the header combinations away from what is convenient to
  * construct with `fetch` and pin down what browsers actually produce, against
  * both handlers. Each half also asserts the served `Referrer-Policy`, because
- * that header is the only reason the `Referer` row has anything to read:
- * tighten it back to `no-referrer` and these tests fail rather than sign-in.
+ * that header is the only reason the `Referer` row has anything to read.
+ *
+ * Where that policy comes from, precisely, because this docstring used to be
+ * wrong about it: both pages now read `pageHeaders()` in settings-pages.ts, so
+ * one edit there is enough to fail both halves below. That was not true before
+ * #61 — the /authorize half read a set spelled out inline in app.ts, and
+ * reintroducing the 0.6.0 bug across the OAuth layer took two edits, only one of
+ * which any test noticed. The connector's own copy in src/settings-pages.ts is
+ * still a third edit; it cannot import from here and is guarded instead by the
+ * drift test in test/unit/settings-headers.test.ts.
+ *
+ * These cases assert `Referrer-Policy` alone, since that is the header the
+ * origin check depends on. The full set is asserted, per page and on the wire,
+ * in page-headers.test.ts.
  */
 
 import { strict as assert } from "node:assert";
