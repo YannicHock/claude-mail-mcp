@@ -52,7 +52,14 @@ import { basename, dirname, join } from "node:path";
 import type { OAuthConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { constantTimeEquals } from "./passwords.js";
-import { createExclusively, logSecretReport, type SecretSource } from "./secrets.js";
+import {
+  canCreateFilesIn,
+  createExclusively,
+  dataDirectoryAdvice,
+  logSecretReport,
+  SecretError,
+  type SecretSource,
+} from "./secrets.js";
 
 /**
  * 32 random bytes, base64url.
@@ -75,6 +82,17 @@ const CLAIM_TOKEN_MODE = 0o600;
 
 /** The path prefix every setup route lives under. */
 export const SETUP_PREFIX = "/setup";
+
+/**
+ * What this service keeps on its data volume, for the one message an operator
+ * reads when it cannot write there. See {@link dataDirectoryAdvice}.
+ */
+export const DATA_DIRECTORY_HOLDS =
+  "the claim token, the live operator record, and the registered clients and " +
+  "refresh sessions in the OAuth state file";
+
+/** The host directory docker-compose.yml would bind-mount at `/data`, if it did. */
+export const DATA_DIRECTORY_BIND_MOUNT = "./oauth-data";
 
 /** Thrown when bootstrap cannot be completed. Surfaces as a 500, never to a client. */
 export class BootstrapError extends Error {}
@@ -232,6 +250,32 @@ export class Bootstrap {
         "This instance has no operator credential and no CLAIM_TOKEN_FILE to write " +
           "a setup token to. Set AUTH_PASSWORD_HASH, or give the service a writable " +
           "data volume so it can generate a claim token."
+      );
+    }
+
+    // #105: the one failure the whole setup flow cannot survive. An unclaimed
+    // instance has to write this file before it has anything to print, so a data
+    // directory it cannot write means no setup URL — and `restart: unless-stopped`
+    // turns that into a loop the operator watches scroll past while waiting for a
+    // link that will never come. Checked here, ahead of the write, so the message
+    // is about the *directory* rather than about a temp file inside it, and
+    // thrown as a BootstrapError so index.ts prints one block and exits instead
+    // of node dumping a stack trace.
+    //
+    // Only for a directory that is *there* and unwritable. One that is not there
+    // at all is a different fault — a path typo, a volume that did not attach —
+    // and `createExclusively` names the path and the ENOENT, which is the useful
+    // thing to say about that one.
+    const directory = dirname(claimTokenFile);
+    if (existsSync(directory) && !existsSync(claimTokenFile) && !canCreateFilesIn(directory)) {
+      throw new BootstrapError(
+        `This instance has not been claimed yet, and it cannot write the claim ` +
+          `token at ${claimTokenFile} — so there is no setup URL to print. ` +
+          dataDirectoryAdvice({
+            path: directory,
+            holds: DATA_DIRECTORY_HOLDS,
+            bindMountSource: DATA_DIRECTORY_BIND_MOUNT,
+          })
       );
     }
 
@@ -507,9 +551,20 @@ function resolveClaimToken(path: string): { value: string; source: ClaimTokenSou
   // instance gated behind an empty token nobody can present. Clear it first.
   if (existsSync(path)) unlinkSync(path);
 
-  const created = createExclusively(path, generateClaimToken(), "CLAIM_TOKEN", {
-    mode: CLAIM_TOKEN_MODE,
-  });
+  // Every other failure this function can have already arrives as a
+  // BootstrapError, which index.ts prints as a plain line and exits on. A
+  // SecretError from the writer did not, and node printed the stack trace of a
+  // permission error four frames deep instead — on the boot whose entire job is
+  // to show the operator a link. Same message, right type.
+  let created: { value: string; raced: boolean };
+  try {
+    created = createExclusively(path, generateClaimToken(), "CLAIM_TOKEN", {
+      mode: CLAIM_TOKEN_MODE,
+    });
+  } catch (err) {
+    if (err instanceof SecretError) throw new BootstrapError(err.message);
+    throw err;
+  }
   return { value: created.value, source: created.raced ? "file" : "generated" };
 }
 

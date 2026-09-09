@@ -41,12 +41,21 @@ services:
       AUTH_TOKEN_FILE: /secrets/shared/auth_token.txt
       SETTINGS_SIGNING_KEY_FILE: /secrets/shared/settings_signing_key.txt
     volumes:
-      # Writable since the settings UI: the connector is the only process that
-      # writes accounts.json, and it is the one that already reads the
-      # credentials in it. The directory must be writable by uid 100 too, not
-      # just the file — saving renames a temp file into place. See
+      # accounts.json — every mailbox credential — and nothing else. Writable
+      # since the settings UI: the connector is the only process that writes
+      # accounts.json, and it is the one that already reads the credentials in
+      # it. The *directory* must be writable by uid 100 too, not just the file —
+      # saving renames a temp file into place. See
       # docs/planning/specs/2026-09-08-settings-ui.md §10.
-      - ./data:/data
+      #
+      # A named volume rather than ./data, and that is the whole of #105: Docker
+      # creates a missing bind-mount source itself, as root:root mode 755, and
+      # uid 100 cannot write in it. A named volume it initialises from the image
+      # instead, where /data is already the runtime user's — so ownership comes
+      # out right with no operator step and no uid in any instruction. Look
+      # inside it with `docker compose exec mail-mcp ls -ln /data`; back it up
+      # and migrate an existing ./data into it per docs/DEPLOYMENT.md step 3.
+      - mail-data:/data
       # Only the shared half of secrets/, because only the shared half is named
       # in this service's environment above. ./secrets/oauth — the OAuth signing
       # key and the operator's password hash — is mounted into mail-oauth alone
@@ -116,15 +125,57 @@ services:
     group_add:
       - "${SECRETS_GID:?set SECRETS_GID in .env to the gid of the group that owns ./secrets/shared and ./secrets/oauth — see docs/DEPLOYMENT.md step 2}"
     volumes:
-      # Registered clients and live refresh sessions. Losing it logs every Claude
+      # Registered clients and live refresh sessions, the live operator record,
+      # and — until setup finishes — the claim token. Losing it logs every Claude
       # client out and forces re-registration.
-      - ./oauth-data:/data
+      #
+      # A named volume, for the reason the connector's carries: this is the
+      # directory an unclaimed instance must write its claim token to before it
+      # can print a setup URL at all, and a root:root bind-mount source Docker
+      # made on the way past turned the first boot of a clean clone into a crash
+      # loop with no URL in it (#105).
+      - oauth-data:/data
       # Both halves, and both writable: this service generates whichever of the
       # three random secrets is missing, and #79's blank-file replacement
       # unlinks before it rewrites.
       - ./secrets/shared:/secrets/shared
       - ./secrets/oauth:/secrets/oauth
     # Healthcheck is inherited from the image's HEALTHCHECK instruction.
+
+# ---------------------------------------------------------------------------
+# The two data volumes. Docker manages them; there is nothing to create before
+# the first `docker compose up` and nothing to chown.
+#
+# That is the point of them. Both images pre-create /data owned by their own
+# runtime user (uid 100 for the connector, uid 102 for the OAuth layer — see the
+# `RUN mkdir -p /data && chown …` line in each Dockerfile), and Docker
+# initialises an empty named volume from the image's directory, ownership
+# included. A bind mount gets none of that: Docker creates a missing source as
+# root:root 755, both services then fail to write, and the OAuth layer's failure
+# lands on the one boot the operator is watching for their setup URL.
+#
+# Compose prefixes these names with the project — `<project>_mail-data` and
+# `<project>_oauth-data`, the project being this directory's name unless you set
+# one. `docker volume ls` shows what yours are called.
+#
+# They are not less inspectable than a directory, only inspected differently:
+#
+#   docker compose exec mail-mcp   ls -ln /data     # what is in there
+#   docker compose exec mail-oauth cat  /data/operator.json
+#
+# and docs/DEPLOYMENT.md step 3 has the backup, restore and hand-edit recipes,
+# plus the migration for an install that already has ./data and ./oauth-data.
+# Nothing there is lost: the migration copies both directories in and keeps them
+# until you have confirmed the stack came back up on their contents.
+#
+# Swap either line back to a bind mount if you would rather have the files under
+# the checkout — `- ./data:/data` — but then create the directory and give it to
+# the right uid *before* the first start, or you are back at #105. Both services
+# now say so at boot, naming the exact mkdir and chown, instead of failing on the
+# first write.
+volumes:
+  mail-data:
+  oauth-data:
 
 # ---------------------------------------------------------------------------
 # ./secrets — files, not environment variables. Values set through `env_file`

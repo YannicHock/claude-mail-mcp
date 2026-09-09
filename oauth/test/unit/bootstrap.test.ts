@@ -595,3 +595,73 @@ describe("a data directory that does not exist yet", () => {
     assert.ok(Bootstrap.open(configFor(dir), silentLogger).setupUrl);
   });
 });
+
+describe("a data volume the claim token cannot be written to", () => {
+  // #105. The single failure the setup flow cannot survive: an unclaimed
+  // instance has to write the claim token before it has anything to print, so a
+  // data directory it cannot write means no setup URL at all — and under
+  // `restart: unless-stopped` the operator watches that scroll past while
+  // waiting for a link that is never coming. Docker made exactly this state on
+  // every clean clone, by creating the missing bind-mount source as root:root.
+  //
+  // What fixed the clean clone is the named volume in docker-compose.yml. What
+  // is pinned here is the other half: for anyone who bind-mounts the path
+  // anyway, the boot fails with one readable block naming the fix.
+
+  // Dropping write permission needs POSIX modes, and root ignores them.
+  const asUnprivilegedPosixUser =
+    process.platform === "win32"
+      ? { skip: "POSIX directory modes only" }
+      : (process.getuid?.() ?? 0) === 0
+        ? { skip: "root writes into a directory whatever its mode says" }
+        : {};
+
+  it("refuses to start, naming the mkdir and the chown", asUnprivilegedPosixUser, () => {
+    const dir = tempDir();
+    chmodSync(dir, 0o500);
+    let thrown: unknown;
+    try {
+      Bootstrap.open(configFor(dir), silentLogger);
+    } catch (err) {
+      thrown = err;
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+
+    // A BootstrapError, not the SecretError the writer used to throw four frames
+    // down: index.ts prints one of those as a plain line and exits, and lets the
+    // other reach node, which dumps a stack trace over the message.
+    assert.ok(
+      thrown instanceof BootstrapError,
+      `expected a BootstrapError, got ${String(thrown)}`
+    );
+    assert.match((thrown as BootstrapError).message, /has not been claimed yet/);
+    assert.match(
+      (thrown as BootstrapError).message,
+      /mkdir -p \.\/oauth-data && sudo chown \d+:\d+ \.\/oauth-data/,
+      "the message has to end in a command the operator can paste"
+    );
+    // The advice createExclusively gives is about secrets/ — a shared group, mode
+    // 2770, the setgid bit — and none of it is true of the data volume. It was
+    // reaching operators whose actual problem was this one.
+    assert.doesNotMatch((thrown as BootstrapError).message, /SECRETS_GID|2770|setgid/);
+  });
+
+  it("says nothing about it when the token is already there", asUnprivilegedPosixUser, () => {
+    // A restart mid-wizard, on a volume that has since been made read-only: the
+    // token is read back, the operator keeps the tab they still have open, and
+    // nothing has to be written for that to work.
+    const dir = tempDir();
+    writeFileSync(join(dir, "claim-token.txt"), "a-token-from-the-first-boot\n");
+    chmodSync(dir, 0o500);
+    let bootstrap: Bootstrap | undefined;
+    try {
+      bootstrap = Bootstrap.open(configFor(dir), silentLogger);
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+
+    assert.equal(bootstrap?.bootstrapped, false);
+    assert.equal(bootstrap?.setupUrl, `${ISSUER}/setup/a-token-from-the-first-boot`);
+  });
+});

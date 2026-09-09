@@ -6,12 +6,21 @@
  * shutdown, so that the app factory stays testable without a listening port.
  */
 
-import { Bootstrap, BootstrapError, operatorSeed } from "./bootstrap.js";
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
+
+import {
+  Bootstrap,
+  BootstrapError,
+  DATA_DIRECTORY_BIND_MOUNT,
+  DATA_DIRECTORY_HOLDS,
+  operatorSeed,
+} from "./bootstrap.js";
 import { ConfigError, loadConfig } from "./config.js";
 import { createApp, SERVICE_NAME, VERSION } from "./app.js";
 import { createLogger } from "./logger.js";
 import { OperatorRecord } from "./operator.js";
-import { logSecretReport } from "./secrets.js";
+import { canCreateFilesIn, dataDirectoryAdvice, logSecretReport } from "./secrets.js";
 import { Store } from "./store.js";
 
 async function main(): Promise<void> {
@@ -54,6 +63,25 @@ async function main(): Promise<void> {
   // mid-setup must not cost the operator the link, and the token it prints is the
   // same one the previous boot wrote.
   bootstrap.announce();
+
+  // The other half of #105. An *unclaimed* instance that cannot write its data
+  // directory is fatal and `Bootstrap.open` has already said so; a claimed one
+  // boots and serves perfectly well until the first client registration, session
+  // rotation or password change fails with an EACCES nobody is watching for. Not
+  // fatal — refusing to start would take a working instance off the air over a
+  // fault it can still serve most requests around — but said out loud at boot,
+  // once, rather than discovered from a Claude client that will not reconnect.
+  const dataDirectory = config.claimTokenFile === null ? null : dirname(config.claimTokenFile);
+  if (dataDirectory !== null && existsSync(dataDirectory) && !canCreateFilesIn(dataDirectory)) {
+    log("warn", "data directory is not writable", {
+      path: dataDirectory,
+      note: dataDirectoryAdvice({
+        path: dataDirectory,
+        holds: DATA_DIRECTORY_HOLDS,
+        bindMountSource: DATA_DIRECTORY_BIND_MOUNT,
+      }),
+    });
+  }
 
   // Absent while unbootstrapped, which is also what leaves the settings UI
   // unmounted — the mount condition in app.ts already required an operator

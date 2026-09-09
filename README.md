@@ -86,13 +86,10 @@ cp oauth/.env.example .env.oauth
 
 Set `PUBLIC_URL` in **both** files to the address your proxy serves — scheme and host, no path, no trailing slash. The two values must match exactly: it is the issuer the connector checks on every request the OAuth layer signs, and a mismatch fails that check silently.
 
-Then create the directories the two containers write to, before the first `docker compose up`. Docker creates a missing bind-mount source itself, as `root` and without the setgid bit, and the containers — which run unprivileged, as two different users — then cannot write in it:
+Then create the two secrets directories and the group that owns them. This is the one thing to do before the first `docker compose up`: Docker creates a missing bind-mount source itself, as `root` and without the setgid bit, and the containers — which run unprivileged, as two different users — then cannot write in it.
 
 ```bash
-mkdir -p data oauth-data secrets/shared secrets/oauth
-sudo chown 100:101 data          # the connector's uid/gid
-sudo chown 102:103 oauth-data    # the OAuth layer's
-
+mkdir -p secrets/shared secrets/oauth
 sudo groupadd --system mailsecrets
 sudo chgrp mailsecrets secrets/shared secrets/oauth
 sudo chmod 2770 secrets/shared secrets/oauth
@@ -100,6 +97,8 @@ echo "SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)" >> .env
 ```
 
 That group is the one thing the two services share, so each can read a secret the other wrote; `docker compose up` refuses to start without `SECRETS_GID`. Why it has to be a group you created rather than one that came with the distribution is in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) and [`docs/HARDENING.md`](docs/HARDENING.md).
+
+The two directories the services *write* — mailbox credentials, and the OAuth layer's own bookkeeping — need nothing from you at all. `docker-compose.yml` keeps them in Docker named volumes, which Docker creates on the first start with the ownership each image already gives its own `/data`. Look inside one with `docker compose exec mail-mcp ls -ln /data`; [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has the backup and restore recipes, and the migration if you are upgrading an install that has `./data` and `./oauth-data` directories today.
 
 `PUBLIC_URL` and `SECRETS_GID` are the only values you supply. The Bearer token for `/mcp`, the OAuth signing key and the settings signing key are **generated on the first boot that finds them missing** and written under `secrets/`. A file that is already there always wins, so upgrading an existing install rotates nothing.
 
@@ -150,7 +149,7 @@ docker compose restart mail-oauth
 
 Then sign in at `https://<your domain>/settings` to add mailboxes, test credentials, and review or revoke connected Claude clients. The wizard's last screen says all of this too, so you do not need this page open while you work.
 
-That is the whole of it. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) covers the reverse proxy in full, backups, updating, and the systemd deployment for anyone who would rather not run Docker; [`docs/HARDENING.md`](docs/HARDENING.md) covers the threat model and the operator checklist.
+That is the whole of it. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) covers the reverse proxy in full, what lives on the two data volumes, backups and updating; [`docs/HARDENING.md`](docs/HARDENING.md) covers the threat model and the operator checklist.
 
 ---
 
@@ -170,7 +169,7 @@ gh attestation verify --owner YannicHock oci://ghcr.io/yannichock/claude-mail-mc
 
 ## Other ways to run it
 
-**Just the connector, without the OAuth layer.** Claude Desktop, and any MCP client that lets you set a custom header, can call `/mcp` directly with `Authorization: Bearer <token>` and needs none of `mail-oauth`. Comment that service out of `docker-compose.yml`, read the token back with `cat secrets/shared/auth_token.txt`, and point your proxy at `127.0.0.1:3220` instead. There is no wizard on this path and no settings UI, so you write `data/accounts.json` yourself — [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has the format and the Claude Desktop config snippet.
+**Just the connector, without the OAuth layer.** Claude Desktop, and any MCP client that lets you set a custom header, can call `/mcp` directly with `Authorization: Bearer <token>` and needs none of `mail-oauth`. Comment that service out of `docker-compose.yml`, read the token back with `cat secrets/shared/auth_token.txt`, and point your proxy at `127.0.0.1:3220` instead. There is no wizard on this path and no settings UI, so you write `accounts.json` onto the connector's data volume yourself — [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has the format, the one command that puts it there, and the Claude Desktop config snippet.
 
 **From source.** `npm install && npm run build && npm start` runs the connector on its own for local development. It is not the way to deploy this — see [CONTRIBUTING.md](CONTRIBUTING.md) and [Development](#development) below.
 
@@ -245,7 +244,7 @@ Claude.ai (web) isn't in this diagram: it reaches the connector through the OAut
 - **The two services run unprivileged, as two different users,** sharing exactly one group: the one that owns `secrets/`, so each can read a secret the other wrote. The OAuth signing key and the operator's password hash are in the half of `secrets/` that is never mounted into the process parsing inbound MIME.
 - **Destructive tools** (`delete_message`) document their irreversibility, so Claude surfaces a confirmation step. Prefer `move_message` to a Trash folder.
 
-The systemd deployment adds a full unit hardening profile — `ProtectSystem=strict`, `SystemCallFilter`, `MemoryMax` and the rest — that has no equivalent on the Docker path, which takes its isolation from the container runtime instead. Both are in [docs/HARDENING.md](docs/HARDENING.md), along with the OAuth layer's own threat model. Reporting issues: [SECURITY.md](SECURITY.md).
+The Docker deployment is the one this project supports, and it takes its isolation from the container runtime: two unprivileged users, one shared group, and no path from the connector to the OAuth layer's secrets. [docs/HARDENING.md](docs/HARDENING.md) has the full threat model, the OAuth layer's own, and the operator checklist. Reporting issues: [SECURITY.md](SECURITY.md).
 
 ---
 
