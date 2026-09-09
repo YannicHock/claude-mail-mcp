@@ -27,10 +27,13 @@ FROM node:24-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production
-# Binds all interfaces inside the container. Unlike the connector, nothing about
-# this service is meant to be published to the host: docker-compose.yml puts it
-# on the reverse proxy's network and publishes no port at all, so the container's
-# own listener is the only thing this affects.
+# Binds all interfaces inside the container; Docker's port publishing forwards to
+# the container's internal IP, not to its loopback interface. Host-side exposure
+# is decided by how the port is published and not here: docker-compose.yml
+# publishes 127.0.0.1:8080:8080 — loopback only, for a TLS terminator running on
+# the host. If yours runs in a container instead, that `ports` block comes out and
+# both services go on the proxy's network, publishing nothing to the host at all.
+# Either way TLS termination stays the proxy's job (see docs/DEPLOYMENT.md).
 ENV HOST=0.0.0.0
 ENV PORT=8080
 ENV STATE_FILE=/data/oauth-state.json
