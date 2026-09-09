@@ -40,7 +40,6 @@
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
-  chownSync,
   existsSync,
   linkSync,
   readFileSync,
@@ -66,25 +65,19 @@ import type { Logger } from "./logger.js";
  * it — which would let any local user plant an `auth_token.txt` before first
  * boot and have this code adopt it, precedence rule and all.
  *
- * So both images join one shared group instead. See {@link SHARED_SECRET_GID}.
+ * So both images join one shared group instead. That group is the operator's
+ * own — created for these secrets and nothing else, and named to the stack as
+ * `SECRETS_GID` — not a gid this repository picks: #76 removed the `mailsecrets`
+ * pinned at 105 from both images, because the `chgrp` runs on the *host*, where
+ * 100–999 is the system range and 105 usually already belongs to a daemon.
+ *
+ * What puts a created file into that group is the **setgid bit** on the
+ * directory it is created in — mode 2770 on both `secrets/shared` and
+ * `secrets/oauth`. Nothing in this module does it, and nothing here can: the
+ * number is not knowable at build time and the two services do not both receive
+ * it at run time either. The directory is the mechanism, and it is the only one.
  */
 export const GENERATED_SECRET_MODE = 0o640;
-
-/**
- * The group both container images' runtime users belong to (`mailsecrets`).
- *
- * Pinned identically in Dockerfile, oauth/Dockerfile and here. That is three
- * copies of one number, so a unit test reads the two Dockerfiles and compares
- * them against this constant: if they ever disagree, one service starts
- * crash-looping on EACCES against a file the other just created, which is a
- * miserable thing to debug and an easy thing to check.
- *
- * A setgid `secrets/` directory (mode 2770, group 105) is what the deployment
- * documents, and is enough on its own. This constant exists so the guarantee
- * does not *depend* on the operator having remembered the setgid bit — see
- * {@link adoptSharedGroup}.
- */
-export const SHARED_SECRET_GID = 105;
 
 /**
  * 48 random bytes, matching the `openssl rand -base64 48` the docs used to ask
@@ -306,14 +299,12 @@ function removeBlankFile(path: string, name: string): void {
 /**
  * How {@link createExclusively} should leave the file it creates.
  *
- * The defaults are the three shared secrets': the whole point of the mode and
- * the group is that the *other* image can read what this one wrote.
+ * The default is the three shared secrets': the whole point of that mode is that
+ * the *other* image can read what this one wrote.
  */
 export interface CreateOptions {
   /** Permission bits. Defaults to {@link GENERATED_SECRET_MODE}. */
   mode?: number;
-  /** Whether to hand the file to the shared group. Defaults to true. */
-  shareGroup?: boolean;
 }
 
 /**
@@ -329,9 +320,11 @@ export interface CreateOptions {
  * That guarantee is worth having for a file this module does not own, which is
  * why the OAuth layer's claim token borrows this writer. Sharing is not: a
  * credential only one service reads gains nothing from the group, and this one
- * is full control over an unclaimed instance. So the mode and the group are
+ * is full control over an unclaimed instance. So the mode is
  * {@link CreateOptions} rather than fixed, and such a caller passes
- * `{ mode: 0o600, shareGroup: false }`.
+ * `{ mode: 0o600 }` — which is the whole of "and not to the group" now that the
+ * setgid directory is what hands a file to one. `600` grants no group anything,
+ * whatever group the file lands in.
  *
  * Exported only so the EEXIST branch — the one a first boot of both services at
  * once actually takes — can be exercised without racing two real processes.
@@ -342,7 +335,7 @@ export function createExclusively(
   name: string,
   options: CreateOptions = {}
 ): { value: string; raced: boolean } {
-  const { mode = GENERATED_SECRET_MODE, shareGroup = true } = options;
+  const { mode = GENERATED_SECRET_MODE } = options;
   const temp = join(dirname(path), `.${basename(path)}.${randomBytes(8).toString("hex")}.tmp`);
   try {
     // Trailing newline so `cat`, `openssl rand -base64 48 > file` and this
@@ -351,7 +344,6 @@ export function createExclusively(
     // writeFileSync's mode is masked by the process umask, which in a container
     // is whatever the base image set. Say it again explicitly.
     chmodSync(temp, mode);
-    if (shareGroup) adoptSharedGroup(temp);
     try {
       linkSync(temp, path);
     } catch (err) {
@@ -374,9 +366,12 @@ export function createExclusively(
     if (err instanceof SecretError) throw err;
     throw new SecretError(
       `Cannot create ${name}_FILE at ${path}: ${describe(err)}. ` +
-        `The directory must be group-owned by gid ${SHARED_SECRET_GID} and mode 2770, ` +
-        `so both services can create files in it: ` +
-        `chgrp ${SHARED_SECRET_GID} secrets && chmod 2770 secrets — see docs/DEPLOYMENT.md.`
+        `${dirname(path)} has to be writable by this service: owned by the group ` +
+        `whose gid you set as SECRETS_GID, and mode 2770 — the setgid bit is what ` +
+        `puts a file created by either service into that group rather than into ` +
+        `the creator's own. Under Docker, set that on the host directory ` +
+        `bind-mounted at ${dirname(path)}, not inside the container — ` +
+        `see docs/DEPLOYMENT.md step 2.`
     );
   } finally {
     try {
@@ -385,34 +380,6 @@ export function createExclusively(
       // Never created, or already gone. Either way there is nothing to clean up
       // and nothing worth failing startup over.
     }
-  }
-}
-
-/**
- * Give the file away to the shared group, when this process is in it.
- *
- * A setgid `secrets/` directory already does this — a file created there
- * inherits the directory's group rather than the creator's — and that is what
- * docs/DEPLOYMENT.md asks for. But `chmod 0770` without the setgid bit is an
- * easy thing to type, and it would leave the connector's file in gid 101 at mode
- * 640, which uid 102 cannot read: exactly the crash loop this whole change
- * exists to remove, reintroduced by one missing digit. So the guarantee is made
- * here as well, where nobody has to remember it.
- *
- * Deliberately best-effort. Outside a container — the systemd deployment, a
- * developer's checkout, this repository's own tests — gid 105 means something
- * else or nothing at all, and the process is not a member, so nothing happens.
- * POSIX only: `getgroups`/`chown` do not apply on Windows, where the tests run
- * too.
- */
-function adoptSharedGroup(path: string): void {
-  if (process.platform === "win32") return;
-  try {
-    if (process.getgroups?.().includes(SHARED_SECRET_GID) !== true) return;
-    chownSync(path, process.getuid?.() ?? -1, SHARED_SECRET_GID);
-  } catch {
-    // Not a member after all, or a filesystem that will not have it. The setgid
-    // directory is the documented path; this was only the belt to its braces.
   }
 }
 

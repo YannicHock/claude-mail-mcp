@@ -63,7 +63,7 @@ async function main(): Promise<void> {
       "your shell history:\n\n" +
       "  read -rs PW && printf '%s\\n' \"$PW\" | docker compose run --rm -T \\\n" +
       "    --entrypoint node mail-oauth dist/hash-password.js \\\n" +
-      "    > secrets/auth_password_hash.txt; unset PW\n\n"
+      "    > secrets/oauth/auth_password_hash.txt; unset PW\n\n"
   );
 }
 

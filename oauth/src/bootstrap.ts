@@ -491,8 +491,12 @@ function claimTokenPresent(config: OAuthConfig): boolean {
  * secrets' 640-in-the-shared-group is what lets the connector read what this
  * service wrote; the claim token is full control over an unclaimed instance —
  * whoever presents it sets the operator password — and there is no second reader
- * to accommodate. So it lands 600 and stays out of the group, beside the
- * `operator.json` and `setup-wizard.json` that this service also owns alone.
+ * to accommodate. So it lands 600 — which grants no group anything, whichever
+ * group `/data` puts it in — beside the `operator.json` and `setup-wizard.json`
+ * that this service also owns alone. The mode is the whole of that now: nothing
+ * chowns a created secret any more, the setgid bit on the two `secrets/`
+ * directories is what hands the shared three to the shared group, and `/data`
+ * is not one of them.
  */
 function resolveClaimToken(path: string): { value: string; source: ClaimTokenSource } {
   const existing = readIfPresent(path);
@@ -505,7 +509,6 @@ function resolveClaimToken(path: string): { value: string; source: ClaimTokenSou
 
   const created = createExclusively(path, generateClaimToken(), "CLAIM_TOKEN", {
     mode: CLAIM_TOKEN_MODE,
-    shareGroup: false,
   });
   return { value: created.value, source: created.raced ? "file" : "generated" };
 }
