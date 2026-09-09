@@ -2,6 +2,18 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **The three random secrets generate themselves on first boot.** `auth_token`, `oauth_signing_key` and `settings_signing_key` are read from their configured `*_FILE` path if it is there, and created at that path if it is not — with a mode both container uids can read. `PUBLIC_URL` and the operator's password hash are the only values left to supply by hand, and the hash goes away with the setup wizard. Each service logs one `secret resolved` line per secret saying whether it read the file or created it. The connector gained `AUTH_TOKEN_FILE` for this; it previously took `AUTH_TOKEN` inline only.
+
+  **A present file always wins**, which is what makes this safe for an instance that is already running: an upgrade reads the secrets it already has and rotates nothing. An inline `AUTH_TOKEN` with no file yet is written to the file rather than replaced, so an install that kept its token in `.env` keeps that token and hands the OAuth layer the same one.
+
+### Changed
+
+- **`docker-compose.yml` mounts `./secrets` as a directory** instead of declaring four Docker file-secrets. Compose refuses to start a stack whose file-secret does not exist, which is exactly the state a first boot is in. The same `secrets/*.txt` files are used, now at `/secrets/<name>.txt` rather than `/run/secrets/<name>`; existing deployments keep their values. The directory needs to be writable by both runtime uids — `chmod 1777 secrets`, or pre-create the files and make the mount read-only.
+
 ## [0.6.3] — 2026-09-09
 
 Both fixes below are the same defect as 0.6.1 and 0.6.2, found by auditing every security header this project emits against what a browser actually does with it, rather than against what the string says.

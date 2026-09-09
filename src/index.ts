@@ -20,6 +20,7 @@ import { config } from "./config.js";
 import { AccountsStore } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
 import { createApp, VERSION } from "./app.js";
+import { logSecretReport } from "./secrets.js";
 
 export { createApp, SERVER_NAME, VERSION } from "./app.js";
 export type { CreateAppOptions, Logger, LogLevel } from "./app.js";
@@ -41,6 +42,11 @@ function log(
 }
 
 async function main(): Promise<void> {
+  // Before anything else: which secrets this boot read and which it created.
+  // auth_token and settings_signing_key are shared with the OAuth layer, and
+  // "who generated it" is otherwise impossible to tell from the outside.
+  logSecretReport(config.secretReport, log);
+
   const store = new AccountsStore(config.accountsFile);
   const pool = new ClientPool(store);
   await store.start((next, prev) => {

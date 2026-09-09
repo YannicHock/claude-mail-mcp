@@ -117,6 +117,9 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     refreshTokenTtl: 2592000,
     redirectAllowlist: [...HOSTED_CLAUDE_REDIRECT_URIS],
     logLevel: "error",
+    // Only loadConfig fills this; the harness builds its config directly and has
+    // no secrets to account for.
+    secretReport: [],
     ...opts.configOverrides,
   };
 

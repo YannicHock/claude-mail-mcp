@@ -2,26 +2,39 @@
  * Configuration.
  *
  * Every secret can be supplied either directly (`NAME`) or as a path to a file
- * holding it (`NAME_FILE`). The file form is what the deployment uses: the target
- * host mounts Docker file-secrets under /run/secrets, matching how the other
- * applications there are configured, and it keeps credentials out of `docker
- * inspect` output and the process environment.
+ * holding it (`NAME_FILE`). The file form is what the deployment uses:
+ * docker-compose.yml mounts ./secrets at /secrets in both services, which keeps
+ * credentials out of `docker inspect` output and the process environment, and
+ * gives the two services one file each to agree on.
  *
  * Validation is strict and happens at startup. A service that sits in front of
  * live mailboxes should refuse to run misconfigured rather than discover it on
- * the first request — in particular, a missing signing key must never silently
- * become a generated one, or every restart would log the operator out and, worse,
- * make it impossible to tell a rotation from an attack.
+ * the first request.
+ *
+ * The three random secrets — the connector's auth token, the token signing key
+ * and the settings signing key — generate themselves when `NAME_FILE` names a
+ * path that does not exist yet; see ./secrets.ts for the precedence rule and why
+ * a present file must always win. Generation writes the value to that path, so a
+ * restart reads back what the first boot produced: nothing here is regenerated
+ * per process, and a rotation stays distinguishable from an attack in the logs.
+ * `AUTH_PASSWORD_HASH` is never generated.
  */
 
 import { readFileSync } from "node:fs";
 // POSIX explicitly: this service only ever runs in a Linux container (see the
-// /data and /run/secrets paths below), so path math on those literals must stay
+// /data and /secrets paths below), so path math on those literals must stay
 // forward-slashed even when a contributor runs the test suite on Windows.
 import { dirname, join } from "node:path/posix";
 
 import type { LogLevel } from "./logger.js";
 import { isValidHashFormat } from "./passwords.js";
+import {
+  SecretError,
+  resolveSecret,
+  type ResolveOptions,
+  type ResolvedSecret,
+  type SecretReportEntry,
+} from "./secrets.js";
 import {
   HOSTED_CLAUDE_REDIRECT_URIS,
   LOOPBACK_REDIRECT_URIS,
@@ -70,6 +83,12 @@ export interface OAuthConfig {
   refreshTokenTtl: number;
   redirectAllowlist: string[];
   logLevel: LogLevel;
+  /**
+   * Where each configured secret came from — read, seeded or generated. Logged
+   * once at startup by index.ts; `loadConfig` runs before the logger exists,
+   * because the log level is part of what it loads.
+   */
+  secretReport: SecretReportEntry[];
 }
 
 const LOG_LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];
@@ -118,6 +137,48 @@ function optional(env: Env, name: string, fallback: string): string {
   return readSecret(env, name) ?? fallback;
 }
 
+/**
+ * Resolve a secret through {@link resolveSecret} and record where it came from.
+ *
+ * Unlike {@link readSecret} above, an absent `NAME_FILE` here is an instruction
+ * to create it rather than an error. Only the three random secrets go through
+ * this; everything else `optional()` reads is configuration, not key material,
+ * and has nothing meaningful to generate.
+ */
+function trackedSecret(
+  env: Env,
+  name: string,
+  report: SecretReportEntry[],
+  options?: ResolveOptions
+): string | undefined {
+  let resolved: ResolvedSecret;
+  try {
+    resolved = resolveSecret(env, name, options);
+  } catch (err) {
+    // Surface as the operator-facing single line index.ts prints, not a stack.
+    throw err instanceof SecretError ? new ConfigError(err.message) : err;
+  }
+  if (resolved.source !== undefined) {
+    report.push({ name, source: resolved.source, path: resolved.path });
+  }
+  return resolved.value;
+}
+
+function requiredSecret(
+  env: Env,
+  name: string,
+  report: SecretReportEntry[],
+  options?: ResolveOptions
+): string {
+  const value = trackedSecret(env, name, report, options);
+  if (value === undefined) {
+    throw new ConfigError(
+      `Missing required configuration: ${name} (or ${name}_FILE). See oauth/.env.example.`
+    );
+  }
+  return value;
+}
+
 function integer(env: Env, name: string, fallback: number): number {
   const raw = env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -138,6 +199,7 @@ function boolean(env: Env, name: string, fallback: boolean): boolean {
 }
 
 export function loadConfig(env: Env = process.env): OAuthConfig {
+  const secretReport: SecretReportEntry[] = [];
   const publicUrlRaw = required(env, "PUBLIC_URL");
   let issuer: string;
   try {
@@ -176,7 +238,9 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
     );
   }
 
-  const signingKeyRaw = required(env, "SIGNING_KEY");
+  const upstreamAuthToken = requiredSecret(env, "UPSTREAM_AUTH_TOKEN", secretReport);
+
+  const signingKeyRaw = requiredSecret(env, "SIGNING_KEY", secretReport);
   const signingKey = new TextEncoder().encode(signingKeyRaw);
   if (signingKey.length < MIN_SIGNING_KEY_BYTES) {
     throw new ConfigError(
@@ -185,7 +249,11 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
     );
   }
 
-  const authPasswordHash = required(env, "AUTH_PASSWORD_HASH");
+  // Never generated: it is the one secret with a meaning outside this
+  // deployment, and the wizard sets it through OperatorRecord instead.
+  const authPasswordHash = requiredSecret(env, "AUTH_PASSWORD_HASH", secretReport, {
+    generate: false,
+  });
   if (!isValidHashFormat(authPasswordHash)) {
     throw new ConfigError(
       "AUTH_PASSWORD_HASH is not a valid scrypt hash. Generate one with: npm run hash-password"
@@ -202,7 +270,7 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
   const stateFileRaw = optional(env, "STATE_FILE", "/data/oauth-state.json");
   const stateFile = stateFileRaw === "" || stateFileRaw === "none" ? null : stateFileRaw;
 
-  const settingsKeyRaw = readSecret(env, "SETTINGS_SIGNING_KEY");
+  const settingsKeyRaw = trackedSecret(env, "SETTINGS_SIGNING_KEY", secretReport);
   let settingsSigningKey: Uint8Array | null = null;
   if (settingsKeyRaw !== undefined) {
     settingsSigningKey = new TextEncoder().encode(settingsKeyRaw);
@@ -229,7 +297,7 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
     mcpPath,
     resource,
     upstreamMcpUrl: upstreamMcpUrl.replace(/\/+$/, ""),
-    upstreamAuthToken: required(env, "UPSTREAM_AUTH_TOKEN"),
+    upstreamAuthToken,
     signingKey,
     authUsername: optional(env, "AUTH_USERNAME", "operator"),
     authPasswordHash,
@@ -241,6 +309,7 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
     refreshTokenTtl: integer(env, "REFRESH_TOKEN_TTL", 30 * 24 * 3600),
     redirectAllowlist: buildRedirectAllowlist(env),
     logLevel: logLevelRaw as LogLevel,
+    secretReport,
   };
 }
 
