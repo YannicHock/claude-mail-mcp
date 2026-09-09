@@ -360,6 +360,65 @@ describe("the step 3 screen", () => {
     assert.match(html, /claude\.ai/);
   });
 
+  /**
+   * Where a fragment first appears, having asserted it appears at all.
+   *
+   * Presence is what the old, backwards screen already satisfied, so the
+   * assertions below compare two offsets in one rendered page rather than
+   * testing that both halves exist.
+   */
+  function positionOf(html: string, needle: RegExp): number {
+    const at = html.search(needle);
+    assert.notEqual(at, -1, `the page does not contain ${String(needle)}`);
+    return at;
+  }
+
+  it("asks the question before it offers the MCP URL to copy", () => {
+    const html = connectPage({ mailboxes: [{ id: "main", label: "Main mailbox" }] });
+
+    const question = positionOf(html, /name="public_url_ok" value="yes"/);
+    const field = positionOf(html, /id="mcp_url"/);
+    const copy = positionOf(html, /copy it/i);
+    const connector = positionOf(html, /Settings → Connectors/);
+
+    assert.ok(question < field, "the confirmation comes before the MCP URL field");
+    assert.ok(question < copy, "and before the instruction to copy that address");
+    assert.ok(question < connector, "and before the claude.ai steps it is copied for");
+  });
+
+  it("shows the address being confirmed above the question, not only below it", () => {
+    // Confirming an address the screen has not shown you is worse than the
+    // ordering bug: PUBLIC_URL itself is in the first half, as the value under
+    // question rather than as something to copy.
+    const html = connectPage();
+
+    const shown = positionOf(html, /<code>https:\/\/mail\.example\.com<\/code>/);
+    const field = positionOf(html, /id="mcp_url"/);
+
+    assert.ok(shown < field, "PUBLIC_URL is legible before the derived address appears");
+  });
+
+  it("puts the No guidance before anything has been offered to copy", () => {
+    const html = connectPage({ showPublicUrlHelp: true });
+
+    const help = positionOf(html, /cannot be changed from here/i);
+    const field = positionOf(html, /id="mcp_url"/);
+
+    assert.ok(help < field, "the fix is explained before the wrong address is handed over");
+  });
+
+  it("still requires an answer in the markup, in the form Finish submits", () => {
+    const html = connectPage();
+
+    const form = positionOf(html, /<form method="post"/);
+    const question = positionOf(html, /name="public_url_ok" value="yes" required/);
+    const finish = positionOf(html, /<button type="submit">Finish<\/button>/);
+
+    assert.ok(form < question && question < finish, "the radios are inside the form");
+    // One form on this screen, so Finish cannot be a submit that skips them.
+    assert.equal(html.split("<form").length - 1, 1);
+  });
+
   it("says what to change when the operator answers No, and that a restart is needed", () => {
     const html = connectPage({ showPublicUrlHelp: true });
 

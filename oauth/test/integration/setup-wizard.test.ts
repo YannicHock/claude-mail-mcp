@@ -1005,6 +1005,17 @@ test("step 3 shows the MCP URL and asks about PUBLIC_URL", async () => {
     assert.equal(/<script/i.test(html), false);
     // A mailbox is configured on this instance, and the screen says which.
     assert.match(html, /Main mailbox/);
+
+    // And in that order (#119): the address is derived from PUBLIC_URL, so an
+    // operator working down the page must not be told to copy it into claude.ai
+    // before being asked whether PUBLIC_URL is right. Offsets, not presence —
+    // presence was true of the backwards page too.
+    const question = html.indexOf('name="public_url_ok" value="yes"');
+    const field = html.indexOf(`value="${harness.config.resource}"`);
+    const copy = html.search(/copy it/i);
+    assert.ok(question !== -1 && field !== -1 && copy !== -1, "all three are on the page");
+    assert.ok(question < field, "the confirmation comes before the MCP URL");
+    assert.ok(question < copy, "and before the instruction to copy it");
   } finally {
     await harness.close();
   }
@@ -1141,6 +1152,12 @@ test("answering No explains PUBLIC_URL and leaves the wizard exactly where it wa
     // It cannot be edited from a browser, so the screen says what to change instead.
     assert.match(html, /PUBLIC_URL=/);
     assert.match(html, /cannot be changed from here/i);
+    // And it says it before handing over the address built from the wrong value,
+    // which is the whole point of asking first (#119).
+    const help = html.search(/cannot be changed from here/i);
+    const field = html.indexOf(`value="${harness.config.resource}"`);
+    assert.ok(field !== -1, "the MCP URL is still on the page");
+    assert.ok(help < field, "the fix comes before the address derived from the bad one");
     // Nothing was claimed: the token is still live and the link still works.
     assert.equal(existsSync(join(dir, "claim-token.txt")), true);
     assert.equal(harness.bootstrap.bootstrapped, false);
