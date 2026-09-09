@@ -36,9 +36,11 @@ import {
   MAILBOX_FIELDS,
   MAILBOX_FIELD_NAMES,
   MAILBOX_SECRET_FIELDS,
+  parseAutoconfigAnswer,
   parseMailboxDraft,
   parseProbeAnswer,
   type MailboxDraft,
+  type MailboxSuggestion,
 } from "../../src/settings-api.js";
 import { renderMailboxForm } from "../../src/settings-pages.js";
 
@@ -217,5 +219,92 @@ describe("parseProbeAnswer", () => {
     for (const value of [undefined, {}, { probe: {} }, { probe: { imap: { ok: true } } }]) {
       assert.equal(parseProbeAnswer(value), null);
     }
+  });
+});
+
+describe("parseAutoconfigAnswer", () => {
+  const suggestion = (): MailboxSuggestion => ({
+    email: "anna@example.invalid",
+    domain: "example.invalid",
+    source: "autoconfig-subdomain",
+    imap: {
+      host: "imap.example.invalid",
+      port: 993,
+      tls: true,
+      socketType: "SSL",
+      user: "anna@example.invalid",
+    },
+    smtp: {
+      host: "smtp.example.invalid",
+      port: 587,
+      tls: false,
+      socketType: "STARTTLS",
+      user: "anna",
+    },
+    caldav: {
+      url: "https://dav.example.invalid/",
+      user: "anna@example.invalid",
+      source: "well-known",
+    },
+  });
+
+  it("reads a suggestion back exactly as it went over the wire", () => {
+    const found = suggestion();
+    assert.deepEqual(parseAutoconfigAnswer(JSON.parse(JSON.stringify({ suggestion: found }))), {
+      suggestion: found,
+    });
+  });
+
+  it("reads a null or absent suggestion as nothing found, which is not a failure", () => {
+    // The ordinary answer for a domain that publishes nothing, and the shape
+    // every refusal inside the cascade collapses into. It has to be readable,
+    // or the wizard would treat "no autoconfig" as "unreadable connector".
+    assert.deepEqual(parseAutoconfigAnswer({ suggestion: null }), { suggestion: null });
+    assert.deepEqual(parseAutoconfigAnswer({}), { suggestion: null });
+  });
+
+  it("reads an absent CalDAV block as no CalDAV, the way most providers answer", () => {
+    const { caldav: _caldav, ...withoutCaldav } = suggestion();
+    assert.equal(parseAutoconfigAnswer({ suggestion: withoutCaldav })?.suggestion?.caldav, null);
+    assert.equal(
+      parseAutoconfigAnswer({ suggestion: { ...suggestion(), caldav: null } })?.suggestion?.caldav,
+      null
+    );
+  });
+
+  it("refuses a half-readable suggestion rather than showing half of one", () => {
+    // Fail closed, and then some: an operator confirming settings has to be
+    // confirming all of them. A suggestion whose SMTP host this build cannot
+    // read is not shown with its IMAP half filled in — it reads as no
+    // suggestion at all, and the screen after it is the provider list.
+    for (const value of [
+      undefined,
+      null,
+      "a string",
+      [],
+      { suggestion: "not an object" },
+      { suggestion: { ...suggestion(), email: 7 } },
+      { suggestion: { ...suggestion(), source: "a-tier-that-does-not-exist" } },
+      { suggestion: { ...suggestion(), smtp: undefined } },
+      { suggestion: { ...suggestion(), imap: { ...suggestion().imap, port: "993" } } },
+      { suggestion: { ...suggestion(), imap: { ...suggestion().imap, port: 0 } } },
+      { suggestion: { ...suggestion(), imap: { ...suggestion().imap, port: 70000 } } },
+      { suggestion: { ...suggestion(), imap: { ...suggestion().imap, port: 993.5 } } },
+      { suggestion: { ...suggestion(), imap: { ...suggestion().imap, tls: "1" } } },
+      { suggestion: { ...suggestion(), imap: { ...suggestion().imap, socketType: "PLAIN" } } },
+      { suggestion: { ...suggestion(), caldav: { url: "https://dav.example.invalid/" } } },
+      { suggestion: { ...suggestion(), caldav: { ...suggestion().caldav, source: "a-guess" } } },
+    ]) {
+      assert.equal(parseAutoconfigAnswer(value), null, JSON.stringify(value) ?? "undefined");
+    }
+  });
+
+  it("carries no password field anywhere, at any depth", () => {
+    // The property the confirmation screen rests on. A suggestion cannot be
+    // turned into a stored account without going back through a form the
+    // operator has read, because the one thing an account needs is the one
+    // thing this type does not have anywhere in it.
+    const json = JSON.stringify(parseAutoconfigAnswer({ suggestion: suggestion() }));
+    assert.equal(/pass/i.test(json), false, json);
   });
 });

@@ -79,6 +79,9 @@ legend { font-size: .85rem; font-weight: 600; padding: 0 .35rem; }
 .row { display: flex; gap: 1rem; }
 .row > * { flex: 1; }
 .row > .narrow { flex: 0 0 8rem; }
+.choice { margin-bottom: .5rem; }
+.choice .checkbox-row { margin-bottom: .15rem; }
+.choice-note { margin: 0 0 .75rem 1.6rem; font-size: .85rem; }
 .checkbox-row { display: flex; align-items: center; gap: .5rem; margin-bottom: 1rem; }
 .checkbox-row input { margin: 0; }
 .checkbox-row label { margin: 0; }
@@ -254,8 +257,15 @@ export interface MailboxProbeView {
 export interface MailboxPageData {
   /** Where the form posts: this screen's own URL under the claim token. */
   action: string;
-  /** Step 1, for the Back link. */
+  /** The screen before this one, for the Back link. */
   backHref: string;
+  /**
+   * Tiers 1 and 2, for the links §5.3 wants reachable from anywhere — the full
+   * form is a fallback, not a one-way door. Both or neither: a screen that
+   * offers one way out and not the other is worse than one that offers none.
+   */
+  addressHref?: string;
+  providersHref?: string;
   /**
    * What to put back in the form after a rejected or failed submission.
    * Password fields are never among them — see {@link renderMailboxStep}.
@@ -282,7 +292,7 @@ export interface MailboxPageData {
  * collected here becomes a `MailboxDraft` and goes to the connector under
  * exactly these names.
  */
-const MAILBOX_DEFAULTS: Record<string, string> = {
+export const MAILBOX_DEFAULTS: Record<string, string> = {
   [MAILBOX_FIELDS.id]: "main",
   [MAILBOX_FIELDS.label]: "Main mailbox",
   [MAILBOX_FIELDS.imapPort]: "993",
@@ -560,6 +570,345 @@ export function renderMailboxStep(data: MailboxPageData): string {
       </span>
     </div>
   </form>
+  ${
+    data.addressHref === undefined || data.providersHref === undefined
+      ? ""
+      : otherWaysIn(
+          {
+            action: data.action,
+            backHref: data.backHref,
+            addressHref: data.addressHref,
+            providersHref: data.providersHref,
+            manualHref: "",
+          },
+          "manual"
+        )
+  }
+  <p><a href="${escapeHtml(data.backHref)}">← Back</a></p>`;
+
+  return wizardPage("mailbox", body);
+}
+
+// ---- Step 2, tiers 1 and 2 — find the settings before asking for them ------
+//
+// Three more screens, all of them step 2. The full form above is the last of
+// them rather than the first: eighteen boxes is what this milestone exists to
+// stop being the second thing a new operator sees, and each tier here exists so
+// that the next one is not needed.
+//
+//   the address screen   →  a lookup, and what it found, for confirmation
+//                        →  or, when it found nothing, the provider list
+//                        →  or, from either, the full form above
+//
+// Every one of them carries the same Skip button, because "someone evaluating
+// the thing should not need mail credentials to hand" has to be true of whatever
+// screen they happen to be looking at.
+
+/** The wizard's own name for the one password box tiers 1 and 2 have. */
+export const SHARED_PASSWORD_FIELD = "password";
+
+/** The name the address box submits: the connector's own, so it carries onward. */
+export const ADDRESS_FIELD = MAILBOX_FIELDS.mailDefaultFrom;
+
+/** The name the provider list submits. */
+export const PROVIDER_FIELD = "provider";
+
+/** What `Other (enter manually)` submits: no preset, straight to the full form. */
+export const PROVIDER_OTHER = "other";
+
+/** Which of step 2's screens is being looked at. Also the `view` query value. */
+export type MailboxView = "address" | "providers" | "manual";
+
+export interface StepTwoLinks {
+  /** Where the form posts: this screen's own URL under the claim token. */
+  action: string;
+  /** Step 1, for the Back link. */
+  backHref: string;
+  /** Tier 1, the address screen. */
+  addressHref: string;
+  /** Tier 2, the provider list — reachable from anywhere, as §5.3 requires. */
+  providersHref: string;
+  /** Tier 3, the full form, for an operator who would rather just type it all. */
+  manualHref: string;
+}
+
+/** Skip is on every one of these screens, and never validates the form first. */
+function skipButton(): string {
+  return `<button type="submit" name="_action" value="skip" class="secondary" formnovalidate>
+        Skip for now
+      </button>`;
+}
+
+/**
+ * The other two tiers, as links.
+ *
+ * Every screen in step 2 offers both of the ones it is not, which is what makes
+ * the cascade a cascade rather than a funnel: the lookup is a convenience, and
+ * an operator who already knows their settings — or who has been sent round by a
+ * failed probe — must never be made to walk through it to reach the form.
+ */
+function otherWaysIn(links: StepTwoLinks, current: MailboxView): string {
+  const all: Array<{ view: MailboxView; href: string; text: string }> = [
+    { view: "address", href: links.addressHref, text: "Look it up from the address" },
+    { view: "providers", href: links.providersHref, text: "Choose provider manually" },
+    { view: "manual", href: links.manualHref, text: "Enter all the settings myself" },
+  ];
+  const links_ = all
+    .filter((entry) => entry.view !== current)
+    .map((entry) => `<a href="${escapeHtml(entry.href)}">${escapeHtml(entry.text)}</a>`)
+    .join(" · ");
+  return `<p class="muted">${links_}</p>`;
+}
+
+export interface MailboxAddressPageData extends StepTwoLinks {
+  /** What to put back in the address box after a rejected submission. */
+  email: string;
+  /** Keyed by field name, so the address's own rejection sits against its box. */
+  errors: Record<string, string>;
+  notice?: { kind: "error" | "info"; message: string };
+}
+
+/**
+ * Tier 1 — an address and a password, and nothing else on the screen.
+ *
+ * On Continue the connector looks the domain up (autoconfig, then the ISPDB,
+ * then RFC 6186 SRV records) and what it finds is shown for confirmation. A
+ * lookup that finds nothing is not a failure and is never reported as one: the
+ * next screen is simply the provider list.
+ *
+ * The password is asked for here rather than after the lookup because it is the
+ * other half of the same thought — "this is my mailbox" — and because a screen
+ * that asks for an address, goes away for up to ten seconds and then asks for a
+ * password reads as two steps rather than one.
+ */
+export function renderMailboxAddressStep(data: MailboxAddressPageData): string {
+  const emailError = data.errors[ADDRESS_FIELD] ?? "";
+  const body = `
+  <p class="lead">
+    Start with the address. Most providers publish their own settings, so the
+    servers, ports and encryption can usually be worked out from it.
+  </p>
+  ${noticeHtml(data.notice)}
+  <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
+    <label for="mail_from">Email address</label>
+    <input id="mail_from" name="${escapeHtml(ADDRESS_FIELD)}" type="email"
+           value="${escapeHtml(data.email)}" required autofocus
+           autocapitalize="none" autocorrect="off" spellcheck="false"${invalid(emailError)}>
+    ${fieldError(emailError)}
+    <label for="mailbox_password">Password</label>
+    <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
+           value="" autocomplete="off" required>
+    <p class="muted">
+      The password for the mailbox itself. Some providers want an app password
+      here rather than the one you sign in to their website with.
+    </p>
+    <div class="actions">
+      ${skipButton()}
+      <button type="submit" name="_action" value="lookup">Continue</button>
+    </div>
+  </form>
+  ${otherWaysIn(data, "address")}
+  <p><a href="${escapeHtml(data.backHref)}">← Back</a></p>`;
+
+  return wizardPage("mailbox", body);
+}
+
+export interface MailboxSuggestionPageData extends StepTwoLinks {
+  /** The domain the settings were found for, for the heading. */
+  domain: string;
+  /** Where the answer came from, in words the operator can act on. */
+  sourceLabel: string;
+  /**
+   * The settings themselves, under `MAILBOX_FIELDS` names — both what the rows
+   * are rendered from and what the hidden inputs carry into the save, so there
+   * is one copy of them on the screen rather than two that could disagree.
+   * Never contains a password.
+   */
+  values: Record<string, string>;
+  errors: Record<string, string>;
+  notice?: { kind: "error" | "info"; message: string };
+}
+
+/** `imap.example.com:993`, or "" when there is no host to show. */
+function endpoint(values: Record<string, string>, hostKey: string, portKey: string): string {
+  const host = values[hostKey] ?? "";
+  const port = values[portKey] ?? "";
+  if (host === "") return "";
+  return port === "" ? host : `${host}:${port}`;
+}
+
+function suggestionRow(name: string, detail: string, encryption: string): string {
+  const right = encryption === "" ? detail : `${detail} · ${encryption}`;
+  return `<div class="probe-row ok"><strong>${escapeHtml(name)}</strong><span>${escapeHtml(
+    right
+  )}</span></div>`;
+}
+
+/**
+ * What the lookup found, shown before any of it is used.
+ *
+ * The whole point of this screen is that it exists. Applying an autoconfig
+ * answer silently would be less typing and much worse: a wrong host produces a
+ * connection failure minutes later, on a screen that says nothing about where
+ * the host came from, and an operator who never saw it has no reason to suspect
+ * it. Here they read it once, and `Edit these` is one press away.
+ *
+ * CalDAV missing is stated as ordinary, because it is. Most mail providers
+ * publish nothing for it, calendars are optional in the account model, and an
+ * operator who reads "not found" as a problem will go looking for one.
+ *
+ * The password is asked for again rather than carried through the lookup. This
+ * screen is rendered from a fresh request, and a password in a hidden input is a
+ * password in the page source, in the browser's back-forward cache and in
+ * whatever the operator screenshots when they ask someone for help — which is
+ * exactly what every other form in this project refuses to do.
+ */
+export function renderMailboxSuggestionStep(data: MailboxSuggestionPageData): string {
+  const { values } = data;
+  const hidden = Object.entries(values)
+    .map(
+      ([name, v]) =>
+        `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(v)}">`
+    )
+    .join("\n    ");
+
+  const caldavUrl = values[MAILBOX_FIELDS.caldavUrl] ?? "";
+  const caldavRow =
+    caldavUrl === ""
+      ? `<div class="probe-row"><strong>CalDAV</strong><span>not found — calendars can be added later</span></div>`
+      : suggestionRow("CalDAV", caldavUrl, "");
+
+  const body = `
+  <h2>Found settings for ${escapeHtml(data.domain)}</h2>
+  <p class="lead">
+    Check these before they are used. Nothing has been stored, and nothing has
+    been contacted with your password yet.
+  </p>
+  ${noticeHtml(data.notice)}
+  <div class="notice">
+${suggestionRow(
+  "IMAP",
+  endpoint(values, MAILBOX_FIELDS.imapHost, MAILBOX_FIELDS.imapPort),
+  values[MAILBOX_FIELDS.imapTls] === CHECKBOX_ON ? "TLS" : "STARTTLS"
+)}
+${suggestionRow(
+  "SMTP",
+  endpoint(values, MAILBOX_FIELDS.smtpHost, MAILBOX_FIELDS.smtpPort),
+  values[MAILBOX_FIELDS.smtpTls] === CHECKBOX_ON ? "TLS" : "STARTTLS"
+)}
+${caldavRow}
+  </div>
+  <p class="muted">${escapeHtml(data.sourceLabel)}</p>
+  <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
+    ${hidden}
+    <label for="mailbox_password">Password</label>
+    <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
+           value="" autocomplete="off" required autofocus>
+    <p class="muted">
+      Passwords are never written back into this page, so it has to be typed
+      again here. It is used to log in to the servers above, and stored only
+      once they both answer.
+    </p>
+    <div class="actions">
+      ${skipButton()}
+      <span class="buttons">
+        <button type="submit" name="_action" value="edit" class="secondary" formnovalidate>
+          Edit these
+        </button>
+        <button type="submit" name="_action" value="save">Continue</button>
+      </span>
+    </div>
+  </form>
+  ${otherWaysIn(data, "address")}
+  <p><a href="${escapeHtml(data.backHref)}">← Back</a></p>`;
+
+  return wizardPage("mailbox", body);
+}
+
+/** One row of the provider list, as this screen needs it. */
+export interface ProviderChoice {
+  id: string;
+  label: string;
+  /** What the operator has to know before this preset works. "" for nothing. */
+  note: string;
+}
+
+export interface MailboxProviderPageData extends StepTwoLinks {
+  providers: readonly ProviderChoice[];
+  /** The domain the lookup found nothing for, or "" when reached from the link. */
+  domain: string;
+  /** Carried across so the address is typed once, not once per screen. */
+  email: string;
+  /** Which radio is on, when a submission is being re-rendered. */
+  selected: string;
+  errors: Record<string, string>;
+  notice?: { kind: "error" | "info"; message: string };
+}
+
+/**
+ * Tier 2 — the list, when the lookup found nothing or the operator asked for it.
+ *
+ * The opening line is about the domain, not about the lookup: "we could not
+ * detect settings for example.com" is a fact, where "the autoconfig lookup
+ * failed" is a failure the operator can neither confirm nor act on. §7 is
+ * explicit that no autoconfig failure is ever shown as an error, and this screen
+ * is where that promise is kept.
+ *
+ * Radios rather than a `<select>`, because each entry has a caveat next to it
+ * and a dropdown has nowhere to put one. Those caveats are the point of the
+ * list: iCloud's IMAP login is not the whole address, Fastmail refuses the
+ * account password outright, and an operator who meets either of those as a
+ * bare "authentication failed" three screens later will conclude they typed
+ * their password wrong.
+ *
+ * Continue leads to the full form with the preset already in it, rather than
+ * straight to a save. The values are the whole reason to pick a provider and
+ * this is the only screen that shows them — and for the entries whose hosts are
+ * a pattern rather than a name, it is also where the host gets corrected.
+ */
+export function renderMailboxProviderStep(data: MailboxProviderPageData): string {
+  const emailError = data.errors[ADDRESS_FIELD] ?? "";
+  const providerError = data.errors[PROVIDER_FIELD] ?? "";
+
+  const choice = (id: string, label: string, note: string): string => {
+    const inputId = `provider_${id.replace(/[^a-z0-9]+/gi, "_")}`;
+    return `<div class="choice">
+      <div class="checkbox-row">
+        <input id="${escapeHtml(inputId)}" name="${escapeHtml(PROVIDER_FIELD)}" type="radio"
+               value="${escapeHtml(id)}"${data.selected === id ? " checked" : ""} required>
+        <label for="${escapeHtml(inputId)}">${escapeHtml(label)}</label>
+      </div>
+      ${note === "" ? "" : `<p class="muted choice-note">${escapeHtml(note)}</p>`}
+    </div>`;
+  };
+
+  const lead =
+    data.domain === ""
+      ? "Pick your provider and the servers, ports and encryption are filled in for you."
+      : `We could not detect settings for ${data.domain}. Pick your provider and the ` +
+        "servers, ports and encryption are filled in for you.";
+
+  const body = `
+  <p class="lead">${escapeHtml(lead)}</p>
+  ${noticeHtml(data.notice)}
+  <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
+    <label for="mail_from">Email address</label>
+    <input id="mail_from" name="${escapeHtml(ADDRESS_FIELD)}" type="email"
+           value="${escapeHtml(data.email)}" required
+           autocapitalize="none" autocorrect="off" spellcheck="false"${invalid(emailError)}>
+    ${fieldError(emailError)}
+    <fieldset>
+      <legend>Provider</legend>
+      ${data.providers.map((p) => choice(p.id, p.label, p.note)).join("\n      ")}
+      ${choice(PROVIDER_OTHER, "Other — enter the settings myself", "")}
+      ${fieldError(providerError)}
+    </fieldset>
+    <div class="actions">
+      ${skipButton()}
+      <button type="submit" name="_action" value="provider">Continue</button>
+    </div>
+  </form>
+  ${otherWaysIn(data, "providers")}
   <p><a href="${escapeHtml(data.backHref)}">← Back</a></p>`;
 
   return wizardPage("mailbox", body);

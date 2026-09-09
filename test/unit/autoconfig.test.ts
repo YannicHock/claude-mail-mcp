@@ -22,6 +22,9 @@ import {
   isPublicIp,
   resolveSafeUrl,
   defaultDeps,
+  AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS,
+  AUTOCONFIG_TOTAL_TIMEOUT_MS,
+  MAX_REDIRECTS,
   MAX_RESPONSE_BYTES,
   type AutoconfigDeps,
   type HttpResponse,
@@ -672,4 +675,72 @@ test("CalDAV discovery cannot cost a lookup the mail settings it already found",
     assert.equal(found.imap.host, "imap.example.com");
     assert.equal(found.caldav, null);
   }
+});
+
+// ------------------------------------------------- the §7 numbers, as shipped
+//
+// The budget tests above all pass `perAttemptMs` and `totalMs` explicitly, which
+// is what makes them fast and is also the hole in them: every one of those tests
+// stays green if `lookupMailboxSettings` stops using its own constants as the
+// defaults, and timeout.test.ts stays green too, because the constants would
+// still hold the right values — nothing would be reading them. The two below
+// close that, by watching what an un-optioned call actually hands the transport.
+
+/** Deps that record the budget each attempt was given and find nothing. */
+function budgetSpy(): { budgets: number[]; deps: AutoconfigDeps } {
+  const budgets: number[] = [];
+  return {
+    budgets,
+    deps: {
+      async resolveAddresses() {
+        return ["93.184.216.34"];
+      },
+      async httpsGet(_url, _addresses, timeoutMs) {
+        budgets.push(timeoutMs);
+        throw new Error("nothing published here");
+      },
+      async resolveSrv() {
+        throw new Error("ENOTFOUND");
+      },
+    },
+  };
+}
+
+test("an un-optioned lookup runs on the per-attempt deadline §7 fixes", async () => {
+  const { budgets, deps } = budgetSpy();
+
+  assert.equal(await lookupMailboxSettings(EMAIL, { deps }), null);
+
+  assert.ok(budgets.length > 0, "the cascade made no attempt at all");
+  for (const budget of budgets) {
+    assert.equal(
+      budget,
+      AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS,
+      "an attempt ran on something other than the shipped per-attempt budget"
+    );
+  }
+});
+
+test("an un-optioned lookup bounds every attempt by the cascade's total too", async () => {
+  // The per-attempt slice is never longer than what is left of the overall
+  // budget, which is what makes the 10-second ceiling real rather than a
+  // sequence of 3-second attempts with no end. With the shipped values the
+  // per-attempt figure is the smaller one, so it is what every slice reads as —
+  // and a total shorter than one attempt would show up here immediately.
+  assert.ok(AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS <= AUTOCONFIG_TOTAL_TIMEOUT_MS);
+
+  const { budgets, deps } = budgetSpy();
+  await lookupMailboxSettings(EMAIL, { deps });
+
+  for (const budget of budgets) {
+    assert.ok(budget <= AUTOCONFIG_TOTAL_TIMEOUT_MS, `an attempt got ${budget}ms`);
+  }
+});
+
+test("the response cap and the redirect limit are the ones §7 asks for", () => {
+  // Pinned as values because the behaviour is pinned above, on `readCapped` and
+  // on the two-redirect case: a cap that quietly became 128 MB, or a limit that
+  // became 5, would leave every other test in this file green.
+  assert.equal(MAX_RESPONSE_BYTES, 128 * 1024);
+  assert.equal(MAX_REDIRECTS, 1);
 });
