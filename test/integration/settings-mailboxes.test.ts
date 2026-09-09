@@ -44,13 +44,25 @@ const CSRF = "test-csrf-value";
 const SUB = "operator";
 const SID = "session-1";
 
+/**
+ * The canonical spelling of this connector's `PUBLIC_URL` — what the OAuth layer
+ * puts in every assertion's `iss`, because its own config canonicalises before
+ * minting. The connector is configured with this by default; the two cases below
+ * hand `startConnector` a different *spelling* of the same URL, which is the
+ * whole of #110.
+ */
+const PUBLIC_URL = "https://mail-mcp.example.invalid";
+
 interface Connector {
   url: string;
   accountsPath: string;
   close(): Promise<void>;
 }
 
-async function startConnector(accounts: Account[] = []): Promise<Connector> {
+async function startConnector(
+  accounts: Account[] = [],
+  publicUrlAsConfigured: string = PUBLIC_URL
+): Promise<Connector> {
   const dir = await makeTmpDir();
   const accountsPath = `${dir}/accounts.json`;
   // Pre-seed accounts.json — empty by default: a fresh deployment that has been
@@ -61,14 +73,13 @@ async function startConnector(accounts: Account[] = []): Promise<Connector> {
   const store = new AccountsStore(accountsPath);
   await store.start();
   const pool = new ClientPool(store);
-  const publicUrl = "https://mail-mcp.example.invalid";
   const app = createApp({
     store,
     pool,
     authToken: AUTH_TOKEN,
     accountsFile: accountsPath,
     settingsSigningKey: SETTINGS_KEY,
-    publicUrl,
+    publicUrl: publicUrlAsConfigured,
   });
 
   const server = await new Promise<Server>((resolve, reject) => {
@@ -98,7 +109,7 @@ function mint(
 ): string {
   const payload = {
     v: 1,
-    iss: "https://mail-mcp.example.invalid",
+    iss: PUBLIC_URL,
     aud: "mail-mcp-settings",
     sub: SUB,
     sid: SID,
@@ -248,6 +259,55 @@ test("an assertion bound to another path is refused", async () => {
   const { url, close } = await startConnector();
   try {
     const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes/work"));
+    assert.equal(res.status, 401);
+  } finally {
+    await close();
+  }
+});
+
+/**
+ * #110, end to end and from the operator's side.
+ *
+ * Both services hold their own `PUBLIC_URL` — `.env` here, `.env.oauth` there —
+ * and the OAuth layer canonicalises its copy before minting, so `iss` always
+ * arrives in the canonical spelling. What used to break was the *other* side:
+ * whatever the operator typed into `.env` went to the comparison verbatim, so a
+ * capital letter in the host or an explicit `:443` — spellings identical to every
+ * browser and every resolver — made `payload.iss !== issuer` hold and answered
+ * 401 to every settings request, with only a `rejected settings request` line to
+ * show for it.
+ *
+ * These two cases fail against the old `.trim().replace(/\/+$/, "")`: they mint
+ * the canonical `iss` and configure the connector with a different spelling. The
+ * comparison itself is untouched and still strict — it is the configured value
+ * that is now canonicalised before it becomes the operand.
+ */
+test("a PUBLIC_URL whose host is spelled with capitals still verifies", async () => {
+  const { url, close } = await startConnector([], "https://Mail-MCP.Example.invalid");
+  try {
+    const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
+    assert.equal(res.status, 200);
+  } finally {
+    await close();
+  }
+});
+
+test("a PUBLIC_URL carrying an explicit default port still verifies", async () => {
+  const { url, close } = await startConnector([], "https://mail-mcp.example.invalid:443/");
+  try {
+    const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
+    assert.equal(res.status, 200);
+  } finally {
+    await close();
+  }
+});
+
+test("a PUBLIC_URL naming a different host is still refused", async () => {
+  // The fix canonicalises; it does not make the comparison lenient. A wrong host
+  // is a wrong issuer, exactly as before.
+  const { url, close } = await startConnector([], "https://other.example.invalid");
+  try {
+    const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
     assert.equal(res.status, 401);
   } finally {
     await close();

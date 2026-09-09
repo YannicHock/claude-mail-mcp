@@ -20,6 +20,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { RequestHandler } from "express";
 
 import type { Logger } from "./app.js";
+import { normalisePublicUrl } from "./canonical-url.js";
 
 /** Header the assertion travels in. Mirrored in oauth/src/assertion.ts. */
 export const ASSERTION_HEADER = "x-settings-assertion";
@@ -55,6 +56,13 @@ declare global {
  * Verify an assertion. Returns null for anything that does not hold — a wrong key,
  * a tampered payload, an expired token, or one minted for a different method or
  * path. Never throws: a malformed header is a 401, not a 500.
+ *
+ * `issuer` must already be canonical — `normalisePublicUrl` from
+ * src/canonical-url.ts, which is what {@link requireSettingsAssertion} applies to
+ * the configured `PUBLIC_URL` before it gets here. The comparison below is byte
+ * equality on purpose and stays that way: canonicalising both sides is the fix
+ * for two spellings of one URL (#110); making the comparison itself lenient would
+ * be a lenient comparison of a security-relevant identifier.
  */
 export function verifyAssertion(
   token: string,
@@ -128,6 +136,25 @@ export function requireSettingsAssertion(opts: {
   log: Logger;
 }): RequestHandler {
   const key = new TextEncoder().encode(opts.key);
+  // Canonicalised once, here, rather than compared leniently below — #110. The
+  // OAuth layer mints `iss` from its own already-canonical `PUBLIC_URL`, so the
+  // arriving side is canonical by construction; this makes the configured side
+  // canonical too, and `verifyAssertion` keeps comparing the two with `!==`.
+  //
+  // Throws rather than falling back to the raw string when `PUBLIC_URL` is not a
+  // URL at all: a process that cannot say what its own issuer is has nothing to
+  // offer but 401s, and refusing to start says so where a log line would not.
+  // src/config.ts has already rejected such a value before it reaches here; this
+  // covers callers that build the app themselves.
+  let issuer: string;
+  try {
+    issuer = normalisePublicUrl(opts.issuer);
+  } catch (err) {
+    throw new Error(
+      `PUBLIC_URL must be an absolute http(s) URL without a fragment — it is the ` +
+        `settings assertion's issuer: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
   return (req, res, next) => {
     // req.header() cannot hand us an array here: @types/express special-cases only
     // set-cookie as string[], and Node joins a repeated header's values with ", ",
@@ -137,7 +164,7 @@ export function requireSettingsAssertion(opts: {
     const verified =
       header === undefined
         ? null
-        : verifyAssertion(header, key, opts.issuer, req.method, req.path);
+        : verifyAssertion(header, key, issuer, req.method, req.path);
     if (verified === null) {
       opts.log("warn", "rejected settings request", { ip: req.ip, path: req.path });
       res.status(401).type("text/plain").send("Unauthorized");

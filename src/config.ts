@@ -10,6 +10,7 @@
  * and its consequences live in src/secrets.ts.
  */
 
+import { normalisePublicUrl } from "./canonical-url.js";
 import {
   resolveSecret,
   type ResolveOptions,
@@ -35,8 +36,10 @@ const secretReport: SecretReportEntry[] = [];
  * `openssl rand -base64 48` must not survive on one side but not the other.
  *
  * Only key material goes through this. `optional()` still reads plain
- * configuration such as ACCOUNTS_FILE, PUBLIC_URL, HOST and LOG_LEVEL, which
- * deliberately preserve incidental whitespace as-is.
+ * configuration such as ACCOUNTS_FILE, HOST and LOG_LEVEL, which deliberately
+ * preserve incidental whitespace as-is. PUBLIC_URL has its own reader,
+ * {@link publicUrl}, because it has to come out of both packages canonicalised
+ * the same way rather than merely trimmed.
  */
 function trackedSecret(name: string, options?: ResolveOptions): string | undefined {
   const resolved = resolveSecret(process.env, name, options);
@@ -119,6 +122,34 @@ export function trustProxyHops(env: NodeJS.ProcessEnv = process.env): number {
   return parsed;
 }
 
+/**
+ * Read `PUBLIC_URL` and canonicalise it the way the OAuth layer canonicalises its
+ * own copy — see {@link normalisePublicUrl} and the note on `publicUrl` below.
+ *
+ * A value that is not an absolute http(s) URL is fatal here rather than passed
+ * along. The OAuth layer already refuses to start on the same input, and the only
+ * thing this process could do with an unusable issuer is answer 401 to every
+ * settings request for the life of the container — which is the failure #110 is
+ * about, not a milder version of it.
+ *
+ * Exported for the test suite, for the same reason `trustProxyHops` is: `config`
+ * below is evaluated once at import time, so a rejection case would otherwise
+ * need a process of its own.
+ */
+export function publicUrl(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.PUBLIC_URL;
+  const value = raw && raw.trim() !== "" ? raw : "http://localhost:3220";
+  try {
+    return normalisePublicUrl(value);
+  } catch (err) {
+    throw new Error(
+      `PUBLIC_URL must be an absolute http(s) URL without a fragment — it is the ` +
+        `settings assertion's issuer and must name the same URL as the OAuth ` +
+        `layer's PUBLIC_URL: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
 export const config = {
   port: int("PORT", 3220),
   /**
@@ -170,12 +201,19 @@ export const config = {
    * nothing anyone could get through.
    */
   authToken: requiredSecret("AUTH_TOKEN"),
-  // Trimmed and stripped of a trailing slash so this matches the OAuth layer's
-  // own normalisation of the same URL (see normalisePublicUrl() in
-  // oauth/src/urls.ts). The two values are compared as the assertion's `iss`
-  // on every settings request; a difference as small as a trailing slash
-  // makes that comparison fail silently and permanently.
-  publicUrl: optional("PUBLIC_URL", "http://localhost:3220").trim().replace(/\/+$/, ""),
+  /**
+   * This service's own public URL — the assertion's `iss`, compared on every
+   * settings request against the value the OAuth layer holds in `.env.oauth`.
+   *
+   * Canonicalised by the rule *both* packages now share: src/canonical-url.ts
+   * here, oauth/src/canonical-url.ts there, byte-identical below their headers
+   * and pinned that way by test/unit/canonical-url.test.ts. Before #110 this
+   * side only trimmed and stripped trailing slashes while the other side ran the
+   * value through `new URL`, so `https://Mail.example.com` against
+   * `https://mail.example.com`, or an explicit `:443` against none, 401'd every
+   * settings request with nothing naming the cause.
+   */
+  publicUrl: publicUrl(),
 
   /**
    * Shared key for the settings assertion the OAuth layer sends with proxied
