@@ -13,7 +13,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -21,7 +21,7 @@ import { join } from "node:path";
 import type { Express } from "express";
 
 import { createApp } from "../../src/app.js";
-import { Bootstrap } from "../../src/bootstrap.js";
+import { Bootstrap, operatorSeed } from "../../src/bootstrap.js";
 import type { OAuthConfig } from "../../src/config.js";
 import { silentLogger, type Logger } from "../../src/logger.js";
 import { OperatorRecord } from "../../src/operator.js";
@@ -138,6 +138,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     ),
     operatorFile: dataDir === null ? null : join(dataDir, "operator.json"),
     claimTokenFile: dataDir === null ? null : join(dataDir, "claim-token.txt"),
+    wizardStateFile: dataDir === null ? null : join(dataDir, "setup-wizard.json"),
     trustProxy: 1,
     accessTokenTtl: 3600,
     refreshTokenTtl: 2592000,
@@ -155,10 +156,18 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   // The same order index.ts uses: decide the state first, and open the operator
   // record only if there is one to open.
   const bootstrap = Bootstrap.open(config, log);
+  // A record already on the data volume is the live credential and is opened as
+  // such, the way index.ts does it: that is how a harness started after a wizard
+  // run signs in with the password the wizard chose, rather than with this file's
+  // constant. Without one, the in-memory record every settings test expects.
+  const recordOnVolume =
+    config.operatorFile !== null && existsSync(config.operatorFile) ? config.operatorFile : null;
   const operator = bootstrap.bootstrapped
     ? await OperatorRecord.open(
-        opts.operatorPath ?? null,
-        { username: TEST_USERNAME, passwordHash: authPasswordHash },
+        opts.operatorPath ?? recordOnVolume,
+        recordOnVolume !== null && opts.operatorPath === undefined
+          ? operatorSeed(config)
+          : { username: TEST_USERNAME, passwordHash: authPasswordHash },
         log
       )
     : undefined;
@@ -502,6 +511,45 @@ export async function postForm(
       "content-type": "application/x-www-form-urlencoded",
       origin: harness.baseUrl,
       cookie: `${SESSION_COOKIE}=${cookie}`,
+    },
+    body: new URLSearchParams(fields),
+  });
+}
+
+// ---- Setup wizard helpers --------------------------------------------------
+
+/** The wizard's base URL for this harness's claim token. */
+export function setupBase(harness: Harness): string {
+  return `${harness.baseUrl}/setup/${harness.claimToken ?? ""}`;
+}
+
+/** GET a wizard screen, e.g. `/credentials`. */
+export async function getSetup(harness: Harness, step = ""): Promise<Response> {
+  return fetch(`${setupBase(harness)}${step}`, { redirect: "manual" });
+}
+
+/**
+ * Submit a wizard form.
+ *
+ * The default headers are the ones **Chrome actually sends on a same-origin form
+ * POST**: a `Referer` and no `Origin` at all. That is the shape #14 is about, and
+ * every suite in this repository missed the 0.6.0 failure because `fetch` sets
+ * `Origin` for free and every test let it. Pass {@link SubmissionOptions} to drive
+ * the other rows of that matrix.
+ */
+export async function postSetupForm(
+  harness: Harness,
+  step: string,
+  fields: Record<string, string>,
+  options: SubmissionOptions = {}
+): Promise<Response> {
+  const url = `${setupBase(harness)}${step}`;
+  return fetch(url, {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      ...(options.headers ?? { referer: url }),
     },
     body: new URLSearchParams(fields),
   });

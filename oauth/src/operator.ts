@@ -34,6 +34,96 @@ export interface OperatorSeed {
   passwordHash: string;
 }
 
+/**
+ * The shortest password this service will accept for the operator account.
+ *
+ * Twelve, and enforced rather than advised, because the instance becomes
+ * internet-reachable the moment setup completes: this credential is what stands
+ * between a mail connector and anyone who finds the address. Rejecting here
+ * costs a retype; rejecting later costs an exposed instance.
+ */
+export const MIN_PASSWORD_LENGTH = 12;
+
+/**
+ * An upper bound, so that a submitted form cannot choose how much CPU this
+ * process spends. scrypt at N=2^16 hashes the whole input, and nothing about a
+ * password beyond this length is worth the memory.
+ */
+export const MAX_PASSWORD_LENGTH = 1024;
+
+/** And one on the username, which is compared, stored and rendered. */
+export const MAX_USERNAME_LENGTH = 64;
+
+/** Which field a rejection belongs next to, so the form can say it in place. */
+export type CredentialField = "username" | "password" | "confirmation";
+
+export interface CredentialProblem {
+  field: CredentialField;
+  message: string;
+}
+
+/**
+ * Check a username and password before either becomes this instance's only
+ * credential.
+ *
+ * Returns every problem it finds rather than the first, so an operator fixing a
+ * form is not sent round the loop once per mistake. An empty array means the
+ * input is acceptable.
+ *
+ * The password-equals-username rule compares case-insensitively and after the
+ * same NFKC normalisation the hash uses. `Operator`/`operator` is the same
+ * guess to anyone trying it, and a check that only caught the exact spelling
+ * would be a rule that reads strict and is not.
+ */
+export function validateNewCredentials(input: {
+  username: string;
+  password: string;
+  confirmation: string;
+}): CredentialProblem[] {
+  const problems: CredentialProblem[] = [];
+  const username = input.username.trim();
+
+  if (username === "") {
+    problems.push({ field: "username", message: "Enter a username." });
+  } else if (username.length > MAX_USERNAME_LENGTH) {
+    problems.push({
+      field: "username",
+      message: `Use at most ${MAX_USERNAME_LENGTH} characters.`,
+    });
+  } else if (/\s/.test(username)) {
+    problems.push({ field: "username", message: "A username cannot contain spaces." });
+  }
+
+  if (input.password.length < MIN_PASSWORD_LENGTH) {
+    problems.push({
+      field: "password",
+      message: `Use at least ${MIN_PASSWORD_LENGTH} characters.`,
+    });
+  } else if (input.password.length > MAX_PASSWORD_LENGTH) {
+    problems.push({
+      field: "password",
+      message: `Use at most ${MAX_PASSWORD_LENGTH} characters.`,
+    });
+  } else if (username !== "" && sameSecretAs(input.password, username)) {
+    problems.push({
+      field: "password",
+      message: "The password cannot be the same as the username.",
+    });
+  }
+
+  if (input.confirmation !== input.password) {
+    problems.push({ field: "confirmation", message: "The two passwords do not match." });
+  }
+
+  return problems;
+}
+
+function sameSecretAs(password: string, username: string): boolean {
+  return (
+    password.normalize("NFKC").toLowerCase() === username.normalize("NFKC").toLowerCase()
+  );
+}
+
 export class OperatorRecord {
   #data: OperatorData;
   readonly #path: string | null;
@@ -102,6 +192,45 @@ export class OperatorRecord {
     }
     log("info", "operator credential source", { source: "file", path });
     return new OperatorRecord(path, parsed, log);
+  }
+
+  /**
+   * Write a brand-new operator credential from a plaintext password.
+   *
+   * This is what the setup wizard's first step calls, and it is deliberately not
+   * `open()` plus `changePassword()`: while the instance is unclaimed there is no
+   * `OperatorRecord` in the process at all — index.ts opens one only once the
+   * state check says the instance is claimed — and there is no username to seed
+   * `open()` with, because choosing it is exactly what this step is for.
+   *
+   * An existing record is replaced, not merged, and its session epoch is bumped
+   * past whatever it was. Re-running step 1 is a legitimate thing to do — the
+   * operator went Back, or mistyped and returned — and it must not leave a
+   * session signed against the old credential valid.
+   *
+   * Unlike `changePassword`, a failed write is thrown rather than only logged.
+   * The wizard has to be able to tell the operator that their credential was not
+   * saved; a screen that says "continue" over a record that was never written
+   * would produce an instance nobody can sign in to.
+   */
+  static async create(
+    path: string,
+    credentials: { username: string; password: string },
+    log: Logger
+  ): Promise<OperatorRecord> {
+    const previous = await readExisting(path);
+    const record = new OperatorRecord(
+      path,
+      {
+        version: CURRENT_VERSION,
+        username: credentials.username.trim(),
+        passwordHash: await hashPassword(credentials.password),
+        sessionEpoch: (previous?.sessionEpoch ?? -1) + 1,
+      },
+      log
+    );
+    await record.#persist();
+    return record;
   }
 
   get username(): string {
@@ -180,6 +309,15 @@ export class OperatorRecord {
       });
     });
     return attempt;
+  }
+}
+
+/** The stored record, or null when there is none this build can read. */
+async function readExisting(path: string): Promise<OperatorData | null> {
+  try {
+    return parse(await readFile(path, "utf8"));
+  } catch {
+    return null;
   }
 }
 

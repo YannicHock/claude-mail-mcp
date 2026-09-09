@@ -16,7 +16,7 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 
 import { ASSERTION_HEADER, signAssertion } from "./assertion.js";
-import { type Bootstrap, parseSetupPath, renderSetupPlaceholder } from "./bootstrap.js";
+import { type Bootstrap, parseSetupPath } from "./bootstrap.js";
 import { registerClient } from "./clients.js";
 import { CodeStore } from "./codes.js";
 import type { OAuthConfig } from "./config.js";
@@ -45,6 +45,7 @@ import {
   sessionOf,
   type MailboxSummary,
 } from "./settings-routes.js";
+import { createSetupWizard } from "./setup-routes.js";
 import { Store } from "./store.js";
 import { LoginThrottle } from "./throttle.js";
 import { TokenIssuer } from "./tokens.js";
@@ -160,7 +161,7 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
   //
   //                    unbootstrapped        claimed
   //   /health          200                   200
-  //   /setup/<token>   the setup page        404
+  //   /setup/<token>   the wizard            404
   //   /setup/<other>   404                   404
   //   /mcp             503                   normal
   //   /settings/*      not mounted           normal
@@ -174,6 +175,13 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
   // instance from a claimed one. A 401 here would announce "there is a token, and
   // this is not it".
   const bootstrap = opts.bootstrap;
+  // Built once, and only for an instance that is actually unclaimed: the state
+  // never goes back to unbootstrapped, so a process that started claimed has no
+  // wizard to build and no progress file to read.
+  const wizard =
+    bootstrap !== undefined && !bootstrap.bootstrapped
+      ? createSetupWizard({ config, log, notFound: sendNotFound })
+      : null;
   if (bootstrap !== undefined) {
     app.use((req, res, next) => {
       // Read per request, not captured: complete() flips this in a live process
@@ -200,25 +208,13 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
       }
 
       const setup = parseSetupPath(req.path);
-      if (setup !== null && bootstrap.accepts(setup.token) && setup.rest === "") {
-        if (req.method !== "GET" && req.method !== "HEAD") {
-          // The placeholder has no form to submit. Issue #22 routes the wizard's
-          // own POSTs from here, behind the same token check.
-          sendNotFound(req, res);
-          return;
-        }
-        res
-          .status(200)
-          .type("html")
-          .set("Cache-Control", "no-store")
-          .set("X-Frame-Options", "DENY")
-          .set(
-            "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; " +
-              "frame-ancestors 'none'"
-          )
-          .set("Referrer-Policy", "same-origin")
-          .send(renderSetupPlaceholder());
+      if (setup !== null && wizard !== null && bootstrap.accepts(setup.token)) {
+        // Past the token check, and only past it, the wizard routes on the rest
+        // of the path — including its own POSTs, which is why the check is here
+        // and the routing is there. An unknown sub-path under a valid token comes
+        // back through `sendNotFound` below, so it is the same 404 a wrong token
+        // gets, byte for byte.
+        wizard.handle(req, res, setup).catch(next);
         return;
       }
 

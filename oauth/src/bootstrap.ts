@@ -7,14 +7,16 @@
  * that window safe. The mechanism is the one Jupyter uses: the instance is
  * claimable only by someone who can read its logs.
  *
- * **Unbootstrapped** means there is no operator credential at all — no operator
- * record on the data volume *and* no `AUTH_PASSWORD_HASH` configured. Not
+ * **Unbootstrapped** means nobody has claimed this instance yet: the claim token
+ * is still on the data volume, or there is no operator credential at all. Not
  * "the secrets are missing": since #17 the three random secrets generate
  * themselves, so their absence says nothing about whether anyone has claimed
- * this instance. And not "no operator record" on its own either: an instance
- * whose operator supplied a password hash by hand is configured, whether or not
- * `operator.json` has been written yet, and gating it would lock out the manual
- * install path that is still the documented one.
+ * this instance. Not "no operator record" on its own either, in either
+ * direction — an instance whose operator supplied a password hash by hand is
+ * configured whether or not `operator.json` exists, and an instance whose wizard
+ * wrote that record in step 1 is *not* configured until the wizard finishes. See
+ * `isBootstrapped` at the foot of this file for why the token is the half of the
+ * pair that decides.
  *
  * In that state the surface is `/health` and `/setup/<token>`, `/mcp` answers
  * 503, the settings UI is not mounted, and everything else — including
@@ -175,7 +177,10 @@ export class Bootstrap {
    * A claim token found on an instance that is *already* claimed is deleted. It
    * can no longer open anything — the gate is off — but it is still a bearer
    * credential sitting in a file, and leaving it there would mean an operator who
-   * later inspects the volume cannot tell whether it is live.
+   * later inspects the volume cannot tell whether it is live. Since the state
+   * rule made a live token mean "setup is unfinished", the only instances that
+   * reach this branch are the ones that were never claimable: `OPERATOR_FILE=none`
+   * and a configured `AUTH_PASSWORD_HASH`.
    */
   static open(config: OAuthConfig, log: Logger): Bootstrap {
     const bootstrapped = isBootstrapped(config);
@@ -312,23 +317,44 @@ function defaultWrite(chunk: string): void {
 }
 
 /**
- * Is there an operator credential at all?
+ * Has this instance been claimed?
  *
- * Three ways there can be one, and any of them means this instance is configured
- * and must not be gated:
+ * Two ways it is configured without ever having been claimable, and either one
+ * means the gate must not close around it:
  *
  *  - `OPERATOR_FILE=none`, which says the credential comes from the secret and
  *    the password-change page is off. Nothing to bootstrap.
- *  - The operator record exists on the data volume — the normal case, and the
- *    one the wizard produces.
  *  - `AUTH_PASSWORD_HASH` is configured. The manual install path: the operator
  *    hashed a password by hand before the first boot, and the record will be
  *    seeded from it moments later by `OperatorRecord.open`.
+ *
+ * Otherwise the answer is the pair #18 describes — *the token file is deleted
+ * and the operator record exists* — and it is a pair on purpose. The operator
+ * record on its own is not the end of setup: **wizard step 1 writes it, with two
+ * screens still to go.** Reading the record alone would mean a container that
+ * restarted at that moment came back deciding it was claimed, 404ing every
+ * `/setup/*` path and deleting the claim token as litter — locking the operator
+ * out of steps 2 and 3 with no route back in, and breaking #18's own promise
+ * that the token survives a restart mid-wizard.
+ *
+ * So a live claim token keeps the instance unclaimed regardless of the record,
+ * and {@link Bootstrap.complete} — which refuses to delete the token before the
+ * record exists — is the single moment the two line up and the door shuts.
+ *
+ * Note what this deliberately does *not* change: an instance with neither a hash
+ * nor a record is still a first boot here, whatever else is on the data volume.
+ * That is issue #58's question and is left exactly as it was.
  */
 function isBootstrapped(config: OAuthConfig): boolean {
   if (config.operatorFile === null) return true;
   if (config.authPasswordHash !== null) return true;
-  return existsSync(config.operatorFile);
+  if (!existsSync(config.operatorFile)) return false;
+  return !claimTokenPresent(config);
+}
+
+/** A claim token on disk means setup was started and never finished. */
+function claimTokenPresent(config: OAuthConfig): boolean {
+  return config.claimTokenFile !== null && existsSync(config.claimTokenFile);
 }
 
 /**
@@ -408,61 +434,4 @@ function storedPasswordHash(path: string | null): string | undefined {
   if (typeof parsed !== "object" || parsed === null) return undefined;
   const hash = (parsed as { passwordHash?: unknown }).passwordHash;
   return typeof hash === "string" && hash !== "" ? hash : undefined;
-}
-
-/**
- * The placeholder served at `/setup/<token>` until the wizard lands.
- *
- * Issue #22 replaces this with the real three-screen flow; the gate, the token
- * lifecycle and the route table around it are what #18 delivers. It says plainly
- * what state the instance is in rather than pretending to be a wizard, because
- * an operator who reaches this page has a working claim token and needs to know
- * that the link is good and the screens are not there yet.
- */
-export function renderSetupPlaceholder(): string {
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex, nofollow">
-<title>Set up claude-mail-mcp</title>
-<style>
-:root { color-scheme: light dark; }
-body {
-  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-  margin: 0; min-height: 100vh;
-  background: Canvas; color: CanvasText;
-}
-main { width: min(40rem, calc(100vw - 3rem)); margin: 0 auto; padding: 2rem 0; }
-h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
-p.sub { margin: 0 0 1.5rem; opacity: .7; font-size: .9rem; }
-.notice {
-  padding: .6rem .7rem; margin-bottom: 1rem; border-radius: 6px; font-size: .9rem;
-  background: color-mix(in srgb, AccentColor 15%, Canvas); color: CanvasText;
-}
-a { color: LinkText; }
-</style>
-</head>
-<body>
-<main>
-<h1>Set up claude-mail-mcp</h1>
-<p class="sub">This instance has not been claimed yet.</p>
-<div class="notice">
-  Your claim token is valid — this page is the proof of it. The setup wizard
-  itself is not implemented yet, so there is nothing to fill in here for now.
-</div>
-<p>
-  Until it lands, configure the instance the documented way: supply an operator
-  password hash as <code>AUTH_PASSWORD_HASH</code> and restart. The MCP endpoint
-  stays unavailable, and the settings UI unmounted, until an operator credential
-  exists.
-</p>
-<p>
-  This link keeps working across restarts and stops working the moment setup
-  completes. Anyone who has it can claim this instance.
-</p>
-</main>
-</body>
-</html>`;
 }
