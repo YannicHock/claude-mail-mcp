@@ -245,9 +245,9 @@ npm run build       # tsc
 npm test            # alias for test:unit
 ```
 
-`npm run test:unit` runs 25 tests, offline — no network, no Docker required.
+`npm run test:unit` runs offline — no network, no Docker required.
 
-`npm run test:integration` runs 14 more: 9 exercise the IMAP/SMTP tools end-to-end against a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) container started from `docker-compose.test.yml`, 5 exercise the MCP protocol surface (auth rejection, `initialize`, `tools/list`, `/health`). The suite manages the GreenMail container itself — no manual `docker compose up` needed — and skips cleanly instead of failing when the Docker daemon isn't reachable.
+`npm run test:integration` adds the cases a mocked client cannot reach: the IMAP/SMTP tools end-to-end against a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) container started from `docker-compose.test.yml`, the connection probe against a real server, and the MCP protocol surface (auth rejection, `initialize`, `tools/list`, `/health`). The suite manages the GreenMail container itself — no manual `docker compose up` needed — and skips cleanly instead of failing when the Docker daemon isn't reachable. It binds fixed host ports, so only one checkout at a time can run it.
 
 ```bash
 npm run test:integration
