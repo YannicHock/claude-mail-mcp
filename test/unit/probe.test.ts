@@ -9,8 +9,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { probeAccount, MAX_MESSAGE_LENGTH } from "../../src/probe.js";
+import {
+  probeAccount,
+  MAX_MESSAGE_LENGTH,
+  CREDENTIAL_REJECTION_MESSAGE,
+} from "../../src/probe.js";
 import type { ImapCreds, SmtpCreds } from "../../src/accounts.js";
+import { startRejectingImapServer } from "../helpers/fake-imap.js";
 
 function creds(overrides: Partial<ImapCreds & SmtpCreds> = {}): ImapCreds & SmtpCreds {
   return {
@@ -32,6 +37,59 @@ test("a closed port fails within the per-probe timeout", async () => {
   assert.equal(report.imap.ok, false);
   assert.equal(report.smtp.ok, false);
   assert.ok(Date.now() - started < 5000);
+});
+
+test("a server that rejects LOGIN is reported as a credential rejection", async () => {
+  // The whole point of this probe is that an operator can tell "wrong
+  // password" apart from "host unreachable". A wrong password is not an
+  // imapflow AuthenticationFailure — the server answers `NO` to LOGIN and
+  // imapflow surfaces a plain Error("Command failed") carrying
+  // `authenticationFailed`/`responseStatus`/`responseText` instead. Reporting
+  // that verbatim reads like a connectivity problem, which is precisely the
+  // confusion this message exists to prevent.
+  //
+  // The Docker-backed suite asserts the same thing against a real GreenMail
+  // rejection (test/integration/probe.test.ts); this covers it offline so a
+  // regression can't wait for someone to run the integration suite.
+  const server = await startRejectingImapServer();
+  try {
+    const report = await probeAccount(
+      { imap: creds({ port: server.port }), smtp: creds({ port: 1 }) },
+      { perProbeMs: 3000, totalMs: 6000 }
+    );
+    assert.equal(report.imap.ok, false);
+    if (report.imap.ok) return;
+    assert.equal(report.imap.message, CREDENTIAL_REJECTION_MESSAGE);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a host that never answers is not reported as a credential rejection", async () => {
+  // The other direction of the case above, and the reason probeImap keys off
+  // the authentication stage rather than off "the connection failed at all":
+  // a blackholed host (192.0.2.1, RFC 5737 TEST-NET-1) and a closed port must
+  // still read as connectivity problems. Telling the operator their password
+  // was rejected by a server they never reached would be a worse bug than the
+  // one this replaced.
+  const report = await probeAccount(
+    {
+      imap: creds({ host: "192.0.2.1", port: 143 }),
+      smtp: creds({ host: "192.0.2.1", port: 25 }),
+    },
+    { perProbeMs: 1500, totalMs: 5000 }
+  );
+  assert.equal(report.imap.ok, false);
+  if (report.imap.ok) return;
+  assert.notEqual(report.imap.message, CREDENTIAL_REJECTION_MESSAGE);
+
+  const refused = await probeAccount(
+    { imap: creds({ port: 1 }), smtp: creds({ port: 1 }) },
+    { perProbeMs: 2000, totalMs: 5000 }
+  );
+  assert.equal(refused.imap.ok, false);
+  if (refused.imap.ok) return;
+  assert.notEqual(refused.imap.message, CREDENTIAL_REJECTION_MESSAGE);
 });
 
 test("failure messages are bounded and carry no password", async () => {

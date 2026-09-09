@@ -16,7 +16,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 
-import { probeAccount } from "../../src/probe.js";
+import { probeAccount, CREDENTIAL_REJECTION_MESSAGE } from "../../src/probe.js";
 import type { ImapCreds, SmtpCreds } from "../../src/accounts.js";
 import { isDockerAvailable, composeUp, composeDown, waitForGreenmailReady } from "../helpers/docker.js";
 import { ensureMailboxes } from "../helpers/imap-setup.js";
@@ -59,7 +59,7 @@ test("correct credentials against GreenMail report success", SKIP, async () => {
   assert.deepEqual(report.smtp, { ok: true });
 });
 
-test("a wrong password reports failure, not success, and the message doesn't echo it", SKIP, async () => {
+test("a wrong password is reported as a credential rejection, and the message doesn't echo it", SKIP, async () => {
   // Unlike the unit suite's "no password in the message" case (which only
   // ever reaches ECONNREFUSED against a closed port — a class of error that
   // structurally never carries credentials in imapflow, nodemailer or
@@ -72,11 +72,14 @@ test("a wrong password reports failure, not success, and the message doesn't ech
   });
   assert.equal(report.imap.ok, false);
   if (report.imap.ok) return;
-  // NOTE: this was tightened to assert the fixed "the server rejected these
-  // credentials" string (imap.ok === false alone also passes if GreenMail is
-  // simply down), but that string turns out not to be what src/probe.ts
-  // actually returns here — see the final-fix-report for why this was left
-  // as a follow-up rather than changed silently.
+  // Asserting the message, not just `ok === false`: the latter also passes
+  // when GreenMail is simply down, which is the one outcome this test exists
+  // to distinguish a rejected password from. GreenMail answers LOGIN with a
+  // bare `NO LOGIN failed. Invalid login/password for user id alice` — no
+  // RFC 5530 `[AUTHENTICATIONFAILED]` code — so this is also the case that
+  // proves probeImap() classifies on the authentication stage itself rather
+  // than on a response code not every server sends.
+  assert.equal(report.imap.message, CREDENTIAL_REJECTION_MESSAGE);
   assert.ok(
     !report.imap.message.includes(wrongPassword),
     `failure message must not echo the password, got: ${report.imap.message}`
