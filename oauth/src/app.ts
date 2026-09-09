@@ -39,7 +39,7 @@ import type { OperatorRecord } from "./operator.js";
 import { constantTimeEquals, verifyPassword } from "./passwords.js";
 import { CODE_CHALLENGE_METHOD, isValidCodeChallenge, verifyChallenge } from "./pkce.js";
 import { createProxy } from "./proxy.js";
-import { pageHeaders } from "./settings-pages.js";
+import { sendPage } from "./settings-pages.js";
 import {
   createSettingsRouter,
   requireSession,
@@ -771,32 +771,46 @@ function tokenError(
   res.status(status).json({ error, error_description: description });
 }
 
+/**
+ * The refusals on the authorization path that render a page instead of
+ * redirecting: an unknown client, a redirect URI this service will not send an
+ * error to, a form POST from somewhere else, a request token that has expired.
+ *
+ * The default CSP, deliberately — the strict one, `form-action 'self'`. The
+ * consent screen widens `form-action` because submitting it hands the browser
+ * off to the client; an error page has no form at all, so there is nothing for
+ * the wider value to permit and every reason not to grant it.
+ *
+ * This function chained `.status().type().send()` and stopped there until #80:
+ * every one of these six pages went out with no `Cache-Control`, no
+ * `X-Frame-Options`, no CSP and no `Referrer-Policy`, two lines above the
+ * function #61 had just fixed for exactly that. The headers are no longer this
+ * function's to remember.
+ */
 function respondWithErrorPage(
   res: Response,
   status: number,
   title: string,
   detail: string
 ): void {
-  res.status(status).type("html").send(renderErrorPage(title, detail));
+  sendPage(res, status, renderErrorPage(title, detail));
 }
 
+/**
+ * The consent screen, and the two re-renders of it that a failed sign-in gets.
+ *
+ * The one page in this service that passes a CSP: `form-action` has to name the
+ * redirect allowlist's origins, because submitting this form redirects to the
+ * client and Chrome enforces `form-action` against the redirect target too.
+ * Everything else is the set every other page carries, from the same function.
+ */
 function sendLoginPage(
   res: Response,
   status: number,
   options: Parameters<typeof renderLoginPage>[0],
   csp: string
 ): void {
-  res
-    .status(status)
-    .type("html")
-    // The same set the settings pages and the wizard are served with, differing
-    // only in the CSP the caller passes: the consent screen carries a request
-    // token and takes a password, must not be cached anywhere, and has no reason
-    // to be framed by anything. Written out inline here until #61 — which is how
-    // this page, the one the operator actually types a password into, ended up
-    // outside every guard covering the identical set next door.
-    .set(pageHeaders(csp))
-    .send(renderLoginPage(options));
+  sendPage(res, status, renderLoginPage(options), csp);
 }
 
 function redirectWithError(

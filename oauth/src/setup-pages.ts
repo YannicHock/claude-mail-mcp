@@ -10,8 +10,10 @@
  * light or dark preference with no theme switch, the same `min(40rem, …)`
  * column, the same `.error` and `.notice` boxes. The stylesheet below is a
  * trimmed copy rather than an import because settings-pages.ts keeps its shell
- * private; the response headers, which are the part that must not drift, *are*
- * imported from it.
+ * private. The response headers, which are the part that must not drift, are
+ * not this module's business at all: setup-routes.ts sends every wizard page
+ * through `sendPage()` in settings-pages.ts, the same function the settings
+ * routes and the /authorize pages go through.
  *
  * `Step N of 3` is plain text on purpose. The existing pages have no stepper
  * component and do not need one for three screens.
@@ -20,19 +22,7 @@
 import { escapeHtml } from "./login.js";
 import type { CredentialField, CredentialProblem } from "./operator.js";
 import { MIN_PASSWORD_LENGTH } from "./operator.js";
-import { SETTINGS_HEADERS } from "./settings-pages.js";
 import { stepNumber, SETUP_STEPS, type SetupStep } from "./setup-state.js";
-
-/**
- * The headers every wizard page is served with — the settings pages' set,
- * imported rather than repeated.
- *
- * `Referrer-Policy: same-origin` is load-bearing here and not a copied habit.
- * Chrome sends no `Origin` header on a same-origin form POST, so `Referer` is
- * the only thing the origin check has left to read; `no-referrer` would refuse
- * every submission in this wizard, which is the failure 0.6.0 shipped.
- */
-export const SETUP_HEADERS: Record<string, string> = SETTINGS_HEADERS;
 
 /** The title of each screen, used in the header line and the document title. */
 const STEP_TITLES: Record<SetupStep, string> = {

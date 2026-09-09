@@ -95,12 +95,12 @@ import {
   renderCredentialsStep,
   renderMailboxStep,
   renderSetupComplete,
-  SETUP_HEADERS,
   type ConfiguredMailbox,
   type ConnectPageData,
   type MailboxPageData,
   type MailboxProbeView,
 } from "./setup-pages.js";
+import { sendPage as sendHtmlPage, sendRedirect } from "./settings-pages.js";
 import { isSetupStep, SetupState, type SetupStep } from "./setup-state.js";
 
 export interface SetupWizardDeps {
@@ -713,12 +713,18 @@ function stringField(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+// The wizard's three send sites, each one line of delegation to the shared
+// helpers in settings-pages.ts. The argument orders below are the ones this
+// file's call sites already use; the header set is no longer named here, and
+// `SETUP_HEADERS` — a bare alias of `SETTINGS_HEADERS`, two names for one
+// object in one package — is gone with it (#80).
+
 function redirect(res: Response, location: string, status = 302): void {
-  res.status(status).set(SETUP_HEADERS).set("Location", location).end();
+  sendRedirect(res, status, location);
 }
 
 function sendPage(res: Response, status: number, html: string): void {
-  res.status(status).type("html").set(SETUP_HEADERS).send(html);
+  sendHtmlPage(res, status, html);
 }
 
 function sendForbidden(res: Response): void {
@@ -731,7 +737,7 @@ function sendForbidden(res: Response): void {
 }
 
 function sendErrorPage(res: Response, title: string, message: string, status = 500): void {
-  res.status(status).type("html").set(SETUP_HEADERS).send(renderErrorPage(title, message));
+  sendHtmlPage(res, status, renderErrorPage(title, message));
 }
 
 // ---- The connector's mailbox routes, as step 2 uses them -------------------
