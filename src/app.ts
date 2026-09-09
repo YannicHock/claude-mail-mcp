@@ -28,7 +28,7 @@ import express, { NextFunction, Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-import { AccountsStore } from "./accounts.js";
+import { AccountsStore, reservedIdAccounts, reservedIdNotice } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
 import { registerMailTools } from "./tools-mail.js";
 import { registerCalendarTools } from "./tools-calendar.js";
@@ -85,6 +85,22 @@ export interface CreateAppOptions {
 export function createApp(opts: CreateAppOptions): express.Express {
   const { store, pool, authToken, accountsFile } = opts;
   const log: Logger = opts.log ?? (() => {});
+
+  // A mailbox already configured under a reserved id ("new", "test") loads
+  // fine — refusing the file would take every other mailbox down with it, see
+  // RESERVED_IDS in accounts.ts — but it cannot be edited in place, and the
+  // only sign of that used to be a Save button that silently did nothing. Warn
+  // once, here rather than in index.ts, because createApp() is the single
+  // factory the process entry point and every test harness both go through,
+  // and the store has already loaded by the time it is called. Operators who
+  // never read logs get the same message on the mailbox list page, per row.
+  for (const account of reservedIdAccounts(store.list())) {
+    log("warn", "mailbox uses a reserved id and cannot be edited in place", {
+      account: account.id,
+      label: account.label,
+      notice: reservedIdNotice(account.id),
+    });
+  }
 
   const mcp = new McpServer({
     name: SERVER_NAME,
