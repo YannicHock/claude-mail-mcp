@@ -417,3 +417,165 @@ export function parseMailboxDraft(value: unknown): MailboxDraft | null {
     caldav,
   };
 }
+
+// ---- The autoconfig lookup -------------------------------------------------
+//
+// Tier 1 of the wizard's step 2. The lookup itself lives in the connector
+// (`src/autoconfig.ts`): it fetches URLs derived from what the operator typed,
+// and the resolve-then-refuse rules that make that safe are the connector's to
+// keep. The wizard has no business owning a second copy of them, and cannot
+// import the first, so it asks over this hop the way it asks for a probe.
+//
+// Everything below is the *shape of the answer*, not the lookup. The connector's
+// own `MailboxSuggestion` is structurally identical to the one declared here,
+// which is deliberate: `settings-routes.ts` hands one straight over as the
+// other, so a field that changes there stops compiling rather than going
+// quietly missing on the way across.
+
+/** An implicit-TLS socket, or a plaintext one upgraded with STARTTLS. */
+export type SuggestedSocketType = "SSL" | "STARTTLS";
+
+/**
+ * One suggested server: the connectable half of a {@link MailboxServerDraft},
+ * and — like {@link MailboxSuggestion} — with no password field anywhere in it.
+ *
+ * `port` is a number here, unlike a draft's. This is not something an operator
+ * typed: it came out of a provider's own configuration document, where it was
+ * already a port or was not read at all.
+ */
+export interface SuggestedServer {
+  host: string;
+  port: number;
+  /** Implicit TLS from the first byte. STARTTLS is `false`, as `imap.tls` means. */
+  tls: boolean;
+  socketType: SuggestedSocketType;
+  user: string;
+}
+
+export interface SuggestedCalDav {
+  url: string;
+  user: string;
+  source: "well-known" | "dns-srv";
+}
+
+/** Which probe in the cascade produced the answer. */
+export type SuggestionSource =
+  | "autoconfig-subdomain"
+  | "autoconfig-well-known"
+  | "ispdb"
+  | "dns-srv";
+
+/**
+ * What was found for a domain — shown to the operator for confirmation, never
+ * applied on its own.
+ *
+ * There is no password field at any depth, on purpose: a suggestion cannot be
+ * turned into a {@link MailboxDraft} without going back through a form the
+ * operator has read, because the one thing a draft needs is the one thing this
+ * does not carry. A wrong autoconfig answer that fails at connect time is far
+ * harder to diagnose than one the operator saw first, and the shape of the type
+ * is what enforces that rather than a comment asking callers to behave.
+ *
+ * `caldav: null` is the ordinary case, not a failure. CalDAV is optional in the
+ * account model and most mail providers publish nothing for it.
+ */
+export interface MailboxSuggestion {
+  email: string;
+  domain: string;
+  source: SuggestionSource;
+  imap: SuggestedServer;
+  smtp: SuggestedServer;
+  caldav: SuggestedCalDav | null;
+}
+
+/** What the wizard posts to `/settings/autoconfig`. */
+export interface AutoconfigRequestBody {
+  _csrf: string;
+  /** The address to look the domain up from. Nothing else is sent — no password. */
+  email: string;
+}
+
+/**
+ * 200 from `POST /settings/autoconfig`.
+ *
+ * `suggestion: null` is the only failure this route has. Every rejection inside
+ * the cascade — a refused address, a redirect to plain HTTP, a timeout, a
+ * document that would not parse — arrives here as the same empty answer a domain
+ * with no autoconfig at all produces, because §7 of the wizard design says no
+ * autoconfig failure is ever shown to the operator as an error, and an operator
+ * cannot act on "the ISPDB returned 502" anyway.
+ */
+export interface AutoconfigAnswer {
+  suggestion: MailboxSuggestion | null;
+}
+
+function parseSuggestedServer(value: unknown): SuggestedServer | null {
+  const obj = asObject(value);
+  if (obj === null || typeof obj.tls !== "boolean") return null;
+  const host = asString(obj.host);
+  const user = asString(obj.user);
+  const socketType = asString(obj.socketType);
+  if (host === null || user === null) return null;
+  if (socketType !== "SSL" && socketType !== "STARTTLS") return null;
+  const port = obj.port;
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host, port, tls: obj.tls, socketType, user };
+}
+
+function parseSuggestedCalDav(value: unknown): SuggestedCalDav | null {
+  const obj = asObject(value);
+  if (obj === null) return null;
+  const url = asString(obj.url);
+  const user = asString(obj.user);
+  const source = asString(obj.source);
+  if (url === null || user === null) return null;
+  if (source !== "well-known" && source !== "dns-srv") return null;
+  return { url, user, source };
+}
+
+const SUGGESTION_SOURCES: readonly string[] = [
+  "autoconfig-subdomain",
+  "autoconfig-well-known",
+  "ispdb",
+  "dns-srv",
+];
+
+/**
+ * The lookup answer, read fail-closed like every other reader here — and then
+ * some, because this one's failure mode is benign.
+ *
+ * `null` means "this build could not read that", and the caller does with it
+ * exactly what it does with `{ suggestion: null }`: shows the provider list. So
+ * an answer from a connector on a different release degrades into the tier below
+ * rather than into a screen full of half-read hosts, and a suggestion whose SMTP
+ * server is unreadable is never shown with only its IMAP half filled in.
+ */
+export function parseAutoconfigAnswer(value: unknown): AutoconfigAnswer | null {
+  const body = asObject(value);
+  if (body === null) return null;
+  if (body.suggestion === null || body.suggestion === undefined) return { suggestion: null };
+
+  const raw = asObject(body.suggestion);
+  if (raw === null) return null;
+  const email = asString(raw.email);
+  const domain = asString(raw.domain);
+  const source = asString(raw.source);
+  if (email === null || domain === null || source === null) return null;
+  if (!SUGGESTION_SOURCES.includes(source)) return null;
+
+  const imap = parseSuggestedServer(raw.imap);
+  const smtp = parseSuggestedServer(raw.smtp);
+  if (imap === null || smtp === null) return null;
+
+  // Absent and null are both "no CalDAV was found", which is the ordinary
+  // answer. Present but unreadable is neither, and is not guessed at.
+  let caldav: SuggestedCalDav | null = null;
+  if (raw.caldav !== null && raw.caldav !== undefined) {
+    caldav = parseSuggestedCalDav(raw.caldav);
+    if (caldav === null) return null;
+  }
+
+  return {
+    suggestion: { email, domain, source: source as SuggestionSource, imap, smtp, caldav },
+  };
+}

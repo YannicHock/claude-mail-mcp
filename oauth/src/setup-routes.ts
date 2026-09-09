@@ -105,28 +105,47 @@ import type { OAuthConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { isSameOrigin, renderErrorPage } from "./login.js";
 import { OperatorRecord, validateNewCredentials } from "./operator.js";
+import { domainOf, findProvider, MAIL_PROVIDERS, prefillFor } from "./providers.js";
 import {
+  CHECKBOX_ON,
   draftFromFields,
   flattenDraft,
+  MAILBOX_FIELDS,
   MAILBOX_SECRET_FIELDS,
+  parseAutoconfigAnswer,
   parseErrorAnswer,
   parseProbeAnswer,
   parseStampAnswer,
+  type AutoconfigRequestBody,
   type MailboxDraft,
   type MailboxProbeOutcome,
   type MailboxProbeReport,
   type MailboxRequestBody,
+  type MailboxSuggestion,
 } from "./settings-api.js";
 import {
+  ADDRESS_FIELD,
+  MAILBOX_DEFAULTS,
+  PROVIDER_FIELD,
+  PROVIDER_OTHER,
   renderConnectStep,
   renderCredentialsStep,
+  renderMailboxAddressStep,
+  renderMailboxProviderStep,
   renderMailboxStep,
+  renderMailboxSuggestionStep,
   renderSetupComplete,
+  SHARED_PASSWORD_FIELD,
   type ConfiguredMailbox,
   type ConnectPageData,
+  type MailboxAddressPageData,
   type MailboxPageData,
   type MailboxProbeLine,
   type MailboxProbeView,
+  type MailboxProviderPageData,
+  type MailboxSuggestionPageData,
+  type MailboxView,
+  type StepTwoLinks,
 } from "./setup-pages.js";
 import { sendPage as sendHtmlPage, sendRedirect } from "./settings-pages.js";
 import { isSetupStep, SetupState, type SetupStep } from "./setup-state.js";
@@ -190,7 +209,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       }
 
       if (req.method === "GET" || req.method === "HEAD") {
-        sendPage(res, 200, await renderStep(step, base));
+        sendPage(res, 200, await renderStep(step, base, viewOf(req)));
         return;
       }
 
@@ -284,12 +303,24 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
   }
 
   /**
-   * Step 2 — the first mailbox.
+   * Step 2 — the first mailbox, over three screens and one form action each.
    *
-   * Three submissions arrive here, told apart by `_action`: `skip`, which
-   * configures nothing and moves on; `test`, which reports the three services
-   * and stores nothing; and `save`, which does both, in that order, and only
-   * writes when IMAP and SMTP have each answered.
+   * `_action` tells them apart, and the first four are the cascade:
+   *
+   *   `lookup`    tier 1 — ask the connector what the address's domain says,
+   *               and show it for confirmation, or fall through to tier 2
+   *   `provider`  tier 2 — a chosen preset, filled into the full form
+   *   `edit`      the confirmation screen's `Edit these`, likewise
+   *   `skip`      configure nothing and go to step 3
+   *
+   * and the last two are the screen this step used to be, unchanged: `test`,
+   * which reports the three services and stores nothing, and `save`, which does
+   * both, in that order, and only writes when IMAP and SMTP have each answered.
+   *
+   * Nothing a tier produces is stored on its own. Every path that ends in an
+   * account ends in `save`, which is the one place that probes and the one place
+   * that writes — the tiers change how many boxes the operator fills in and
+   * nothing whatever about what happens to what is in them.
    *
    * The order is the whole point of the screen. A probe that ran after the write
    * would leave an operator finishing setup over credentials that were already
@@ -307,19 +338,29 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
+    const links = stepTwoLinks(base);
+
     const page = (status: number, data: Partial<MailboxPageData>): void => {
       sendPage(
         res,
         status,
         renderMailboxStep({
-          action: `${base}/mailbox`,
-          backHref: `${base}/credentials`,
+          action: links.action,
+          backHref: links.backHref,
+          addressHref: links.addressHref,
+          providersHref: links.providersHref,
           values: {},
           errors: {},
           ...(mailboxes === null ? { unavailable: true } : {}),
           ...data,
         })
       );
+    };
+    const addressPage = (status: number, data: Partial<MailboxAddressPageData>): void => {
+      sendPage(res, status, renderMailboxAddressStep({ ...links, email: "", errors: {}, ...data }));
+    };
+    const providerPage = (status: number, data: Partial<MailboxProviderPageData>): void => {
+      sendPage(res, status, renderMailboxProviderStep(providerPageData(links, data)));
     };
 
     try {
@@ -333,12 +374,115 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     const action = stringField(body._action);
 
     if (action === "skip") {
-      // Someone evaluating the thing should not need mail credentials to hand.
-      // Nothing is written, nothing is contacted, and step 3 says plainly that
-      // no mailbox is configured.
+      // Someone evaluating the thing should not need mail credentials to hand,
+      // whichever of the three screens they are looking at when they decide
+      // that. Nothing is written, nothing is contacted, and step 3 says plainly
+      // that no mailbox is configured.
       log("info", "setup step 2 skipped: no mailbox was configured", {});
       await state.advanceTo("connect");
       redirect(res, `${base}/connect`, 303);
+      return;
+    }
+
+    if (mailboxes === null) {
+      // No settings signing key: the connector would refuse every request this
+      // step makes — the lookup included — so it makes none and says so instead
+      // of failing obscurely on whichever tier the operator happened to be on.
+      page(200, {});
+      return;
+    }
+
+    if (action === "lookup") {
+      const email = stringField(body[ADDRESS_FIELD]).trim();
+      if (domainOf(email) === "") {
+        // This one *is* shown as an error, and it is not an autoconfig failure:
+        // it is about what the operator typed, which they can see and fix. The
+        // rule §7 states is that no failure of the lookup is surfaced — and
+        // this is a submission that never became one.
+        addressPage(400, {
+          email,
+          errors: { [ADDRESS_FIELD]: "Enter a full email address, like anna@example.com." },
+        });
+        return;
+      }
+
+      const found = await mailboxes.lookup(email);
+      // A boolean and nothing else. Not the address, and not the hosts.
+      log("info", "setup step 2 looked up an address", { found: found !== null });
+
+      if (found === null) {
+        // Not an error, and not reported as one. The domain published nothing
+        // this build could use, and the answer to that is the next tier.
+        providerPage(200, { email, domain: domainOf(email) });
+        return;
+      }
+
+      sendPage(
+        res,
+        200,
+        renderMailboxSuggestionStep({
+          ...links,
+          domain: found.domain,
+          sourceLabel: sourceLabel(found),
+          values: suggestedValues(found),
+          errors: {},
+        })
+      );
+      return;
+    }
+
+    if (action === "provider") {
+      const email = stringField(body[ADDRESS_FIELD]).trim();
+      const chosen = stringField(body[PROVIDER_FIELD]);
+
+      if (domainOf(email) === "") {
+        providerPage(400, {
+          email,
+          selected: chosen,
+          errors: { [ADDRESS_FIELD]: "Enter a full email address, like anna@example.com." },
+        });
+        return;
+      }
+
+      if (chosen === PROVIDER_OTHER) {
+        page(200, { values: emptyMailboxValues(email) });
+        return;
+      }
+
+      const provider = findProvider(chosen);
+      if (provider === null) {
+        providerPage(400, {
+          email,
+          selected: "",
+          errors: { [PROVIDER_FIELD]: "Choose a provider, or pick Other." },
+        });
+        return;
+      }
+
+      log("info", "setup step 2: a provider preset was chosen", { provider: provider.id });
+      page(200, {
+        values: prefillFor(provider, email),
+        notice: {
+          kind: "info",
+          message:
+            `${provider.label} settings have been filled in. Check them, add the ` +
+            "passwords, and test the connection before saving.",
+        },
+      });
+      return;
+    }
+
+    if (action === "edit") {
+      // `Edit these` on the confirmation screen: the same values, in the form
+      // that can change them. `formValues` is what strips the passwords, which
+      // is why this goes through a draft rather than echoing the body back.
+      page(200, {
+        values: formValues(draftFromFields(body)),
+        notice: {
+          kind: "info",
+          message: "Nothing has been saved. Change whatever is wrong and test the connection.",
+        },
+      });
       return;
     }
 
@@ -349,14 +493,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    if (mailboxes === null) {
-      // No settings signing key: the connector would refuse every request this
-      // step makes, so it makes none and says so instead of failing obscurely.
-      page(200, {});
-      return;
-    }
-
-    const draft = draftFromFields(body);
+    const draft = draftFromFields(withSharedPassword(body));
     const values = formValues(draft);
 
     const tested = await mailboxes.test(draft);
@@ -675,7 +812,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     );
   }
 
-  async function renderStep(step: SetupStep, base: string): Promise<string> {
+  async function renderStep(step: SetupStep, base: string, view: MailboxView): Promise<string> {
     if (step === "credentials") {
       return renderCredentialsStep({
         action: `${base}/credentials`,
@@ -684,13 +821,22 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       });
     }
     if (step === "mailbox") {
-      return renderMailboxStep({
-        action: `${base}/mailbox`,
-        backHref: `${base}/credentials`,
-        values: {},
-        errors: {},
-        ...(mailboxes === null ? { unavailable: true } : {}),
-      });
+      const links = stepTwoLinks(base);
+      // The three tiers on GET, chosen by `?view=`. A bare URL is tier 1 — the
+      // address screen — which is what makes it the default the operator meets
+      // and the full form the fallback rather than the front door. `?view=` is
+      // how the `Choose provider manually` link and its sibling reach the other
+      // two at any time, including after a Back from step 3.
+      if (mailboxes === null) {
+        return renderMailboxStep({ ...links, values: {}, errors: {}, unavailable: true });
+      }
+      if (view === "manual") {
+        return renderMailboxStep({ ...links, values: {}, errors: {} });
+      }
+      if (view === "providers") {
+        return renderMailboxProviderStep(providerPageData(links, {}));
+      }
+      return renderMailboxAddressStep({ ...links, email: "", errors: {} });
     }
     return renderConnectStep(await connectPageData(base));
   }
@@ -804,6 +950,142 @@ function stringField(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+// ---- Step 2's three screens ------------------------------------------------
+
+/** Every URL step 2's screens link to, built once from the token'd base. */
+function stepTwoLinks(base: string): StepTwoLinks {
+  return {
+    action: `${base}/mailbox`,
+    backHref: `${base}/credentials`,
+    addressHref: `${base}/mailbox`,
+    providersHref: `${base}/mailbox?view=providers`,
+    manualHref: `${base}/mailbox?view=manual`,
+  };
+}
+
+/**
+ * Which tier a GET is asking for. Anything unrecognised is tier 1, because a
+ * mistyped query is not a reason to show someone eighteen boxes.
+ */
+function viewOf(req: Request): MailboxView {
+  const view = req.query?.view;
+  if (view === "providers" || view === "manual") return view;
+  return "address";
+}
+
+/** The provider screen's data, with the table and the defaults filled in. */
+function providerPageData(
+  links: StepTwoLinks,
+  data: Partial<MailboxProviderPageData>
+): MailboxProviderPageData {
+  return {
+    ...links,
+    providers: MAIL_PROVIDERS.map((provider) => ({
+      id: provider.id,
+      label: provider.label,
+      note: provider.note,
+    })),
+    domain: "",
+    email: "",
+    selected: "",
+    errors: {},
+    ...data,
+  };
+}
+
+/** Where a suggestion came from, said so an operator could go and check it. */
+function sourceLabel(suggestion: MailboxSuggestion): string {
+  switch (suggestion.source) {
+    case "autoconfig-subdomain":
+      return `Published by autoconfig.${suggestion.domain}.`;
+    case "autoconfig-well-known":
+      return `Published by ${suggestion.domain} itself.`;
+    case "ispdb":
+      return "From the Mozilla ISP database, not from the provider directly.";
+    case "dns-srv":
+      return `From ${suggestion.domain}'s DNS service records.`;
+  }
+}
+
+/**
+ * A suggestion, as the values the confirmation screen shows and submits.
+ *
+ * Under `MAILBOX_FIELDS` names because that is the only vocabulary that reaches
+ * the connector, and with the same `id` and label the full form would have
+ * defaulted to — this screen renders explicit hidden inputs rather than relying
+ * on the form's own defaults, so it has to state them.
+ *
+ * There is no password in it, and there is nowhere for one to come from: a
+ * {@link MailboxSuggestion} has no password field at any depth.
+ */
+function suggestedValues(suggestion: MailboxSuggestion): Record<string, string> {
+  const values: Record<string, string> = {
+    ...MAILBOX_DEFAULTS,
+    [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON,
+    [MAILBOX_FIELDS.mailDefaultFrom]: suggestion.email,
+    [MAILBOX_FIELDS.imapHost]: suggestion.imap.host,
+    [MAILBOX_FIELDS.imapPort]: String(suggestion.imap.port),
+    [MAILBOX_FIELDS.imapUser]: suggestion.imap.user,
+    [MAILBOX_FIELDS.imapTls]: suggestion.imap.tls ? CHECKBOX_ON : "",
+    [MAILBOX_FIELDS.smtpHost]: suggestion.smtp.host,
+    [MAILBOX_FIELDS.smtpPort]: String(suggestion.smtp.port),
+    [MAILBOX_FIELDS.smtpUser]: suggestion.smtp.user,
+    [MAILBOX_FIELDS.smtpTls]: suggestion.smtp.tls ? CHECKBOX_ON : "",
+  };
+  if (suggestion.caldav !== null) {
+    values[MAILBOX_FIELDS.caldavUrl] = suggestion.caldav.url;
+    values[MAILBOX_FIELDS.caldavUser] = suggestion.caldav.user;
+  }
+  return values;
+}
+
+/**
+ * The full form with only the address in it, for `Other (enter manually)`.
+ *
+ * The two TLS boxes are stated rather than left out. An absent checkbox is how a
+ * browser submits an unticked one, so the form reads any non-empty `values` as a
+ * previous submission and renders TLS off — which is the wrong default and, on
+ * this path, one nobody chose.
+ */
+function emptyMailboxValues(email: string): Record<string, string> {
+  return {
+    [MAILBOX_FIELDS.mailDefaultFrom]: email,
+    [MAILBOX_FIELDS.imapTls]: CHECKBOX_ON,
+    [MAILBOX_FIELDS.smtpTls]: CHECKBOX_ON,
+  };
+}
+
+/**
+ * Tiers 1 and 2 ask for one password; the connector's draft has three.
+ *
+ * A screen with two boxes cannot express a mailbox whose IMAP and SMTP logins
+ * take different passwords, and does not try to: it collects the one password
+ * an ordinary mailbox has and this spreads it across the services the draft
+ * names. The full form is where the other case is expressed, and it sends no
+ * `password` field at all, so this is inert there.
+ *
+ * A per-service password already in the body wins, and CalDAV is only filled in
+ * when there is a CalDAV URL to go with it — `draftFromFields` builds a CalDAV
+ * block as soon as any one of its three fields is non-empty, and a block that
+ * is nothing but a password is a probe against a server that was never named.
+ */
+function withSharedPassword(body: Record<string, unknown>): Record<string, unknown> {
+  const shared = stringField(body[SHARED_PASSWORD_FIELD]);
+  if (shared === "") return body;
+
+  const filled = { ...body };
+  for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
+    if (stringField(filled[name]) === "") filled[name] = shared;
+  }
+  if (
+    stringField(filled[MAILBOX_FIELDS.caldavUrl]) !== "" &&
+    stringField(filled[MAILBOX_FIELDS.caldavPass]) === ""
+  ) {
+    filled[MAILBOX_FIELDS.caldavPass] = shared;
+  }
+  return filled;
+}
+
 // The wizard's three send sites, each one line of delegation to the shared
 // helpers in settings-pages.ts. The argument orders below are the ones this
 // file's call sites already use; the header set is no longer named here, and
@@ -837,6 +1119,7 @@ function sendErrorPage(res: Response, title: string, message: string, status = 5
 const UPSTREAM_NEW = "/settings/mailboxes/new";
 const UPSTREAM_TEST = "/settings/mailboxes/test";
 const UPSTREAM_CREATE = "/settings/mailboxes";
+const UPSTREAM_AUTOCONFIG = "/settings/autoconfig";
 
 /**
  * Who the assertion says is asking.
@@ -865,6 +1148,16 @@ const PROBE_TIMEOUT_MS = 30_000;
  * screen claimed at the end of it.
  */
 const QUICK_TIMEOUT_MS = 5_000;
+/**
+ * The autoconfig cascade's own budget plus the slack to hear about it.
+ *
+ * `AUTOCONFIG_TOTAL_TIMEOUT_MS` in the connector is 10 seconds and is the
+ * deadline for the whole cascade, so a lookup that runs to the end of it still
+ * has an answer to send — `null`. Aborting at 10 here would turn that answer
+ * into no answer, which is the same screen for the operator but a warning in the
+ * log about a connector that did exactly what it promised.
+ */
+const LOOKUP_TIMEOUT_MS = 13_000;
 
 /**
  * What one call to the connector came back as.
@@ -893,6 +1186,11 @@ interface MailboxClient {
   /** Probe without saving: the connector's own "Test connection" action. */
   test(draft: MailboxDraft): Promise<ConnectorAnswer<MailboxProbeReport>>;
   /**
+   * What the address's domain says its own settings are, or null — which covers
+   * "nothing published" and every failure alike, by design. Never throws.
+   */
+  lookup(email: string): Promise<MailboxSuggestion | null>;
+  /**
    * The current `accounts.json` stamp, as the connector states it. Also what an
    * unanswered {@link MailboxClient.create} is settled by: asked a second time,
    * a stamp that has moved is the write, landed.
@@ -918,10 +1216,12 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
   async function call<T>(opts: {
     method: "GET" | "POST";
     path: string;
-    /** The mailbox to send, or null for the read-only call. */
-    draft: MailboxDraft | null;
-    /** The stamp the write must still be against. Ignored without a draft. */
-    stamp: string;
+    /**
+     * The request document, built around the CSRF value minted for this call —
+     * or null for the read-only one, which sends no body at all. A function
+     * rather than a value because `_csrf` does not exist until we are inside.
+     */
+    payload: ((csrf: string) => MailboxRequestBody | AutoconfigRequestBody) | null;
     timeoutMs: number;
     /** The status that means the operation happened. */
     okStatus: number;
@@ -938,8 +1238,7 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
       key,
       config.issuer
     );
-    const body: MailboxRequestBody | null =
-      opts.draft === null ? null : { _csrf: csrf, _stamp: opts.stamp, mailbox: opts.draft };
+    const body = opts.payload === null ? null : opts.payload(csrf);
 
     try {
       const res = await fetch(`${config.upstreamMcpUrl}${opts.path}`, {
@@ -982,8 +1281,7 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
       call({
         method: "POST",
         path: UPSTREAM_TEST,
-        draft,
-        stamp: "",
+        payload: (csrf) => ({ _csrf: csrf, _stamp: "", mailbox: draft }),
         timeoutMs: PROBE_TIMEOUT_MS,
         okStatus: 200,
         read: parseProbeAnswer,
@@ -992,14 +1290,46 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
       call({
         method: "POST",
         path: UPSTREAM_CREATE,
-        draft,
-        stamp,
+        payload: (csrf) => ({ _csrf: csrf, _stamp: stamp, mailbox: draft }),
         timeoutMs: QUICK_TIMEOUT_MS,
         okStatus: 201,
         // Not `parseCreatedAnswer`. The 201 is what says the account is there,
         // and nothing on this screen depends on the id or the stamp it echoes.
         read: () => STORED,
       }),
+
+    /**
+     * Tier 1, and the one call here whose failures all collapse into one shape.
+     *
+     * Every outcome that is not a readable suggestion returns `null`, because
+     * §7 of the design says no autoconfig failure is ever shown to the operator
+     * as an error and the screen's answer to all of them is the same: the
+     * provider list. A connector that is down, one on a release whose answer
+     * this build cannot read, and a domain that simply publishes nothing are
+     * indistinguishable here on purpose.
+     *
+     * They are distinguishable in the log, though, which is where an operator
+     * looking for why their domain was not detected can actually act on the
+     * difference. The address is not logged: it is the one field in this wizard
+     * that identifies a person.
+     */
+    async lookup(email) {
+      const answer = await call({
+        method: "POST",
+        path: UPSTREAM_AUTOCONFIG,
+        payload: (csrf) => ({ _csrf: csrf, email }),
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+        okStatus: 200,
+        read: parseAutoconfigAnswer,
+      });
+      if (answer.kind === "ok") return answer.value.suggestion;
+      log("warn", "setup step 2: the autoconfig lookup did not answer usefully", {
+        kind: answer.kind,
+        status: answer.kind === "rejected" || answer.kind === "refused" ? answer.status : 0,
+      });
+      return null;
+    },
+
     async stamp() {
       // Read immediately before the write rather than embedded in the wizard's
       // own form, so the connector's optimistic-concurrency check cannot fail
@@ -1007,8 +1337,7 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
       const answer = await call({
         method: "GET",
         path: UPSTREAM_NEW,
-        draft: null,
-        stamp: "",
+        payload: null,
         timeoutMs: QUICK_TIMEOUT_MS,
         okStatus: 200,
         read: parseStampAnswer,

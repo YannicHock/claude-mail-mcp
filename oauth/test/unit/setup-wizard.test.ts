@@ -23,23 +23,37 @@ import {
   validateNewCredentials,
 } from "../../src/operator.js";
 import { verifyPassword } from "../../src/passwords.js";
+import { escapeHtml } from "../../src/login.js";
+import { MAIL_PROVIDERS } from "../../src/providers.js";
 import {
+  CHECKBOX_ON,
   draftFromFields,
   flattenDraft,
+  MAILBOX_FIELDS,
   MAILBOX_FIELD_NAMES,
   parseErrorAnswer,
   parseProbeAnswer,
   parseStampAnswer,
 } from "../../src/settings-api.js";
 import {
+  ADDRESS_FIELD,
+  PROVIDER_FIELD,
+  PROVIDER_OTHER,
   renderConnectStep,
   renderCredentialsStep,
+  renderMailboxAddressStep,
+  renderMailboxProviderStep,
   renderMailboxStep,
+  renderMailboxSuggestionStep,
   renderSetupComplete,
+  SHARED_PASSWORD_FIELD,
   type CompletePageData,
   type ConnectPageData,
+  type MailboxAddressPageData,
   type MailboxPageData,
   type MailboxProbeView,
+  type MailboxProviderPageData,
+  type MailboxSuggestionPageData,
 } from "../../src/setup-pages.js";
 import { SetupState } from "../../src/setup-state.js";
 
@@ -653,5 +667,247 @@ describe("reading the connector's answers", () => {
     assert.equal(parseStampAnswer({ stamp: "412-1757000000000" }), "412-1757000000000");
     assert.equal(parseStampAnswer({}), null);
     assert.equal(parseStampAnswer("<html><body>Unauthorized</body></html>"), null);
+  });
+});
+
+// ---- Step 2's first two tiers ---------------------------------------------
+
+const STEP_TWO_LINKS = {
+  action: "/setup/tok/mailbox",
+  backHref: "/setup/tok/credentials",
+  addressHref: "/setup/tok/mailbox",
+  providersHref: "/setup/tok/mailbox?view=providers",
+  manualHref: "/setup/tok/mailbox?view=manual",
+};
+
+describe("tier 1 — the address screen", () => {
+  const render = (data: Partial<MailboxAddressPageData> = {}): string =>
+    renderMailboxAddressStep({ ...STEP_TWO_LINKS, email: "", errors: {}, ...data });
+
+  it("asks for two things, not eighteen", () => {
+    // The whole reason this screen exists ahead of the full form. If it ever
+    // grows a host box, the cascade has collapsed back into the thing this
+    // milestone was written to remove.
+    const html = render();
+    assert.match(html, /Step 2 of 3 · Add your first mailbox/);
+    assert.match(html, new RegExp(`name="${ADDRESS_FIELD}"`));
+    assert.match(html, new RegExp(`name="${SHARED_PASSWORD_FIELD}"`));
+
+    for (const name of [
+      MAILBOX_FIELDS.imapHost,
+      MAILBOX_FIELDS.imapPort,
+      MAILBOX_FIELDS.smtpHost,
+      MAILBOX_FIELDS.caldavUrl,
+      MAILBOX_FIELDS.mailDraftsFolder,
+    ]) {
+      assert.equal(html.includes(`name="${name}"`), false, `tier 1 renders a box for ${name}`);
+    }
+  });
+
+  it("offers the two tiers below it, so the lookup is never the only way", () => {
+    const html = render();
+    assert.match(html, /Choose provider manually/);
+    assert.match(html, /Enter all the settings myself/);
+    assert.match(html, /view=providers/);
+    assert.match(html, /view=manual/);
+  });
+
+  it("can be skipped without mail credentials to hand", () => {
+    // `formnovalidate`, because both boxes are `required` and a browser will
+    // not submit an empty form at all — which would make Skip unpressable.
+    assert.match(render(), /name="_action" value="skip"[^>]*formnovalidate|formnovalidate[^>]*/);
+    assert.match(render(), /value="skip"/);
+  });
+
+  it("puts a rejected address back in the box, escaped", () => {
+    const html = render({
+      email: '"><script>alert(1)</script>',
+      errors: { [ADDRESS_FIELD]: "Enter a full email address, like anna@example.com." },
+    });
+    assert.equal(html.includes("<script>"), false);
+    assert.match(html, /Enter a full email address/);
+    assert.match(html, /aria-invalid="true"/);
+  });
+
+  it("never writes a password back into the page", () => {
+    assert.match(
+      render(),
+      new RegExp(`name="${SHARED_PASSWORD_FIELD}"[^>]*value=""`),
+      "the password box has something in it"
+    );
+  });
+});
+
+/**
+ * The rendered body, without the inline stylesheet.
+ *
+ * Every wizard page carries the same `<style>` block, and it defines `.error`
+ * and `.field-error` — so a test asking "does this screen report an error"
+ * against the whole document always says yes, and would say yes for a screen
+ * that reported nothing at all. §7's promise is about what the operator reads.
+ */
+function visibleBody(html: string): string {
+  const end = html.indexOf("</style>");
+  return end === -1 ? html : html.slice(end);
+}
+
+describe("the confirmation screen", () => {
+  const values = (extra: Record<string, string> = {}): Record<string, string> => ({
+    [MAILBOX_FIELDS.id]: "main",
+    [MAILBOX_FIELDS.label]: "Main mailbox",
+    [MAILBOX_FIELDS.mailDefaultFrom]: "anna@example.com",
+    [MAILBOX_FIELDS.imapHost]: "imap.example.com",
+    [MAILBOX_FIELDS.imapPort]: "993",
+    [MAILBOX_FIELDS.imapUser]: "anna@example.com",
+    [MAILBOX_FIELDS.imapTls]: CHECKBOX_ON,
+    [MAILBOX_FIELDS.smtpHost]: "smtp.example.com",
+    [MAILBOX_FIELDS.smtpPort]: "587",
+    [MAILBOX_FIELDS.smtpUser]: "anna@example.com",
+    [MAILBOX_FIELDS.smtpTls]: "",
+    ...extra,
+  });
+
+  const render = (data: Partial<MailboxSuggestionPageData> = {}): string =>
+    renderMailboxSuggestionStep({
+      ...STEP_TWO_LINKS,
+      domain: "example.com",
+      sourceLabel: "Published by autoconfig.example.com.",
+      values: values(),
+      errors: {},
+      ...data,
+    });
+
+  it("shows what was found instead of applying it", () => {
+    // The point of the screen. A wrong autoconfig answer that fails at connect
+    // time is far harder to diagnose than one the operator read first, so every
+    // value that is about to be used appears on the page in words.
+    const html = render();
+    assert.match(html, /Found settings for example\.com/);
+    assert.match(html, /imap\.example\.com:993/);
+    assert.match(html, /smtp\.example\.com:587/);
+    assert.match(html, /TLS/);
+    assert.match(html, /STARTTLS/);
+    assert.match(html, /Published by autoconfig\.example\.com\./);
+  });
+
+  it("says CalDAV was not found as an ordinary fact, not a failure", () => {
+    // Most mail providers publish nothing for CalDAV and calendars are optional
+    // in the account model. An operator who reads "not found" as a problem goes
+    // looking for one that is not there.
+    const html = render();
+    assert.match(html, /CalDAV/);
+    assert.match(html, /not found — calendars can be added later/);
+    assert.equal(/CalDAV[\s\S]{0,120}(failed|error)/i.test(html), false, html);
+  });
+
+  it("shows a CalDAV endpoint when the lookup found one", () => {
+    const html = render({
+      values: values({
+        [MAILBOX_FIELDS.caldavUrl]: "https://dav.example.com/",
+        [MAILBOX_FIELDS.caldavUser]: "anna@example.com",
+      }),
+    });
+    assert.match(html, /https:\/\/dav\.example\.com\//);
+    assert.equal(html.includes("not found"), false);
+  });
+
+  it("carries every value into the save as a hidden field", () => {
+    // The rows and the hidden inputs come off the same record, so what the
+    // operator confirmed is exactly what gets probed. A value shown but not
+    // carried would be a confirmation of something that never happened.
+    const html = render();
+    for (const [name, value] of Object.entries(values())) {
+      assert.match(
+        html,
+        new RegExp(`<input type="hidden" name="${name.replace(".", "\\.")}" value="${value}">`),
+        `${name} is shown but not carried`
+      );
+    }
+  });
+
+  it("offers Edit these, which does not validate the password box first", () => {
+    assert.match(render(), /value="edit"[^>]*formnovalidate/);
+    assert.match(render(), /Edit these/);
+  });
+
+  it("asks for the password again rather than hiding one in the page", () => {
+    const html = render();
+    assert.match(html, new RegExp(`name="${SHARED_PASSWORD_FIELD}"[^>]*type="password"`));
+    assert.match(html, /never written back into this page/i);
+    assert.equal(/type="hidden"[^>]*pass/i.test(html), false, html);
+  });
+
+  it("escapes a host the lookup brought back rather than rendering it", () => {
+    const html = render({
+      values: values({ [MAILBOX_FIELDS.imapHost]: '"><script>alert(1)</script>' }),
+      domain: "<b>example.com</b>",
+    });
+    assert.equal(html.includes("<script>"), false);
+    assert.equal(html.includes("<b>example.com</b>"), false);
+  });
+});
+
+describe("tier 2 — the provider list", () => {
+  const render = (data: Partial<MailboxProviderPageData> = {}): string =>
+    renderMailboxProviderStep({
+      ...STEP_TWO_LINKS,
+      providers: MAIL_PROVIDERS.map((p) => ({ id: p.id, label: p.label, note: p.note })),
+      domain: "",
+      email: "",
+      selected: "",
+      errors: {},
+      ...data,
+    });
+
+  it("lists every provider in the table, plus a way out of it", () => {
+    const html = render();
+    for (const provider of MAIL_PROVIDERS) {
+      assert.match(html, new RegExp(`value="${provider.id}"`), provider.id);
+      assert.ok(html.includes(escapeHtml(provider.label)), provider.label);
+    }
+    assert.match(html, new RegExp(`value="${PROVIDER_OTHER}"`));
+  });
+
+  it("shows each provider's caveat next to the choice, not three screens later", () => {
+    // The caveats are the point of the list. An operator who meets Fastmail's
+    // refusal of the account password as a bare "authentication failed" will
+    // conclude they typed their password wrong.
+    const html = render();
+    for (const provider of MAIL_PROVIDERS) {
+      if (provider.note === "") continue;
+      assert.ok(
+        html.includes(escapeHtml(provider.note)),
+        `${provider.id}'s caveat is not on the screen`
+      );
+    }
+  });
+
+  it("names the domain as a fact and never reports the lookup as an error", () => {
+    // §7: no autoconfig failure is ever shown to the operator as an error. This
+    // is the screen where that promise is kept or broken.
+    const html = render({ domain: "example.com" });
+    assert.match(html, /We could not detect settings for example\.com/);
+    const body = visibleBody(html);
+    assert.equal(/\bfailed\b|\berror\b|class="error"/i.test(body), false, body);
+  });
+
+  it("says nothing about a lookup when it was reached from the link", () => {
+    const html = render();
+    assert.equal(html.includes("could not detect"), false);
+  });
+
+  it("keeps the address and the choice across a rejected submission", () => {
+    const html = render({
+      email: "anna@example.com",
+      selected: "posteo",
+      errors: { [PROVIDER_FIELD]: "Choose a provider, or pick Other." },
+    });
+    assert.match(html, /value="anna@example\.com"/);
+    assert.match(html, /value="posteo" checked/);
+    assert.match(html, /Choose a provider, or pick Other\./);
+  });
+
+  it("can be skipped, like every other screen in step 2", () => {
+    assert.match(render(), /value="skip"/);
   });
 });

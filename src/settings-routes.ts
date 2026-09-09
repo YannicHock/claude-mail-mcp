@@ -48,6 +48,14 @@
  * The `/:id` edit routes are not negotiated. They have no second caller, and a
  * surface with no user is a surface with no tests.
  *
+ * ## The one route that is JSON and nothing else
+ *
+ * `POST /settings/autoconfig` answers a document whatever it is asked for,
+ * because there is no page behind it: it is the wizard's tier-1 lookup, run here
+ * rather than there because `src/autoconfig.ts` and the §7 constraints that make
+ * a user-derived fetch safe are in this package and cannot be imported out of
+ * it. See the route itself for why it is a POST and why it always answers 200.
+ *
  * Route path collisions: "new" and "test" are reserved path segments — GET
  * /settings/mailboxes/new and POST /settings/mailboxes/test are registered ahead of
  * the `:id` routes they would otherwise be ambiguous with. An operator who names an
@@ -65,6 +73,7 @@ import { timingSafeEqual } from "node:crypto";
 import express, { type Request, type RequestHandler, type Response, type Router } from "express";
 
 import type { Logger } from "./app.js";
+import { lookupMailboxSettings, type MailboxSuggestion as LookupSuggestion } from "./autoconfig.js";
 import {
   AccountsStore,
   AccountsStoreError,
@@ -82,6 +91,7 @@ import {
   MAILBOX_FIELDS,
   MAILBOX_SECRET_FIELDS,
   parseMailboxDraft,
+  type AutoconfigAnswer,
   type MailboxCreatedAnswer,
   type MailboxErrorAnswer,
   type MailboxProbeAnswer,
@@ -322,7 +332,12 @@ function sendPlain(res: Response, status: number, text: string): void {
 function sendJson(
   res: Response,
   status: number,
-  payload: MailboxProbeAnswer | MailboxStampAnswer | MailboxCreatedAnswer | MailboxErrorAnswer
+  payload:
+    | MailboxProbeAnswer
+    | MailboxStampAnswer
+    | MailboxCreatedAnswer
+    | MailboxErrorAnswer
+    | AutoconfigAnswer
 ): void {
   res.status(status).type("application/json").set(SETTINGS_HEADERS).json(payload);
 }
@@ -577,6 +592,49 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       );
     }
   );
+
+  /**
+   * Tier 1 of the wizard's step 2: what this domain says its own mail settings
+   * are.
+   *
+   * The lookup is `src/autoconfig.ts`, which is in this package because the §7
+   * constraints that make it safe are — it fetches URLs derived from an address
+   * an operator typed, and resolve-then-refuse, HTTPS-after-redirect, the two
+   * deadlines and the body cap all live there and are tested there. The OAuth
+   * layer cannot import any of that and must not grow a second copy, so it asks
+   * here, exactly as it asks for a probe.
+   *
+   * Not negotiated, unlike the three mailbox routes: there is no page behind
+   * this and never was one. The wizard renders the answer in its own chrome, and
+   * an HTML branch here would be a surface with no caller and therefore no test.
+   *
+   * `POST` rather than `GET` for the two reasons a lookup keyed on an address
+   * usually is: the address stays out of the request line and out of everything
+   * that records one, and the CSRF guard the state-changing routes carry applies
+   * unchanged — this route makes an outbound request on the strength of its
+   * body, which is worth binding to the assertion the same way a write is.
+   *
+   * The answer is always 200. `lookupMailboxSettings` resolves with `null` for
+   * every refusal in the cascade and never rejects, and this route keeps that
+   * property rather than converting some of it into a status code: §7 says no
+   * autoconfig failure is ever shown to the operator as an error, and the
+   * wizard's response to `null` — the provider list — is the same one it has for
+   * a domain that simply publishes nothing.
+   */
+  router.post("/settings/autoconfig", guardAssertion, jsonBody, formBody, guardCsrf, async (req, res) => {
+    const email = raw(req.body as FormBody, "email");
+
+    // Structurally the type declared in settings-api.ts. Assigned rather than
+    // mapped field by field on purpose: if the connector's own suggestion shape
+    // ever moves, this line stops compiling instead of quietly sending the
+    // wizard a document it will read as unreadable.
+    const suggestion: LookupSuggestion | null = await lookupMailboxSettings(email);
+
+    // The address is not logged — nothing an operator types into the wizard is,
+    // and an email address is the one field here that identifies a person.
+    log("info", "settings: autoconfig lookup", { found: suggestion !== null });
+    sendJson(res, 200, { suggestion });
+  });
 
   router.post("/settings/mailboxes/:id", guardAssertion, formBody, guardCsrf, async (req, res) => {
     const existing = findAccount(store, idParam(req));

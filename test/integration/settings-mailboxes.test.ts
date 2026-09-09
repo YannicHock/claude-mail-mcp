@@ -952,3 +952,145 @@ test("the JSON routes are behind exactly the credentials the pages are", async (
     await close();
   }
 });
+
+// ---- The autoconfig lookup route -------------------------------------------
+//
+// What is asserted here is the *route*: its guards, its content type, its
+// status, and that a lookup which finds nothing is a 200 rather than an error.
+// The cascade behind it — HTTPS-only, resolve-then-refuse, one redirect, the two
+// deadlines, the body cap — is exercised against injected fixtures in
+// test/unit/autoconfig.test.ts, which is the only place it can be exercised
+// without outbound traffic. Every case below uses an address the module refuses
+// before it opens a socket, so this suite stays offline: `parseAddress` rejects
+// anything without a two-label domain, and a single-label or bracketed domain is
+// exactly the shape that would otherwise turn this route into a port scanner.
+
+/** An address `parseAddress` refuses outright, so nothing leaves the process. */
+const UNRESOLVABLE = "operator@localhost";
+
+test("the autoconfig route answers a document, and a miss is a 200 not an error", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await postJson(url, "/settings/autoconfig", {
+      _csrf: CSRF,
+      email: UNRESOLVABLE,
+    });
+
+    // §7: the whole cascade is best-effort, and no autoconfig failure is ever
+    // shown to the operator as an error. A status code is the first place that
+    // promise could be broken, so it is the first place it is pinned.
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+    assert.deepEqual(await res.json(), { suggestion: null });
+  } finally {
+    await close();
+  }
+});
+
+test("the autoconfig route is a document whether or not JSON was asked for", async () => {
+  // Unlike the three mailbox routes, this one is not negotiated: there is no
+  // page behind it and never was. A caller that forgets the Accept header gets
+  // the same answer rather than a rendered form it cannot read.
+  const { url, close } = await startConnector();
+  try {
+    const res = await fetch(`${url}/settings/autoconfig`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${AUTH_TOKEN}`,
+        [ASSERTION_HEADER]: mint("POST", "/settings/autoconfig"),
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ _csrf: CSRF, email: UNRESOLVABLE }).toString(),
+      redirect: "manual",
+    });
+
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+    assert.deepEqual(await res.json(), { suggestion: null });
+  } finally {
+    await close();
+  }
+});
+
+test("a body with no address at all is a miss, not a rejection", async () => {
+  // There is nothing for the operator to fix in a rejection here and nothing
+  // this route could say that the provider list does not say better.
+  const { url, close } = await startConnector();
+  try {
+    for (const body of [{ _csrf: CSRF }, { _csrf: CSRF, email: "" }, { _csrf: CSRF, email: 7 }]) {
+      const res = await postJson(url, "/settings/autoconfig", body);
+      assert.equal(res.status, 200, JSON.stringify(body));
+      assert.deepEqual(await res.json(), { suggestion: null });
+    }
+  } finally {
+    await close();
+  }
+});
+
+test("the autoconfig route is behind exactly the credentials the others are", async () => {
+  // It makes an outbound request on the strength of its body, which is worth
+  // binding to the assertion the same way a write is. A route that fetched a
+  // user-named host on an unauthenticated POST would be the SSRF the §7 rules
+  // exist to prevent, reachable without any of them being consulted.
+  const { url, close } = await startConnector();
+  try {
+    const body = { _csrf: CSRF, email: UNRESOLVABLE };
+
+    const noBearer = await fetch(`${url}/settings/autoconfig`, {
+      method: "POST",
+      headers: {
+        [ASSERTION_HEADER]: mint("POST", "/settings/autoconfig"),
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    assert.equal(noBearer.status, 401, "no bearer token");
+
+    const noAssertion = await fetch(`${url}/settings/autoconfig`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${AUTH_TOKEN}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    assert.equal(noAssertion.status, 401, "no settings assertion");
+
+    const wrongKey = await postJson(url, "/settings/autoconfig", body, {
+      assertion: mint("POST", "/settings/autoconfig", OTHER_KEY),
+    });
+    assert.equal(wrongKey.status, 401, "an assertion this connector did not key");
+
+    const wrongPath = await postJson(url, "/settings/autoconfig", body, {
+      assertion: mint("POST", "/settings/mailboxes/test"),
+    });
+    assert.equal(wrongPath.status, 401, "an assertion bound to another path");
+
+    const expired = await postJson(url, "/settings/autoconfig", body, {
+      assertion: mintExpired("POST", "/settings/autoconfig"),
+    });
+    assert.equal(expired.status, 401, "an expired assertion");
+
+    const wrongCsrf = await postJson(url, "/settings/autoconfig", { ...body, _csrf: "not-it" });
+    assert.equal(wrongCsrf.status, 403, "the CSRF field is checked here too");
+  } finally {
+    await close();
+  }
+});
+
+test("the autoconfig answer carries the settings header set", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await postJson(url, "/settings/autoconfig", { _csrf: CSRF, email: UNRESOLVABLE });
+    await res.json();
+
+    // `no-store` is the one that means as much to a document as to a page: a
+    // suggestion names an operator's mail hosts and their login.
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    assert.equal(res.headers.get("x-frame-options"), "DENY");
+  } finally {
+    await close();
+  }
+});
