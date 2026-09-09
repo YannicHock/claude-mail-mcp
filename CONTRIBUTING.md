@@ -30,14 +30,19 @@ in the [README](README.md#quick-start).
 ```bash
 npm run typecheck        # tsc --noEmit over src/
 npm run typecheck:test   # tsc over src/ + test/
-npm run test:unit        # 25 tests, offline — no network, no Docker
-npm run test:integration # 14 tests; starts a disposable GreenMail container
+npm run test:unit        # offline — no network, no Docker
+npm run test:integration # starts a disposable GreenMail container
 ```
 
 `npm test` is an alias for `test:unit`. The integration suite manages its own
 GreenMail container from `docker-compose.test.yml` and skips cleanly rather than
-failing when the Docker daemon isn't reachable. CI runs all four on every push
-and pull request.
+failing when the Docker daemon isn't reachable. It binds fixed host ports, so
+only one checkout on a machine can run it at a time — a second one fails on the
+port bind, which looks like broken code rather than a busy port (#57).
+
+The OAuth layer in `oauth/` has the same four commands, run from that directory.
+Its integration suite needs no Docker: it drives the real app against an
+in-process stub upstream. CI runs all eight on every push and pull request.
 
 ## Testing against a real mailbox
 
