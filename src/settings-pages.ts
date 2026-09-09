@@ -227,10 +227,17 @@ function textField(opts: {
 ${fieldErrorHtml(opts.errors, opts.errorKey ?? opts.name)}`;
 }
 
-function passwordField(opts: { id: string; name: string; label: string; required?: boolean }): string {
+function passwordField(opts: {
+  id: string;
+  name: string;
+  label: string;
+  required?: boolean;
+  errors?: Record<string, string>;
+}): string {
   return `<label for="${escapeHtml(opts.id)}">${escapeHtml(opts.label)}</label>
 <input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="password" value=""
-       placeholder="unchanged" autocomplete="new-password"${opts.required ? " required" : ""}>`;
+       placeholder="unchanged" autocomplete="new-password"${opts.required ? " required" : ""}>
+${fieldErrorHtml(opts.errors, opts.name)}`;
 }
 
 function checkboxField(opts: { id: string; name: string; label: string; checked: boolean }): string {
@@ -372,7 +379,7 @@ ${textField({
   value: fieldValue(values, "caldav.user", caldav?.user ?? ""),
   errors,
 })}
-${passwordField({ id: "caldav_pass", name: "caldav.pass", label: "Password" })}
+${passwordField({ id: "caldav_pass", name: "caldav.pass", label: "Password", errors })}
 ${
   caldav
     ? checkboxField({
@@ -434,7 +441,7 @@ ${probeSectionHtml(opts.probe, !reserved)}
     required: true,
     errors,
   })}
-  ${passwordField({ id: "imap_pass", name: "imap.pass", label: "Password", required: isNew })}
+  ${passwordField({ id: "imap_pass", name: "imap.pass", label: "Password", required: isNew, errors })}
   ${checkboxField({
     id: "imap_tls",
     name: "imap.tls",
@@ -472,7 +479,7 @@ ${probeSectionHtml(opts.probe, !reserved)}
     required: true,
     errors,
   })}
-  ${passwordField({ id: "smtp_pass", name: "smtp.pass", label: "Password", required: isNew })}
+  ${passwordField({ id: "smtp_pass", name: "smtp.pass", label: "Password", required: isNew, errors })}
   ${checkboxField({
     id: "smtp_tls",
     name: "smtp.tls",

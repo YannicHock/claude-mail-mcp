@@ -57,6 +57,32 @@ test("password inputs render empty and say what empty means", () => {
   }
 });
 
+test("a rejected password field renders its error next to the input", () => {
+  // parseAccountForm keys password failures by field name (imap.pass,
+  // smtp.pass, caldav.pass). Without a field-error slot on the password
+  // input the operator gets a 400 and no indication which of eighteen
+  // fields is at fault. See issue #83.
+  const html = renderMailboxForm({
+    csrf: "c",
+    stamp: "1-2",
+    account: null,
+    errors: {
+      "imap.pass": "Required.",
+      "smtp.pass": "Required.",
+      "caldav.pass": "Required.",
+    },
+  });
+  for (const name of ["imap.pass", "smtp.pass", "caldav.pass"]) {
+    const at = html.indexOf(`name="${name}"`);
+    assert.notEqual(at, -1, `${name} must be on the form`);
+    const afterInput = html.slice(html.indexOf(">", at) + 1).trimStart();
+    assert.ok(
+      afterInput.startsWith('<p class="field-error">Required.</p>'),
+      `${name} must render its error right after the input, got: ${afterInput.slice(0, 80)}`
+    );
+  }
+});
+
 test("the list page never renders a password either", () => {
   const html = renderMailboxList({
     csrf: "c",
