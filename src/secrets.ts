@@ -304,6 +304,19 @@ function removeBlankFile(path: string, name: string): void {
 }
 
 /**
+ * How {@link createExclusively} should leave the file it creates.
+ *
+ * The defaults are the three shared secrets': the whole point of the mode and
+ * the group is that the *other* image can read what this one wrote.
+ */
+export interface CreateOptions {
+  /** Permission bits. Defaults to {@link GENERATED_SECRET_MODE}. */
+  mode?: number;
+  /** Whether to hand the file to the shared group. Defaults to true. */
+  shareGroup?: boolean;
+}
+
+/**
  * Write the secret to a temp file in the same directory and hard-link it into
  * place, which fails rather than clobbers if the target already exists.
  *
@@ -313,23 +326,32 @@ function removeBlankFile(path: string, name: string): void {
  * file closes that window — the path either does not exist or holds the complete
  * value, never anything in between.
  *
+ * That guarantee is worth having for a file this module does not own, which is
+ * why the OAuth layer's claim token borrows this writer. Sharing is not: a
+ * credential only one service reads gains nothing from the group, and this one
+ * is full control over an unclaimed instance. So the mode and the group are
+ * {@link CreateOptions} rather than fixed, and such a caller passes
+ * `{ mode: 0o600, shareGroup: false }`.
+ *
  * Exported only so the EEXIST branch — the one a first boot of both services at
  * once actually takes — can be exercised without racing two real processes.
  */
 export function createExclusively(
   path: string,
   value: string,
-  name: string
+  name: string,
+  options: CreateOptions = {}
 ): { value: string; raced: boolean } {
+  const { mode = GENERATED_SECRET_MODE, shareGroup = true } = options;
   const temp = join(dirname(path), `.${basename(path)}.${randomBytes(8).toString("hex")}.tmp`);
   try {
     // Trailing newline so `cat`, `openssl rand -base64 48 > file` and this
     // module all produce the same shape. Every reader trims.
-    writeFileSync(temp, `${value}\n`, { encoding: "utf8", mode: GENERATED_SECRET_MODE });
+    writeFileSync(temp, `${value}\n`, { encoding: "utf8", mode });
     // writeFileSync's mode is masked by the process umask, which in a container
     // is whatever the base image set. Say it again explicitly.
-    chmodSync(temp, GENERATED_SECRET_MODE);
-    adoptSharedGroup(temp);
+    chmodSync(temp, mode);
+    if (shareGroup) adoptSharedGroup(temp);
     try {
       linkSync(temp, path);
     } catch (err) {
