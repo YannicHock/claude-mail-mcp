@@ -15,7 +15,10 @@ import {
   CREDENTIAL_REJECTION_MESSAGE,
 } from "../../src/probe.js";
 import type { ImapCreds, SmtpCreds } from "../../src/accounts.js";
-import { startRejectingImapServer } from "../helpers/fake-imap.js";
+import {
+  startRejectingImapServer,
+  startMidLoginDropImapServer,
+} from "../helpers/fake-imap.js";
 
 function creds(overrides: Partial<ImapCreds & SmtpCreds> = {}): ImapCreds & SmtpCreds {
   return {
@@ -212,3 +215,74 @@ test("an unresponsive CalDAV host fails within the per-probe timeout via an abor
   // this test's assertions passed, the whole process would hang on it
   // afterward. See the task report for the wall-clock evidence.
 });
+
+test("a server that drops the connection mid-LOGIN does not take the process down", async () => {
+  // The regression this test exists for is not the returned value — that was
+  // always right — but what imapflow does a moment *after* it.
+  //
+  // A server that greets, answers CAPABILITY and then closes the socket while
+  // LOGIN is still in flight makes imapflow reject the pending command with
+  // "Unexpected close", which probeImap correctly reports as a connectivity
+  // failure. imapflow then emits a *second* failure for the same event — an
+  // 'error' event on the ImapFlow instance itself (`Connection not available`,
+  // `code: NoConnection`), raised from its socket 'end' handler after
+  // probeAccount has already resolved. An EventEmitter with no 'error'
+  // listener rethrows, so Node turned that into an uncaught exception and the
+  // connector died — from a connection test, against a host the operator typed
+  // in, which is exactly the input probeAccount promises to survive.
+  //
+  // Asserting only on the report would pass with or without the fix, so the
+  // process-level handler below is the real assertion. node:test installs an
+  // 'uncaughtException' handler of its own and will attribute the late event
+  // to whichever test is running — which is what makes this fail rather than
+  // abort the run — but that attribution is the runner's business, not a
+  // contract this test should rest on. Capturing the event here says out loud
+  // what is being asserted, and gives the wait below something concrete to
+  // watch for instead of a fixed sleep.
+  const escaped: unknown[] = [];
+  const onUncaught = (err: unknown): void => {
+    escaped.push(err);
+  };
+  process.on("uncaughtException", onUncaught);
+
+  const server = await startMidLoginDropImapServer();
+  try {
+    const report = await probeAccount(
+      { imap: creds({ port: server.port }), smtp: creds({ port: 1 }) },
+      { perProbeMs: 3000, totalMs: 6000 }
+    );
+
+    // (a) the probe still reports the truth: reached, then lost — a
+    // connectivity failure, not a rejected password.
+    assert.equal(report.imap.ok, false);
+    if (report.imap.ok) return;
+    assert.notEqual(report.imap.message, CREDENTIAL_REJECTION_MESSAGE);
+
+    // (b) nothing escapes afterwards. The late event arrives within a tick or
+    // two of the socket closing, so this poll settles immediately when the bug
+    // is present; the full budget is only ever spent on the passing path,
+    // which is the trade an absence assertion has to make.
+    await waitFor(() => escaped.length > 0, 1000);
+    assert.deepEqual(
+      escaped.map((err) => (err instanceof Error ? err.message : String(err))),
+      [],
+      "probeImap left imapflow's post-resolution 'error' event with nowhere to go"
+    );
+  } finally {
+    process.off("uncaughtException", onUncaught);
+    await server.close();
+  }
+});
+
+/**
+ * Resolve as soon as `predicate` holds, or after `budgetMs`, whichever comes
+ * first. Polls on a timer rather than awaiting a promise, so it observes an
+ * event delivered by any means — including one Node routes through
+ * 'uncaughtException' rather than through a rejection this test could await.
+ */
+async function waitFor(predicate: () => boolean, budgetMs: number): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
