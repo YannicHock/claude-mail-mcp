@@ -187,6 +187,28 @@ Path: malicious npm package update tries to read `accounts.json` or exfiltrate.
 Mitigations: `ProtectSystem=strict` blocks writes outside `/var/lib/mail-mcp`. `IPAddressAllow` (if configured) blocks egress to unknown hosts. Reading credentials is still possible — at-rest encryption is the only true defence here, with the trade-offs noted above.
 Residual risk: medium. Pin dependency versions in `package-lock.json` (already done), subscribe to GHSA notifications, run `npm audit` regularly.
 
+### Scenario: the connector process is compromised (container deployment)
+
+Path: something the connector executes — a parser bug reached through
+attacker-supplied MIME, or a compromised dependency — gets to read files as uid
+100 inside the `mail-mcp` container.
+Mitigations: the two containers mount **different** secrets directories.
+`./secrets/shared` (the connector's own Bearer token and the settings signing
+key) is mounted into both; `./secrets/oauth` (the OAuth signing key and the
+operator's scrypt password hash) is mounted into `mail-oauth` alone, so there is
+no path to either of those from the connector, whatever group it is in. Until
+v0.6 one flat `./secrets` was mounted read-write into both services, which handed
+the connector a signing key it could have used to mint its own access tokens for
+`/mcp` and a password hash it could have attacked offline — neither of which its
+environment ever named.
+Residual risk: everything the connector legitimately holds is still exposed —
+`data/accounts.json` with every mailbox credential, and both files in
+`secrets/shared`. The shared directory stays writable on both sides (each service
+generates whatever is missing on a first boot), so a compromised connector can
+also *replace* the shared token, which denies service and re-keys the proxy on
+the next restart. Nothing in the OAuth layer's half is reachable, and the OAuth
+layer's own compromise is unchanged: it legitimately reads all four.
+
 ### Scenario: MITM between Claude.ai and the connector
 
 Path: attacker on the network path forges responses or steals the Bearer token (or any tokens issued by an OAuth layer, if you've added one).

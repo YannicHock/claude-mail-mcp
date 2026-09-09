@@ -519,3 +519,83 @@ describe("the shared group contract", () => {
     assert.match(example, /^SECRETS_GID=/m);
   });
 });
+
+describe("each service is mounted only the secrets it names", () => {
+  // The shared group is what lets the two services read each other's *shared*
+  // secrets. It is not a licence for the connector to see the OAuth layer's, and
+  // for one release it was: `./secrets` was one directory mounted read-write into
+  // both, so the process that parses attacker-supplied MIME off the public
+  // internet could read oauth_signing_key.txt (forge an access token for /mcp)
+  // and auth_password_hash.txt (crack it offline, then own /authorize and
+  // /settings). Its environment names neither. The mount is now split by
+  // audience, and what keeps the connector out of secrets/oauth is the mount
+  // rather than the group — so it is the mount that has to be pinned (#77).
+  const compose = readFileSync(new URL("../../docker-compose.yml", import.meta.url), "utf8").replace(
+    /\r\n/g,
+    "\n"
+  );
+
+  // Everything from `  mail-mcp:` to `  mail-oauth:`, and everything after it up
+  // to the trailing top-level comment block. Crude, and deliberately so: a real
+  // YAML parse would need a dependency this package does not have, and the two
+  // service keys are the only two-space keys in the file.
+  const services = compose.split(/^ {2}mail-oauth:$/m);
+  const connector = services[0] ?? "";
+  const oauth = (services[1] ?? "").split(/^# ---/m)[0] ?? "";
+
+  it("neither service mounts a flat ./secrets", () => {
+    assert.doesNotMatch(
+      compose,
+      /^\s*-\s*\.\/secrets:/m,
+      "./secrets:/secrets hands every service all four secrets — mount ./secrets/shared " +
+        "and ./secrets/oauth separately. See #77."
+    );
+  });
+
+  /** Just the `- ./host:/container` entries, so a mention in a comment or in the
+   *  `group_add` error message is not mistaken for a mount. */
+  const mounts = (block: string): string[] =>
+    (block.match(/^\s*-\s*\.\/\S+:\/\S+$/gm) ?? []).map((line) => line.replace(/^\s*-\s*/, ""));
+
+  it("the connector mounts the shared half and nothing else", () => {
+    assert.ok(mounts(connector).includes("./secrets/shared:/secrets/shared"));
+    assert.deepEqual(
+      mounts(connector).filter((m) => m.startsWith("./secrets/oauth")),
+      [],
+      "mail-mcp must not mount ./secrets/oauth — the signing key and the password " +
+        "hash are no business of the connector's"
+    );
+  });
+
+  it("the OAuth layer mounts both halves", () => {
+    // Both, and both writable: it generates whatever of the three random secrets
+    // is missing, and replacing a blank file means unlinking it first.
+    assert.ok(mounts(oauth).includes("./secrets/shared:/secrets/shared"));
+    assert.ok(mounts(oauth).includes("./secrets/oauth:/secrets/oauth"));
+    assert.deepEqual(
+      mounts(oauth).filter((m) => m.startsWith("./secrets/") && m.endsWith(":ro")),
+      [],
+      "mail-oauth's secrets mounts must stay writable"
+    );
+  });
+
+  it("every secret path a service names is inside a directory it mounts", () => {
+    // The check that would have caught the original defect from the other end:
+    // the connector's two _FILE paths were already only the shared pair, and the
+    // mount handed it more than they named.
+    for (const [name, block, allowed] of [
+      ["mail-mcp", connector, ["/secrets/shared/"]],
+      ["mail-oauth", oauth, ["/secrets/shared/", "/secrets/oauth/"]],
+    ] as const) {
+      const paths = block.match(/^\s*\w+_FILE:\s*(\/secrets\/\S+)$/gm) ?? [];
+      assert.ok(paths.length > 0, `${name} names no *_FILE secret paths at all`);
+      for (const line of paths) {
+        const path = line.split(":")[1]?.trim() ?? "";
+        assert.ok(
+          allowed.some((prefix) => path.startsWith(prefix)),
+          `${name} names ${path}, which is not under a directory it mounts`
+        );
+      }
+    }
+  });
+});
