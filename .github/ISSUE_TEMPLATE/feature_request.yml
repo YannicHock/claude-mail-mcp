@@ -1,0 +1,49 @@
+name: Feature request
+description: A new capability or an improvement to an existing one
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project aims to stay small: one focused MCP connector for IMAP,
+        SMTP and CalDAV. New tools should map cleanly onto a verb of one of
+        those protocols. Logic that interprets mail rather than moves it —
+        auto-categorisation, scoring, summarisation — belongs on the Claude
+        side, not in the connector. See
+        [CONTRIBUTING.md](https://github.com/YannicHock/claude-mail-mcp/blob/main/CONTRIBUTING.md).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The problem, not the solution. What can you not ask Claude to do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: If it is a new tool, name it and say what it would take and return.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part
+      options:
+        - Mail (IMAP/SMTP)
+        - Calendar (CalDAV)
+        - OAuth / connecting from Claude
+        - Settings UI
+        - Deployment and operations
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you have tried instead
+      description: Existing tools that almost work, or how you work around it now.
