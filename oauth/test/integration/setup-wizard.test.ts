@@ -1,5 +1,5 @@
 /**
- * Step 1 of the setup wizard, against the real gate and the real middleware chain.
+ * The setup wizard, against the real gate and the real middleware chain.
  *
  * Two things this file exists to hold in place.
  *
@@ -18,6 +18,14 @@
  * missed it because every one of them set `Origin` explicitly. The helper used
  * here sends what Chrome sends — a `Referer` and nothing else — by default, and
  * `Origin` only where a test is about `Origin`.
+ *
+ * **Step 2 against a stubbed connector.** The mailbox itself is probed and
+ * stored by the connector, which this package cannot import and does not run in
+ * these suites. What is asserted here is the wizard's half of that conversation:
+ * that it asks before it writes, that it refuses to write when the answer is a
+ * failure, that it can be skipped without asking at all, and that the mailbox
+ * password reaches the connector and nothing else. The upstream stub records
+ * every request, which is how each of those is checked rather than assumed.
  */
 
 import { strict as assert } from "node:assert";
@@ -26,19 +34,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { ASSERTION_HEADER } from "../../src/assertion.js";
 import { verifyPassword } from "../../src/passwords.js";
 import { SESSION_COOKIE } from "../../src/session.js";
+import { mailboxFormPage, type StubProbeReport } from "../helpers/connector-pages.js";
 import {
   getSetup,
   postSetupForm,
   setupBase,
   signInWith,
   startHarness,
+  UPSTREAM_TOKEN,
   type Harness,
 } from "../helpers/harness.js";
 
 const USERNAME = "anna";
 const PASSWORD = "a-password-nobody-guesses";
+const MAILBOX_PASSWORD = "the-mailbox-password-itself";
 
 function dataDir(): string {
   return mkdtempSync(join(tmpdir(), "oauth-wizard-flow-"));
@@ -322,6 +334,384 @@ test("the wizard is only reachable with the claim token", async () => {
     assert.equal(existsSync(join(dir, "operator.json")), false, "and it wrote nothing");
     // The real one is untouched by any of that.
     assert.equal((await fetch(`${setupBase(harness)}/credentials`)).status, 200);
+  } finally {
+    await harness.close();
+  }
+});
+
+// ---- Step 2 — the first mailbox -------------------------------------------
+
+/** What an operator types into step 2, under the connector's own field names. */
+function mailboxFields(overrides: Record<string, string> = {}): Record<string, string> {
+  return {
+    id: "main",
+    label: "Main mailbox",
+    default: "1",
+    "mail.defaultFrom": "anna@example.com",
+    "imap.host": "imap.example.com",
+    "imap.port": "993",
+    "imap.tls": "1",
+    "imap.user": "anna@example.com",
+    "imap.pass": MAILBOX_PASSWORD,
+    "smtp.host": "smtp.example.com",
+    "smtp.port": "465",
+    "smtp.tls": "1",
+    "smtp.user": "anna@example.com",
+    "smtp.pass": MAILBOX_PASSWORD,
+    ...overrides,
+  };
+}
+
+interface ConnectorBehaviour {
+  probe?: StubProbeReport;
+  /** Status for `POST /settings/mailboxes/test`. 200 unless a test says otherwise. */
+  probeStatus?: number;
+  probeBody?: string;
+  /** Status for `POST /settings/mailboxes`. 303 is what a stored account looks like. */
+  createStatus?: number;
+  createBody?: string;
+}
+
+/** Answer the three connector routes step 2 uses, and nothing else. */
+function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): void {
+  harness.upstream.respondWith((req, res) => {
+    const url = req.url ?? "";
+    if (req.method === "POST" && url === "/settings/mailboxes/test") {
+      const status = behaviour.probeStatus ?? 200;
+      res.writeHead(status, { "content-type": "text/html" });
+      res.end(
+        behaviour.probeBody ??
+          mailboxFormPage({
+            probe: behaviour.probe ?? { imap: { ok: true }, smtp: { ok: true } },
+          })
+      );
+      return;
+    }
+    if (req.method === "GET" && url === "/settings/mailboxes/new") {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(mailboxFormPage({ stamp: "412-1757000000000" }));
+      return;
+    }
+    if (req.method === "POST" && url === "/settings/mailboxes") {
+      const status = behaviour.createStatus ?? 303;
+      res.writeHead(
+        status,
+        status === 303
+          ? { location: "/settings/mailboxes" }
+          : { "content-type": "text/html" }
+      );
+      res.end(behaviour.createBody ?? "");
+      return;
+    }
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not stubbed");
+  });
+}
+
+/** Complete step 1, which is how step 2 becomes reachable at all. */
+async function reachStep2(harness: Harness): Promise<void> {
+  const res = await postSetupForm(harness, "/credentials", {
+    username: USERNAME,
+    password: PASSWORD,
+    confirmation: PASSWORD,
+  });
+  assert.equal(res.status, 303, "step 1 completes");
+}
+
+function upstreamPosts(harness: Harness, url: string): number {
+  return harness.upstream.requests.filter((r) => r.method === "POST" && r.url === url).length;
+}
+
+test("credentials that fail the probe are not saved", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      probe: {
+        imap: { ok: false, message: "the server rejected these credentials" },
+        smtp: { ok: true },
+      },
+    });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+
+    assert.equal(res.status, 400);
+    const html = await res.text();
+    assert.match(html, /the server rejected these credentials/);
+    assert.match(html, /nothing was stored/i);
+    // The probe ran; the write did not, and no stamp was even asked for.
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes/test"), 1);
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 0);
+    assert.equal(
+      harness.upstream.requests.some((r) => r.url === "/settings/mailboxes/new"),
+      false
+    );
+    // And the wizard has not moved on.
+    const entry = await getSetup(harness);
+    assert.equal(entry.headers.get("location"), `/setup/${harness.claimToken}/mailbox`);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("skipping reaches step 3 with no account configured", async () => {
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness);
+
+    const res = await postSetupForm(harness, "/mailbox", { _action: "skip" });
+
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
+    // Someone looking around first should not need mail credentials to hand:
+    // the connector was not contacted at all.
+    assert.deepEqual(harness.upstream.requests, []);
+    assert.equal((await getSetup(harness, "/connect")).status, 200);
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(dir, "setup-wizard.json"), "utf8")) as Record<string, unknown>,
+      { version: 1, furthest: "connect" }
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+test("IMAP, SMTP and CalDAV are each reported separately", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      probe: {
+        imap: { ok: true },
+        smtp: { ok: false, message: "connect ECONNREFUSED" },
+        caldav: { ok: false, message: "404 Not Found" },
+      },
+    });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields({ "caldav.url": "https://dav.example.com", "caldav.user": "anna" }),
+      _action: "test",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    // Three services, three verdicts — not one pass/fail across the lot.
+    assert.match(html, /<strong>IMAP<\/strong><span>ok<\/span>/);
+    assert.match(html, /<strong>SMTP<\/strong><span>failed: connect ECONNREFUSED<\/span>/);
+    assert.match(html, /<strong>CalDAV<\/strong><span>failed: 404 Not Found<\/span>/);
+    // "Test connection" never stores anything, whatever it finds.
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 0);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("CalDAV alone failing does not stop a working mailbox being saved", async () => {
+  // CalDAV is optional in the account model. Treating it as fatal would lock out
+  // every IMAP-only provider, which is most of them.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      probe: {
+        imap: { ok: true },
+        smtp: { ok: true },
+        caldav: { ok: false, message: "404 Not Found" },
+      },
+    });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields({ "caldav.url": "https://dav.example.com", "caldav.user": "anna" }),
+      _action: "save",
+    });
+
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 1);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a verified mailbox is probed first, then stored, with the credentials the connector expects", async () => {
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness);
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
+
+    // The order is the requirement: probe, read the stamp, then write.
+    assert.deepEqual(
+      harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
+      [
+        "POST /settings/mailboxes/test",
+        "GET /settings/mailboxes/new",
+        "POST /settings/mailboxes",
+      ]
+    );
+
+    for (const request of harness.upstream.requests) {
+      // Both credentials the settings proxy carries, on every hop: the static
+      // token the connector's bearer check wants, and an assertion bound to
+      // this method and this path — the connector 401s on any other.
+      assert.equal(request.headers.authorization, `Bearer ${UPSTREAM_TOKEN}`);
+      const header = request.headers[ASSERTION_HEADER];
+      assert.equal(typeof header, "string", ASSERTION_HEADER);
+      const payload = JSON.parse(
+        Buffer.from((header as string).split(".")[0], "base64url").toString("utf8")
+      ) as Record<string, unknown>;
+      assert.equal(payload.aud, "mail-mcp-settings");
+      assert.equal(payload.iss, harness.config.issuer);
+      assert.equal(payload.htm, request.method);
+      assert.equal(payload.htu, request.url);
+    }
+
+    const create = harness.upstream.requests[2];
+    const body = new URLSearchParams(create.body);
+    assert.equal(body.get("imap.pass"), MAILBOX_PASSWORD);
+    // The CSRF field the connector compares against is the assertion's own
+    // claim: this hop has no browser and no cookie, only the two credentials.
+    const createAssertion = JSON.parse(
+      Buffer.from(String(create.headers[ASSERTION_HEADER]).split(".")[0], "base64url").toString(
+        "utf8"
+      )
+    ) as { csrf: string };
+    assert.equal(body.get("_csrf"), createAssertion.csrf);
+    assert.equal(body.get("_stamp"), "412-1757000000000", "the stamp the connector just gave");
+
+    // The wizard's own progress note still holds nothing but progress.
+    const progress = readFileSync(join(dir, "setup-wizard.json"), "utf8");
+    assert.deepEqual(JSON.parse(progress) as Record<string, unknown>, {
+      version: 1,
+      furthest: "connect",
+    });
+    assert.equal(progress.includes(MAILBOX_PASSWORD), false, "no mailbox password near it");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a mailbox password is never written back into the page", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      probe: { imap: { ok: false, message: "no route to host" }, smtp: { ok: true } },
+    });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+    const html = await res.text();
+
+    // What was typed comes back, so a retry is not a retype of everything …
+    assert.match(html, /value="imap\.example\.com"/);
+    // … but the password does not, and the page says so rather than leaving the
+    // operator to wonder why the box is empty.
+    assert.equal(html.includes(MAILBOX_PASSWORD), false);
+    assert.match(html, /Passwords are never written back/);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("the connector's own rejection is shown against the field it rejected", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      probeStatus: 400,
+      probeBody: mailboxFormPage({
+        errors: { id: 'An account with id "main" already exists.' },
+      }),
+    });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+
+    assert.equal(res.status, 400);
+    assert.match(await res.text(), /An account with id &quot;main&quot; already exists\./);
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 0);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("an unreadable or refused answer saves nothing, rather than assuming it passed", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+
+    // A connector that answers with something this build cannot read …
+    stubConnector(harness, { probeBody: "<html><body>Bad Gateway</body></html>" });
+    let res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
+    assert.equal(res.status, 502);
+    assert.match(await res.text(), /nothing was saved/i);
+
+    // … and one that refuses the request outright.
+    stubConnector(harness, { probeStatus: 401 });
+    res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
+    assert.equal(res.status, 502);
+    assert.match(await res.text(), /HTTP 401/);
+
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 0);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a cross-origin step 2 submission is refused before the connector is touched", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness);
+
+    const res = await postSetupForm(
+      harness,
+      "/mailbox",
+      { ...mailboxFields(), _action: "save" },
+      {
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: "https://evil.example",
+        },
+      }
+    );
+
+    assert.equal(res.status, 403);
+    assert.deepEqual(harness.upstream.requests, []);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("step 2 cannot be posted to before step 1 is done", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    stubConnector(harness);
+
+    const res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
+
+    // 303, so the browser follows it with a GET rather than re-submitting.
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/credentials`);
+    assert.deepEqual(harness.upstream.requests, []);
   } finally {
     await harness.close();
   }
