@@ -281,6 +281,12 @@ carries no `epoch` and is read as 0, which matches the initial `tokenEpoch`, so 
 upgrade invalidates nothing on its own. Cost: two store fields and two comparisons in
 the verify path.
 
+> **Superseded, 2026-09-09.** The paragraph above describes the session case as an
+> accepted limitation. It is no longer one: #2 added a `sid` claim to the access token
+> and a third comparison in the verify path, so revoking a single session now stops the
+> access token it already handed out. The text is kept as written because it records why
+> the epoch and `revokedAt` mechanisms have the shape they do.
+
 ## 9. Operator password
 
 The live hash moves to `oauth-data/operator.json` — `{version, username, passwordHash,

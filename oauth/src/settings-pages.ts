@@ -268,10 +268,8 @@ export function renderClients(opts: ClientsData): string {
 
   const body = `
   <h1>Connected clients</h1>
-  <p class="sub">Revoking a client is immediate for both its refresh and access
-     tokens. Revoking a single session stops it refreshing immediately, but its
-     current access token keeps working until it expires on its own, within the
-     access-token lifetime.</p>
+  <p class="sub">Revoking is immediate for both refresh and access tokens,
+     whether you revoke a whole client or a single session.</p>
   ${notice}
 
   <h2>Clients</h2>
