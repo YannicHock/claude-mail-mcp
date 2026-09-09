@@ -46,6 +46,8 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 - **A revert of the connector's `Referrer-Policy` no longer passes silently.** The 0.6.3 fix to the connector's own settings headers was held in place by nothing but a comment claiming a byte-for-byte mirror of the OAuth layer's set; the header matrix added in 0.6.1 covers only the OAuth layer's copy. The values are now asserted on a served settings response as literals, and the two copies of `SETTINGS_HEADERS` are compared against each other directly.
 
+- **The integration suite's own header check can now fail.** It looped over `SETTINGS_HEADERS` and compared the served response against the same constant, so it stayed green through a `Referrer-Policy` flipped to `no-referrer`; it asserts literals now, and covers the headers as they survive the whole `createApp` chain rather than the router alone.
+
 - **Both lockfiles carried the pre-Node-24 `engines` range.** `package.json` requires `>=24.0.0` in both packages, but the root-package entry of each lockfile still recorded `^20.19.0 || >=22.7.0` and `>=22.7.0`. `npm install` corrected it every time, in every branch, so the change surfaced in `git status` after a routine install and each contributor had to work out whether it was theirs. Both lockfiles now say what their `package.json` says, and `scripts/check-versions.sh` compares the two in the same pass it already makes for the version string.
 
 ## [0.6.3] — 2026-09-09

@@ -25,7 +25,6 @@ import { AccountsStore, type Account } from "../../src/accounts.js";
 import { ClientPool } from "../../src/client-pool.js";
 import { createApp } from "../../src/app.js";
 import { ASSERTION_HEADER } from "../../src/settings-assertion.js";
-import { SETTINGS_HEADERS } from "../../src/settings-pages.js";
 import { readStamp } from "../../src/accounts-writer.js";
 import { makeAccount, makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
 
@@ -168,6 +167,32 @@ function validForm(overrides: Record<string, string> = {}): Record<string, strin
   };
 }
 
+/**
+ * The security headers a settings response must carry once it has been through
+ * the whole app, written out as literals.
+ *
+ * Deliberately not derived from `SETTINGS_HEADERS`. This case used to loop over
+ * that constant, which compared the constant with itself: flipping
+ * `Referrer-Policy` to `no-referrer` in src/settings-pages.ts — the regression
+ * that made every browser sign-in impossible in 0.6.0 — left this file green.
+ * Spelling the expectation out independently is what gives the assertion the
+ * ability to fail, and it is the same second opinion
+ * test/unit/settings-headers.test.ts keeps for the router in isolation.
+ *
+ * What this copy adds over that unit test: the response here has travelled the
+ * real `createApp` chain — the body parser, `trust proxy`, the bearer check and
+ * the router mounted alongside `/mcp` and `/health` — so a middleware added
+ * upstream that strips or overwrites one of these headers fails here and
+ * nowhere else. Keep both.
+ */
+const EXPECTED_HEADERS = {
+  "cache-control": "no-store",
+  "x-frame-options": "DENY",
+  "content-security-policy":
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+  "referrer-policy": "same-origin",
+};
+
 /** Attach `_stamp` from the connector's current on-disk stamp. */
 async function withStamp(
   accountsPath: string,
@@ -264,7 +289,8 @@ test("settings pages carry the no-store/CSP/frame/referrer header set", async ()
   const { url, close } = await startConnector();
   try {
     const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
-    for (const [name, value] of Object.entries(SETTINGS_HEADERS)) {
+    assert.equal(res.status, 200);
+    for (const [name, value] of Object.entries(EXPECTED_HEADERS)) {
       assert.equal(res.headers.get(name), value, `expected ${name} to be set on a settings page`);
     }
   } finally {
