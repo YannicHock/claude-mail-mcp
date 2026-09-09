@@ -35,10 +35,17 @@
  * failure, that it can be skipped without asking at all, and that the mailbox
  * password reaches the connector and nothing else. The upstream stub records
  * every request, which is how each of those is checked rather than assumed.
+ *
+ * That stub answers in JSON, in the shapes settings-api.ts declares. It used to
+ * answer in HTML copied verbatim out of the connector's own renderer, under a
+ * "change one, change both" rule that nothing enforced; #69 replaced the markup
+ * with a contract, and this file's half of it is held up by the same types the
+ * connector's integration suite holds its half up by.
  */
 
 import { strict as assert } from "node:assert";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import type { ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -46,7 +53,12 @@ import test from "node:test";
 import { ASSERTION_HEADER } from "../../src/assertion.js";
 import { verifyPassword } from "../../src/passwords.js";
 import { SESSION_COOKIE } from "../../src/session.js";
-import { mailboxFormPage, type StubProbeReport } from "../helpers/connector-pages.js";
+import {
+  flattenDraft,
+  MAILBOX_FIELD_NAMES,
+  type MailboxProbeReport,
+  type MailboxRequestBody,
+} from "../../src/settings-api.js";
 import {
   getSetup,
   postSetupForm,
@@ -373,15 +385,17 @@ function mailboxFields(overrides: Record<string, string> = {}): Record<string, s
 
 /** What `GET /settings/mailboxes/new` reports before anything has been written. */
 const STAMP_BEFORE = "412-1757000000000";
+/** What an acknowledged write reports back. Nothing on this side reads it. */
+const STAMP_AFTER = "530-1757000009999";
 
 interface ConnectorBehaviour {
-  probe?: StubProbeReport;
+  probe?: MailboxProbeReport;
   /** Status for `POST /settings/mailboxes/test`. 200 unless a test says otherwise. */
   probeStatus?: number;
-  probeBody?: string;
-  /** Status for `POST /settings/mailboxes`. 303 is what a stored account looks like. */
+  probeBody?: unknown;
+  /** Status for `POST /settings/mailboxes`. 201 is what a stored account looks like. */
   createStatus?: number;
-  createBody?: string;
+  createBody?: unknown;
   /**
    * Answer the save with no answer at all.
    *
@@ -403,31 +417,43 @@ interface ConnectorBehaviour {
   newStatusAfterCreate?: number;
 }
 
-/** Answer the three connector routes step 2 uses, and nothing else. */
+/**
+ * Answer the three connector routes step 2 uses, and nothing else.
+ *
+ * In JSON, because that is what step 2 asks for now (#69). Every response goes
+ * out as a document rather than a page, and the shapes are the ones
+ * settings-api.ts declares — which is also what the connector's own integration
+ * suite pins against the real routes, so the two halves of this conversation are
+ * each held to the same contract from their own side.
+ */
 function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): void {
   let saveArrived = false;
+  const json = (res: ServerResponse, status: number, body: unknown): void => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+
   harness.upstream.respondWith((req, res) => {
     const url = req.url ?? "";
     if (req.method === "POST" && url === "/settings/mailboxes/test") {
       const status = behaviour.probeStatus ?? 200;
-      res.writeHead(status, { "content-type": "text/html" });
-      res.end(
-        behaviour.probeBody ??
-          mailboxFormPage({
-            probe: behaviour.probe ?? { imap: { ok: true }, smtp: { ok: true } },
-          })
+      json(
+        res,
+        status,
+        behaviour.probeBody ?? {
+          probe: behaviour.probe ?? { imap: { ok: true }, smtp: { ok: true }, caldav: null },
+        }
       );
       return;
     }
     if (req.method === "GET" && url === "/settings/mailboxes/new") {
       const status = saveArrived ? (behaviour.newStatusAfterCreate ?? 200) : 200;
-      res.writeHead(status, { "content-type": "text/html" });
       if (status !== 200) {
-        res.end("<html><body>Service Unavailable</body></html>");
+        json(res, status, { message: "Service Unavailable", errors: {} });
         return;
       }
       const stamp = saveArrived ? (behaviour.stampAfterCreate ?? STAMP_BEFORE) : STAMP_BEFORE;
-      res.end(mailboxFormPage({ stamp }));
+      json(res, 200, { stamp });
       return;
     }
     if (req.method === "POST" && url === "/settings/mailboxes") {
@@ -439,14 +465,8 @@ function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): vo
         res.destroy();
         return;
       }
-      const status = behaviour.createStatus ?? 303;
-      res.writeHead(
-        status,
-        status === 303
-          ? { location: "/settings/mailboxes" }
-          : { "content-type": "text/html" }
-      );
-      res.end(behaviour.createBody ?? "");
+      const status = behaviour.createStatus ?? 201;
+      json(res, status, behaviour.createBody ?? { id: "main", stamp: STAMP_AFTER });
       return;
     }
     res.writeHead(404, { "content-type": "text/plain" });
@@ -481,6 +501,7 @@ test("credentials that fail the probe are not saved", async () => {
       probe: {
         imap: { ok: false, message: "the server rejected these credentials" },
         smtp: { ok: true },
+        caldav: null,
       },
     });
 
@@ -596,8 +617,14 @@ test("a verified mailbox is probed first, then stored, with the credentials the 
     await reachStep2(harness);
     stubConnector(harness);
 
+    // Every box filled in, CalDAV included, so the draft that goes over the
+    // wire has to carry the whole vocabulary and not merely most of it.
     const res = await postSetupForm(harness, "/mailbox", {
-      ...mailboxFields(),
+      ...mailboxFields({
+        "caldav.url": "https://dav.example.com",
+        "caldav.user": "anna",
+        "caldav.pass": MAILBOX_PASSWORD,
+      }),
       _action: "save",
     });
 
@@ -630,9 +657,24 @@ test("a verified mailbox is probed first, then stored, with the credentials the 
       assert.equal(payload.htu, request.url);
     }
 
+    for (const request of harness.upstream.requests.filter((r) => r.method === "POST")) {
+      // A JSON document, not a form. The connector answers these three routes
+      // either way, and the wizard asks for the document because the alternative
+      // was reading its own answers back out of rendered markup (#69).
+      assert.equal(request.headers["content-type"], "application/json");
+      assert.equal(request.headers.accept, "application/json");
+    }
+
     const create = harness.upstream.requests[2];
-    const body = new URLSearchParams(create.body);
-    assert.equal(body.get("imap.pass"), MAILBOX_PASSWORD);
+    const body = JSON.parse(create.body) as MailboxRequestBody;
+    assert.equal(body.mailbox.imap.pass, MAILBOX_PASSWORD);
+    // What the operator typed, under every name the contract has — the request
+    // half of #69, where a name only one package knew about used to be dropped
+    // on the way over and reported back as "Required." for a filled-in box.
+    for (const name of MAILBOX_FIELD_NAMES) {
+      assert.ok(name in flattenDraft(body.mailbox), `the draft carries no ${name}`);
+    }
+    assert.equal(flattenDraft(body.mailbox)["mail.defaultFrom"], "anna@example.com");
     // The CSRF field the connector compares against is the assertion's own
     // claim: this hop has no browser and no cookie, only the two credentials.
     const createAssertion = JSON.parse(
@@ -640,8 +682,8 @@ test("a verified mailbox is probed first, then stored, with the credentials the 
         "utf8"
       )
     ) as { csrf: string };
-    assert.equal(body.get("_csrf"), createAssertion.csrf);
-    assert.equal(body.get("_stamp"), "412-1757000000000", "the stamp the connector just gave");
+    assert.equal(body._csrf, createAssertion.csrf);
+    assert.equal(body._stamp, "412-1757000000000", "the stamp the connector just gave");
 
     // The wizard's own progress note still holds nothing but progress.
     const progress = readFileSync(join(dir, "setup-wizard.json"), "utf8");
@@ -751,9 +793,7 @@ test("a save the connector refuses does not blame the passwords for it", async (
     await reachStep2(harness);
     stubConnector(harness, {
       createStatus: 400,
-      createBody: mailboxFormPage({
-        errors: { id: 'An account with id "main" already exists.' },
-      }),
+      createBody: { errors: { id: 'An account with id "main" already exists.' } },
     });
 
     const res = await postSetupForm(harness, "/mailbox", {
@@ -776,7 +816,7 @@ test("a mailbox password is never written back into the page", async () => {
   try {
     await reachStep2(harness);
     stubConnector(harness, {
-      probe: { imap: { ok: false, message: "no route to host" }, smtp: { ok: true } },
+      probe: { imap: { ok: false, message: "no route to host" }, smtp: { ok: true }, caldav: null },
     });
 
     const res = await postSetupForm(harness, "/mailbox", {
@@ -802,9 +842,7 @@ test("the connector's own rejection is shown against the field it rejected", asy
     await reachStep2(harness);
     stubConnector(harness, {
       probeStatus: 400,
-      probeBody: mailboxFormPage({
-        errors: { id: 'An account with id "main" already exists.' },
-      }),
+      probeBody: { errors: { id: 'An account with id "main" already exists.' } },
     });
 
     const res = await postSetupForm(harness, "/mailbox", {

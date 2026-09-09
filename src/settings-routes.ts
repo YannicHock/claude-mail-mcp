@@ -17,6 +17,37 @@
  * CSRF without ever having seen the session cookie, which the OAuth layer strips
  * before forwarding.
  *
+ * ## The same routes, in JSON
+ *
+ * Three of them answer `Accept: application/json` with a document instead of a
+ * page: `GET /settings/mailboxes/new` (the accounts stamp), `POST
+ * /settings/mailboxes/test` (the probe) and `POST /settings/mailboxes` (the
+ * write). That is the surface the OAuth layer's setup wizard uses, and before
+ * #69 it had to read those three facts back out of the rendered markup with
+ * regular expressions.
+ *
+ * Content negotiation rather than a second set of `/settings/api/…` paths, for
+ * three reasons. The guards are already attached here — `requireSettingsAssertion`,
+ * then the body parser, then `requireFormCsrf` — and a JSON branch inside a
+ * handler cannot become a route that forgot one, which a new path can. The
+ * assertion binds the method and the path it was signed for, so keeping the
+ * paths means the wizard signs exactly what it already signed and no new URL
+ * appears for an operator to rate-limit, document or firewall. And the probe
+ * and the account write stay in one place each: the JSON branch is a different
+ * send at the end of the same handler, over the same `parseAccountForm`, the
+ * same `probeAccount` and the same `store.create`.
+ *
+ * The request body may be JSON too — `{ _csrf, _stamp, mailbox }`, where
+ * `mailbox` is a `MailboxDraft` from settings-api.ts. The two bookkeeping
+ * fields keep their form names deliberately, so the CSRF guard and the stamp
+ * check are the same lines of code for both content types; `submittedFields`
+ * flattens the draft onto the field names the form parser already reads.
+ * Nothing else about the vocabulary is written here: it comes from
+ * `MAILBOX_FIELDS`, which the OAuth layer mirrors.
+ *
+ * The `/:id` edit routes are not negotiated. They have no second caller, and a
+ * surface with no user is a surface with no tests.
+ *
  * Route path collisions: "new" and "test" are reserved path segments — GET
  * /settings/mailboxes/new and POST /settings/mailboxes/test are registered ahead of
  * the `:id` routes they would otherwise be ambiguous with. An operator who names an
@@ -31,7 +62,7 @@
  */
 
 import { timingSafeEqual } from "node:crypto";
-import express, { type RequestHandler, type Response, type Router } from "express";
+import express, { type Request, type RequestHandler, type Response, type Router } from "express";
 
 import type { Logger } from "./app.js";
 import {
@@ -47,6 +78,16 @@ import {
 import { StaleStampError } from "./accounts-writer.js";
 import { probeAccount, type ProbeReport } from "./probe.js";
 import {
+  flattenDraft,
+  MAILBOX_FIELDS,
+  MAILBOX_SECRET_FIELDS,
+  parseMailboxDraft,
+  type MailboxCreatedAnswer,
+  type MailboxErrorAnswer,
+  type MailboxProbeAnswer,
+  type MailboxStampAnswer,
+} from "./settings-api.js";
+import {
   renderMailboxForm,
   renderMailboxList,
   SETTINGS_HEADERS,
@@ -61,7 +102,7 @@ export interface SettingsRouterDeps {
   log: Logger;
 }
 
-const PASSWORD_FIELDS = new Set(["imap.pass", "smtp.pass", "caldav.pass"]);
+const PASSWORD_FIELDS = new Set<string>(MAILBOX_SECRET_FIELDS);
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
 /** Thrown by an individual field parser; caught and folded into the errors record. */
@@ -155,42 +196,42 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
   if (existing) {
     id = existing.id;
   } else {
-    id = requireStr("id");
+    id = requireStr(MAILBOX_FIELDS.id);
     if (id !== "" && !ID_PATTERN.test(id)) {
-      errors.id = "Use lowercase letters, digits, _ or -, up to 32 characters, starting alphanumeric.";
+      errors[MAILBOX_FIELDS.id] ="Use lowercase letters, digits, _ or -, up to 32 characters, starting alphanumeric.";
     } else if (RESERVED_IDS.has(id)) {
       // Same rule AccountsStore.create() enforces (see RESERVED_IDS in
       // accounts.ts) — caught here too so the operator sees a clean field
       // error instead of the generic AccountsStoreError re-render below.
-      errors.id = `"${id}" is reserved and can't be used as a mailbox id. Choose another id.`;
+      errors[MAILBOX_FIELDS.id] =`"${id}" is reserved and can't be used as a mailbox id. Choose another id.`;
     }
   }
 
-  const label = requireStr("label");
-  const isDefault = checkbox(body, "default");
+  const label = requireStr(MAILBOX_FIELDS.label);
+  const isDefault = checkbox(body, MAILBOX_FIELDS.isDefault);
 
-  const imapHost = requireStr("imap.host");
-  const imapPort = requirePort("imap.port");
-  const imapUser = requireStr("imap.user");
-  const imapPass = password("imap.pass", existing?.imap.pass);
-  const imapTls = checkbox(body, "imap.tls");
+  const imapHost = requireStr(MAILBOX_FIELDS.imapHost);
+  const imapPort = requirePort(MAILBOX_FIELDS.imapPort);
+  const imapUser = requireStr(MAILBOX_FIELDS.imapUser);
+  const imapPass = password(MAILBOX_FIELDS.imapPass, existing?.imap.pass);
+  const imapTls = checkbox(body, MAILBOX_FIELDS.imapTls);
 
-  const smtpHost = requireStr("smtp.host");
-  const smtpPort = requirePort("smtp.port");
-  const smtpUser = requireStr("smtp.user");
-  const smtpPass = password("smtp.pass", existing?.smtp.pass);
-  const smtpTls = checkbox(body, "smtp.tls");
+  const smtpHost = requireStr(MAILBOX_FIELDS.smtpHost);
+  const smtpPort = requirePort(MAILBOX_FIELDS.smtpPort);
+  const smtpUser = requireStr(MAILBOX_FIELDS.smtpUser);
+  const smtpPass = password(MAILBOX_FIELDS.smtpPass, existing?.smtp.pass);
+  const smtpTls = checkbox(body, MAILBOX_FIELDS.smtpTls);
 
-  const defaultFrom = requireStr("mail.defaultFrom");
-  const defaultFromNameRaw = raw(body, "mail.defaultFromName");
-  const draftsFolderRaw = raw(body, "mail.draftsFolder");
+  const defaultFrom = requireStr(MAILBOX_FIELDS.mailDefaultFrom);
+  const defaultFromNameRaw = raw(body, MAILBOX_FIELDS.mailDefaultFromName);
+  const draftsFolderRaw = raw(body, MAILBOX_FIELDS.mailDraftsFolder);
   const draftsFolder = draftsFolderRaw.trim() === "" ? "Drafts" : draftsFolderRaw;
-  const sentFolderRaw = raw(body, "mail.sentFolder");
+  const sentFolderRaw = raw(body, MAILBOX_FIELDS.mailSentFolder);
   const sentFolder = sentFolderRaw.trim() === "" ? null : sentFolderRaw;
 
   const removeCaldav = checkbox(body, "remove_caldav");
-  const caldavUrl = raw(body, "caldav.url");
-  const caldavUser = raw(body, "caldav.user");
+  const caldavUrl = raw(body, MAILBOX_FIELDS.caldavUrl);
+  const caldavUser = raw(body, MAILBOX_FIELDS.caldavUser);
 
   let caldav: CalDavCreds | undefined;
   if (removeCaldav) {
@@ -201,15 +242,15 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
       // the "Remove CalDAV" checkbox above. Falling through to `undefined`
       // here would silently drop the stored CalDAV username and password
       // from accounts.json the moment the operator saves.
-      errors["caldav.url"] = 'Required — tick "Remove CalDAV" to remove it.';
+      errors[MAILBOX_FIELDS.caldavUrl] = 'Required — tick "Remove CalDAV" to remove it.';
     }
     // No existing CalDAV block and a blank URL: there was never a CalDAV
     // block to begin with, which is not an error.
   } else {
     if (caldavUser.trim() === "") {
-      errors["caldav.user"] = "Required.";
+      errors[MAILBOX_FIELDS.caldavUser] = "Required.";
     }
-    const caldavPass = password("caldav.pass", existing?.caldav?.pass);
+    const caldavPass = password(MAILBOX_FIELDS.caldavPass, existing?.caldav?.pass);
     caldav = { url: caldavUrl, user: caldavUser, pass: caldavPass };
   }
 
@@ -269,6 +310,57 @@ function sendPlain(res: Response, status: number, text: string): void {
   res.status(status).type("text/plain").set(SETTINGS_HEADERS).send(text);
 }
 
+/**
+ * The same answers, as JSON.
+ *
+ * The header set goes out unchanged. Most of it is about a page rather than a
+ * document — a CSP means nothing to a `fetch` — but `Cache-Control: no-store`
+ * means exactly as much here, these bodies carry the same account details the
+ * pages do, and one send path with one header set is easier to keep right than
+ * two.
+ */
+function sendJson(
+  res: Response,
+  status: number,
+  payload: MailboxProbeAnswer | MailboxStampAnswer | MailboxCreatedAnswer | MailboxErrorAnswer
+): void {
+  res.status(status).type("application/json").set(SETTINGS_HEADERS).json(payload);
+}
+
+/**
+ * Whether this caller wants JSON rather than a page.
+ *
+ * `req.accepts` decides it, which fails safe in the direction that matters: a
+ * browser sends `text/html,…` and a bare `fetch` sends the wildcard, and both
+ * of those pick "html" out of this list. Only an explicit `application/json`
+ * picks JSON. A body that arrived as JSON counts too — answering a JSON
+ * document with a rendered form would be a half-and-half state nobody could
+ * act on.
+ */
+function wantsJson(req: Request): boolean {
+  return req.accepts(["html", "json"]) === "json" || req.is("application/json") === "application/json";
+}
+
+/** What a JSON body that is not a mailbox draft is told. */
+const MALFORMED_DRAFT =
+  "The request body was not a mailbox draft: it needs a `mailbox` object with id, " +
+  "label, default, mail, imap and smtp.";
+
+/**
+ * The submitted mailbox, as `parseAccountForm` wants it.
+ *
+ * The flat form body for an HTML submission; for a JSON one, the draft under
+ * `mailbox` flattened onto the very same names. One parser, one set of rules,
+ * one place a blank password means "keep the stored one" — the content type
+ * changes how the fields arrive and nothing else. Null means the JSON body was
+ * not a draft at all.
+ */
+function submittedFields(body: FormBody, json: boolean): FormBody | null {
+  if (!json) return body;
+  const draft = parseMailboxDraft(body.mailbox);
+  return draft === null ? null : flattenDraft(draft);
+}
+
 function csrfMatches(expected: string, submitted: unknown): boolean {
   if (typeof submitted !== "string" || submitted.length === 0) return false;
   const expectedBuf = Buffer.from(expected, "utf8");
@@ -303,6 +395,10 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   const { store, issuer, settingsKey, log } = deps;
   const router = express.Router();
   const formBody = express.urlencoded({ extended: false, limit: "64kb" });
+  // Chained ahead of `formBody` on the two routes that also answer JSON. Each
+  // parser ignores a body of the other's content type, so the pair is exactly
+  // "read whichever of the two this is" and neither route grew a branch for it.
+  const jsonBody = express.json({ limit: "64kb" });
   const guardAssertion = requireSettingsAssertion({ key: settingsKey, issuer, log });
   const guardCsrf = requireFormCsrf();
 
@@ -328,9 +424,16 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     );
   });
 
-  router.get("/settings/mailboxes/new", guardAssertion, async (_req, res) => {
+  router.get("/settings/mailboxes/new", guardAssertion, async (req, res) => {
     const assertion = assertionOf(res);
     const stamp = await store.stamp();
+    if (wantsJson(req)) {
+      // The stamp is the whole of what a programmatic caller comes here for: it
+      // is what a later write has to still be against, and reading it off this
+      // route rather than a new one is why there is no new route.
+      sendJson(res, 200, { stamp });
+      return;
+    }
     sendHtml(res, 200, renderMailboxForm({ csrf: assertion.csrf, stamp, account: null }));
   });
 
@@ -345,43 +448,97 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     sendHtml(res, 200, renderMailboxForm({ csrf: assertion.csrf, stamp, account }));
   });
 
-  router.post("/settings/mailboxes", guardAssertion, formBody, guardCsrf, async (req, res) => {
-    const body = req.body as FormBody;
-    const assertion = assertionOf(res);
-    const submittedStamp = raw(body, "_stamp");
-    const parsed = parseAccountForm(body, null);
-    if (parsed.errors) {
-      sendHtml(
-        res,
-        400,
-        renderMailboxForm({
-          csrf: assertion.csrf,
-          stamp: submittedStamp,
-          account: null,
-          values: sanitize(body),
-          errors: parsed.errors,
-        })
-      );
-      return;
-    }
-    try {
-      await store.create(parsed.account, submittedStamp);
-    } catch (err) {
-      if (err instanceof StaleStampError) {
-        sendHtml(
-          res,
-          409,
-          renderMailboxForm({
-            csrf: assertion.csrf,
-            stamp: await store.stamp(),
-            account: null,
-            values: sanitize(body),
-            errors: { id: err.message },
-          })
-        );
+  router.post(
+    "/settings/mailboxes",
+    guardAssertion,
+    jsonBody,
+    formBody,
+    guardCsrf,
+    async (req, res) => {
+      const body = req.body as FormBody;
+      const json = wantsJson(req);
+      const assertion = assertionOf(res);
+      const submittedStamp = raw(body, "_stamp");
+
+      const fields = submittedFields(body, json);
+      if (fields === null) {
+        sendJson(res, 400, { message: MALFORMED_DRAFT, errors: {} });
         return;
       }
-      if (err instanceof AccountsStoreError) {
+
+      const rejected = (status: number, errors: Record<string, string>, stamp: string): void => {
+        if (json) {
+          sendJson(res, status, { errors });
+          return;
+        }
+        sendHtml(
+          res,
+          status,
+          renderMailboxForm({
+            csrf: assertion.csrf,
+            stamp,
+            account: null,
+            values: sanitize(body),
+            errors,
+          })
+        );
+      };
+
+      const parsed = parseAccountForm(fields, null);
+      if (parsed.errors) {
+        rejected(400, parsed.errors, submittedStamp);
+        return;
+      }
+      try {
+        await store.create(parsed.account, submittedStamp);
+      } catch (err) {
+        if (err instanceof StaleStampError) {
+          rejected(409, { [MAILBOX_FIELDS.id]: err.message }, await store.stamp());
+          return;
+        }
+        if (err instanceof AccountsStoreError) {
+          rejected(400, { [MAILBOX_FIELDS.id]: err.message }, submittedStamp);
+          return;
+        }
+        throw err;
+      }
+      if (json) {
+        // 201 and not the browser's 303: there is nowhere to send a caller that
+        // is not a browser, and the two facts it wants are the id it now has
+        // and where accounts.json got to. The status is what says "stored" —
+        // the setup wizard reads nothing out of this body, and an answer that
+        // never arrives is settled by asking for the stamp again.
+        sendJson(res, 201, { id: parsed.account.id, stamp: await store.stamp() });
+        return;
+      }
+      res.redirect(303, "/settings/mailboxes");
+    }
+  );
+
+  router.post(
+    "/settings/mailboxes/test",
+    guardAssertion,
+    jsonBody,
+    formBody,
+    guardCsrf,
+    async (req, res) => {
+      const body = req.body as FormBody;
+      const json = wantsJson(req);
+      const assertion = assertionOf(res);
+      const submittedStamp = raw(body, "_stamp");
+
+      const fields = submittedFields(body, json);
+      if (fields === null) {
+        sendJson(res, 400, { message: MALFORMED_DRAFT, errors: {} });
+        return;
+      }
+
+      const parsed = parseAccountForm(fields, null);
+      if (parsed.errors) {
+        if (json) {
+          sendJson(res, 400, { errors: parsed.errors });
+          return;
+        }
         sendHtml(
           res,
           400,
@@ -390,52 +547,36 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
             stamp: submittedStamp,
             account: null,
             values: sanitize(body),
-            errors: { id: err.message },
+            errors: parsed.errors,
           })
         );
         return;
       }
-      throw err;
-    }
-    res.redirect(303, "/settings/mailboxes");
-  });
-
-  router.post("/settings/mailboxes/test", guardAssertion, formBody, guardCsrf, async (req, res) => {
-    const body = req.body as FormBody;
-    const assertion = assertionOf(res);
-    const submittedStamp = raw(body, "_stamp");
-    const parsed = parseAccountForm(body, null);
-    if (parsed.errors) {
+      const report = await probeAccount({
+        imap: parsed.account.imap,
+        smtp: parsed.account.smtp,
+        caldav: parsed.account.caldav,
+      });
+      if (json) {
+        // `ProbeReport` already is the wire shape — `{ ok }` or
+        // `{ ok, message }` per service, and null for a CalDAV block that was
+        // never given. Nothing is stored on this route whatever it finds.
+        sendJson(res, 200, { probe: report });
+        return;
+      }
       sendHtml(
         res,
-        400,
+        200,
         renderMailboxForm({
           csrf: assertion.csrf,
           stamp: submittedStamp,
           account: null,
           values: sanitize(body),
-          errors: parsed.errors,
+          probe: toProbeView(report),
         })
       );
-      return;
     }
-    const report = await probeAccount({
-      imap: parsed.account.imap,
-      smtp: parsed.account.smtp,
-      caldav: parsed.account.caldav,
-    });
-    sendHtml(
-      res,
-      200,
-      renderMailboxForm({
-        csrf: assertion.csrf,
-        stamp: submittedStamp,
-        account: null,
-        values: sanitize(body),
-        probe: toProbeView(report),
-      })
-    );
-  });
+  );
 
   router.post("/settings/mailboxes/:id", guardAssertion, formBody, guardCsrf, async (req, res) => {
     const existing = findAccount(store, idParam(req));

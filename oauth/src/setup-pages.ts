@@ -22,6 +22,7 @@
 import { escapeHtml } from "./login.js";
 import type { CredentialField, CredentialProblem } from "./operator.js";
 import { MIN_PASSWORD_LENGTH } from "./operator.js";
+import { CHECKBOX_ON, MAILBOX_FIELDS } from "./settings-api.js";
 import { stepNumber, SETUP_STEPS, type SetupStep } from "./setup-state.js";
 
 /** The title of each screen, used in the header line and the document title. */
@@ -277,14 +278,15 @@ export interface MailboxPageData {
 /**
  * Pre-filled values, so the common case is a few boxes rather than a form.
  *
- * The keys are the connector's field names, not names of this screen's own:
- * everything collected here is posted to `/settings/mailboxes` unchanged.
+ * The keys are `MAILBOX_FIELDS`, not names of this screen's own: everything
+ * collected here becomes a `MailboxDraft` and goes to the connector under
+ * exactly these names.
  */
 const MAILBOX_DEFAULTS: Record<string, string> = {
-  id: "main",
-  label: "Main mailbox",
-  "imap.port": "993",
-  "smtp.port": "465",
+  [MAILBOX_FIELDS.id]: "main",
+  [MAILBOX_FIELDS.label]: "Main mailbox",
+  [MAILBOX_FIELDS.imapPort]: "993",
+  [MAILBOX_FIELDS.smtpPort]: "465",
 };
 
 function value(values: Record<string, string>, key: string): string {
@@ -298,7 +300,7 @@ function checked(values: Record<string, string>, key: string): boolean {
   // submitted anything, an absent checkbox means they unticked it — a browser
   // sends nothing at all for one that is off.
   if (Object.keys(values).length === 0) return true;
-  return values[key] === "1";
+  return values[key] === CHECKBOX_ON;
 }
 
 function textInput(opts: {
@@ -358,7 +360,7 @@ function checkboxInput(opts: {
   values: Record<string, string>;
 }): string {
   return `<div class="checkbox-row">
-  <input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="checkbox" value="1"${
+  <input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="checkbox" value="${CHECKBOX_ON}"${
     checked(opts.values, opts.name) ? " checked" : ""
   }>
   <label for="${escapeHtml(opts.id)}">${escapeHtml(opts.label)}</label>
@@ -395,11 +397,13 @@ function noticeHtml(notice: MailboxPageData["notice"]): string {
 /**
  * Step 2 — the first mailbox, verified before it is stored.
  *
- * The field names are the connector's own, verbatim, because the connector is
- * what parses, probes and stores them. This screen supplies the wizard's chrome,
- * a Skip button and sensible ports; everything it collects goes to the same
- * `/settings/mailboxes` routes the settings UI posts to, and nothing about a
- * mailbox is validated, probed or written on this side of that hop.
+ * The field names come from `MAILBOX_FIELDS` in settings-api.ts, which the
+ * connector's own form and parser read too — one table of names, so a rename is
+ * a compile error rather than a field that quietly fails to arrive. This screen
+ * supplies the wizard's chrome, a Skip button and sensible ports; everything it
+ * collects becomes a `MailboxDraft` for the same `/settings/mailboxes` routes
+ * the settings UI posts to, and nothing about a mailbox is validated, probed or
+ * written on this side of that hop.
  *
  * Skip carries `formnovalidate` on purpose. Every credential field is
  * `required`, which is what catches an incomplete form in the browser rather
@@ -434,10 +438,10 @@ export function renderMailboxStep(data: MailboxPageData): string {
   ${noticeHtml(data.notice)}
   ${probeSection(data.probe)}
   <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
-    <input type="hidden" name="default" value="1">
+    <input type="hidden" name="${MAILBOX_FIELDS.isDefault}" value="${CHECKBOX_ON}">
     ${textInput({
       id: "label",
-      name: "label",
+      name: MAILBOX_FIELDS.label,
       label: "Name for this mailbox",
       values,
       errors,
@@ -445,7 +449,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
     })}
     ${textInput({
       id: "mailbox_id",
-      name: "id",
+      name: MAILBOX_FIELDS.id,
       label: "ID",
       values,
       errors,
@@ -454,7 +458,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
     })}
     ${textInput({
       id: "mail_from",
-      name: "mail.defaultFrom",
+      name: MAILBOX_FIELDS.mailDefaultFrom,
       label: "Email address",
       values,
       errors,
@@ -467,7 +471,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
     <div class="row">
       <div>${textInput({
         id: "imap_host",
-        name: "imap.host",
+        name: MAILBOX_FIELDS.imapHost,
         label: "Host",
         values,
         errors,
@@ -475,7 +479,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
       })}</div>
       <div class="narrow">${textInput({
         id: "imap_port",
-        name: "imap.port",
+        name: MAILBOX_FIELDS.imapPort,
         label: "Port",
         values,
         errors,
@@ -483,16 +487,16 @@ export function renderMailboxStep(data: MailboxPageData): string {
         required: true,
       })}</div>
     </div>
-    ${checkboxInput({ id: "imap_tls", name: "imap.tls", label: "TLS", values })}
+    ${checkboxInput({ id: "imap_tls", name: MAILBOX_FIELDS.imapTls, label: "TLS", values })}
     ${textInput({
       id: "imap_user",
-      name: "imap.user",
+      name: MAILBOX_FIELDS.imapUser,
       label: "Username",
       values,
       errors,
       required: true,
     })}
-    ${passwordInput({ id: "imap_pass", name: "imap.pass", label: "Password", errors, required: true })}
+    ${passwordInput({ id: "imap_pass", name: MAILBOX_FIELDS.imapPass, label: "Password", errors, required: true })}
     </fieldset>
 
     <fieldset>
@@ -500,7 +504,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
     <div class="row">
       <div>${textInput({
         id: "smtp_host",
-        name: "smtp.host",
+        name: MAILBOX_FIELDS.smtpHost,
         label: "Host",
         values,
         errors,
@@ -508,7 +512,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
       })}</div>
       <div class="narrow">${textInput({
         id: "smtp_port",
-        name: "smtp.port",
+        name: MAILBOX_FIELDS.smtpPort,
         label: "Port",
         values,
         errors,
@@ -516,16 +520,16 @@ export function renderMailboxStep(data: MailboxPageData): string {
         required: true,
       })}</div>
     </div>
-    ${checkboxInput({ id: "smtp_tls", name: "smtp.tls", label: "TLS", values })}
+    ${checkboxInput({ id: "smtp_tls", name: MAILBOX_FIELDS.smtpTls, label: "TLS", values })}
     ${textInput({
       id: "smtp_user",
-      name: "smtp.user",
+      name: MAILBOX_FIELDS.smtpUser,
       label: "Username",
       values,
       errors,
       required: true,
     })}
-    ${passwordInput({ id: "smtp_pass", name: "smtp.pass", label: "Password", errors, required: true })}
+    ${passwordInput({ id: "smtp_pass", name: MAILBOX_FIELDS.smtpPass, label: "Password", errors, required: true })}
     </fieldset>
 
     <fieldset>
@@ -535,9 +539,9 @@ export function renderMailboxStep(data: MailboxPageData): string {
       not stop the mailbox being stored; the calendar tools stay unavailable
       until it does.
     </p>
-    ${textInput({ id: "caldav_url", name: "caldav.url", label: "URL", values, errors })}
-    ${textInput({ id: "caldav_user", name: "caldav.user", label: "Username", values, errors })}
-    ${passwordInput({ id: "caldav_pass", name: "caldav.pass", label: "Password", errors })}
+    ${textInput({ id: "caldav_url", name: MAILBOX_FIELDS.caldavUrl, label: "URL", values, errors })}
+    ${textInput({ id: "caldav_user", name: MAILBOX_FIELDS.caldavUser, label: "Username", values, errors })}
+    ${passwordInput({ id: "caldav_pass", name: MAILBOX_FIELDS.caldavPass, label: "Password", errors })}
     </fieldset>
 
     <p class="muted">

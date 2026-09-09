@@ -24,6 +24,14 @@ import {
 } from "../../src/operator.js";
 import { verifyPassword } from "../../src/passwords.js";
 import {
+  draftFromFields,
+  flattenDraft,
+  MAILBOX_FIELD_NAMES,
+  parseErrorAnswer,
+  parseProbeAnswer,
+  parseStampAnswer,
+} from "../../src/settings-api.js";
+import {
   renderConnectStep,
   renderCredentialsStep,
   renderMailboxStep,
@@ -33,9 +41,7 @@ import {
   type MailboxPageData,
   type MailboxProbeView,
 } from "../../src/setup-pages.js";
-import { readFieldErrors, readProbeReport, readStamp } from "../../src/setup-routes.js";
 import { SetupState } from "../../src/setup-state.js";
-import { mailboxFormPage } from "../helpers/connector-pages.js";
 
 const GOOD_PASSWORD = "correct horse battery staple";
 
@@ -435,28 +441,21 @@ describe("the step 2 screen", () => {
   it("collects a mailbox under the connector's own field names", () => {
     // The point of the exercise: no second form, no second set of names. What
     // this screen submits is what /settings/mailboxes already parses.
+    //
+    // The list is MAILBOX_FIELD_NAMES rather than a copy of it, which is the
+    // request half of #69: a field renamed in one package used to go quietly
+    // missing on the way to the other, and the connector then reported
+    // "Required." for a box the operator had filled in. There is one table of
+    // names now, and this is what says this form renders all of it.
     const html = mailboxPage();
 
     assert.match(html, /Step 2 of 3 · Add your first mailbox/);
-    for (const name of [
-      "id",
-      "label",
-      "mail.defaultFrom",
-      "imap.host",
-      "imap.port",
-      "imap.tls",
-      "imap.user",
-      "imap.pass",
-      "smtp.host",
-      "smtp.port",
-      "smtp.tls",
-      "smtp.user",
-      "smtp.pass",
-      "caldav.url",
-      "caldav.user",
-      "caldav.pass",
-    ]) {
-      assert.match(html, new RegExp(`name="${name.replace(".", "\\.")}"`), name);
+    for (const name of MAILBOX_FIELD_NAMES) {
+      // The three mail.* defaults are the connector's business, not this
+      // screen's: they are left at their stored defaults and the operator
+      // changes them from the settings UI once setup is finished.
+      if (name.startsWith("mail.") && name !== "mail.defaultFrom") continue;
+      assert.ok(html.includes(`name="${name}"`), `step 2's form has no box named ${name}`);
     }
     assert.equal(/<script/i.test(html), false);
   });
@@ -519,95 +518,140 @@ describe("the step 2 screen", () => {
   });
 });
 
+describe("the mailbox draft the wizard sends", () => {
+  it("reads a submitted form into a draft and flattens it straight back", () => {
+    const submitted: Record<string, string> = {
+      id: "main",
+      label: "Main mailbox",
+      default: "1",
+      "mail.defaultFrom": "anna@example.com",
+      "mail.defaultFromName": "Anna",
+      "mail.draftsFolder": "Drafts",
+      "mail.sentFolder": "Sent",
+      "imap.host": "imap.example.com",
+      "imap.port": "993",
+      "imap.user": "anna@example.com",
+      "imap.pass": "secret",
+      "imap.tls": "1",
+      "smtp.host": "smtp.example.com",
+      "smtp.port": "465",
+      "smtp.user": "anna@example.com",
+      "smtp.pass": "secret",
+      "smtp.tls": "1",
+      "caldav.url": "https://dav.example.com",
+      "caldav.user": "anna",
+      "caldav.pass": "secret",
+    };
+
+    assert.deepEqual(flattenDraft(draftFromFields(submitted)), submitted);
+  });
+
+  it("keeps an unticked checkbox unticked rather than defaulting it back on", () => {
+    // A browser sends nothing at all for a checkbox that is off, so "absent"
+    // has to survive the round trip as false — otherwise an operator who turns
+    // TLS off gets it turned back on for them.
+    const draft = draftFromFields({ "imap.host": "imap.example.com" });
+    assert.equal(draft.imap.tls, false);
+    assert.equal(draft.default, false);
+    assert.equal(flattenDraft(draft)["imap.tls"], "");
+  });
+
+  it("has no CalDAV block when nothing was typed into one, and one when anything was", () => {
+    assert.equal(draftFromFields({ id: "main" }).caldav, null);
+    // Not only the URL: a half-filled CalDAV section has to come back to the
+    // operator with what they typed still in it.
+    assert.deepEqual(draftFromFields({ "caldav.user": "anna" }).caldav, {
+      url: "",
+      user: "anna",
+      pass: "",
+    });
+    assert.equal("caldav.url" in flattenDraft(draftFromFields({ id: "main" })), false);
+  });
+
+  it("reads a repeated or missing field as absent rather than as an array", () => {
+    const draft = draftFromFields({ id: ["main", "other"], label: undefined });
+    assert.equal(draft.id, "");
+    assert.equal(draft.label, "");
+  });
+});
+
 describe("reading the connector's answers", () => {
-  it("reads one result per service out of the probe panel", () => {
-    const report = readProbeReport(
-      mailboxFormPage({
-        probe: {
-          imap: { ok: true },
-          smtp: { ok: false, message: "the server rejected these credentials" },
-          caldav: { ok: false, message: "404 Not Found" },
-        },
-      })
-    );
+  it("reads one result per service out of the probe answer", () => {
+    const report = parseProbeAnswer({
+      probe: {
+        imap: { ok: true },
+        smtp: { ok: false, message: "the server rejected these credentials" },
+        caldav: { ok: false, message: "404 Not Found" },
+      },
+    });
 
     assert.deepEqual(report, {
-      imap: { tested: true, ok: true, message: "" },
-      smtp: { tested: true, ok: false, message: "the server rejected these credentials" },
-      caldav: { tested: true, ok: false, message: "404 Not Found" },
+      imap: { ok: true },
+      smtp: { ok: false, message: "the server rejected these credentials" },
+      caldav: { ok: false, message: "404 Not Found" },
     });
   });
 
-  it("reads a missing CalDAV row as not tested, not as a failure", () => {
-    // The connector omits the row entirely when no CalDAV URL was submitted.
-    const report = readProbeReport(
-      mailboxFormPage({ probe: { imap: { ok: true }, smtp: { ok: true } } })
-    );
-    assert.deepEqual(report?.caldav, { tested: false, ok: false, message: "" });
+  it("reads a null CalDAV result as not tested, not as a failure", () => {
+    // The connector reports null when no CalDAV URL was submitted.
+    const report = parseProbeAnswer({ probe: { imap: { ok: true }, smtp: { ok: true }, caldav: null } });
+    assert.equal(report?.caldav, null);
+    // Absent is the same thing said more quietly, and reads the same way.
+    assert.equal(parseProbeAnswer({ probe: { imap: { ok: true }, smtp: { ok: true } } })?.caldav, null);
   });
 
-  it("un-escapes a failure message rather than showing the entities back", () => {
-    const report = readProbeReport(
-      mailboxFormPage({
-        probe: { imap: { ok: true }, smtp: { ok: false, message: 'no "route" to <host> & no reply' } },
-      })
-    );
-    assert.equal(report?.smtp.message, 'no "route" to <host> & no reply');
-  });
-
-  it("reads nothing at all as nothing, so a save cannot proceed on it", () => {
+  it("reads nothing it does not recognise as nothing, so a save cannot proceed on it", () => {
     // Fail closed. An answer this build cannot read is not evidence that the
     // mailbox works, and the caller refuses to store credentials without a
     // report for them.
-    assert.equal(readProbeReport(mailboxFormPage()), null);
-    assert.equal(readProbeReport("<html><body>Unauthorized</body></html>"), null);
+    assert.equal(parseProbeAnswer(undefined), null);
+    assert.equal(parseProbeAnswer({}), null);
+    assert.equal(parseProbeAnswer({ probe: { imap: { ok: true } } }), null, "SMTP missing");
+    assert.equal(parseProbeAnswer({ probe: { imap: { ok: true }, smtp: { ok: "yes" } } }), null);
+    // A failure with no message is not a failure this screen can report on.
+    assert.equal(parseProbeAnswer({ probe: { imap: { ok: false }, smtp: { ok: true } } }), null);
+    // Present but unreadable is not the same as absent: it is not guessed at.
     assert.equal(
-      readProbeReport(mailboxFormPage({ probe: { imap: { ok: true }, smtp: { ok: true } } }))?.imap
-        .ok,
-      true
+      parseProbeAnswer({ probe: { imap: { ok: true }, smtp: { ok: true }, caldav: {} } }),
+      null
     );
   });
 
   it("reads each rejected field under the name the connector rejected", () => {
-    const errors = readFieldErrors(
-      mailboxFormPage({
-        errors: {
-          id: 'An account with id "main" already exists.',
-          "imap.port": "Must be a port number between 1 and 65535.",
-        },
-      })
-    );
+    const answer = parseErrorAnswer({
+      errors: {
+        id: 'An account with id "main" already exists.',
+        "imap.port": "Must be a port number between 1 and 65535.",
+        "imap.pass": "Required.",
+      },
+    });
 
-    assert.deepEqual(errors, {
+    assert.deepEqual(answer.errors, {
       id: 'An account with id "main" already exists.',
       "imap.port": "Must be a port number between 1 and 65535.",
-    });
-  });
-
-  it("reads a rejected password back, now that the connector renders one", () => {
-    // #83 gave the password fields an error line of their own; the reader here
-    // matches any input, and its `[^>]*` has to keep spanning the newline the
-    // connector's `passwordField()` puts inside the tag. Nothing asserted that
-    // until now, so a reader that only ever saw single-line text inputs would
-    // have looked fine (#92).
-    const errors = readFieldErrors(
-      mailboxFormPage({
-        errors: {
-          "imap.pass": "Required.",
-          "smtp.pass": "A password is needed when a user is given.",
-        },
-      })
-    );
-
-    assert.deepEqual(errors, {
       "imap.pass": "Required.",
-      "smtp.pass": "A password is needed when a user is given.",
     });
   });
 
-  it("reads the accounts stamp the connector's own form was rendered from", () => {
-    assert.equal(readStamp(mailboxFormPage({ stamp: "412-1757000000000" })), "412-1757000000000");
-    assert.equal(readStamp(mailboxFormPage()), "absent");
-    assert.equal(readStamp("<html><body>Unauthorized</body></html>"), null);
+  it("drops a rejection under a name this build has no box for", () => {
+    // The error map is rendered against the form. A connector on a different
+    // release must not be able to put arbitrary keys into it.
+    const answer = parseErrorAnswer({ errors: { "imap.host": "Required.", nonsense: "boo" } });
+    assert.deepEqual(answer.errors, { "imap.host": "Required." });
+  });
+
+  it("reads a refusal it cannot parse as a refusal with nothing to point at", () => {
+    assert.deepEqual(parseErrorAnswer(undefined), { errors: {} });
+    assert.deepEqual(parseErrorAnswer("Unauthorized"), { errors: {} });
+    assert.deepEqual(parseErrorAnswer({ message: "not a draft" }), {
+      message: "not a draft",
+      errors: {},
+    });
+  });
+
+  it("reads the accounts stamp the connector states", () => {
+    assert.equal(parseStampAnswer({ stamp: "412-1757000000000" }), "412-1757000000000");
+    assert.equal(parseStampAnswer({}), null);
+    assert.equal(parseStampAnswer("<html><body>Unauthorized</body></html>"), null);
   });
 });
