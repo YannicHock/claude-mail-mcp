@@ -101,6 +101,9 @@ test("a session cookie minted before a password change stops working after it", 
   try {
     const cookie = await harness.signIn();
     assert.equal((await getSettings(harness, cookie)).status, 200);
+    // Present because this harness is bootstrapped; an unclaimed one has no
+    // operator record at all.
+    assert.ok(harness.operator);
     await harness.operator.changePassword("a new password entirely");
     const after = await getSettings(harness, cookie);
     assert.equal(after.status, 200);

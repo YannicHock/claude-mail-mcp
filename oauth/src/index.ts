@@ -6,6 +6,7 @@
  * shutdown, so that the app factory stays testable without a listening port.
  */
 
+import { Bootstrap, BootstrapError, operatorSeed } from "./bootstrap.js";
 import { ConfigError, loadConfig } from "./config.js";
 import { createApp, SERVICE_NAME, VERSION } from "./app.js";
 import { createLogger } from "./logger.js";
@@ -33,17 +34,43 @@ async function main(): Promise<void> {
   // operator otherwise has no way to tell which of the two services wrote it.
   logSecretReport(config.secretReport, log);
   const store = await Store.open(config.stateFile, log);
-  const operator = await OperatorRecord.open(
-    config.operatorFile,
-    { username: config.authUsername, passwordHash: config.authPasswordHash },
-    log
-  );
-  const { app } = createApp({ config, store, operator, log });
+
+  // Before the operator record, not after: whether to open one at all is what
+  // this answers. An unclaimed instance has no operator to seed a record from,
+  // and seeding one anyway would claim the instance on its owner's behalf with a
+  // password nobody chose.
+  let bootstrap: Bootstrap;
+  try {
+    bootstrap = Bootstrap.open(config, log);
+  } catch (err) {
+    if (err instanceof BootstrapError) {
+      process.stderr.write(`${SERVICE_NAME}: ${err.message}\n`);
+      process.exit(1);
+    }
+    throw err;
+  }
+
+  // Every boot while unclaimed, not only the first. A container that restarts
+  // mid-setup must not cost the operator the link, and the token it prints is the
+  // same one the previous boot wrote.
+  bootstrap.announce();
+
+  // Absent while unbootstrapped, which is also what leaves the settings UI
+  // unmounted — the mount condition in app.ts already required an operator
+  // record, so that half of the state table needs no new code.
+  const operator = bootstrap.bootstrapped
+    ? await OperatorRecord.open(config.operatorFile, operatorSeed(config), log)
+    : undefined;
+
+  const { app } = createApp({ config, store, operator, bootstrap, log });
 
   const server = app.listen(config.port, config.host, () => {
     log("info", "listening", {
       version: VERSION,
       address: `${config.host}:${config.port}`,
+      // Which half of the state table this process is serving. Never the token:
+      // the banner above is where that belongs, once, deliberately.
+      bootstrapped: bootstrap.bootstrapped,
       issuer: config.issuer,
       resource: config.resource,
       upstream: config.upstreamMcpUrl,

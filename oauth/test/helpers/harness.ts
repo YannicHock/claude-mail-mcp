@@ -13,11 +13,15 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { mkdtempSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Express } from "express";
 
 import { createApp } from "../../src/app.js";
+import { Bootstrap } from "../../src/bootstrap.js";
 import type { OAuthConfig } from "../../src/config.js";
 import { silentLogger, type Logger } from "../../src/logger.js";
 import { OperatorRecord } from "../../src/operator.js";
@@ -56,9 +60,16 @@ export interface Harness {
   baseUrl: string;
   config: OAuthConfig;
   store: Store;
-  operator: OperatorRecord;
+  /** Absent when the harness was started unbootstrapped: there is no operator yet. */
+  operator: OperatorRecord | undefined;
   throttle: LoginThrottle;
   upstream: UpstreamStub;
+  /** The live bootstrap state the app is gating on. */
+  bootstrap: Bootstrap;
+  /** The complete setup URL, or null once (or because) the instance is claimed. */
+  setupUrl: string | null;
+  /** The claim token on its own, pulled back out of {@link setupUrl}. */
+  claimToken: string | null;
   /** Sign in as the test operator and return the session cookie's value. */
   signIn(): Promise<string>;
   close(): Promise<void>;
@@ -74,6 +85,17 @@ export interface HarnessOptions {
    * that need `changePassword` or a persisted `bumpSessionEpoch` pass one.
    */
   operatorPath?: string;
+  /**
+   * Start the app in the unbootstrapped state: no operator record, no configured
+   * password hash, and the claim-token gate in front of every route.
+   *
+   * The operator record and the claim token land in a fresh temp directory unless
+   * {@link HarnessOptions.dataDir} names one — pass the same directory to two
+   * harnesses in a row to exercise a restart.
+   */
+  unbootstrapped?: boolean;
+  /** Where the operator record and the claim token live. A temp dir by default. */
+  dataDir?: string;
 }
 
 export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> {
@@ -95,6 +117,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   const issuer = `http://localhost:${port}`;
 
   const authPasswordHash = await hashPassword(TEST_PASSWORD, FAST_SCRYPT);
+  const dataDir =
+    opts.dataDir ?? (opts.unbootstrapped ? mkdtempSync(join(tmpdir(), "oauth-harness-")) : null);
 
   const config: OAuthConfig = {
     port,
@@ -106,12 +130,14 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     upstreamAuthToken: UPSTREAM_TOKEN,
     signingKey: new TextEncoder().encode("test-signing-key-at-least-32-bytes-long"),
     authUsername: TEST_USERNAME,
-    authPasswordHash,
+    // Null is what makes the instance unbootstrapped: no hash and no record.
+    authPasswordHash: opts.unbootstrapped ? null : authPasswordHash,
     stateFile: null,
     settingsSigningKey: new TextEncoder().encode(
       "test-settings-signing-key-at-least-32-bytes-long"
     ),
-    operatorFile: null,
+    operatorFile: dataDir === null ? null : join(dataDir, "operator.json"),
+    claimTokenFile: dataDir === null ? null : join(dataDir, "claim-token.txt"),
     trustProxy: 1,
     accessTokenTtl: 3600,
     refreshTokenTtl: 2592000,
@@ -126,19 +152,27 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   const log = opts.log ?? silentLogger;
   const store = await Store.open(null, silentLogger);
   const throttle = opts.throttle ?? new LoginThrottle();
-  const operator = await OperatorRecord.open(
-    opts.operatorPath ?? null,
-    { username: TEST_USERNAME, passwordHash: authPasswordHash },
-    log
-  );
+  // The same order index.ts uses: decide the state first, and open the operator
+  // record only if there is one to open.
+  const bootstrap = Bootstrap.open(config, log);
+  const operator = bootstrap.bootstrapped
+    ? await OperatorRecord.open(
+        opts.operatorPath ?? null,
+        { username: TEST_USERNAME, passwordHash: authPasswordHash },
+        log
+      )
+    : undefined;
   ({ app } = createApp({
     config,
     store,
     operator,
+    bootstrap,
     log,
     throttle,
     proxyTimeoutMs: 5_000,
   }));
+
+  const setupUrl = bootstrap.setupUrl;
 
   return {
     baseUrl: issuer,
@@ -147,6 +181,9 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     operator,
     throttle,
     upstream,
+    bootstrap,
+    setupUrl,
+    claimToken: setupUrl === null ? null : (setupUrl.split("/").pop() ?? null),
     async signIn(): Promise<string> {
       const res = await fetch(`${issuer}/settings/login`, {
         method: "POST",

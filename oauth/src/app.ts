@@ -16,6 +16,7 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 
 import { ASSERTION_HEADER, signAssertion } from "./assertion.js";
+import { type Bootstrap, parseSetupPath, renderSetupPlaceholder } from "./bootstrap.js";
 import { registerClient } from "./clients.js";
 import { CodeStore } from "./codes.js";
 import type { OAuthConfig } from "./config.js";
@@ -62,6 +63,16 @@ export interface CreateAppOptions {
    * opted into the settings UI at all.
    */
   operator?: OperatorRecord;
+  /**
+   * The live bootstrap state. Absent means "bootstrapped", which is what every
+   * caller that predates the claim-token gate wants and what the settings-only
+   * tests still build.
+   *
+   * When it reports unbootstrapped this app answers `/health`, serves the setup
+   * page to the holder of the claim token, 503s the MCP endpoint and 404s
+   * everything else — see the gate below.
+   */
+  bootstrap?: Bootstrap;
   /** Overrides for tests; production uses the defaults. */
   codeStore?: CodeStore;
   throttle?: LoginThrottle;
@@ -138,6 +149,82 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
 
   const jsonBody = express.json({ limit: "64kb" });
   const formBody = express.urlencoded({ extended: false, limit: "64kb" });
+
+  const mcpRoute = config.mcpPath === "" ? "/" : config.mcpPath;
+
+  // ---- The claim-token gate ----------------------------------------------
+
+  // First in the chain, ahead of every route, because an unclaimed instance must
+  // not answer any of them. See bootstrap.ts for what "unclaimed" means and why
+  // it is not simply "the secrets are missing".
+  //
+  //                    unbootstrapped        claimed
+  //   /health          200                   200
+  //   /setup/<token>   the setup page        404
+  //   /setup/<other>   404                   404
+  //   /mcp             503                   normal
+  //   /settings/*      not mounted           normal
+  //   everything else  404                   normal
+  //
+  // Two properties this table is built around. `/mcp` answers 503 rather than
+  // 401: an instance with no credentials cannot reject anything meaningfully, and
+  // a 401 would invite guessing against a service that has nothing to guess at.
+  // And a wrong claim token gets the *same* 404 the claimed instance serves —
+  // byte for byte, from the same responder — so scanning cannot tell an unclaimed
+  // instance from a claimed one. A 401 here would announce "there is a token, and
+  // this is not it".
+  const bootstrap = opts.bootstrap;
+  if (bootstrap !== undefined) {
+    app.use((req, res, next) => {
+      // Read per request, not captured: complete() flips this in a live process
+      // and the routes must open in the same breath.
+      if (bootstrap.bootstrapped) {
+        // `/setup/*` is not registered anywhere else, so it falls through to the
+        // catch-all 404 below. Permanently: there is no route back into setup,
+        // and starting over means deleting the data volume.
+        next();
+        return;
+      }
+
+      if (req.path === "/health") {
+        next();
+        return;
+      }
+
+      if (req.path === mcpRoute) {
+        res.status(503).json({
+          error: "not_configured",
+          error_description: "This instance has not been set up yet.",
+        });
+        return;
+      }
+
+      const setup = parseSetupPath(req.path);
+      if (setup !== null && bootstrap.accepts(setup.token) && setup.rest === "") {
+        if (req.method !== "GET" && req.method !== "HEAD") {
+          // The placeholder has no form to submit. Issue #22 routes the wizard's
+          // own POSTs from here, behind the same token check.
+          sendNotFound(req, res);
+          return;
+        }
+        res
+          .status(200)
+          .type("html")
+          .set("Cache-Control", "no-store")
+          .set("X-Frame-Options", "DENY")
+          .set(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; " +
+              "frame-ancestors 'none'"
+          )
+          .set("Referrer-Policy", "same-origin")
+          .send(renderSetupPlaceholder());
+        return;
+      }
+
+      sendNotFound(req, res);
+    });
+  }
 
   // ---- Discovery ---------------------------------------------------------
 
@@ -342,11 +429,7 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
     const username = typeof body.username === "string" ? body.username : "";
     const password = typeof body.password === "string" ? body.password : "";
 
-    // Both checks always run, so a wrong username and a wrong password cost the
-    // same and neither can be distinguished by timing or by the message shown.
-    const usernameOk = constantTimeEquals(username, config.authUsername);
-    const passwordOk = await verifyPassword(password, config.authPasswordHash);
-    if (!usernameOk || !passwordOk) {
+    if (!(await verifyOperator(username, password))) {
       const failures = throttle.recordFailure(ip);
       // Fixed shape: the fail2ban filter in docs/HARDENING.md matches this line.
       log("warn", LOGIN_FAILURE_EVENT, { ip, failures });
@@ -368,7 +451,7 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
       codeChallenge: request.codeChallenge,
       scope: request.scope,
       resource: request.resource,
-      sub: config.authUsername,
+      sub: operatorUsername,
     });
 
     const target = new URL(request.redirectUri);
@@ -378,6 +461,33 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
     target.searchParams.set("iss", config.issuer);
     res.redirect(302, target.toString());
   });
+
+  /**
+   * The operator identity the consent screen authenticates against.
+   *
+   * The operator record when there is one, and the configured hash only when
+   * there is not (`OPERATOR_FILE=none`). The record is the live credential — that
+   * is the entire reason it exists, since `/run/secrets` is read-only and a
+   * password change has to be able to write somewhere — but this route had kept
+   * checking `AUTH_PASSWORD_HASH` directly, so a password changed in the settings
+   * UI left the OAuth sign-in still accepting the old one. It has to be the
+   * record now in any case: since the claim-token gate the hash may legitimately
+   * be absent, and after the setup wizard there is nothing else to check against.
+   *
+   * Both halves always run, so a wrong username and a wrong password cost the
+   * same and neither can be told from the other by timing or by the message.
+   */
+  const operatorUsername = opts.operator?.username ?? config.authUsername;
+  async function verifyOperator(username: string, password: string): Promise<boolean> {
+    if (opts.operator !== undefined) return opts.operator.verify(username, password);
+    const nameOk = constantTimeEquals(username, config.authUsername);
+    const hash = config.authPasswordHash;
+    // No record and no hash: there is nothing to authenticate against. The gate
+    // means this route is not reachable in that state at all; failing closed is
+    // what keeps that true if it ever becomes reachable.
+    const passwordOk = hash === null ? false : await verifyPassword(password, hash);
+    return nameOk && passwordOk;
+  }
 
   // ---- Token -------------------------------------------------------------
 
@@ -484,8 +594,6 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
     log,
     ...(opts.proxyTimeoutMs !== undefined ? { timeoutMs: opts.proxyTimeoutMs } : {}),
   });
-
-  const mcpRoute = config.mcpPath === "" ? "/" : config.mcpPath;
 
   app.all(mcpRoute, async (req: Request, res: Response) => {
     const header = req.get("authorization") ?? "";
@@ -605,12 +713,7 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
     });
   }
 
-  app.use((req, res) => {
-    res.status(404).json({
-      error: "not_found",
-      message: `${req.method} ${req.path} is not a valid endpoint.`,
-    });
-  });
+  app.use(sendNotFound);
 
   // Express 5 forwards async rejections here. Without it a thrown error in a
   // handler would hang the request until the client's own timeout.
@@ -627,6 +730,22 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
   });
 
   return { app, store };
+}
+
+/**
+ * The 404 every unmatched path gets.
+ *
+ * One function rather than one per site, because the claim-token gate depends on
+ * its response being *identical* to the catch-all's: a wrong token on an
+ * unclaimed instance and any unknown path on a claimed one must be
+ * indistinguishable, down to the body. Two copies of this would drift and the
+ * difference would be the oracle.
+ */
+function sendNotFound(req: Request, res: Response): void {
+  res.status(404).json({
+    error: "not_found",
+    message: `${req.method} ${req.path} is not a valid endpoint.`,
+  });
 }
 
 function tokenResponse(issued: {

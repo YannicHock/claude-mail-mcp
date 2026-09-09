@@ -57,13 +57,33 @@ describe("loadConfig", () => {
     assert.equal(config.logLevel, "info");
   });
 
+  describe("the claim token file", () => {
+    it("defaults to the data volume, beside the operator record", () => {
+      const config = loadConfig(baseEnv());
+      assert.equal(config.operatorFile, "/data/operator.json");
+      assert.equal(config.claimTokenFile, "/data/claim-token.txt");
+    });
+
+    it("follows STATE_FILE onto whatever volume that names", () => {
+      const config = loadConfig(baseEnv({ STATE_FILE: "/srv/oauth/state.json" }));
+      assert.equal(config.claimTokenFile, "/srv/oauth/claim-token.txt");
+    });
+
+    it("is null when there is no state file, and when set to none", () => {
+      assert.equal(loadConfig(baseEnv({ STATE_FILE: "none" })).claimTokenFile, null);
+      assert.equal(loadConfig(baseEnv({ CLAIM_TOKEN_FILE: "none" })).claimTokenFile, null);
+    });
+
+    it("honours an explicit CLAIM_TOKEN_FILE", () => {
+      assert.equal(
+        loadConfig(baseEnv({ CLAIM_TOKEN_FILE: "/data/claim.txt" })).claimTokenFile,
+        "/data/claim.txt"
+      );
+    });
+  });
+
   describe("required values", () => {
-    for (const name of [
-      "PUBLIC_URL",
-      "UPSTREAM_AUTH_TOKEN",
-      "SIGNING_KEY",
-      "AUTH_PASSWORD_HASH",
-    ]) {
+    for (const name of ["PUBLIC_URL", "UPSTREAM_AUTH_TOKEN", "SIGNING_KEY"]) {
       it(`refuses to start without ${name}`, () => {
         assert.throws(
           () => loadConfig(baseEnv({ [name]: undefined })),
@@ -75,6 +95,22 @@ describe("loadConfig", () => {
 
     it("treats a blank value as absent", () => {
       assert.throws(() => loadConfig(baseEnv({ SIGNING_KEY: "   " })), ConfigError);
+    });
+
+    it("starts without AUTH_PASSWORD_HASH, unconfigured rather than broken", () => {
+      // Since the claim-token gate, a missing password hash is a *state* — an
+      // instance nobody has claimed yet — not a misconfiguration. bootstrap.ts
+      // decides what such an instance is allowed to answer.
+      const config = loadConfig(baseEnv({ AUTH_PASSWORD_HASH: undefined }));
+      assert.equal(config.authPasswordHash, null);
+    });
+
+    it("still refuses a malformed AUTH_PASSWORD_HASH", () => {
+      // Absent is a state; present-but-wrong is a typo, and stays fatal.
+      assert.throws(
+        () => loadConfig(baseEnv({ AUTH_PASSWORD_HASH: "not-a-hash" })),
+        ConfigError
+      );
     });
   });
 
@@ -220,15 +256,36 @@ describe("loadConfig", () => {
     });
 
     it("never generates the password hash", () => {
+      // The one secret with a meaning outside this deployment. An absent file is
+      // an unclaimed instance, not something this process can invent a value for,
+      // so it boots with a null hash and writes nothing.
+      const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
+
+      const config = loadConfig(baseEnv(secretFiles(dir)));
+
+      assert.equal(config.authPasswordHash, null);
+      assert.equal(existsSync(join(dir, "auth_password_hash.txt")), false);
+      assert.ok(
+        !config.secretReport.some((entry) => entry.name === "AUTH_PASSWORD_HASH"),
+        "nothing to report about a secret that was not configured"
+      );
+    });
+
+    it("still fails loudly on a password hash file it cannot read", () => {
+      // ENOENT is a state; anything else is a broken mount and must stop the
+      // service rather than silently downgrade it to unclaimed.
       const dir = mkdtempSync(join(tmpdir(), "oauth-config-"));
       assert.throws(
-        () => loadConfig(baseEnv(secretFiles(dir))),
+        () =>
+          loadConfig(
+            baseEnv({
+              ...secretFiles(dir),
+              AUTH_PASSWORD_HASH_FILE: dir,
+            })
+          ),
         (err: unknown) =>
-          err instanceof ConfigError &&
-          err.message.includes("AUTH_PASSWORD_HASH_FILE") &&
-          err.message.includes("never generated")
+          err instanceof ConfigError && err.message.includes("AUTH_PASSWORD_HASH_FILE")
       );
-      assert.equal(existsSync(join(dir, "auth_password_hash.txt")), false);
     });
 
     it("seeds the file from an inline UPSTREAM_AUTH_TOKEN rather than generating one", () => {

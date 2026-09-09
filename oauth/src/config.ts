@@ -58,7 +58,19 @@ export interface OAuthConfig {
   upstreamAuthToken: string;
   signingKey: Uint8Array;
   authUsername: string;
-  authPasswordHash: string;
+  /**
+   * The operator's password hash, or null when none was supplied.
+   *
+   * Optional since the claim-token gate: an instance with no hash *and* no
+   * operator record is an unbootstrapped one, which is a state this service now
+   * starts in deliberately rather than refusing to boot from. It is still never
+   * generated — it is the one secret with a meaning outside the deployment — and
+   * a hash that is present but malformed is still fatal.
+   *
+   * Null does not mean "no password". Once the operator record exists it is the
+   * live credential and this is ignored; see operator.ts.
+   */
+  authPasswordHash: string | null;
   stateFile: string | null;
   /**
    * Key for the assertion the settings proxy sends to the connector. Null turns
@@ -73,6 +85,13 @@ export interface OAuthConfig {
    * behaviour — hash from the secret, password change disabled.
    */
   operatorFile: string | null;
+  /**
+   * Where the one-time claim token lives while this instance is unbootstrapped.
+   * Sits on the same data volume as the operator record, because the two have to
+   * disappear and appear together. Null disables the gate's ability to mint a
+   * token at all, which is only sensible when there is nothing to gate.
+   */
+  claimTokenFile: string | null;
   /**
    * Number of reverse-proxy hops in front of this service. Determines which
    * X-Forwarded-For entry becomes `req.ip`, and therefore which address the
@@ -179,6 +198,54 @@ function requiredSecret(
   return value;
 }
 
+/**
+ * Read a secret that is allowed to be missing entirely.
+ *
+ * Deliberately not {@link trackedSecret} with `generate: false`: that treats an
+ * absent `NAME_FILE` as a misconfiguration and throws, which is exactly right for
+ * every caller it has and exactly wrong for `AUTH_PASSWORD_HASH` now that a
+ * missing hash is a legitimate state rather than a mistake. Every deployment's
+ * compose file points `AUTH_PASSWORD_HASH_FILE` at a path in `./secrets`, so on a
+ * first boot the file simply is not there yet.
+ *
+ * Only ENOENT is tolerated. A `NAME_FILE` that exists but cannot be read stays
+ * fatal, as it has always been — a permission error on a secret mount must stop
+ * the service, not silently downgrade the instance to unclaimed.
+ */
+function absentableSecret(
+  env: Env,
+  name: string,
+  report: SecretReportEntry[]
+): string | null {
+  const path = env[`${name}_FILE`]?.trim();
+  const inline = env[name]?.trim();
+
+  if (path !== undefined && path !== "") {
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new ConfigError(
+          `Cannot read ${name}_FILE at ${path}: ` +
+            (err instanceof Error ? err.message : String(err))
+        );
+      }
+      if (inline === undefined || inline === "") return null;
+      report.push({ name, source: "environment", path: null });
+      return inline;
+    }
+    const value = raw.trim();
+    if (value === "") return null;
+    report.push({ name, source: "file", path });
+    return value;
+  }
+
+  if (inline === undefined || inline === "") return null;
+  report.push({ name, source: "environment", path: null });
+  return inline;
+}
+
 function integer(env: Env, name: string, fallback: number): number {
   const raw = env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -250,11 +317,11 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
   }
 
   // Never generated: it is the one secret with a meaning outside this
-  // deployment, and the wizard sets it through OperatorRecord instead.
-  const authPasswordHash = requiredSecret(env, "AUTH_PASSWORD_HASH", secretReport, {
-    generate: false,
-  });
-  if (!isValidHashFormat(authPasswordHash)) {
+  // deployment, and the wizard sets it through OperatorRecord instead. Absent is
+  // allowed and means "nobody has configured this instance yet" — see
+  // bootstrap.ts. Present but malformed stays fatal: that is a typo, not a state.
+  const authPasswordHash = absentableSecret(env, "AUTH_PASSWORD_HASH", secretReport);
+  if (authPasswordHash !== null && !isValidHashFormat(authPasswordHash)) {
     throw new ConfigError(
       "AUTH_PASSWORD_HASH is not a valid scrypt hash. Generate one with: npm run hash-password"
     );
@@ -290,6 +357,17 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
   const operatorFile =
     operatorFileRaw === "" || operatorFileRaw === "none" ? null : operatorFileRaw;
 
+  // Next to the operator record, on the same volume: the token exists exactly
+  // while the record does not, and a deployment that persists one but not the
+  // other could neither remember a claim nor resume an interrupted one.
+  const claimTokenFileRaw = optional(
+    env,
+    "CLAIM_TOKEN_FILE",
+    stateFile === null ? "" : join(dirname(stateFile), "claim-token.txt")
+  );
+  const claimTokenFile =
+    claimTokenFileRaw === "" || claimTokenFileRaw === "none" ? null : claimTokenFileRaw;
+
   return {
     port: integer(env, "PORT", 8080),
     host: optional(env, "HOST", "0.0.0.0"),
@@ -304,6 +382,7 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
     stateFile,
     settingsSigningKey,
     operatorFile,
+    claimTokenFile,
     trustProxy: trustProxyHops(env),
     accessTokenTtl: integer(env, "ACCESS_TOKEN_TTL", 3600),
     refreshTokenTtl: integer(env, "REFRESH_TOKEN_TTL", 30 * 24 * 3600),
