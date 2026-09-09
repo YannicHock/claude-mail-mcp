@@ -741,17 +741,7 @@ not an hour later. This is the boundary the revocation work in #2 exists for.
 
 ---
 
-## A note on `SECURITY.md`
-
-[SECURITY.md](../SECURITY.md) predates the OAuth layer and **contradicts this
-document in several places** — it describes the OAuth layer as "not part of this
-repository", frames the threat model around a single process gated by a static
-token, and lists `accounts.json` and `.env` paths (`/var/lib/mail-mcp`,
-`mailmcp:mailmcp`) from a host install [DEPLOYMENT.md](DEPLOYMENT.md) no longer
-describes — there is no supported from-source production deployment.
-Where the two disagree, this document describes what ships. Bringing `SECURITY.md`
-forward is separate work.
-
 ## Reporting issues
 
-See [SECURITY.md](../SECURITY.md) for the private disclosure process.
+[SECURITY.md](../SECURITY.md) carries the private disclosure process, and what is
+in scope for a report and what is not.
