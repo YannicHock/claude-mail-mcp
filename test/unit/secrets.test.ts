@@ -28,7 +28,6 @@ import { describe, it } from "node:test";
 import type { LogLevel } from "../../src/app.js";
 import {
   GENERATED_SECRET_MODE,
-  SHARED_SECRET_GID,
   SecretError,
   createExclusively,
   logSecretReport,
@@ -438,35 +437,85 @@ describe("the two copies of this module", () => {
 });
 
 describe("the shared group contract", () => {
-  // SHARED_SECRET_GID is written down in three places: here, Dockerfile and
-  // oauth/Dockerfile. It is the only group the two images have in common, and a
-  // mode-640 secret written by one is unreadable to the other the moment those
-  // numbers disagree — as an EACCES crash loop at startup, in whichever service
-  // did not write the file. Nothing else in the build would notice.
+  // The two images still need one group in common — a mode-640 secret written by
+  // one is unreadable to the other without it — but that group is *not* a
+  // build-time constant any more, and this suite now pins the absence.
+  //
+  // It used to be gid 105, pinned in both Dockerfiles and published as a
+  // `secrets-gid` label, with the deployment saying `chgrp 105 secrets`. 105 is
+  // genuinely free in node:24-alpine; the chgrp runs on the host, where 100-999
+  // is the system range and 105 is usually a real system group with a daemon in
+  // it. `2770` then gave that group unlink rights over auth_token.txt, and "a
+  // present file wins" adopted whatever it put there (#76).
+  //
+  // The group is the operator's own now, created with `groupadd --system` and
+  // applied to both container processes by docker-compose.yml's `group_add`.
+  // What has to be pinned is therefore the wiring, plus the one combination that
+  // would be actively worse than either scheme alone: an image-side numeric
+  // `mailsecrets` riding alongside the host-side `group_add`. createExclusively
+  // chowns each new secret to SHARED_SECRET_GID whenever the process happens to
+  // be in that group, so a container carrying both would move every secret it
+  // creates into the *host's* group 105 — the group this change exists to keep
+  // them away from — and out of the group the other service can read.
   const dockerfiles = {
     "Dockerfile": new URL("../../Dockerfile", import.meta.url),
     "oauth/Dockerfile": new URL("../../oauth/Dockerfile", import.meta.url),
   };
 
   for (const [name, url] of Object.entries(dockerfiles)) {
-    it(`${name} creates mailsecrets with gid ${SHARED_SECRET_GID}`, () => {
+    it(`${name} pins no gid for the shared secrets group`, () => {
       const dockerfile = readFileSync(url, "utf8");
-      assert.match(
+      assert.doesNotMatch(
         dockerfile,
-        new RegExp(`addgroup -S -g ${SHARED_SECRET_GID} mailsecrets`),
-        `${name} must pin gid ${SHARED_SECRET_GID} for mailsecrets`
+        /addgroup\s+(-\S+\s+)*-g\s+\d+\s+mailsecrets/,
+        `${name} must not bake a numeric gid for mailsecrets into the image — ` +
+          `the group belongs to the host, and docker-compose.yml supplies it ` +
+          `with group_add: ["\${SECRETS_GID}"]. See #76.`
       );
     });
 
-    it(`${name} puts its runtime user in mailsecrets`, () => {
-      // Creating the group is not enough — the runtime user has to be *in* it.
+    it(`${name} puts its runtime user in no shared secrets group`, () => {
       const dockerfile = readFileSync(url, "utf8");
-      assert.match(dockerfile, /addgroup mail(mcp|oauth) mailsecrets/);
+      assert.doesNotMatch(dockerfile, /addgroup\s+mail(mcp|oauth)\s+mailsecrets/);
     });
 
-    it(`${name} publishes the gid as a label`, () => {
+    it(`${name} publishes no secrets-gid label`, () => {
+      // The label was a promise about a number that no longer exists. Anything
+      // reading it would be reading a stale one.
       const dockerfile = readFileSync(url, "utf8");
-      assert.match(dockerfile, new RegExp(`secrets-gid="${SHARED_SECRET_GID}"`));
+      assert.doesNotMatch(dockerfile, /secrets-gid=/);
     });
   }
+
+  it("docker-compose.yml puts both services in ${SECRETS_GID}", () => {
+    // Both, not one: the group exists precisely so each service can read what
+    // the other wrote, so a group_add on a single service is the same EACCES
+    // crash loop by another route.
+    const compose = readFileSync(new URL("../../docker-compose.yml", import.meta.url), "utf8");
+    const entries = compose.match(/^\s*-\s*"\$\{SECRETS_GID[:?}]/gm) ?? [];
+    assert.equal(entries.length, 2, "both services need group_add: [\"${SECRETS_GID}\"]");
+    assert.equal(
+      (compose.match(/^\s*group_add:/gm) ?? []).length,
+      2,
+      "both services need a group_add block"
+    );
+  });
+
+  it("docker-compose.yml refuses to start without SECRETS_GID", () => {
+    // `${SECRETS_GID}` on its own interpolates to the empty string and the stack
+    // comes up with no shared group at all, which fails later and elsewhere. The
+    // `:?` form makes `docker compose up` say so instead.
+    const compose = readFileSync(new URL("../../docker-compose.yml", import.meta.url), "utf8");
+    for (const entry of compose.match(/\$\{SECRETS_GID[^}]*\}/g) ?? []) {
+      assert.match(entry, /^\$\{SECRETS_GID:\?/, `${entry} must use the required-variable form`);
+    }
+  });
+
+  it(".env.docker.example carries SECRETS_GID", () => {
+    // It has to be *this* file: Compose interpolates only from the project's
+    // .env, never from a service's env_file, so putting it in .env.oauth would
+    // leave mail-oauth's group_add empty.
+    const example = readFileSync(new URL("../../.env.docker.example", import.meta.url), "utf8");
+    assert.match(example, /^SECRETS_GID=/m);
+  });
 });

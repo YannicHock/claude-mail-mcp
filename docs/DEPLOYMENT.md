@@ -394,46 +394,76 @@ docker compose pull
 ```bash
 cp .env.docker.example .env
 # edit .env: PUBLIC_URL, LOG_LEVEL
+
+# a group for these secrets and nothing else, and the directory it owns
+sudo groupadd --system mailsecrets
 mkdir -p secrets
-sudo chgrp 105 secrets && sudo chmod 2770 secrets
+sudo chgrp mailsecrets secrets && sudo chmod 2770 secrets
+
+# fill in SECRETS_GID with the gid your host assigned
+sed -i "s/^SECRETS_GID=.*/SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)/" .env
+grep '^SECRETS_GID=' .env
 ```
 
 `HOST`, `PORT` and `ACCOUNTS_FILE` are fixed by the image and `docker-compose.yml` — they're not set in `.env` (see the comments in `.env.docker.example`).
 
-`PUBLIC_URL` is the only value you have to supply: the container cannot discover
-its own external address. The Bearer token clients send to `/mcp`, the OAuth
-signing key and the settings signing key are **generated on the first boot that
-finds them missing**, into `secrets/`. Read the token back afterwards with
-`cat secrets/auth_token.txt`, or set `AUTH_TOKEN` in `.env` before the first
-start to choose it yourself — either way, the file wins from then on and an
-upgrade never rotates a token out from under a connected client.
+`PUBLIC_URL` and `SECRETS_GID` are the only values you have to supply: the
+container cannot discover its own external address, and it cannot know which gid
+your host handed the group you just made. The Bearer token clients send to
+`/mcp`, the OAuth signing key and the settings signing key are **generated on the
+first boot that finds them missing**, into `secrets/`. Read the token back
+afterwards with `cat secrets/auth_token.txt`, or set `AUTH_TOKEN` in `.env`
+before the first start to choose it yourself — either way, the file wins from
+then on and an upgrade never rotates a token out from under a connected client.
 
-**`chgrp 105` and `chmod 2770` are both load-bearing.** Both containers create
-files in `secrets/` and they run as different non-root uids — 100 for the
-connector, 102 for the OAuth layer — so each image puts its runtime user in one
-shared group, `mailsecrets`, **gid 105**. That gid is pinned in both
-`Dockerfile`s and is part of their published contract; confirm it against the
-images you pulled with:
+**Why a group you create rather than a number this page picks.** Both containers
+create files in `secrets/` and they run as different non-root uids — 100 for the
+connector, 102 for the OAuth layer — so they need one group in common. `2770`
+gives that group `rwx` on the directory, and directory write permission is what
+permits `unlink`: every member of the owning group can delete `auth_token.txt`
+and put its own there. Since a present file always wins over a generated one,
+that planted token is the one both services adopt on the next restart. The files
+themselves land at `640` in the same group, so a member can simply read the token
+gating `POST /mcp` instead.
+
+That is safe only when the group has no members but these two containers, which
+is what `groupadd --system mailsecrets` gives you and what a pre-existing group
+does not. An earlier draft of this page told you to run `sudo chgrp 105 secrets`,
+because gid 105 was pinned into both images and verified free *in
+`node:24-alpine`*. The
+`chgrp` runs on the host, where 100–999 is the system range: on a stock Debian 12
+or Ubuntu 22.04–24.04, `getent group 105` usually returns a real system group
+with a daemon in it, and the instruction handed that group everything above.
+Neither image pins a gid any longer, and `docker-compose.yml` puts both container
+processes in *your* group with `group_add: ["${SECRETS_GID}"]`. Confirm it on a
+running stack:
 
 ```bash
 docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
-# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp),101(mailmcp),105(mailsecrets)
-docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp-oauth:latest
-# uid=102(mailoauth) gid=103(mailoauth) groups=103(mailoauth),103(mailoauth),105(mailsecrets)
+# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp),101(mailmcp)
+docker compose exec mail-mcp id
+# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp),<SECRETS_GID>
+docker compose exec mail-oauth id
+# uid=102(mailoauth) gid=103(mailoauth) groups=103(mailoauth),<SECRETS_GID>
 ```
 
-The **setgid** bit — the `2` in `2770` — is what makes a file created by one
-service land in group 105 rather than in the creator's own group, which is what
-lets the other service read it. `chmod 770` without it leaves the connector's
-file in gid 101 at mode `640`, and the OAuth layer crash-loops on `EACCES`. The
-services also set the group explicitly when they can, so a forgotten setgid bit
-is survivable, but write the mode correctly and do not rely on that.
+The bare `docker run` shows no shared group at all — correct, and the reason
+`group_add` is not optional. Leave `SECRETS_GID` empty and `docker compose up`
+refuses to start rather than coming up without it.
 
-`2770` equally means **no other account on the host can write here**, and that is
-not incidental. A present file always wins over a generated one, so any local
-user able to drop an `auth_token.txt` into this directory before the first boot
-would choose the token the connector then adopts — instance takeover with no
-exploit involved. A world-writable `secrets/` is not an acceptable shortcut.
+The **setgid** bit — the `2` in `2770` — is what makes a file created by one
+service land in the directory's group rather than in the creator's own, which is
+what lets the other service read it. `chmod 770` without it leaves the
+connector's file in gid 101 at mode `640`, and the OAuth layer crash-loops on
+`EACCES`. Write the mode correctly: the setgid directory is the only thing
+providing this. The services still carry a best-effort `chown` as a second line
+of defence, but it targets the gid that used to be built into the images, so on a
+current build it never fires and nothing stands behind the setgid bit.
+
+`2770` equally means **no account outside that group can write here**, and that
+is not incidental — see the takeover path two paragraphs up. A world-writable
+`secrets/` is not an acceptable shortcut, and neither is reusing a group that
+came with the distribution.
 
 Generated files land at mode `640`, owner and group only. `600` is the intuitive
 choice and the one that crash-loops both containers, because neither runtime uid
@@ -444,6 +474,27 @@ If you would rather not manage the group at all, create the four files yourself
 instead — nothing is ever generated over a file that already exists, and the
 mount in `docker-compose.yml` can then be made read-only.
 
+**Upgrading an install that already ran `chgrp 105`.** Do it in this order, with
+the stack still up; nothing is regenerated and no token changes.
+
+```bash
+getent group 105                       # see who you gave the directory to
+sudo groupadd --system mailsecrets
+sudo chgrp -R mailsecrets secrets && sudo chmod 2770 secrets
+sudo chmod 640 secrets/*.txt
+sed -i "s/^SECRETS_GID=.*/SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)/" .env
+grep -q '^SECRETS_GID=' .env || echo "SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)" >> .env
+docker compose pull && docker compose up -d
+docker compose exec mail-mcp id        # the new gid must appear in groups=
+```
+
+If `getent group 105` named a real group, treat the secrets in that directory as
+having been exposed to it: rotate them after the move by deleting
+`secrets/auth_token.txt`, `secrets/oauth_signing_key.txt` and
+`secrets/settings_signing_key.txt` and restarting, then re-enter the new
+`auth_token` in any Claude Desktop client. Every OAuth client is logged out and
+re-registers by itself.
+
 ### 3. Create `accounts.json`
 
 The container runs as the non-root user `mailmcp`, **uid 100 / gid 101**. Those
@@ -452,7 +503,7 @@ contract; confirm them against the image you actually pulled with:
 
 ```bash
 docker run --rm --entrypoint id ghcr.io/yannichock/claude-mail-mcp:latest
-# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp),101(mailmcp),105(mailsecrets)
+# uid=100(mailmcp) gid=101(mailmcp) groups=101(mailmcp),101(mailmcp)
 ```
 
 The credentials file has to be readable by that uid *and* unreadable to every
@@ -526,23 +577,25 @@ assumes the `mail-oauth` service above is running.
 **The shared signing key generates itself.** Both services mount the *same* file,
 `secrets/settings_signing_key.txt`, and it is what lets the connector trust that a
 settings request really came from the OAuth layer. Whichever service starts first
-creates it, at mode `640` in group 105; there is nothing to run.
+creates it, at mode `640` in the `secrets/` directory's group; there is nothing
+to run.
 
 To supply your own instead, write it before the first start — a file that is already
 there is always used as it stands:
 
 ```bash
 mkdir -p secrets
-sudo chgrp 105 secrets && sudo chmod 2770 secrets   # as in step 2 above
+sudo chgrp mailsecrets secrets && sudo chmod 2770 secrets   # as in step 2 above
 openssl rand -base64 48 > secrets/settings_signing_key.txt
-sudo chgrp 105 secrets/settings_signing_key.txt
+sudo chgrp mailsecrets secrets/settings_signing_key.txt
 chmod 640 secrets/settings_signing_key.txt
 ```
 
 `chmod 600` here is the mistake that costs an evening: the file is read by two
 containers running as *different* non-root uids, so the one that did not write it
 crash-loops on `EACCES` with nothing in `docker compose logs` but a permission
-error. Group 105 is `mailsecrets`, the one group both images share — see step 2.
+error. `mailsecrets` is the group you created in step 2 and that
+`docker-compose.yml` adds to both containers through `SECRETS_GID`.
 
 `secrets/` is already in `.gitignore`. Never commit this file. `docker-compose.yml`
 wires it into both services as `SETTINGS_SIGNING_KEY_FILE=/secrets/settings_signing_key.txt`.
