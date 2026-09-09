@@ -103,9 +103,43 @@ const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
  * at all, taking every other configured mailbox down with it. An operator who
  * already has such an account keeps a broken in-place edit until they delete and
  * recreate it under another id — worse than ideal, but far better than the
- * connector refusing to start.
+ * connector refusing to start. {@link reservedIdAccounts} and
+ * {@link reservedIdNotice} are how that operator is told, rather than left to
+ * discover it from a Save button that does nothing: the server warns once at
+ * startup, and the mailbox list page repeats it on the affected row.
  */
 export const RESERVED_IDS = new Set(["new", "test"]);
+
+/**
+ * What is actually broken, per reserved id — the two collide in different
+ * halves of the request and it would be a lie to describe them the same way.
+ * `test` renders a real edit form whose POST target is the create form's probe
+ * route; `new` never renders an edit form at all, because the literal GET route
+ * wins first.
+ */
+const RESERVED_ID_COLLISIONS: Record<string, string> = {
+  new: 'its Edit link lands on the empty "Add mailbox" form, because GET /settings/mailboxes/new is the create page',
+  test: "its edit form renders but Save silently never persists, because POST /settings/mailboxes/test is the create form's connection probe",
+};
+
+/** The accounts in `accounts` that are stuck on a reserved id. */
+export function reservedIdAccounts(accounts: Account[]): Account[] {
+  return accounts.filter((a) => RESERVED_IDS.has(a.id));
+}
+
+/**
+ * One sentence pair for an account already configured under a reserved id: what
+ * does not work, and the only way out of it. Rendered verbatim into the mailbox
+ * list row and logged at startup, so it has to hold up read cold, without the
+ * surrounding page.
+ */
+export function reservedIdNotice(id: string): string {
+  const collision = RESERVED_ID_COLLISIONS[id] ?? "its edit page collides with a literal settings route";
+  return (
+    `"${id}" is a reserved id: ${collision}. ` +
+    `Delete this mailbox and recreate it under a different id — Delete and "Make default" still work.`
+  );
+}
 
 export class AccountsStoreError extends Error {
   constructor(message: string) {

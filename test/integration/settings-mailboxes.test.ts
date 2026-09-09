@@ -21,13 +21,13 @@ import { readFile, writeFile } from "node:fs/promises";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { AccountsStore } from "../../src/accounts.js";
+import { AccountsStore, type Account } from "../../src/accounts.js";
 import { ClientPool } from "../../src/client-pool.js";
 import { createApp } from "../../src/app.js";
 import { ASSERTION_HEADER } from "../../src/settings-assertion.js";
 import { SETTINGS_HEADERS } from "../../src/settings-pages.js";
 import { readStamp } from "../../src/accounts-writer.js";
-import { makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
+import { makeAccount, makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
 
 const AUTH_TOKEN = "settings-routes-test-token-please-do-not-reuse";
 const SETTINGS_KEY = "s".repeat(32);
@@ -42,14 +42,14 @@ interface Connector {
   close(): Promise<void>;
 }
 
-async function startConnector(): Promise<Connector> {
+async function startConnector(accounts: Account[] = []): Promise<Connector> {
   const dir = await makeTmpDir();
   const accountsPath = `${dir}/accounts.json`;
-  // Pre-seed an empty but present accounts.json — a fresh deployment that has
-  // been initialised but has no mailboxes yet, and (unlike an absent file) one
-  // a probe-only "test connection" submission can read back afterwards to prove
-  // it wrote nothing.
-  await writeFile(accountsPath, JSON.stringify({ version: 1, accounts: [] }), "utf8");
+  // Pre-seed accounts.json — empty by default: a fresh deployment that has been
+  // initialised but has no mailboxes yet, and (unlike an absent file) one a
+  // probe-only "test connection" submission can read back afterwards to prove it
+  // wrote nothing. A caller that needs mailboxes already on disk passes them in.
+  await writeFile(accountsPath, JSON.stringify({ version: 1, accounts }), "utf8");
   const store = new AccountsStore(accountsPath);
   await store.start();
   const pool = new ClientPool(store);
@@ -472,6 +472,37 @@ test("creating a mailbox with a reserved id ('new' or 'test') is rejected up fro
       JSON.parse(await readFile(accountsPath, "utf8")).accounts,
       [],
       "neither reserved id was persisted"
+    );
+  } finally {
+    await close();
+  }
+});
+
+/**
+ * The other half of that rule: an account that is *already* on disk under a
+ * reserved id keeps loading, because refusing the file would take every other
+ * mailbox down with it (see RESERVED_IDS in src/accounts.ts). It cannot be
+ * edited in place, though, so the list page says so on that account's own row —
+ * the operator who never reads the logs finds out here instead of from a Save
+ * button that silently does nothing.
+ */
+test("an existing mailbox on a reserved id still loads and says why Save does nothing", async () => {
+  const { url, close } = await startConnector([
+    makeAccount({ id: "work", label: "Work", default: true }),
+    makeAccount({ id: "test", label: "Old test mailbox" }),
+  ]);
+  try {
+    const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /Work/, "the unaffected mailbox is still listed");
+    assert.match(html, /Old test mailbox/, "the affected mailbox is still listed");
+    assert.match(html, /never persists/i, "the row says the edit form does not save");
+    assert.match(html, /recreate it under a different id/, "and names the way out");
+    assert.equal(
+      (html.match(/class="row-notice"/g) ?? []).length,
+      1,
+      "only the affected row carries the notice"
     );
   } finally {
     await close();

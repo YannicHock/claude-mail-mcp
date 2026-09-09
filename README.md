@@ -73,7 +73,9 @@ npm run build
 npm start
 ```
 
-The server boots with **no mailboxes configured** — that's fine. Hand-craft an `accounts.json` (no setup UI ships with this repo yet — see [Deployment](docs/DEPLOYMENT.md) for the OAuth-shim caveat):
+The server boots with **no mailboxes configured** — that's fine. Since 0.6.0 mailboxes are added from a browser: a settings UI at `/settings` adds, tests, edits and removes them and writes `accounts.json` for you. It is served by the OAuth layer, so it comes with the Docker deployment below — see [Deployment](docs/DEPLOYMENT.md), "Enable the settings UI", for the shared signing key it needs.
+
+A bare `npm start` runs the connector on its own, without that layer, so during local development you still write the file yourself. Either way, this is the format:
 
 ```json
 {
@@ -105,8 +107,6 @@ curl http://localhost:3220/health
 ## Run with Docker
 
 Two multi-arch (amd64/arm64) images are published to GHCR: `ghcr.io/yannichock/claude-mail-mcp` and `ghcr.io/yannichock/claude-mail-mcp-oauth`. A push to `main` publishes them tagged `sha-<short>` and nothing else; a `v*` tag publishes `X.Y.Z` and moves `latest`. So **`:latest` always names a release**, and `sha-<short>` is how you run an unreleased commit — it names one commit and can never move. Both images carry a build-provenance attestation, checkable with `gh attestation verify --owner YannicHock oci://ghcr.io/yannichock/claude-mail-mcp:latest`.
-
-The package is newly created and not guaranteed to be public — if `docker pull` gets rejected, `docker login ghcr.io` first with a GitHub token that has `read:packages`.
 
 Either path needs the same two things as the Quick start above: an `AUTH_TOKEN` and an `accounts.json` (an empty one is fine to boot with).
 
@@ -151,16 +151,16 @@ docker compose logs -f
 
 `docker-compose.test.yml` is a separate file for local development only — it spins up a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) server for the integration test suite (see [Development](#development) below) and has nothing to do with running the connector itself.
 
-Neither path includes an OAuth shim — see [Connecting from Claude.ai](#connecting-from-claudeai) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for that prerequisite and for putting nginx in front on a real host.
+`docker run` starts the connector on its own. `docker-compose.yml` also brings up the OAuth layer as the `mail-oauth` service, which is what Claude.ai web and the settings UI go through; it needs its own `.env.oauth` and a set of files under `secrets/` that the snippet above does not create — see [Connecting from Claude.ai](#connecting-from-claudeai) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for those and for putting nginx in front on a real host.
 
 ---
 
 ## Connecting from Claude.ai
 
-The server speaks the **Streamable HTTP MCP transport**, gated by a single static Bearer token (`AUTH_TOKEN`). That's everything this repository ships — no OAuth flow, no login UI, no per-user sessions.
+The connector speaks the **Streamable HTTP MCP transport**, gated by a single static Bearer token (`AUTH_TOKEN`). Since 0.4.0 the repository also ships an OAuth 2.1 layer in `oauth/`, published as a second image, for the clients that cannot send a Bearer token themselves.
 
 - **Claude Desktop**, or any MCP client that lets you set a custom header, can call `/mcp` directly with `Authorization: Bearer <AUTH_TOKEN>` — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the config snippet. No extra layer needed.
-- **Claude.ai (web)** only connects to remote MCP servers that advertise OAuth 2.1 discovery (Dynamic Client Registration + PKCE), which this server doesn't implement. To use it from Claude.ai web you have to put an OAuth 2.1 layer in front yourself — **this repository does not include one, and there is currently no reference implementation to point you at.** See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) (Option B) and [`docs/HARDENING.md`](docs/HARDENING.md) for what such a layer would need to satisfy.
+- **Claude.ai (web)** only connects to remote MCP servers that advertise OAuth 2.1 discovery (Dynamic Client Registration + PKCE), which the connector itself doesn't implement. The `oauth/` layer does: discovery, dynamic client registration, PKCE, refresh rotation, and an authenticated proxy in front of `/mcp`. `docker-compose.yml` runs it as `mail-oauth`; nginx fronts it instead of the connector, which stays unreachable from outside. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) (Option B) for the wiring and [`docs/HARDENING.md`](docs/HARDENING.md) for what it has to satisfy.
 
 ---
 
@@ -208,7 +208,7 @@ this server
 
 Everything is one Node process. IMAP holds a single long-lived connection with per-call mailbox locks. SMTP and CalDAV are stateless per call.
 
-Claude.ai (web) isn't in this diagram: it needs an OAuth 2.1 layer between itself and nginx that this repository doesn't provide — see [Connecting from Claude.ai](#connecting-from-claudeai) above.
+Claude.ai (web) isn't in this diagram: it reaches the connector through the OAuth 2.1 layer in `oauth/`, a second Node process that nginx fronts in the connector's place — see [Connecting from Claude.ai](#connecting-from-claudeai) above.
 
 ---
 
@@ -216,7 +216,7 @@ Claude.ai (web) isn't in this diagram: it needs an OAuth 2.1 layer between itsel
 
 See **[SECURITY.md](SECURITY.md)** for the threat model and **[docs/HARDENING.md](docs/HARDENING.md)** for the full operator checklist.
 
-In one sentence: TLS via Let's Encrypt + HSTS/security headers + a rate-limited static Bearer token + loopback-only binding + a credentials file readable only by the service. **No OAuth, no sessions, and no `/settings` route ship with this repository** — see below.
+In one sentence: TLS via Let's Encrypt + HSTS/security headers + a rate-limited static Bearer token + loopback-only binding + a credentials file readable only by the service. The OAuth layer in `oauth/` adds discovery, operator sessions and the `/settings` UI on top of that; it is a separate service, and the connector runs without it — see below.
 
 ### Quick summary
 
@@ -231,7 +231,7 @@ The transport, auth, network and output rows below apply to **both** deployments
 - **Output:** `list_accounts` returns id/label/From — never credentials. Logs never include passwords or Bearer tokens.
 - **Destructive tools** (`delete_message`) document irreversibility so Claude.ai surfaces a confirmation step. Prefer `move_message` to a Trash folder for reversibility.
 
-Remote or multi-client access (e.g. Claude.ai web) needs an OAuth 2.1 layer in front that is **not part of this repository** — see [Connecting from Claude.ai](#connecting-from-claudeai) above and [docs/HARDENING.md](docs/HARDENING.md#optional-adding-an-oauth-layer-for-remotemulti-client-access) for what that layer would need to provide.
+Remote or multi-client access (e.g. Claude.ai web) goes through the OAuth 2.1 layer in `oauth/` rather than straight at `/mcp`, and that layer has a threat model of its own — see [Connecting from Claude.ai](#connecting-from-claudeai) above and [docs/HARDENING.md](docs/HARDENING.md#optional-adding-an-oauth-layer-for-remotemulti-client-access) for what it has to provide.
 
 Full threat-model walkthrough and operator hardening checklist in [docs/HARDENING.md](docs/HARDENING.md). Reporting issues: see [SECURITY.md](SECURITY.md).
 
@@ -261,17 +261,16 @@ Releases are cut by pushing a `v*` tag. That runs the same suite, re-runs the ve
 
 ## Roadmap
 
-✅ marks a released version.
+✅ marks a released version. What shipped, in order:
 
 - **v0.1** ✅ — Single account configured through `.env`; IMAP, SMTP and CalDAV tools over MCP
-- **v0.2** ✅ — Multi-account per deployment. No browser setup flow: accounts are configured by editing `accounts.json` — see [Connecting from Claude.ai](#connecting-from-claudeai).
+- **v0.2** ✅ — Multi-account per deployment, configured by hand-editing `accounts.json`
 - **v0.3** ✅ — Docker image on GHCR, test foundation (25 unit, 14 integration), CI and release pipeline
 - **v0.4** ✅ — OAuth 2.1 layer in `oauth/` for claude.ai web and Cowork: discovery, dynamic client registration, PKCE, refresh rotation, and an authenticated proxy in front of `/mcp`
 - **v0.5** ✅ — Node 24 and a dependency refresh across both packages; separate pipelines for branches and releases, with a version-consistency gate and build-provenance attestations
-- **v0.6** — Browser settings UI: manage mailboxes, verify IMAP/SMTP/CalDAV credentials before saving, review and revoke connected Claude clients
-- **v0.7** — Threading-aware `list_threads` tool, attachment download as base64, calendar invitation (iMIP) sending
-- **v0.8** — CardDAV (contacts), JMAP support as an alternative to IMAP for Fastmail/Topicbox
-- **v1.0** — Audit log, Prometheus metrics, rate limiting, hardened deployment guide
+- **v0.6** ✅ — Browser settings UI: manage mailboxes, verify IMAP/SMTP/CalDAV credentials before saving, review and revoke connected Claude clients
+
+What is planned lives in the [milestones](https://github.com/YannicHock/claude-mail-mcp/milestones), each with the issues it is made of. It is not repeated here — the copy that used to be went stale and started contradicting them.
 
 ---
 
