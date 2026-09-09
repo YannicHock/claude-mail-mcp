@@ -63,6 +63,16 @@ import { createExclusively, logSecretReport, type SecretSource } from "./secrets
  */
 export const CLAIM_TOKEN_BYTES = 32;
 
+/**
+ * Mode for the claim token on disk: this service's uid, and nobody else.
+ *
+ * The same 600 `operator.json` and the wizard's progress file are written at,
+ * and for the same reason — the OAuth layer is the only reader of all three.
+ * Not `GENERATED_SECRET_MODE`: that mode exists so the *connector* can read the
+ * secrets both images share, and this is not one of them.
+ */
+const CLAIM_TOKEN_MODE = 0o600;
+
 /** The path prefix every setup route lives under. */
 export const SETUP_PREFIX = "/setup";
 
@@ -476,6 +486,13 @@ function claimTokenPresent(config: OAuthConfig): boolean {
  * same guarantee — the path either does not exist or holds the complete value,
  * never a half-written one — and `createExclusively` is where that guarantee
  * already lives.
+ *
+ * Which is why it is asked for the guarantee and nothing else. The shared
+ * secrets' 640-in-the-shared-group is what lets the connector read what this
+ * service wrote; the claim token is full control over an unclaimed instance —
+ * whoever presents it sets the operator password — and there is no second reader
+ * to accommodate. So it lands 600 and stays out of the group, beside the
+ * `operator.json` and `setup-wizard.json` that this service also owns alone.
  */
 function resolveClaimToken(path: string): { value: string; source: ClaimTokenSource } {
   const existing = readIfPresent(path);
@@ -486,7 +503,10 @@ function resolveClaimToken(path: string): { value: string; source: ClaimTokenSou
   // instance gated behind an empty token nobody can present. Clear it first.
   if (existsSync(path)) unlinkSync(path);
 
-  const created = createExclusively(path, generateClaimToken(), "CLAIM_TOKEN");
+  const created = createExclusively(path, generateClaimToken(), "CLAIM_TOKEN", {
+    mode: CLAIM_TOKEN_MODE,
+    shareGroup: false,
+  });
   return { value: created.value, source: created.raced ? "file" : "generated" };
 }
 

@@ -355,6 +355,64 @@ describe("resolveSecret", () => {
   });
 });
 
+describe("a file only one service reads", () => {
+  // The claim token, and nothing else so far. It borrows this module's atomic
+  // write — the path either does not exist or holds the whole value — without
+  // borrowing the sharing the three real secrets need: sharing a full-control
+  // bearer credential with a second image buys nothing and widens it. The
+  // reasoning is oauth/src/bootstrap.ts's; these tests are where it is enforced
+  // rather than only stated.
+  it("takes the mode the caller asks for", posixOnly, () => {
+    const dir = workdir();
+    const path = join(dir, "claim-token.txt");
+
+    createExclusively(path, "a-claim-token", "CLAIM_TOKEN", { mode: 0o600, shareGroup: false });
+
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+  });
+
+  it("keeps the shared-secret mode when no options are given", posixOnly, () => {
+    // The three secrets pass nothing, so the default is the decision they rely
+    // on: narrow it and both images start crash-looping on EACCES.
+    const dir = workdir();
+    const path = join(dir, "auth_token.txt");
+
+    createExclusively(path, "shared", "AUTH_TOKEN");
+
+    assert.equal(statSync(path).mode & 0o777, GENERATED_SECRET_MODE);
+  });
+
+  it("still writes the value whole, and cleans up after itself", () => {
+    // Every platform: narrowing the mode must not cost the atomic write, which
+    // is the only reason that caller reuses this writer at all.
+    const dir = workdir();
+    const path = join(dir, "claim-token.txt");
+
+    const created = createExclusively(path, "a-claim-token", "CLAIM_TOKEN", {
+      mode: 0o600,
+      shareGroup: false,
+    });
+
+    assert.equal(created.raced, false);
+    assert.equal(readFileSync(path, "utf8"), "a-claim-token\n");
+    assert.deepEqual(readdirSync(dir), ["claim-token.txt"]);
+  });
+
+  it("still lets a present file win", () => {
+    const dir = workdir();
+    const path = join(dir, "claim-token.txt");
+    writeFileSync(path, "written-by-the-boot-that-got-there-first\n");
+
+    const created = createExclusively(path, "mine", "CLAIM_TOKEN", {
+      mode: 0o600,
+      shareGroup: false,
+    });
+
+    assert.equal(created.raced, true);
+    assert.equal(created.value, "written-by-the-boot-that-got-there-first");
+  });
+});
+
 describe("logSecretReport", () => {
   it("states, per secret, whether it was read or generated", () => {
     const lines: Array<{ level: LogLevel; message: string; extra?: Record<string, unknown> }> = [];

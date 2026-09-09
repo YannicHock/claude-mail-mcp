@@ -16,6 +16,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -41,6 +42,9 @@ const VALID_HASH =
   "scrypt$1024$8$1$c2FsdHNhbHRzYWx0c2E$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhcw";
 
 const ISSUER = "https://mail.example.com";
+
+/** Node reports a crude, non-POSIX mode on Windows; the mode only matters in the image. */
+const posixOnly = process.platform === "win32" ? { skip: "POSIX file modes only" } : {};
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "oauth-bootstrap-"));
@@ -341,6 +345,18 @@ describe("the claim token", () => {
       !lines.some((line) => JSON.stringify(line).includes(onDisk)),
       "the token itself is never a log field"
     );
+  });
+
+  it("is written 0600, not at the shared secrets' mode", posixOnly, () => {
+    // Whoever holds this token can claim the instance and set the operator
+    // password, and only this service ever reads it — so it goes on the volume
+    // at the same mode as operator.json and setup-wizard.json beside it, rather
+    // than at the 640 the two images need for the secrets they share.
+    const dir = tempDir();
+
+    Bootstrap.open(configFor(dir), silentLogger);
+
+    assert.equal(statSync(join(dir, "claim-token.txt")).mode & 0o777, 0o600);
   });
 
   it("survives a restart mid-wizard, rather than being regenerated", () => {
