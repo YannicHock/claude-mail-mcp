@@ -55,112 +55,133 @@ Hosted email-AI services need full mailbox access. That's a lot of trust to hand
 
 - One Node process for all your mailboxes
 - Credentials in a single `accounts.json` you own, on your own disk
-- One Bearer token gates every MCP call
-- Add the URL to Claude.ai once, done
+- One Bearer token gates every MCP call, and the instance generates it itself
+- Set up from the browser, then add the URL to Claude.ai once, done
 
 ---
 
 ## Quick start
 
+Four steps, about ten minutes. You will not build anything, write any JSON, or generate any secret: the stack creates its own tokens and keys on first boot, and a browser wizard sets the operator password and the first mailbox.
+
+### Before you start
+
+Three things this project assumes and cannot arrange for you:
+
+- **A server with a public domain name.** The hostname needs an **A record** — Claude connectors are IPv4-only, and a name that publishes AAAA records only cannot be reached at all.
+- **A reverse proxy terminating TLS in front of it,** forwarding to `127.0.0.1:8080` — nginx, Caddy, Traefik, Nginx Proxy Manager, whichever you already run. **claude.ai will not connect over plain HTTP**, and this is the single most likely reason a first attempt fails. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has a working nginx recipe, and the variant for a proxy that runs in a container itself and so cannot reach the host's loopback.
+- **Docker Engine with the Compose plugin.** No Node toolchain on the server — the two images are pulled from GHCR.
+
+Port `8080` is the OAuth layer, and it is the one the proxy fronts. The connector on `3220` stays unreachable from outside; both are published to loopback only.
+
+### 1. Configure
+
 ```bash
 git clone https://github.com/YannicHock/claude-mail-mcp.git
 cd claude-mail-mcp
-npm install
-cp .env.example .env
-# Generate an AUTH_TOKEN and fill it into .env:
-#   echo "AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
-npm run build
-npm start
+
+cp .env.docker.example .env
+cp oauth/.env.example .env.oauth
 ```
 
-The server boots with **no mailboxes configured** — that's fine. Since 0.6.0 mailboxes are added from a browser: a settings UI at `/settings` adds, tests, edits and removes them and writes `accounts.json` for you. It is served by the OAuth layer, so it comes with the Docker deployment below — see [Deployment](docs/DEPLOYMENT.md), "Enable the settings UI", for the shared signing key it needs.
+Set `PUBLIC_URL` in **both** files to the address your proxy serves — scheme and host, no path, no trailing slash. The two values must match exactly: it is the issuer the connector checks on every request the OAuth layer signs, and a mismatch fails that check silently.
 
-A bare `npm start` runs the connector on its own, without that layer, so during local development you still write the file yourself. Either way, this is the format:
-
-```json
-{
-  "version": 1,
-  "accounts": [
-    {
-      "id": "main",
-      "label": "Main",
-      "default": true,
-      "imap": { "host": "imap.mailbox.org", "port": 993, "user": "you@example.com", "pass": "secret", "tls": true },
-      "smtp": { "host": "smtp.mailbox.org", "port": 465, "user": "you@example.com", "pass": "secret", "tls": true },
-      "mail": { "defaultFrom": "you@example.com", "draftsFolder": "Drafts", "sentFolder": "Sent" }
-    }
-  ]
-}
-```
-
-For local development, save it in your checkout and set `ACCOUNTS_FILE=./accounts.json` in `.env` (`accounts.json` and `data/` are git-ignored, so it can't be committed by accident). On a server, `.env.example` already points `ACCOUNTS_FILE` at `/var/lib/mail-mcp/accounts.json`, owned by the `mailmcp` service user at mode 600 — see [Deployment](docs/DEPLOYMENT.md) step 4. The backend re-reads via `fs.watch`, no restart needed.
-
-Smoke test:
+Then create the directories the two containers write to, before the first `docker compose up`. Docker creates a missing bind-mount source itself, as `root` and without the setgid bit, and the containers — which run unprivileged, as two different users — then cannot write in it:
 
 ```bash
-curl http://localhost:3220/health
-# {"status":"ok","server":"claude-mail-mcp","version":"0.5.0","accounts":[{…}],…}
+mkdir -p data oauth-data secrets/shared secrets/oauth
+sudo chown 100:101 data          # the connector's uid/gid
+sudo chown 102:103 oauth-data    # the OAuth layer's
+
+sudo groupadd --system mailsecrets
+sudo chgrp mailsecrets secrets/shared secrets/oauth
+sudo chmod 2770 secrets/shared secrets/oauth
+echo "SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)" >> .env
 ```
+
+That group is the one thing the two services share, so each can read a secret the other wrote; `docker compose up` refuses to start without `SECRETS_GID`. Why it has to be a group you created rather than one that came with the distribution is in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) and [`docs/HARDENING.md`](docs/HARDENING.md).
+
+`PUBLIC_URL` and `SECRETS_GID` are the only values you supply. The Bearer token for `/mcp`, the OAuth signing key and the settings signing key are **generated on the first boot that finds them missing** and written under `secrets/`. A file that is already there always wins, so upgrading an existing install rotates nothing.
+
+### 2. Start it
+
+```bash
+docker compose up -d
+```
+
+Two services come up: `mail-mcp`, the connector, and `mail-oauth`, the layer claude.ai signs in against.
+
+### 3. Open the setup URL
+
+An instance nobody has configured yet prints a complete, clickable setup link to its logs on every boot, and answers nothing else — `/mcp` returns 503 and every other path returns 404 — until setup finishes:
+
+```bash
+docker compose logs mail-oauth
+```
+
+```
+────────────────────────────────────────────────────────────────
+  Setup required. Open this once to configure the instance:
+
+    https://mcp-mail.example.com/setup/<token>
+
+  Anyone with this link can claim this instance. It stops
+  working as soon as setup completes.
+────────────────────────────────────────────────────────────────
+```
+
+The link in that banner is a bearer credential — anyone holding it can claim the instance — so open it yourself rather than pasting it anywhere. It survives a restart and is reprinted on every boot until you finish, so an interrupted setup is not a lost one.
+
+### 4. Work through the wizard
+
+Three screens:
+
+1. **Operator account** — a username and a password of at least 12 characters. This is what you sign in to the settings UI with, and what Claude signs in against.
+2. **First mailbox** — type the address and its password; the settings for that domain are looked up and shown for you to confirm rather than silently applied. If nothing is found you get a provider list, and behind that the full IMAP/SMTP/CalDAV form. IMAP and SMTP are tested against the real server before anything is stored. *Skip for now* is on every one of these screens — mailboxes can be added later from the settings UI.
+3. **The MCP URL** — confirm it is the address the outside world reaches this instance at, and press **Finish**.
+
+Finish deletes the claim token and closes `/setup` permanently. Add the MCP URL as a custom connector in claude.ai — Settings → Connectors → Add custom connector — and it answers immediately; the MCP endpoint needs no restart.
+
+The settings UI does need one. It is mounted when the process starts, and this process started before there was an operator account to mount it against:
+
+```bash
+docker compose restart mail-oauth
+```
+
+Then sign in at `https://<your domain>/settings` to add mailboxes, test credentials, and review or revoke connected Claude clients. The wizard's last screen says all of this too, so you do not need this page open while you work.
+
+That is the whole of it. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) covers the reverse proxy in full, backups, updating, and the systemd deployment for anyone who would rather not run Docker; [`docs/HARDENING.md`](docs/HARDENING.md) covers the threat model and the operator checklist.
 
 ---
 
-## Run with Docker
+## The images
 
-Two multi-arch (amd64/arm64) images are published to GHCR: `ghcr.io/yannichock/claude-mail-mcp` and `ghcr.io/yannichock/claude-mail-mcp-oauth`. A push to `main` publishes them tagged `sha-<short>` and nothing else; a `v*` tag publishes `X.Y.Z` and moves `latest`. So **`:latest` always names a release**, and `sha-<short>` is how you run an unreleased commit — it names one commit and can never move. Both images carry a build-provenance attestation, checkable with `gh attestation verify --owner YannicHock oci://ghcr.io/yannichock/claude-mail-mcp:latest`.
+Two multi-arch (amd64/arm64) images are published to GHCR: `ghcr.io/yannichock/claude-mail-mcp` and `ghcr.io/yannichock/claude-mail-mcp-oauth`. They are released together, from one commit, and `scripts/check-versions.sh` fails the build if the tree stops agreeing with itself about which version that is — so the two tags always name the same source.
 
-Either path needs the same two things as the Quick start above: an `AUTH_TOKEN` and an `accounts.json` (an empty one is fine to boot with).
-
-### `docker run`
+A push to `main` publishes them tagged `sha-<short>` and nothing else; a `v*` tag publishes `X.Y.Z` and moves `latest`. So **`:latest` always names a release**, and `sha-<short>` is how you run an unreleased commit — it names one commit and can never move. Both images carry a build-provenance attestation:
 
 ```bash
-mkdir -p data
-echo '{"version":1,"accounts":[]}' > data/accounts.json   # or a real one, see Quick start
-# Once it holds real credentials, lock it down. The container runs as uid 100 /
-# gid 101 (`mailmcp`), so it needs the ownership change as well as the mode —
-# `chmod 600` alone makes the file unreadable to the container and the server
-# crash-loops on EACCES. See docs/DEPLOYMENT.md, "Container deployment" step 3.
-chown 100:101 data/accounts.json && chmod 600 data/accounts.json
-
-docker run -d \
-  --name claude-mail-mcp \
-  -p 127.0.0.1:3220:3220 \
-  -e AUTH_TOKEN="$(openssl rand -hex 32)" \
-  -e PUBLIC_URL=https://mcp-mail.example.com \
-  -v "$(pwd)/data:/data:ro" \
-  ghcr.io/yannichock/claude-mail-mcp:latest
-
-curl http://127.0.0.1:3220/health
-# {"status":"ok","server":"claude-mail-mcp","version":"0.5.0","accounts":[],"accounts_file":"/data/accounts.json"}
+gh attestation verify --owner YannicHock oci://ghcr.io/yannichock/claude-mail-mcp:latest
 ```
 
-Always publish with an explicit loopback host IP, `-p 127.0.0.1:3220:3220` — **never a bare `-p 3220:3220`**. The image binds `0.0.0.0` *inside* the container out of necessity (that's how Docker's port publishing reaches it at all); the host-side exposure is controlled entirely by how you publish the port. A bare publish puts the unauthenticated `GET /health` endpoint — it leaks the server name, version, account count and `accounts_file` path — on every interface, including the public internet on a host like Hetzner. The `Dockerfile` carries the same warning inline.
+`docker-compose.test.yml` has nothing to do with running any of this — it gives the integration suite a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) server to talk to. See [Development](#development).
 
-### docker-compose
+---
 
-`docker-compose.yml` in this repo already pins the port publish above and mounts `/data` read-only:
+## Other ways to run it
 
-```bash
-cp .env.docker.example .env
-# fill in AUTH_TOKEN, PUBLIC_URL, LOG_LEVEL
-mkdir -p data
-echo '{"version":1,"accounts":[]}' > data/accounts.json   # or a real one, see Quick start
-chown 100:101 data/accounts.json && chmod 600 data/accounts.json   # see note above
-docker compose up -d
-docker compose logs -f
-```
+**Just the connector, without the OAuth layer.** Claude Desktop, and any MCP client that lets you set a custom header, can call `/mcp` directly with `Authorization: Bearer <token>` and needs none of `mail-oauth`. Comment that service out of `docker-compose.yml`, read the token back with `cat secrets/shared/auth_token.txt`, and point your proxy at `127.0.0.1:3220` instead. There is no wizard on this path and no settings UI, so you write `data/accounts.json` yourself — [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has the format and the Claude Desktop config snippet.
 
-`docker-compose.test.yml` is a separate file for local development only — it spins up a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) server for the integration test suite (see [Development](#development) below) and has nothing to do with running the connector itself.
-
-`docker run` starts the connector on its own. `docker-compose.yml` also brings up the OAuth layer as the `mail-oauth` service, which is what Claude.ai web and the settings UI go through; it needs its own `.env.oauth` and a set of files under `secrets/` that the snippet above does not create — see [Connecting from Claude.ai](#connecting-from-claudeai) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for those and for putting nginx in front on a real host.
+**From source.** `npm install && npm run build && npm start` runs the connector on its own for local development. It is not the way to deploy this — see [CONTRIBUTING.md](CONTRIBUTING.md) and [Development](#development) below.
 
 ---
 
 ## Connecting from Claude.ai
 
-The connector speaks the **Streamable HTTP MCP transport**, gated by a single static Bearer token (`AUTH_TOKEN`). Since 0.4.0 the repository also ships an OAuth 2.1 layer in `oauth/`, published as a second image, for the clients that cannot send a Bearer token themselves.
+The connector speaks the **Streamable HTTP MCP transport**, gated by a single static Bearer token — generated on first boot into `secrets/shared/auth_token.txt`. Since 0.4.0 the repository also ships an OAuth 2.1 layer in `oauth/`, published as a second image, for the clients that cannot send a Bearer token themselves.
 
-- **Claude Desktop**, or any MCP client that lets you set a custom header, can call `/mcp` directly with `Authorization: Bearer <AUTH_TOKEN>` — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the config snippet. No extra layer needed.
-- **Claude.ai (web)** only connects to remote MCP servers that advertise OAuth 2.1 discovery (Dynamic Client Registration + PKCE), which the connector itself doesn't implement. The `oauth/` layer does: discovery, dynamic client registration, PKCE, refresh rotation, and an authenticated proxy in front of `/mcp`. `docker-compose.yml` runs it as `mail-oauth`; nginx fronts it instead of the connector, which stays unreachable from outside. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) (Option B) for the wiring and [`docs/HARDENING.md`](docs/HARDENING.md) for what it has to satisfy.
+- **Claude Desktop**, or any MCP client that lets you set a custom header, can call `/mcp` directly with `Authorization: Bearer <token>` — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the config snippet. No extra layer needed.
+- **Claude.ai (web)** only connects to remote MCP servers that advertise OAuth 2.1 discovery (Dynamic Client Registration + PKCE), which the connector itself doesn't implement. The `oauth/` layer does: discovery, dynamic client registration, PKCE, refresh rotation, and an authenticated proxy in front of `/mcp`. `docker-compose.yml` runs it as `mail-oauth`; your reverse proxy fronts it instead of the connector, which stays unreachable from outside. That is the path the [Quick start](#quick-start) sets up. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the wiring and [`docs/HARDENING.md`](docs/HARDENING.md) for what it has to satisfy.
 
 ---
 
@@ -185,7 +206,7 @@ The connector speaks the **Streamable HTTP MCP transport**, gated by a single st
 | iCloud | `https://caldav.icloud.com/` |
 | Nextcloud | `https://cloud.example.com/remote.php/dav/principals/users/USER/` |
 
-If your provider doesn't speak CalDAV, just omit the `caldav` block from that account in `accounts.json` — the calendar tools are always registered, but they return a clear error for any account with no `caldav` configured. Mail still works regardless.
+If your provider doesn't speak CalDAV, leave the CalDAV fields blank in the setup wizard or the settings UI — the calendar tools are always registered, but they return a clear error for any account with no `caldav` configured. Mail still works regardless.
 
 ---
 
@@ -195,7 +216,7 @@ If your provider doesn't speak CalDAV, just omit the `caldav` block from that ac
 Claude Desktop / any Bearer-capable MCP client
     │  HTTPS + Authorization: Bearer <AUTH_TOKEN>
     ▼
-nginx (TLS termination, security headers, rate-limit on /mcp)
+your reverse proxy (TLS termination, security headers, rate-limit on /mcp)
     │
     ├──▶ /mcp    ─▶ this server (Port 3220, Bearer-auth gated)
     └──▶ /health ─▶ this server (Port 3220)
@@ -208,36 +229,29 @@ this server
 
 Everything is one Node process. IMAP holds a single long-lived connection with per-call mailbox locks. SMTP and CalDAV are stateless per call.
 
-Claude.ai (web) isn't in this diagram: it reaches the connector through the OAuth 2.1 layer in `oauth/`, a second Node process that nginx fronts in the connector's place — see [Connecting from Claude.ai](#connecting-from-claudeai) above.
+Claude.ai (web) isn't in this diagram: it reaches the connector through the OAuth 2.1 layer in `oauth/`, a second Node process that the proxy fronts in the connector's place. That is the arrangement the [Quick start](#quick-start) builds — see [Connecting from Claude.ai](#connecting-from-claudeai) above.
 
 ---
 
 ## Security model
 
-See **[SECURITY.md](SECURITY.md)** for the threat model and **[docs/HARDENING.md](docs/HARDENING.md)** for the full operator checklist.
+**[SECURITY.md](SECURITY.md)** is the threat model; **[docs/HARDENING.md](docs/HARDENING.md)** is the operator checklist, and it is where the detail lives. The shape of it, so you know what you are agreeing to:
 
-In one sentence: TLS via Let's Encrypt + HSTS/security headers + a rate-limited static Bearer token + loopback-only binding + a credentials file readable only by the service. The OAuth layer in `oauth/` adds discovery, operator sessions and the `/settings` UI on top of that; it is a separate service, and the connector runs without it — see below.
+- **You hold the credentials.** Mailbox passwords live in an `accounts.json` on your own disk and nowhere else. `list_accounts` returns id, label and From — never a credential — and logs carry neither passwords nor tokens.
+- **TLS, security headers and rate limits are the reverse proxy's job,** and you supply the proxy. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) carries an nginx recipe that does all three, including a login-grade limit scoped to the two endpoints that check the operator password.
+- **Both services bind loopback only.** The proxy is the only thing that can reach either of them from outside.
+- **`/mcp` is gated by one static Bearer token,** generated on first boot, which the OAuth layer substitutes into every request it proxies and never hands to a client.
+- **An unclaimed instance is claimable only from its own logs.** Until setup completes, `/mcp` answers 503 and everything but `/health` and the setup URL answers 404, so the window between `docker compose up` and the first sign-in is not an open form on the public internet. It reduces takeover to an attacker who can already read your container logs.
+- **The two services run unprivileged, as two different users,** sharing exactly one group: the one that owns `secrets/`, so each can read a secret the other wrote. The OAuth signing key and the operator's password hash are in the half of `secrets/` that is never mounted into the process parsing inbound MIME.
+- **Destructive tools** (`delete_message`) document their irreversibility, so Claude surfaces a confirmation step. Prefer `move_message` to a Trash folder.
 
-### Quick summary
-
-The transport, auth, network and output rows below apply to **both** deployments. The **process** and **storage** rows describe the **systemd** deployment in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) specifically — `ProtectSystem=strict`, `ProtectHome`, `SystemCallFilter` and `MemoryMax` are systemd unit settings and have no equivalent in the Docker path, which gets its isolation from the container runtime instead. Each row says which.
-
-- **Transport:** TLS 1.3 (Let's Encrypt, auto-renew), HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `X-Robots-Tag: noindex` — delivered by the nginx config in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). `Referrer-Policy: same-origin` is set by the application on its own pages.
-- **Auth:** `/mcp` is gated by a single static Bearer token (`AUTH_TOKEN`), checked on every request — no OAuth, no per-user sessions, no token expiry. Rate-limited at nginx (120 req/min per IP on `/mcp`, `/health` is unthrottled) — sized for JSON-RPC, where each MCP message is a separate POST, rather than for a login form.
-- **Process (systemd path):** Runs as a dedicated non-root `mailmcp` system user (no shell). Full systemd hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `ProtectKernel*`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `RestrictNamespaces`, `LockPersonality`, `SystemCallFilter=@system-service ~@privileged @resources`, `MemoryMax=512M`.
-- **Process (Docker path):** Runs as the non-root `mailmcp` user (uid 100) inside the container, with `dist/` and `node_modules/` owned by root so the runtime user cannot rewrite its own code, and `/data` mounted read-only. None of the systemd settings above apply; add container-level limits (`--memory`, `--read-only`, `--cap-drop ALL`) if you want their equivalents.
-- **Network:** Backend bound to `127.0.0.1` only — nginx is the only thing that can reach it from outside. UFW default-deny on the host.
-- **Storage (systemd path):** Credentials chmod 600, owned by `mailmcp`, in `/var/lib/mail-mcp/`. `.env` chmod 640 `root:mailmcp`. **(Docker path):** `./data/accounts.json` chmod 600, owned by the container's uid 100 / gid 101, bind-mounted read-only at `/data`.
-- **Output:** `list_accounts` returns id/label/From — never credentials. Logs never include passwords or Bearer tokens.
-- **Destructive tools** (`delete_message`) document irreversibility so Claude.ai surfaces a confirmation step. Prefer `move_message` to a Trash folder for reversibility.
-
-Remote or multi-client access (e.g. Claude.ai web) goes through the OAuth 2.1 layer in `oauth/` rather than straight at `/mcp`, and that layer has a threat model of its own — see [Connecting from Claude.ai](#connecting-from-claudeai) above and [docs/HARDENING.md](docs/HARDENING.md#optional-adding-an-oauth-layer-for-remotemulti-client-access) for what it has to provide.
-
-Full threat-model walkthrough and operator hardening checklist in [docs/HARDENING.md](docs/HARDENING.md). Reporting issues: see [SECURITY.md](SECURITY.md).
+The systemd deployment adds a full unit hardening profile — `ProtectSystem=strict`, `SystemCallFilter`, `MemoryMax` and the rest — that has no equivalent on the Docker path, which takes its isolation from the container runtime instead. Both are in [docs/HARDENING.md](docs/HARDENING.md), along with the OAuth layer's own threat model. Reporting issues: [SECURITY.md](SECURITY.md).
 
 ---
 
 ## Development
+
+Working on the code, not deploying it — the [Quick start](#quick-start) is that, and [CONTRIBUTING.md](CONTRIBUTING.md) has the rest of this.
 
 ```bash
 npm install
