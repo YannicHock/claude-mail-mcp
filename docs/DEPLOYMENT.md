@@ -286,6 +286,102 @@ server {
 certbot --nginx -d mcp-mail.example.com
 ```
 
+### Rate-limiting the settings sign-in
+
+Only relevant once the OAuth layer fronts the public hostname and the settings UI is
+enabled (container deployment, step 6 below). Two of its endpoints verify the operator
+password — `POST /settings/login` and `POST /settings/password` — and those two get a
+zone of their own. `mailmcp_auth`'s 120r/m is sized for JSON-RPC and is far too loose
+for a password form.
+
+Add the map and the zone to the same `http {}`-context file as the zone above:
+
+```nginx
+# /etc/nginx/conf.d/mail-mcp-limits.conf, next to mailmcp_auth
+#
+# The key is the client address for POST and *empty* for every other method.
+# nginx does not account a request whose key evaluates to empty, so this is
+# what keeps `GET /settings/password` — merely opening the change-password
+# form — out of the zone, while the POST that submits it is counted.
+map $request_method $mcp_mail_login_key {
+    POST    $binary_remote_addr;
+    default "";
+}
+
+limit_req_zone $mcp_mail_login_key zone=mcp_mail_login:10m rate=10r/m;
+```
+
+Then, in the `server {}` block that proxies to the OAuth layer, exactly two locations:
+
+```nginx
+    # --- Exactly these two paths, and nothing else under /settings. ---
+    #
+    # `location =` is an exact match, and nginx prefers an exact match over
+    # every prefix match, so these two blocks are entered by
+    # `/settings/login` and `/settings/password` and by no other URI.
+    # `/settings/mailboxes`, `/settings/mailboxes/new`,
+    # `/settings/clients/<id>/revoke`, `/settings/logout` and the rest keep
+    # falling through to whatever serves `/settings` — and they must. Editing
+    # several mailboxes is a burst of perfectly ordinary requests, and the
+    # design document is emphatic on this point because a login-grade limit on
+    # a non-login path has already taken this project down once.
+    #
+    # Do not "simplify" these into one `location /settings`. That is the outage.
+    #
+    # Neither block sets `add_header`, deliberately: they therefore inherit the
+    # server-level security headers above, and the application's own
+    # `Referrer-Policy` still reaches the browser untouched. If you ever add an
+    # `add_header` here, repeat all the server-level ones too — and do not add
+    # a `Referrer-Policy`, for the reason given up there.
+
+    location = /settings/login {
+        limit_req        zone=mcp_mail_login burst=5 nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /settings/password {
+        limit_req        zone=mcp_mail_login burst=5 nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+```
+
+`10r/m` with `burst=5 nodelay` allows five attempts straight away and then one every
+six seconds. That is deliberately **looser** than the application's own throttle, which
+stops at five failures in fifteen minutes: the application stays the thing that decides
+when the account is locked and the thing that says so on the page, and nginx only caps
+the flood before it gets there. A limit tighter than the application's would replace a
+sign-in page that explains itself with a bare error from the proxy. `limit_req_status
+429` is there for the same reason — the default 503 reads as "the service is down" on a
+login form.
+
+Both paths share the one zone, so rejected sign-ins also spend the budget for a password
+change from that address. That mirrors what the application already does: the sign-in
+shares its throttle with the `/authorize` consent screen on purpose, because both guard
+the same credential.
+
+The zone keys on `$binary_remote_addr` — the address **this** nginx sees. In this recipe
+it is the internet-facing edge, so that is the client. If you put anything in front of it
+that does not preserve the source address (another reverse proxy, or Docker's own port
+publishing), every request arrives from one address and the whole internet shares a
+single bucket. That is [issue #15](https://github.com/YannicHock/claude-mail-mcp/issues/15),
+which describes the same collapse happening to the application-side throttle; the
+configuration here neither depends on it being fixed nor makes it worse, and whatever
+fixes it there fixes it here.
+
 ## 7. Add to Claude
 
 ### Option A — Claude Desktop (Bearer auth, simplest)
@@ -756,6 +852,11 @@ The sign-in shares its rate limit with the `/authorize` consent screen, delibera
 both guard the same credential. Five failed attempts lock **both** for fifteen
 minutes, so a failed settings login also blocks connecting a new Claude client during
 that window.
+
+That is the application's own throttle, and the edge should carry one in front of it:
+[Rate-limiting the settings sign-in](#rate-limiting-the-settings-sign-in) in step 6
+above scopes an nginx `limit_req` to `POST /settings/login` and
+`POST /settings/password` and to nothing else under `/settings`.
 
 ### 7. Updating
 
