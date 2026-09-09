@@ -290,11 +290,14 @@ describe("the two copies of this module", () => {
   it("stay identical below the header comment", () => {
     const body = (url: URL): string =>
       readFileSync(url, "utf8")
+        // Line endings first. On a CRLF checkout the header ends `*/\r\n`, the
+        // regex below does not match it, and the comparison then fails on the
+        // one paragraph that is supposed to differ.
+        .replace(/\r\n/g, "\n")
         // The header names the *other* package, so it differs on purpose.
         .replace(/^\/\*\*[\s\S]*?\*\/\n/, "")
         // The Logger type lives in a different module in each package.
-        .replace('from "./app.js"', 'from "./logger.js"')
-        .replace(/\r\n/g, "\n");
+        .replace('from "./app.js"', 'from "./logger.js"');
 
     assert.equal(
       body(new URL("../../src/secrets.ts", import.meta.url)),
