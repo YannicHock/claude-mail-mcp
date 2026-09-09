@@ -22,7 +22,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 
 import type { LogLevel } from "../../src/app.js";
@@ -143,7 +143,8 @@ describe("resolveSecret", () => {
       // 0600 is the intuitive mode for a secret and the documented crash loop:
       // the two images run as different non-root uids, and both read the shared
       // auth_token and settings_signing_key. They read it through the group they
-      // share (see SHARED_SECRET_GID), which is why this is 0640 and not 0644 —
+      // share — the one that owns the setgid directory the file is created in,
+      // named to the stack as SECRETS_GID — which is why this is 0640 and not 0644 —
       // a world-readable secret hands every account on the host the connector's
       // token. Asserted on every platform, because the constant is the decision.
       assert.equal(GENERATED_SECRET_MODE & 0o040, 0o040, "must be group-readable");
@@ -186,7 +187,29 @@ describe("resolveSecret", () => {
           err.message.includes("K_FILE") &&
           // and says what to do about it, since the usual cause is a secrets
           // directory the shared group cannot write to
-          err.message.includes("chmod 2770")
+          err.message.includes("2770")
+      );
+    });
+
+    it("names the directory it failed in, and the operator's own group", () => {
+      // This message is read at the exact moment somebody is stuck, so what it
+      // names has to still be true. #76 removed the pinned gid — the group is
+      // the operator's now and this stack knows it only as SECRETS_GID — and
+      // #77 split secrets/ into secrets/shared and secrets/oauth, so "the
+      // secrets directory" is no longer one place. Naming dirname(path) is the
+      // only phrasing that survives both: it is the directory the write
+      // actually failed in, whichever of the two that was.
+      const path = "/nonexistent-directory/k.txt";
+      assert.throws(
+        () => resolveSecret({ K_FILE: path }, "K"),
+        (err: unknown) =>
+          err instanceof SecretError &&
+          err.message.includes(dirname(path)) &&
+          err.message.includes("SECRETS_GID") &&
+          // The gid #76 removed, and the flat directory #77 replaced. Either one
+          // in this message sends an operator to fix a thing that is not there.
+          !/\b105\b/.test(err.message) &&
+          !/chgrp/.test(err.message)
       );
     });
 
@@ -450,13 +473,16 @@ describe("the shared group contract", () => {
   //
   // The group is the operator's own now, created with `groupadd --system` and
   // applied to both container processes by docker-compose.yml's `group_add`.
-  // What has to be pinned is therefore the wiring, plus the one combination that
-  // would be actively worse than either scheme alone: an image-side numeric
-  // `mailsecrets` riding alongside the host-side `group_add`. createExclusively
-  // chowns each new secret to SHARED_SECRET_GID whenever the process happens to
-  // be in that group, so a container carrying both would move every secret it
-  // creates into the *host's* group 105 — the group this change exists to keep
-  // them away from — and out of the group the other service can read.
+  // What has to be pinned is therefore the wiring: the two images must bake no
+  // gid of their own, and both services must actually be put in the host's.
+  //
+  // src/secrets.ts used to chown each secret it created to a `SHARED_SECRET_GID`
+  // of its own, which made an image-side numeric `mailsecrets` riding alongside
+  // the host-side `group_add` worse than either scheme alone. That constant is
+  // gone (#89) — the setgid bit on secrets/shared and secrets/oauth is the only
+  // mechanism now — but a baked gid remains wrong for the reason #76 gives: a
+  // number chosen against node:24-alpine is a guess about a host it has never
+  // seen, and on the host it usually names somebody else's daemon.
   const dockerfiles = {
     "Dockerfile": new URL("../../Dockerfile", import.meta.url),
     "oauth/Dockerfile": new URL("../../oauth/Dockerfile", import.meta.url),

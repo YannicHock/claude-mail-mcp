@@ -18,7 +18,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 
 import type { LogLevel } from "../../src/logger.js";
@@ -139,7 +139,8 @@ describe("resolveSecret", () => {
       // 0600 is the intuitive mode for a secret and the documented crash loop:
       // the two images run as different non-root uids, and both read the shared
       // auth_token and settings_signing_key. They read it through the group they
-      // share (see SHARED_SECRET_GID), which is why this is 0640 and not 0644 —
+      // share — the one that owns the setgid directory the file is created in,
+      // named to the stack as SECRETS_GID — which is why this is 0640 and not 0644 —
       // a world-readable secret hands every account on the host the connector's
       // token. Asserted on every platform, because the constant is the decision.
       assert.equal(GENERATED_SECRET_MODE & 0o040, 0o040, "must be group-readable");
@@ -182,7 +183,29 @@ describe("resolveSecret", () => {
           err.message.includes("K_FILE") &&
           // and says what to do about it, since the usual cause is a secrets
           // directory the shared group cannot write to
-          err.message.includes("chmod 2770")
+          err.message.includes("2770")
+      );
+    });
+
+    it("names the directory it failed in, and the operator's own group", () => {
+      // This message is read at the exact moment somebody is stuck, so what it
+      // names has to still be true. #76 removed the pinned gid — the group is
+      // the operator's now and this stack knows it only as SECRETS_GID — and
+      // #77 split secrets/ into secrets/shared and secrets/oauth, so "the
+      // secrets directory" is no longer one place. Naming dirname(path) is the
+      // only phrasing that survives both: it is the directory the write
+      // actually failed in, whichever of the two that was.
+      const path = "/nonexistent-directory/k.txt";
+      assert.throws(
+        () => resolveSecret({ K_FILE: path }, "K"),
+        (err: unknown) =>
+          err instanceof SecretError &&
+          err.message.includes(dirname(path)) &&
+          err.message.includes("SECRETS_GID") &&
+          // The gid #76 removed, and the flat directory #77 replaced. Either one
+          // in this message sends an operator to fix a thing that is not there.
+          !/\b105\b/.test(err.message) &&
+          !/chgrp/.test(err.message)
       );
     });
 
@@ -362,11 +385,18 @@ describe("a file only one service reads", () => {
   // bearer credential with a second image buys nothing and widens it. The
   // reasoning is oauth/src/bootstrap.ts's; these tests are where it is enforced
   // rather than only stated.
+  //
+  // The mode is now the whole of that enforcement. There used to be a
+  // `shareGroup: false` beside it, turning off a chown to a gid pinned into both
+  // images; #76 removed the pin and the setgid directory became the only thing
+  // that hands a created file to the shared group, so the flag went with it.
+  // `0600` grants no group anything whatever group the file lands in, which is
+  // the same guarantee stated in the one place that still has teeth.
   it("takes the mode the caller asks for", posixOnly, () => {
     const dir = workdir();
     const path = join(dir, "claim-token.txt");
 
-    createExclusively(path, "a-claim-token", "CLAIM_TOKEN", { mode: 0o600, shareGroup: false });
+    createExclusively(path, "a-claim-token", "CLAIM_TOKEN", { mode: 0o600 });
 
     assert.equal(statSync(path).mode & 0o777, 0o600);
   });
@@ -388,10 +418,7 @@ describe("a file only one service reads", () => {
     const dir = workdir();
     const path = join(dir, "claim-token.txt");
 
-    const created = createExclusively(path, "a-claim-token", "CLAIM_TOKEN", {
-      mode: 0o600,
-      shareGroup: false,
-    });
+    const created = createExclusively(path, "a-claim-token", "CLAIM_TOKEN", { mode: 0o600 });
 
     assert.equal(created.raced, false);
     assert.equal(readFileSync(path, "utf8"), "a-claim-token\n");
@@ -403,10 +430,7 @@ describe("a file only one service reads", () => {
     const path = join(dir, "claim-token.txt");
     writeFileSync(path, "written-by-the-boot-that-got-there-first\n");
 
-    const created = createExclusively(path, "mine", "CLAIM_TOKEN", {
-      mode: 0o600,
-      shareGroup: false,
-    });
+    const created = createExclusively(path, "mine", "CLAIM_TOKEN", { mode: 0o600 });
 
     assert.equal(created.raced, true);
     assert.equal(created.value, "written-by-the-boot-that-got-there-first");
