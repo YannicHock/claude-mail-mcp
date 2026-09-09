@@ -341,26 +341,61 @@ ${fieldError(message)}${opts.hint === undefined ? "" : `<p class="muted">${escap
 }
 
 /**
- * A password box that is always empty.
+ * A password box, empty unless the caller has a password to carry into it.
  *
- * The connector's own mailbox form does the same, and this screen must not
- * become the one place in the project that writes a mailbox password back into
- * a page. The cost is a retype after a failed connection test; the alternative
- * is a credential sitting in HTML, in the browser's back-forward cache, and in
- * whatever the operator screenshots when they ask someone for help.
+ * The rule this used to state — always empty, no exceptions — was aimed at one
+ * thing: a mailbox password read back out of somewhere and written into a page.
+ * The connector's own form never does it, and neither does the re-render after
+ * a failed probe, where the password is the thing most likely to have been
+ * wrong and the retype is the point. `formValues` is what enforces that: it
+ * strips every secret out of a draft before the draft becomes a page.
+ *
+ * A password carried forward from the screen the operator typed it on is not
+ * that. It is their own submission, still in flight, on its way to the form
+ * that is about to send it — and #120 is what happens without it: the wizard
+ * asks for the same mailbox password twice, with a screen in between that never
+ * mentions the first one. So the value comes from `values`, which is empty on
+ * every path that is not a carry.
  */
 function passwordInput(opts: {
   id: string;
   name: string;
   label: string;
+  values: Record<string, string>;
   errors: Record<string, string>;
   required?: boolean;
 }): string {
   const message = opts.errors[opts.name] ?? "";
+  const carried = opts.values[opts.name] ?? "";
   return `<label for="${escapeHtml(opts.id)}">${escapeHtml(opts.label)}</label>
-<input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="password" value=""
+<input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="password" value="${escapeHtml(carried)}"
        autocomplete="off"${opts.required === true ? " required" : ""}${invalid(message)}>
 ${fieldError(message)}`;
+}
+
+/**
+ * What the form says about its password boxes, which is not the same sentence
+ * whether or not there is anything in them.
+ *
+ * "Passwords are never written back into this page" is true of every path that
+ * re-renders this form after the connector has been asked something — and false
+ * of the two that arrive carrying one the operator typed a screen ago. Leaving
+ * the line up on those would tell an operator the boxes are empty while they
+ * are looking at two that are not.
+ */
+function passwordNote(values: Record<string, string>): string {
+  const carried =
+    (values[MAILBOX_FIELDS.imapPass] ?? "") !== "" ||
+    (values[MAILBOX_FIELDS.smtpPass] ?? "") !== "";
+  const about = carried
+    ? "The password you entered has been carried over rather than asked for again. " +
+      "Change it here if this mailbox takes a different one for IMAP and SMTP."
+    : "Passwords are never written back into this page, so retype them if a test " +
+      "sends you round again.";
+  return `<p class="muted">
+      ${escapeHtml(about)} Folder names and the rest of the account settings
+      can be changed once setup is finished.
+    </p>`;
 }
 
 function checkboxInput(opts: {
@@ -506,7 +541,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
       errors,
       required: true,
     })}
-    ${passwordInput({ id: "imap_pass", name: MAILBOX_FIELDS.imapPass, label: "Password", errors, required: true })}
+    ${passwordInput({ id: "imap_pass", name: MAILBOX_FIELDS.imapPass, label: "Password", values, errors, required: true })}
     </fieldset>
 
     <fieldset>
@@ -539,7 +574,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
       errors,
       required: true,
     })}
-    ${passwordInput({ id: "smtp_pass", name: MAILBOX_FIELDS.smtpPass, label: "Password", errors, required: true })}
+    ${passwordInput({ id: "smtp_pass", name: MAILBOX_FIELDS.smtpPass, label: "Password", values, errors, required: true })}
     </fieldset>
 
     <fieldset>
@@ -551,14 +586,10 @@ export function renderMailboxStep(data: MailboxPageData): string {
     </p>
     ${textInput({ id: "caldav_url", name: MAILBOX_FIELDS.caldavUrl, label: "URL", values, errors })}
     ${textInput({ id: "caldav_user", name: MAILBOX_FIELDS.caldavUser, label: "Username", values, errors })}
-    ${passwordInput({ id: "caldav_pass", name: MAILBOX_FIELDS.caldavPass, label: "Password", errors })}
+    ${passwordInput({ id: "caldav_pass", name: MAILBOX_FIELDS.caldavPass, label: "Password", values, errors })}
     </fieldset>
 
-    <p class="muted">
-      Passwords are never written back into this page, so retype them if a test
-      sends you round again. Folder names and the rest of the account settings
-      can be changed once setup is finished.
-    </p>
+    ${passwordNote(values)}
 
     <div class="actions">
       <button type="submit" name="_action" value="skip" class="secondary" formnovalidate>
@@ -725,8 +756,63 @@ export interface MailboxSuggestionPageData extends StepTwoLinks {
    * Never contains a password.
    */
   values: Record<string, string>;
+  /**
+   * The password the operator typed on the address screen, or "" when the
+   * submission that triggered the lookup did not carry one.
+   *
+   * Not part of {@link values}: those are the connector's field names and the
+   * rows on the screen are rendered from them, which is the last place a
+   * password belongs. This is the wizard's own one-password field, carried
+   * through as its own thing.
+   */
+  password: string;
   errors: Record<string, string>;
   notice?: { kind: "error" | "info"; message: string };
+}
+
+/**
+ * The password, carried rather than asked for a second time.
+ *
+ * #120: the operator typed it on the address screen, that submission is what
+ * produced this one, and asking again — on a screen that until now said nothing
+ * about the first answer — is the wizard forgetting something the operator can
+ * plainly see it was told.
+ *
+ * A hidden input is the shape, because that is how the rest of this screen
+ * already travels: the settings it is confirming are hidden inputs too, the
+ * page is `Cache-Control: no-store`, the whole flow is behind the claim token,
+ * and the value goes back over the same TLS POST it arrived on. What it must
+ * not become is a secret in `setup-wizard.json`, which holds `{version,
+ * furthest}` and will go on holding nothing else.
+ *
+ * It is stated in words as well. A screen that has silently acquired a
+ * credential is a screen an operator cannot reason about: they cannot tell
+ * whether Continue is about to use the password they typed or an empty one, and
+ * if they press `Edit these` they meet a form that is mysteriously filled in.
+ *
+ * The empty case is not hypothetical. `required` on the address screen is the
+ * browser's promise, not this package's, and a POST that skipped it still has
+ * to produce a screen the operator can finish on.
+ */
+function suggestionPassword(password: string): string {
+  if (password === "") {
+    return `<label for="mailbox_password">Password</label>
+    <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
+           value="" autocomplete="off" required autofocus>
+    <p class="muted">
+      Passwords are never written back into this page, so it has to be typed
+      here. It is used to log in to the servers above, and stored only once they
+      both answer.
+    </p>`;
+  }
+  return `<input type="hidden" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" value="${escapeHtml(
+    password
+  )}">
+    <p class="muted">
+      The password you entered is carried with this form, so there is nothing to
+      type here. It is used to log in to the servers above, and stored only once
+      they both answer — press Edit these to change it.
+    </p>`;
 }
 
 /** `imap.example.com:993`, or "" when there is no host to show. */
@@ -757,11 +843,8 @@ function suggestionRow(name: string, detail: string, encryption: string): string
  * publish nothing for it, calendars are optional in the account model, and an
  * operator who reads "not found" as a problem will go looking for one.
  *
- * The password is asked for again rather than carried through the lookup. This
- * screen is rendered from a fresh request, and a password in a hidden input is a
- * password in the page source, in the browser's back-forward cache and in
- * whatever the operator screenshots when they ask someone for help — which is
- * exactly what every other form in this project refuses to do.
+ * The password is carried through the lookup rather than asked for again, and
+ * {@link suggestionPassword} is where that is argued.
  */
 export function renderMailboxSuggestionStep(data: MailboxSuggestionPageData): string {
   const { values } = data;
@@ -801,14 +884,7 @@ ${caldavRow}
   <p class="muted">${escapeHtml(data.sourceLabel)}</p>
   <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
     ${hidden}
-    <label for="mailbox_password">Password</label>
-    <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
-           value="" autocomplete="off" required autofocus>
-    <p class="muted">
-      Passwords are never written back into this page, so it has to be typed
-      again here. It is used to log in to the servers above, and stored only
-      once they both answer.
-    </p>
+    ${suggestionPassword(data.password)}
     <div class="actions">
       ${skipButton()}
       <span class="buttons">
@@ -841,8 +917,34 @@ export interface MailboxProviderPageData extends StepTwoLinks {
   email: string;
   /** Which radio is on, when a submission is being re-rendered. */
   selected: string;
+  /**
+   * The password the operator typed on the address screen, or "" when this
+   * screen was reached from its own link and nobody has typed one yet.
+   */
+  password: string;
   errors: Record<string, string>;
   notice?: { kind: "error" | "info"; message: string };
+}
+
+/**
+ * The password on the way through tier 2, on the one route that has one.
+ *
+ * This screen is reached two ways, and #120 is only about one of them. From a
+ * lookup that found nothing, the operator typed a password on the address
+ * screen a moment ago and this screen is on the way to the form that will use
+ * it. From the `Choose provider manually` link, nobody has typed anything, so
+ * there is nothing to carry and nothing to say about it — and a note claiming
+ * otherwise would be the worse half of the bug.
+ */
+function providerPassword(password: string): string {
+  if (password === "") return "";
+  return `<input type="hidden" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" value="${escapeHtml(
+    password
+  )}">
+    <p class="muted">
+      The password you entered is carried with this form, so the next screen has
+      it already.
+    </p>`;
 }
 
 /**
@@ -903,6 +1005,7 @@ export function renderMailboxProviderStep(data: MailboxProviderPageData): string
       ${choice(PROVIDER_OTHER, "Other — enter the settings myself", "")}
       ${fieldError(providerError)}
     </fieldset>
+    ${providerPassword(data.password)}
     <div class="actions">
       ${skipButton()}
       <button type="submit" name="_action" value="provider">Continue</button>

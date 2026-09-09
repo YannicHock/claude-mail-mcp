@@ -1301,6 +1301,22 @@ function lookups(harness: Harness): number {
   return upstreamPosts(harness, "/settings/autoconfig");
 }
 
+/**
+ * Every hidden input on a screen, as the browser would submit them.
+ *
+ * Read out of the page rather than assembled from what the test knows, because
+ * what a screen carries onward is exactly the thing these tests are about: a
+ * value shown but not carried, or typed but not carried, is invisible to any
+ * assertion built from the fixture instead of from the HTML.
+ */
+function hiddenFields(html: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (const match of html.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)) {
+    fields[match[1]] = match[2];
+  }
+  return fields;
+}
+
 test("step 2 opens on the address, not on eighteen boxes", async () => {
   const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
   try {
@@ -1497,21 +1513,15 @@ test("Continue on the confirmation screen probes and stores what was shown", asy
     });
     const html = await found.text();
 
-    // Submit exactly what the confirmation screen carries, plus the password it
-    // asks for — the hidden fields, read straight back out of the page.
-    const hidden: Record<string, string> = {};
-    for (const match of html.matchAll(
-      /<input type="hidden" name="([^"]+)" value="([^"]*)">/g
-    )) {
-      hidden[match[1]] = match[2];
-    }
+    // Submit exactly what the confirmation screen carries and nothing else —
+    // the hidden fields, read straight back out of the page. The password is
+    // among them, which is the whole of #120: the operator typed it on the
+    // address screen and this submission is the one they made by pressing
+    // Continue, not a second round of typing.
+    const hidden = hiddenFields(html);
     assert.ok(Object.keys(hidden).length > 0, "the confirmation screen carried nothing");
 
-    const res = await postSetupForm(harness, "/mailbox", {
-      ...hidden,
-      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
-      _action: "save",
-    });
+    const res = await postSetupForm(harness, "/mailbox", { ...hidden, _action: "save" });
 
     assert.equal(res.status, 303);
     assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
@@ -1561,18 +1571,9 @@ test("a found CalDAV endpoint is stored with the same password, and only then", 
       [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
       _action: "lookup",
     });
-    const hidden: Record<string, string> = {};
-    for (const match of (await found.text()).matchAll(
-      /<input type="hidden" name="([^"]+)" value="([^"]*)">/g
-    )) {
-      hidden[match[1]] = match[2];
-    }
+    const hidden = hiddenFields(await found.text());
 
-    const res = await postSetupForm(harness, "/mailbox", {
-      ...hidden,
-      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
-      _action: "save",
-    });
+    const res = await postSetupForm(harness, "/mailbox", { ...hidden, _action: "save" });
     assert.equal(res.status, 303);
 
     const body = JSON.parse(harness.upstream.requests[3].body) as MailboxRequestBody;
@@ -1586,7 +1587,120 @@ test("a found CalDAV endpoint is stored with the same password, and only then", 
   }
 });
 
-test("Edit these hands the same settings to the full form, minus the password", async () => {
+test("the password typed on the address screen is not asked for a second time", async () => {
+  // #120, end to end. One password, typed once on the screen that asks for it,
+  // carried through the lookup in the form the operator is already looking at —
+  // and still nowhere near the wizard's state file.
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { suggestion: suggestionFor() });
+
+    const found = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    assert.equal(found.status, 200);
+    const confirmation = await found.text();
+
+    // Carried, not re-asked: no second password box on the confirmation screen,
+    // and the value travelling in the form Continue submits.
+    assert.equal(
+      hiddenFields(confirmation)[SHARED_PASSWORD_FIELD],
+      MAILBOX_PASSWORD,
+      "the confirmation screen dropped the password"
+    );
+    assert.equal(
+      /type="password"/.test(confirmation),
+      false,
+      "the confirmation screen still asks for the password"
+    );
+    // And it says so, rather than carrying it invisibly: an operator who cannot
+    // see the value has no other way to know why the next screen is filled in.
+    assert.match(confirmation, /carried/i);
+
+    // Edit these — the one route from a successful lookup to the full form.
+    const edited = await postSetupForm(harness, "/mailbox", {
+      ...hiddenFields(confirmation),
+      _action: "edit",
+    });
+    assert.equal(edited.status, 200);
+    const form = await edited.text();
+
+    for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
+      assert.ok(
+        form.includes(`name="${name}" type="password" value="${MAILBOX_PASSWORD}"`),
+        `the full form asks for ${name} again`
+      );
+    }
+    assert.match(form, /carried over/i);
+    assert.equal(lookups(harness), 1, "nothing but the lookup was contacted");
+    assert.equal(harness.upstream.requests.length, 1);
+
+    // The state file is the thing this must not have bought: progress and a
+    // version, and no secret anywhere near it — #23's rule, unweakened.
+    const state = readFileSync(join(dir, "setup-wizard.json"), "utf8");
+    assert.deepEqual(JSON.parse(state) as Record<string, unknown>, {
+      version: 1,
+      furthest: "mailbox",
+    });
+    assert.equal(state.includes(MAILBOX_PASSWORD), false);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a lookup that finds nothing carries the password on to tier 2 as well", async () => {
+  // Tier 2 is reached two ways, and only one of them has a password to carry.
+  // From the lookup it does — the operator typed one on the address screen a
+  // moment ago — and dropping it there is the same bug in the other branch.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness);
+
+    const missed = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    const list = await missed.text();
+    assert.match(list, /We could not detect settings for example\.com/);
+    assert.equal(hiddenFields(list)[SHARED_PASSWORD_FIELD], MAILBOX_PASSWORD);
+
+    const chosen = await postSetupForm(harness, "/mailbox", {
+      ...hiddenFields(list),
+      [ADDRESS_FIELD]: "anna@example.com",
+      [PROVIDER_FIELD]: "posteo",
+      _action: "provider",
+    });
+    assert.equal(chosen.status, 200);
+    const form = await chosen.text();
+
+    for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
+      assert.ok(
+        form.includes(`name="${name}" type="password" value="${MAILBOX_PASSWORD}"`),
+        `the full form asks for ${name} again`
+      );
+    }
+    // Posteo's preset names a CalDAV URL, so the password goes with it — the
+    // same rule the save path applies, and for the same reason.
+    assert.ok(
+      form.includes(`name="${MAILBOX_FIELDS.caldavPass}" type="password" value="${MAILBOX_PASSWORD}"`)
+    );
+
+    // The provider list reached from its own link has no password to carry, and
+    // does not pretend to: the full form is where it gets typed on that route.
+    const fromLink = await getSetup(harness, "/mailbox?view=providers");
+    assert.equal(/name="password"/.test(await fromLink.text()), false);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("Edit these hands the same settings to the full form, with the password", async () => {
   const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
   try {
     await reachStep2(harness);
@@ -1617,9 +1731,16 @@ test("Edit these hands the same settings to the full form, minus the password", 
     }
     assert.match(html, /value="imap\.example\.com"/);
     assert.match(html, /value="993"/);
-    // Nothing was contacted, and the password is not in the page.
+    // The password comes with them. It is not read back out of anything — it is
+    // the value the operator typed two screens ago, travelling in the form they
+    // are still filling in, and asking for it again here is #120.
+    assert.ok(html.includes(`name="${MAILBOX_FIELDS.imapPass}" type="password" value="${MAILBOX_PASSWORD}"`));
+    assert.ok(html.includes(`name="${MAILBOX_FIELDS.smtpPass}" type="password" value="${MAILBOX_PASSWORD}"`));
+    // No CalDAV URL was confirmed, so no CalDAV password is guessed at: a block
+    // that is nothing but a password probes a server nobody named.
+    assert.ok(html.includes(`name="${MAILBOX_FIELDS.caldavPass}" type="password" value=""`));
+    // Nothing was contacted.
     assert.equal(harness.upstream.requests.length, 0);
-    assert.equal(html.includes(MAILBOX_PASSWORD), false);
   } finally {
     await harness.close();
   }
