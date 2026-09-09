@@ -14,8 +14,11 @@ import {
   TEST_USERNAME,
   UPSTREAM_TOKEN,
   completeAuthorizationFlow,
+  extractCsrf,
   extractRequestToken,
+  getClients,
   makePkce,
+  postForm,
   registerClaudeClient,
   startHarness,
   type Harness,
@@ -327,3 +330,121 @@ describe("the token endpoint", () => {
     assert.equal(body.error, "unsupported_grant_type");
   });
 });
+
+describe("revoking a single session", () => {
+  /**
+   * The assertion that matters is the last one: not that the session record left
+   * the store, but that the access token the client is already holding stops
+   * reaching the connector. Asserting only the former is what let this ship —
+   * the store is emptied either way, so a test written against it passes whether
+   * or not the token was actually withdrawn.
+   *
+   * Its own harness, not the module-scoped one, so revoking here cannot reach
+   * the sessions the other tests in this file opened.
+   */
+  it("stops the access token that session already handed out", async () => {
+    const own = await startHarness();
+    try {
+      const issued = await completeAuthorizationFlow(own);
+      const accessToken = issued.body.access_token as string;
+
+      const before = await callMcp(own, accessToken);
+      assert.equal(before.status, 200, "the token works before the revoke");
+
+      const cookie = await own.signIn();
+      const csrf = extractCsrf(await (await getClients(own, cookie)).text());
+      const [sid] = Object.keys(own.store.sessions);
+      assert.ok(sid, "the flow opened a session to revoke");
+      const revoke = await postForm(own, `/settings/sessions/${sid}/revoke`, cookie, {
+        _csrf: csrf,
+      });
+      assert.equal(revoke.status, 303);
+      assert.equal(own.store.getSession(sid), undefined, "the session record is gone");
+
+      const upstreamCalls = own.upstream.requests.length;
+      const after = await callMcp(own, accessToken);
+      assert.equal(after.status, 401, "the access token is refused straight away");
+      assert.equal(
+        own.upstream.requests.length,
+        upstreamCalls,
+        "and nothing was proxied to the connector"
+      );
+      const challenge = after.headers.get("www-authenticate") ?? "";
+      assert.match(challenge, /error="invalid_token"/);
+      assert.match(challenge, /session/i, "the challenge says why");
+    } finally {
+      await own.close();
+    }
+  });
+
+  it("leaves another session's access token working", async () => {
+    const own = await startHarness();
+    try {
+      const kept = await completeAuthorizationFlow(own);
+      const doomed = await completeAuthorizationFlow(own);
+      const keptSid = sidOfClient(own, kept.clientId);
+      const doomedSid = sidOfClient(own, doomed.clientId);
+      assert.notEqual(keptSid, doomedSid);
+
+      const cookie = await own.signIn();
+      const csrf = extractCsrf(await (await getClients(own, cookie)).text());
+      await postForm(own, `/settings/sessions/${doomedSid}/revoke`, cookie, { _csrf: csrf });
+
+      assert.equal((await callMcp(own, doomed.body.access_token as string)).status, 401);
+      assert.equal((await callMcp(own, kept.body.access_token as string)).status, 200);
+    } finally {
+      await own.close();
+    }
+  });
+
+  it("survives a refresh: the rotated access token keeps the same session", async () => {
+    // Rotation reuses the sid rather than opening a new session, so the claim the
+    // new access token carries has to be the one the settings page revokes.
+    const own = await startHarness();
+    try {
+      const issued = await completeAuthorizationFlow(own);
+      const refreshed = await fetch(`${own.baseUrl}/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: issued.body.refresh_token as string,
+        }),
+      });
+      const body = (await refreshed.json()) as Record<string, unknown>;
+      const rotatedAccess = body.access_token as string;
+      assert.equal((await callMcp(own, rotatedAccess)).status, 200);
+
+      const cookie = await own.signIn();
+      const csrf = extractCsrf(await (await getClients(own, cookie)).text());
+      const [sid] = Object.keys(own.store.sessions);
+      await postForm(own, `/settings/sessions/${sid}/revoke`, cookie, { _csrf: csrf });
+
+      assert.equal((await callMcp(own, rotatedAccess)).status, 401);
+    } finally {
+      await own.close();
+    }
+  });
+});
+
+/** POST a JSON-RPC call to /mcp with the given bearer token. */
+async function callMcp(target: Harness, accessToken: string): Promise<Response> {
+  return fetch(`${target.baseUrl}/mcp`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+  });
+}
+
+/** The one open session belonging to a given client. */
+function sidOfClient(target: Harness, clientId: string): string {
+  const found = Object.entries(target.store.sessions).find(
+    ([, session]) => session.clientId === clientId
+  );
+  assert.ok(found, `no session for ${clientId}`);
+  return found[0];
+}

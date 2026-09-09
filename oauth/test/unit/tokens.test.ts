@@ -377,3 +377,105 @@ test("a legacy token missing the epoch claim is rejected once the store's epoch 
   const result = await issuer.verifyAccessToken(legacy, RESOURCE);
   assert.equal(result.ok, false);
 });
+
+test("an access token stops verifying once its own session is revoked", async () => {
+  const store = await Store.open(null, silentLogger);
+  store.putClient(clientRecord("c1"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  const { accessToken } = await issuer.issue(accessClaims({ clientId: "c1" }));
+
+  assert.equal((await issuer.verifyAccessToken(accessToken, RESOURCE)).ok, true);
+
+  // Exactly what /settings/sessions/:sid/revoke does, and all it does: no epoch
+  // bump and no revokedAt, so the sid claim is the only thing left to catch this.
+  const [sid] = Object.keys(store.sessions);
+  store.deleteSession(sid);
+
+  const after = await issuer.verifyAccessToken(accessToken, RESOURCE);
+  assert.equal(after.ok, false);
+  assert.ok(!after.ok);
+  assert.equal(after.reason, "revoked_session");
+});
+
+test("revoking one session leaves the other session's access token working", async () => {
+  const store = await Store.open(null, silentLogger);
+  store.putClient(clientRecord("c1"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  const first = await issuer.issue(accessClaims({ clientId: "c1" }));
+  const second = await issuer.issue(accessClaims({ clientId: "c1" }));
+
+  // Both sessions belong to the same client, which is the case the client-level
+  // revocation cannot express: it would take the other one down with it.
+  const [firstSid] = Object.keys(store.sessions);
+  store.deleteSession(firstSid);
+
+  assert.equal((await issuer.verifyAccessToken(first.accessToken, RESOURCE)).ok, false);
+  assert.equal((await issuer.verifyAccessToken(second.accessToken, RESOURCE)).ok, true);
+});
+
+test("an access token minted by a refresh dies with the session too", async () => {
+  const store = await Store.open(null, silentLogger);
+  store.putClient(clientRecord("c1"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  const first = await issuer.issue(accessClaims({ clientId: "c1" }));
+  const rotated = await issuer.rotate(first.refreshToken);
+  assert.ok(rotated.ok);
+
+  // Rotation reuses the sid rather than opening a second session, so the rotated
+  // access token has to carry the sid the operator sees listed — not a new one.
+  const [sid] = Object.keys(store.sessions);
+  store.deleteSession(sid);
+
+  const after = await issuer.verifyAccessToken(rotated.tokens.accessToken, RESOURCE);
+  assert.equal(after.ok, false);
+  assert.ok(!after.ok);
+  assert.equal(after.reason, "revoked_session");
+});
+
+test("a token minted before the sid claim existed still verifies", async () => {
+  // Same tolerance the epoch claim gets: an upgrade must not sign every connected
+  // client out, and the window closes on its own within one access-token lifetime.
+  const store = await Store.open(null, silentLogger);
+  store.putClient(clientRecord("c1"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  const legacy = await new SignJWT({
+    token_use: "access",
+    client_id: "c1",
+    scope: "mcp",
+    epoch: 0,
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuer(ISSUER)
+    .setAudience(RESOURCE)
+    .setSubject("operator")
+    .setIssuedAt()
+    .setExpirationTime("1h")
+    .setJti("legacy-no-sid")
+    .sign(KEY);
+  assert.equal((await issuer.verifyAccessToken(legacy, RESOURCE)).ok, true);
+});
+
+test("a token naming a session that never existed is refused", async () => {
+  const store = await Store.open(null, silentLogger);
+  store.putClient(clientRecord("c1"));
+  const issuer = new TokenIssuer(issuerOptions(store));
+  const forged = await new SignJWT({
+    token_use: "access",
+    client_id: "c1",
+    scope: "mcp",
+    epoch: 0,
+    sid: "a-session-that-was-never-opened",
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuer(ISSUER)
+    .setAudience(RESOURCE)
+    .setSubject("operator")
+    .setIssuedAt()
+    .setExpirationTime("1h")
+    .setJti("unknown-sid")
+    .sign(KEY);
+  const result = await issuer.verifyAccessToken(forged, RESOURCE);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok);
+  assert.equal(result.reason, "revoked_session");
+});
