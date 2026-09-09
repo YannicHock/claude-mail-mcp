@@ -83,9 +83,12 @@ async function main(): Promise<void> {
     });
   }
 
-  // Absent while unbootstrapped, which is also what leaves the settings UI
-  // unmounted — the mount condition in app.ts already required an operator
-  // record, so that half of the state table needs no new code.
+  // Absent while unbootstrapped: there is no record to open and seeding one
+  // would claim the instance on its owner's behalf. That is also what keeps
+  // `/settings/*` a 404 in that state — and no longer what keeps it one
+  // afterwards. Since #121 the app resolves the record itself the first time it
+  // needs one, so a wizard that finishes in this process opens the settings UI
+  // in the same breath it opens `/mcp`, without a restart.
   const operator = bootstrap.bootstrapped
     ? await OperatorRecord.open(config.operatorFile, operatorSeed(config), log)
     : undefined;
