@@ -406,6 +406,93 @@ export function createExclusively(
   }
 }
 
+/**
+ * Can this process create a file in `directory`?
+ *
+ * Answered by creating one and removing it again, rather than by reading a mode
+ * off `stat`. What decides is the effective uid, *every* supplementary group
+ * `group_add` put this process in, and any ACL on the directory — and the only
+ * check that accounts for all three is the one the kernel performs. A container
+ * that can write only by virtue of `group_add` looks unauthorised to a mode
+ * comparison and is not.
+ *
+ * A directory that is not there at all is not writable either, and this says so.
+ * Callers that need to tell the two apart ask `existsSync` first, because they
+ * mean different things: absent is a path typo or a volume that did not attach,
+ * present-and-unwritable is the ownership fault {@link dataDirectoryAdvice}
+ * explains.
+ */
+export function canCreateFilesIn(directory: string): boolean {
+  const probe = join(directory, `.writable.${randomBytes(8).toString("hex")}.tmp`);
+  try {
+    writeFileSync(probe, "");
+  } catch {
+    return false;
+  }
+  try {
+    unlinkSync(probe);
+  } catch {
+    // Created but not removable is still writable, and a stray empty file is not
+    // worth failing a boot over.
+  }
+  return true;
+}
+
+/** A service's data directory, as {@link dataDirectoryAdvice} needs to describe it. */
+export interface DataDirectory {
+  /** The path inside the container — `/data` under docker-compose.yml. */
+  path: string;
+  /**
+   * What the service keeps there, as a noun phrase. Named in the message because
+   * an operator deciding how urgent this is needs to know what is at stake.
+   */
+  holds: string;
+  /** The host directory to create, for a deployment that bind-mounts this path. */
+  bindMountSource: string;
+  /**
+   * The ids to name in the `chown`. Default to this process's own, which under
+   * Docker *are* the image's runtime user — so the command is a fact about the
+   * running container rather than a number copied out of a Dockerfile that may
+   * since have changed. Passed explicitly only by this module's tests.
+   */
+  uid?: number;
+  gid?: number;
+}
+
+/**
+ * Everything worth saying to an operator whose service cannot write its data
+ * directory, in one block.
+ *
+ * This is issue #105's "fail better", and the shape of it is deliberate. The
+ * operator reading this is looking for a setup URL, not an error, so the message
+ * names the directory, says what is in it, and ends with the one command that
+ * fixes it — the exact `mkdir` and `chown`, on its own line, ready to paste.
+ *
+ * The uid and gid are read from the running process rather than written into the
+ * text. A hardcoded `chown 100:101` in a document is a claim about an image, and
+ * it is exactly the kind of claim that goes stale; this one cannot, because the
+ * process printing it is the process that has to own the directory.
+ *
+ * Deliberately *not* the advice {@link createExclusively} gives for a failed
+ * write. That one is about `secrets/` — a shared group, mode 2770 and the setgid
+ * bit — and it was reaching operators whose real problem was `/data`, which is
+ * not a secrets directory, has no shared group, and needs none of it.
+ */
+export function dataDirectoryAdvice(directory: DataDirectory): string {
+  const uid = directory.uid ?? process.getuid?.() ?? 0;
+  const gid = directory.gid ?? process.getgid?.() ?? 0;
+  return (
+    `${directory.path} is not writable by this service (uid ${uid}, gid ${gid}). ` +
+    `It holds ${directory.holds}. docker-compose.yml keeps this directory in a ` +
+    `Docker named volume, which Docker initialises from the image — where /data ` +
+    `already belongs to this uid — so there is nothing to create and nothing to ` +
+    `chown. If you have replaced that with a bind mount, create the host ` +
+    `directory and hand it to this service before starting again:\n\n` +
+    `    mkdir -p ${directory.bindMountSource} && ` +
+    `sudo chown ${uid}:${gid} ${directory.bindMountSource}\n`
+  );
+}
+
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }

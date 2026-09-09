@@ -16,11 +16,14 @@
  * CalDAV error friendly if the resolved account has none configured.
  */
 
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
+
 import { config } from "./config.js";
 import { AccountsStore } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
 import { createApp, VERSION } from "./app.js";
-import { logSecretReport } from "./secrets.js";
+import { canCreateFilesIn, dataDirectoryAdvice, logSecretReport } from "./secrets.js";
 
 export { createApp, SERVER_NAME, VERSION } from "./app.js";
 export type { CreateAppOptions, Logger, LogLevel } from "./app.js";
@@ -46,6 +49,41 @@ async function main(): Promise<void> {
   // auth_token and settings_signing_key are shared with the OAuth layer, and
   // "who generated it" is otherwise impossible to tell from the outside.
   logSecretReport(config.secretReport, log);
+
+  // #105, the connector's half of it — and the quiet half. An unwritable data
+  // directory does not stop this process: it reads accounts.json perfectly well
+  // and serves every mail tool from it. What it stops is a mailbox ever being
+  // *saved*, which is the setup wizard's step 2 and the whole of the settings
+  // UI, and it stops it with an EACCES from a browser form rather than anything
+  // in the startup log.
+  //
+  // So the answer depends on what is already there. No accounts file yet means
+  // an instance that can never acquire one — the first boot of a clean clone,
+  // which is what the issue is about — and it says so and stops. One that exists
+  // means a connector already serving mailboxes, and taking it off the air over a
+  // fault it can serve around would be the worse trade: that one gets a warning
+  // it can act on at leisure.
+  //
+  // A directory that is not there at all is neither: the accounts file is
+  // optional, an absent path is how a local `npm start` legitimately begins, and
+  // AccountsStore already starts empty on ENOENT.
+  const dataDirectory = dirname(config.accountsFile);
+  if (existsSync(dataDirectory) && !canCreateFilesIn(dataDirectory)) {
+    const advice = dataDirectoryAdvice({
+      path: dataDirectory,
+      holds: "accounts.json, every mailbox credential this connector holds",
+      bindMountSource: "./data",
+    });
+    if (existsSync(config.accountsFile)) {
+      log("warn", "data directory is not writable", { path: dataDirectory, note: advice });
+    } else {
+      // Not through `log`: this is the last thing this process will do, the
+      // operator is reading `docker compose logs`, and a paste-ready command
+      // inside a JSON string is not something anyone can act on.
+      process.stderr.write(`claude-mail-mcp: ${advice}`);
+      process.exit(1);
+    }
+  }
 
   const store = new AccountsStore(config.accountsFile);
   const pool = new ClientPool(store);

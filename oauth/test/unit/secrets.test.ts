@@ -9,6 +9,7 @@
 
 import { strict as assert } from "node:assert";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -25,7 +26,9 @@ import type { LogLevel } from "../../src/logger.js";
 import {
   GENERATED_SECRET_MODE,
   SecretError,
+  canCreateFilesIn,
   createExclusively,
+  dataDirectoryAdvice,
   logSecretReport,
   resolveSecret,
   type SecretReportEntry,
@@ -594,5 +597,90 @@ describe("logSecretReport", () => {
     );
     assert.equal(lines.length, 1);
     assert.ok(!lines[0]?.includes("value"));
+  });
+});
+
+describe("a data directory this service cannot write to", () => {
+  // #105. Docker creates a missing bind-mount source as root:root 755, both
+  // images run unprivileged, and the OAuth layer's first boot then dies writing
+  // the claim token — so the operator watching the log for a setup URL gets a
+  // restart loop instead. docker-compose.yml uses named volumes now, which
+  // Docker initialises from the image with the right ownership; this is what is
+  // left for the deployment that bind-mounts the path anyway.
+
+  // Dropping write permission needs POSIX modes, and root ignores them.
+  const asUnprivilegedPosixUser =
+    process.platform === "win32"
+      ? { skip: "POSIX directory modes only" }
+      : (process.getuid?.() ?? 0) === 0
+        ? { skip: "root writes into a directory whatever its mode says" }
+        : {};
+
+  it("is writable when it is writable, and is left exactly as it was found", () => {
+    const dir = workdir();
+    assert.equal(canCreateFilesIn(dir), true);
+    assert.deepEqual(readdirSync(dir), [], "the probe file must not survive the probe");
+  });
+
+  it("is not writable when it is not there at all", () => {
+    // A different fault with a different fix — a path typo, or a volume that did
+    // not attach — which is why callers ask existsSync first rather than reading
+    // this as an ownership problem.
+    assert.equal(canCreateFilesIn(join(workdir(), "never-created")), false);
+  });
+
+  it("is not writable when the mode says so", asUnprivilegedPosixUser, () => {
+    const dir = workdir();
+    chmodSync(dir, 0o500);
+    try {
+      assert.equal(canCreateFilesIn(dir), false);
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+  });
+
+  it("tells the operator the one command that fixes it", () => {
+    const advice = dataDirectoryAdvice({
+      path: "/data",
+      holds: "the claim token",
+      bindMountSource: "./oauth-data",
+      uid: 102,
+      gid: 103,
+    });
+
+    assert.match(advice, /^\/data is not writable by this service \(uid 102, gid 103\)/);
+    assert.match(advice, /It holds the claim token\./);
+    // Paste-ready, on a line of its own, with no placeholder left to fill in.
+    assert.ok(
+      advice.includes("\n    mkdir -p ./oauth-data && sudo chown 102:103 ./oauth-data\n"),
+      `the exact command has to be in there verbatim:\n${advice}`
+    );
+  });
+
+  it("takes the ids from the running process rather than from a document", () => {
+    // The whole reason this is generated rather than written down: a `chown
+    // 100:101` in a README is a claim about an image, and #105 is what happens
+    // when such a claim is the only thing standing between a clean clone and a
+    // crash loop. The process that has to own the directory is the one saying so.
+    const advice = dataDirectoryAdvice({
+      path: "/data",
+      holds: "accounts.json",
+      bindMountSource: "./data",
+    });
+    const uid = process.getuid?.() ?? 0;
+    const gid = process.getgid?.() ?? 0;
+    assert.ok(advice.includes(`sudo chown ${uid}:${gid} ./data`));
+  });
+
+  it("does not repeat the secrets directory's advice, which is about a different fault", () => {
+    // What an operator used to get here, from createExclusively: a shared group,
+    // mode 2770 and the setgid bit. All true of secrets/, none of it true of
+    // /data, which has no second reader and no shared group.
+    const advice = dataDirectoryAdvice({
+      path: "/data",
+      holds: "accounts.json",
+      bindMountSource: "./data",
+    });
+    assert.doesNotMatch(advice, /SECRETS_GID|2770|setgid/);
   });
 });

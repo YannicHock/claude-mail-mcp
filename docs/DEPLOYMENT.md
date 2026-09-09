@@ -57,7 +57,7 @@ instead of `127.0.0.1:8080`.
 What you give up is worth knowing before you choose it: **there is no setup wizard
 and no settings UI without `mail-oauth`.** Both are served from its public origin.
 Mailboxes then go into `accounts.json` by hand, as
-[step 3](#3-the-data-directories-and-accountsjson) describes, and `secrets/oauth/`
+[step 3](#3-the-data-volumes-and-accountsjson) describes, and `secrets/oauth/`
 stays unused.
 
 ---
@@ -341,58 +341,78 @@ starts the server instead of the hashing tool. `read -rs` keeps the password off
 the terminal and out of shell history.
 
 `AUTH_PASSWORD_HASH` only **seeds** the operator record, once, on that record's
-first creation. After that the live credential is `oauth-data/operator.json` and
-the secret is not read again — [see below](#where-the-operator-password-actually-lives).
+first creation. After that the live credential is `operator.json` on the OAuth
+layer's data volume and the secret is not read again — [see below](#where-the-operator-password-actually-lives).
 
 ---
 
-## 3. The data directories, and `accounts.json`
+## 3. The data volumes, and `accounts.json`
 
-Two bind mounts, one per service, and each has to be writable by that service's
-uid **before** the first start. Docker will create a missing one as `root:root`,
-which neither container can write to.
+**There is nothing to create here.** Both services keep their state on a Docker
+named volume — `mail-data` and `oauth-data` in `docker-compose.yml`, which Compose
+creates on the first start as `<project>_mail-data` and `<project>_oauth-data` —
+and Docker initialises an empty named volume from the image, ownership included.
+Both images pre-create `/data` owned by their own runtime user, so it comes out
+right without an operator step and without any instruction here naming a uid.
+
+Up to v0.6 these were bind mounts, `./data` and `./oauth-data`, and neither
+directory is tracked in git. So on a clean clone Docker created both itself, as
+`root:root` mode 755, and the two services — uid 100 and uid 102 — could write in
+neither. The connector failed quietly, on the first mailbox somebody tried to
+save; the OAuth layer failed on the one boot that matters, unable to write the
+claim token and therefore unable to print a setup URL at all, in a restart loop
+(#105). [The migration](#migrating-from-data-and-oauth-data) is below and loses
+nothing.
+
+**The connector's volume** holds `accounts.json`, every mailbox credential you
+own. The connector writes it — the settings UI and the setup wizard both save
+through it — so the *directory* has to be writable too, not just the file: saving
+writes a temp file next to `accounts.json` and renames it into place.
+
+**The OAuth layer's volume** holds `oauth-state.json` (registered clients and live
+refresh sessions), `operator.json` (the live operator credential), and, while the
+instance is unclaimed, `claim-token.txt` and `setup-wizard.json`.
+
+Look inside either of them through the service that owns it:
 
 ```bash
-mkdir -p data oauth-data
-sudo chown 100:101 data          # mailmcp,  from the connector's image
-sudo chown 102:103 oauth-data    # mailoauth, from the OAuth layer's image
-sudo chmod 700 data oauth-data
+docker compose exec mail-mcp   ls -ln /data
+docker compose exec mail-oauth ls -ln /data
+docker volume ls                  # what Compose called them on your host
 ```
 
-**`./data` → `/data` in `mail-mcp`** holds `accounts.json`, every mailbox
-credential you own. The connector writes it — the settings UI and the setup wizard
-both save through it — so the **directory** must be writable too, not just the
-file: saving writes a temp file next to `accounts.json` and renames it into place.
-Getting that wrong produces an `EACCES` on the first save from the browser rather
-than at startup, so a healthy-looking container still fails the first time somebody
-adds a mailbox.
-
-**`./oauth-data` → `/data` in `mail-oauth`** holds the OAuth layer's own
-bookkeeping: `oauth-state.json` (registered clients and live refresh sessions),
-`operator.json` (the live operator credential), and, while the instance is
-unclaimed, `claim-token.txt` and `setup-wizard.json`. If this directory is not
-writable, the very first boot cannot create the claim token and the service exits
-with the reason:
+Both services check that directory at startup now, and neither leaves you to find
+out later. If you swap a volume back to a bind mount and forget to hand the
+directory over, the OAuth layer refuses to start and the connector — on an install
+that has no `accounts.json` yet — does too, each printing the exact `mkdir` and
+`chown` for its own uid rather than a number written down here:
 
 ```
-SecretError: Cannot create CLAIM_TOKEN_FILE at /data/claim-token.txt:
-EACCES: permission denied … /data has to be writable by this service …
+/data is not writable by this service (uid 102, gid 103). It holds the claim
+token, the live operator record, and the registered clients and refresh sessions
+in the OAuth state file. … If you have replaced that with a bind mount, create
+the host directory and hand it to this service before starting again:
+
+    mkdir -p ./oauth-data && sudo chown 102:103 ./oauth-data
 ```
+
+A connector that already has an `accounts.json` warns instead of exiting: it can
+still serve every mailbox it has, it just cannot save a new one.
 
 ### Writing `accounts.json` by hand
 
 You do not need to. The wizard's step 2 configures the first mailbox and the
 settings UI manages the rest. Write it yourself when you are running the connector
-without the OAuth layer, or when you are restoring a backup.
+without the OAuth layer, or when you are restoring a single file from a backup.
 
-`data/` is owned by uid 100 and mode `700` by now, so this goes in as root, and
-`install` creates the file **already** owned by the container's uid and already at
-mode `600` — the credentials are never briefly world-readable between writing the
-file and locking it down:
+Pipe it in through the connector's own image. The `--entrypoint` override means
+the service does not start — this container exists only to hold the volume — and
+because it runs as the image's own user the file lands owned by the connector,
+with no `chown` and no uid to get wrong:
 
 ```bash
-sudo install -o 100 -g 101 -m 600 /dev/null data/accounts.json
-sudo tee data/accounts.json >/dev/null <<'JSON'
+docker compose run --rm --no-deps -T --entrypoint sh mail-mcp \
+  -c 'cat > /data/accounts.json && chmod 600 /data/accounts.json' <<'JSON'
 {
   "version": 1,
   "accounts": [
@@ -407,19 +427,23 @@ sudo tee data/accounts.json >/dev/null <<'JSON'
   ]
 }
 JSON
-ls -l data/accounts.json
-# -rw------- 1 100 101 … data/accounts.json
+
+docker compose exec mail-mcp ls -ln /data/accounts.json
+# -rw------- 1 100 101 … /data/accounts.json
 ```
 
-**`chmod 600` without the ownership change is the trap**, and it is silent until
-startup: the file stays owned by the host user that created it — root, if you did
-this with `sudo` — and uid 100 cannot read it. The connector rethrows every error
-that is not `ENOENT`, so it exits 1 and `restart: unless-stopped` turns that into
-an endless crash loop with nothing in `docker compose logs` but:
+**Writing that file from the host is the trap this replaces.** A file created with
+`sudo` stays owned by root, `chmod 600` then means uid 100 cannot read it, and the
+connector rethrows every error that is not `ENOENT` — so it exits 1 and
+`restart: unless-stopped` turns that into an endless crash loop with nothing in
+`docker compose logs` but:
 
 ```
 Fatal startup error: Error: EACCES: permission denied, open '/data/accounts.json'
 ```
+
+Writing it through the image cannot produce that: the process doing the writing is
+the process that has to read it back.
 
 Add a `"caldav": { "url": …, "user": …, "pass": … }` block per account if your
 provider speaks CalDAV. Multiple accounts go in the same array — see the
@@ -433,12 +457,60 @@ thing. An unreadable one is fatal, which is why the ownership above matters.
 
 The file is re-read via `fs.watch`, so adding a mailbox needs no restart.
 
-> Hot reload relies on inotify events crossing the bind mount, which they do on a
-> Linux host — the deployment this document describes. They do **not** cross a
-> Docker Desktop bind mount on Windows or macOS: the container reads the updated
-> file correctly, but no watch event ever fires, so the running process keeps the
-> accounts it started with. If you develop on one of those,
+> Hot reload relies on inotify events reaching the container, which they do from a
+> named volume and from a bind mount on a Linux host — the deployment this
+> document describes. They do **not** cross a Docker Desktop *bind mount* on
+> Windows or macOS: the container reads the updated file correctly, but no watch
+> event ever fires, so the running process keeps the accounts it started with. If
+> you develop on one of those and have swapped in a bind mount,
 > `docker compose restart mail-mcp` after editing `accounts.json`.
+
+### Migrating from `./data` and `./oauth-data`
+
+An install from v0.6 or earlier has both directories in the checkout. Nothing in
+them is thrown away and nothing is regenerated: the two commands below copy them
+onto the named volumes, and the old directories stay where they are until you have
+seen the stack come back up on their contents.
+
+**Copy before you start anything.** The `--entrypoint` override is what makes that
+possible — it creates the container, which is what makes Docker create and
+initialise the volume, while the service itself never runs. That ordering matters
+for `mail-oauth` in particular: booting it against an empty volume would find no
+operator record, mint a *new* claim token, and leave you with a configured instance
+that thinks it is unclaimed once the real `operator.json` is copied in beside it.
+
+```bash
+docker compose down
+
+docker compose run --rm --no-deps -v "$PWD/data:/old:ro" --entrypoint sh mail-mcp \
+  -c 'cp -r /old/. /data/ && ls -ln /data'
+docker compose run --rm --no-deps -v "$PWD/oauth-data:/old:ro" --entrypoint sh mail-oauth \
+  -c 'cp -r /old/. /data/ && ls -ln /data'
+```
+
+`cp -r` rather than `cp -a`, deliberately: each copy runs as the service's own
+user, so every file arrives owned by the process that has to read it, whatever it
+was owned by on the host. Modes come across — `accounts.json` stays `600`.
+
+Then start, and check that what came back is what you had:
+
+```bash
+docker compose up -d
+docker compose exec mail-mcp   ls -ln /data
+docker compose exec mail-oauth ls -ln /data
+docker compose logs mail-oauth | tail -n 20
+```
+
+A migrated OAuth volume prints **no** setup banner — `operator.json` came across
+with everything else, so the instance is claimed and `/setup` is 404, exactly as it
+was. Your Claude clients stay connected: `oauth-state.json` holds their
+registrations and refresh sessions, and none of the secrets under `secrets/` were
+touched.
+
+Once you are satisfied, back the two directories up somewhere off the host and
+remove them. If something is wrong instead, `docker compose down`, put the bind
+mounts back in `docker-compose.yml` — `- ./data:/data` and `- ./oauth-data:/data` —
+and you are exactly where you started.
 
 ---
 
@@ -716,7 +788,7 @@ instance serves, byte for byte, so scanning cannot tell the two apart.
 ### The setup URL
 
 The first boot generates the claim token, writes it to
-`oauth-data/claim-token.txt` at mode `600`, and prints the complete link — built
+`/data/claim-token.txt` on its own volume at mode `600`, and prints the complete link — built
 from `PUBLIC_URL`, so you copy a link rather than assembling one:
 
 ```
@@ -743,7 +815,7 @@ anywhere.
 ### The three screens
 
 1. **The operator account.** A username and a password, hashed with scrypt and
-   written to `oauth-data/operator.json`. Passwords under 12 characters, and a
+   written to `/data/operator.json` on its volume. Passwords under 12 characters, and a
    password equal to the username, are refused here rather than after the instance
    is exposed.
 2. **The first mailbox.** Type an address and a password and the connector looks
@@ -761,7 +833,8 @@ anywhere.
 **Finish** deletes the claim token, and that is the whole transition — the operator
 record was written back in step 1. `/setup/*` becomes the same 404 a wrong token
 always got, permanently: there is no route back in, and starting over means
-deleting `oauth-data/`.
+deleting the OAuth layer's data volume — `docker compose down`, then
+`docker volume rm <project>_oauth-data`, which `docker volume ls` names for you.
 
 ### After Finish
 
@@ -899,7 +972,7 @@ assertion from the OAuth layer.
 Sign in at `https://<your PUBLIC_URL>/settings` with the operator account:
 
 - `/settings/mailboxes` — add, test, edit and remove mailboxes; writes
-  `data/accounts.json`
+  `accounts.json` on the connector's data volume
 - `/settings/clients` — review and revoke connected Claude clients and their live
   sessions
 - `/settings/password` — change the operator password
@@ -941,8 +1014,8 @@ values identically and in lower case.
 
 `AUTH_PASSWORD_HASH` (or `AUTH_PASSWORD_HASH_FILE`) **seeds** the operator record
 once, on that record's first creation. After that the live value is
-`oauth-data/operator.json`, because a password change has to be able to write
-somewhere the secrets mount may not be.
+`/data/operator.json` on the OAuth layer's own volume, because a password change
+has to be able to write somewhere the secrets mount may not be.
 
 The consequence worth knowing before it costs you an evening: **editing the secret
 later has no effect.** The service logs which source is live at startup and warns
@@ -975,6 +1048,13 @@ with itself when the tag was cut. Confirm it at runtime:
 curl -s http://127.0.0.1:8080/health   # "version": X.Y.Z
 curl -s http://127.0.0.1:3220/health   # the same X.Y.Z
 ```
+
+**An upgrade that also brings a new `docker-compose.yml` may need one of the two
+migrations below.** Both are one-way moves of files you already have, neither
+regenerates anything, and both are safe to postpone: `secrets/` is two directories
+now rather than one, and the two data directories are named volumes rather than
+bind mounts — [that one is in step 3](#migrating-from-data-and-oauth-data), with
+the reason in #105.
 
 ### Upgrading from a flat `secrets/` (v0.6 and earlier)
 
@@ -1048,9 +1128,10 @@ container-side paths are the only thing the images care about; nothing is baked
 into either of them.
 
 Whatever else your file does, four things have to hold: both services in the group
-that owns the two setgid directories; `./data` writable by uid 100 and
-`./oauth-data` writable by uid 102; `UPSTREAM_MCP_URL` reaching the connector on a
-network the internet cannot; and the same `PUBLIC_URL` on both sides.
+that owns the two setgid directories; each service's `/data` writable by that
+service — which a named volume gives you and a bind mount does not, unless you hand
+the directory over first; `UPSTREAM_MCP_URL` reaching the connector on a network
+the internet cannot; and the same `PUBLIC_URL` on both sides.
 
 ---
 
@@ -1063,20 +1144,41 @@ pipeline.
 
 | what | why |
 |------|-----|
-| `data/accounts.json` | every mailbox credential. Losing it means re-entering all of them by hand |
+| the connector's data volume (`accounts.json`) | every mailbox credential. Losing it means re-entering all of them by hand |
 | `secrets/shared/`, `secrets/oauth/` | the Bearer token, both signing keys and the password hash. Losing the OAuth signing key logs every connected client out; losing `auth_token.txt` breaks every Claude Desktop client |
-| `oauth-data/` | the live operator credential (`operator.json`), registered clients and refresh sessions (`oauth-state.json`) |
+| the OAuth layer's data volume | the live operator credential (`operator.json`), registered clients and refresh sessions (`oauth-state.json`) |
 | `.env`, `.env.oauth` | `PUBLIC_URL`, `SECRETS_GID`, `AUTH_USERNAME` and anything else you set |
+
+The two `secrets/` directories are ordinary directories in the checkout and your
+existing backup tool already reaches them. The two data volumes are Docker's, so
+they come out through the service that owns each one — which also puts them back
+without a `chown`, because the process doing the extracting is the process that has
+to read the result:
+
+```bash
+docker compose run --rm --no-deps -T --entrypoint tar mail-mcp   -cf - -C /data . > mail-data.tar
+docker compose run --rm --no-deps -T --entrypoint tar mail-oauth -cf - -C /data . > oauth-data.tar
+
+# and back, onto an empty volume, with the stack down
+docker compose run --rm --no-deps -T --entrypoint tar mail-mcp   -xf - -C /data < mail-data.tar
+docker compose run --rm --no-deps -T --entrypoint tar mail-oauth -xf - -C /data < oauth-data.tar
+```
+
+Those tarballs hold plaintext mailbox passwords and the operator's password hash.
+Encrypt them at rest — `restic`, `borgbackup`, or a `tar | gpg` pipeline — and
+treat them exactly as you treat `secrets/`.
 
 **Restore the secrets before starting the stack.** A container that comes up
 against an empty `secrets/shared` does not fail — it generates a new token, exactly
 as designed — and you will have quietly replaced the credential every client
-holds.
+holds. The same ordering applies to the OAuth layer's data volume: start it empty
+and it mints a claim token, and an `operator.json` restored afterwards lands beside
+a live one.
 
 Preserve ownership and modes through the restore: `640` and the `mailsecrets` group
-under `secrets/`, `100:101` under `data/`, `102:103` under `oauth-data/`, and the
-setgid bit on both secrets directories. `restic restore` and `tar -p` keep them;
-a plain `cp` as root does not.
+under `secrets/`, and the setgid bit on both secrets directories. `restic restore`
+and `tar -p` keep them; a plain `cp` as root does not. The data volumes need none
+of that care as long as they are restored through their own service, as above.
 
 ---
 
