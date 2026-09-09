@@ -1076,11 +1076,11 @@ export interface CompletePageData {
  *
  * It is rendered as the answer to the POST rather than redirected to, because by
  * the time this is built there is no URL left to redirect to. `/setup/*` is 404
- * from this instant on — the whole point of the button — and `/settings` is not
- * mounted in this process yet, for the reason the second half of this page says
- * out loud. A reload cannot re-submit anything either: the token is gone, so the
- * gate answers the repeated POST with the same 404 as any other, which is a
- * stronger guarantee than the redirect-after-POST it replaces.
+ * from this instant on — the whole point of the button — and `/settings`, which
+ * since #121 opens in this same process, is a page to sign in to rather than one
+ * to be dropped on. A reload cannot re-submit anything either: the token is
+ * gone, so the gate answers the repeated POST with the same 404 as any other,
+ * which is a stronger guarantee than the redirect-after-POST it replaces.
  */
 export function renderSetupComplete(data: CompletePageData): string {
   const body = `
@@ -1099,17 +1099,11 @@ export function renderSetupComplete(data: CompletePageData): string {
     unknown: "Setup is finished either way; the mailbox list is on the settings page below.",
   })}
 
-  <h2>The settings UI needs one restart</h2>
+  <h2>The settings UI</h2>
   <p>
     Sign in at <a href="${escapeHtml(data.settingsUrl)}">${escapeHtml(data.settingsUrl)}</a>
-    with the account you created in step 1. That page is mounted when the process
-    starts, and this process started before there was an operator account to mount
-    it against, so it answers 404 until the container comes back:
-  </p>
-  <pre>docker compose restart mail-oauth</pre>
-  <p class="muted">
-    Restarting is safe now: the instance is claimed, no new claim token is minted,
-    and no setup URL is printed again.
+    with the account you created in step 1. It opened when you pressed Finish, in
+    this same process, and needs no restart either.
   </p>`;
 
   return page("claude-mail-mcp — setup complete", "Setup is complete", body);

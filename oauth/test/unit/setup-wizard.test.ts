@@ -475,14 +475,17 @@ describe("the completion screen", () => {
     assert.equal(/<script/i.test(html), false);
   });
 
-  it("is honest that the settings UI needs one restart, and names the command", () => {
-    // The settings router is mounted at construction from an operator record
-    // that did not exist when this process started, so it is not there yet.
+  it("sends the operator to the settings UI without a restart", () => {
+    // This screen used to print `docker compose restart mail-oauth`, because the
+    // settings mount was decided at construction against an operator record that
+    // did not exist when the process started. It is resolved per request now
+    // (#121), so the page has one fewer instruction and no command at all.
     const html = completePage();
 
-    assert.match(html, /docker compose restart mail-oauth/);
     assert.match(html, /https:\/\/mail\.example\.com\/settings/);
-    // /mcp, by contrast, is live immediately.
+    assert.equal(/docker compose restart/.test(html), false);
+    assert.equal(/<pre>/.test(html), false, "nothing left for the operator to run");
+    // Said of both halves now: /mcp and the settings UI alike.
     assert.match(html, /no restart/i);
   });
 
