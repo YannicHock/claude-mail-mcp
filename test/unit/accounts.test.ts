@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import {
   AccountsStoreError,
   NoSuchAccountError,
+  RESERVED_IDS,
+  reservedIdAccounts,
+  reservedIdNotice,
   type Account,
 } from "../../src/accounts.js";
 import {
@@ -249,5 +252,58 @@ describe("AccountsStore — hot reload", () => {
         if (calls.length >= 2) secondChangeSeen.resolve();
       }
     );
+  });
+});
+
+/**
+ * An accounts.json that already contains a mailbox called "new" or "test" must
+ * keep loading — rejecting it in parseAccount() would take every other
+ * configured mailbox down with it on the next restart (see RESERVED_IDS in
+ * src/accounts.ts). What the operator gets instead is a warning, built from the
+ * two helpers below, that says what is broken and how to get out of it.
+ */
+describe("AccountsStore — reserved ids that are already on disk", () => {
+  test("a file containing a reserved id still loads, every other mailbox included", async () => {
+    const work = makeAccount({ id: "work", label: "Work", default: true });
+    const broken = makeAccount({ id: "test", label: "Old test mailbox" });
+    await withAccountsStore([work, broken], (store) => {
+      assert.deepEqual(store.ids(), ["work", "test"]);
+      assert.equal(store.resolve("test").label, "Old test mailbox");
+    });
+  });
+
+  test("reservedIdAccounts() picks out exactly the affected accounts", () => {
+    const accounts = [
+      makeAccount({ id: "work" }),
+      makeAccount({ id: "test" }),
+      makeAccount({ id: "new" }),
+      makeAccount({ id: "testing" }),
+    ];
+    assert.deepEqual(
+      reservedIdAccounts(accounts).map((a) => a.id),
+      ["test", "new"]
+    );
+    assert.deepEqual(reservedIdAccounts([makeAccount({ id: "work" })]), []);
+  });
+
+  test("every reserved id has a notice of its own, none falls back to the generic one", () => {
+    for (const id of RESERVED_IDS) {
+      const notice = reservedIdNotice(id);
+      assert.ok(notice.includes(`"${id}"`), `the notice for ${id} should name the id`);
+      assert.match(notice, /recreate it under a different id/);
+      assert.match(notice, /Delete and "Make default" still work/);
+      assert.ok(
+        !notice.includes("collides with a literal settings route"),
+        `${id} should describe its own collision, not the generic fallback`
+      );
+    }
+  });
+
+  test("the notice tells the truth about which half of the edit page is broken", () => {
+    // "test": GET /settings/mailboxes/test has no literal collision, so the
+    // edit form does render — but its action is the create form's probe route.
+    assert.match(reservedIdNotice("test"), /never persists/i);
+    // "new": the literal GET route wins, so the page is never reached at all.
+    assert.match(reservedIdNotice("new"), /Add mailbox/);
   });
 });

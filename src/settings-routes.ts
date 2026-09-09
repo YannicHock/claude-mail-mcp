@@ -24,7 +24,10 @@
  * routes (they will hit the reserved handler instead); the two-segment routes
  * (`/:id/test`, `/:id/default`, `/:id/delete`) are unaffected since no reserved
  * literal exists at that depth. This mirrors a limitation already present in how
- * settings-pages.ts builds these URLs, not something introduced here.
+ * settings-pages.ts builds these URLs, not something introduced here. Creating
+ * such an account is refused, but one that already exists still loads, so the
+ * list route below hands the renderer a per-row notice saying what is broken and
+ * that the remedy is to delete and recreate it.
  */
 
 import { timingSafeEqual } from "node:crypto";
@@ -36,6 +39,8 @@ import {
   AccountsStoreError,
   NoSuchAccountError,
   RESERVED_IDS,
+  reservedIdAccounts,
+  reservedIdNotice,
   type Account,
   type CalDavCreds,
 } from "./accounts.js";
@@ -304,10 +309,22 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   router.get("/settings/mailboxes", guardAssertion, async (_req, res) => {
     const assertion = assertionOf(res);
     const stamp = await store.stamp();
+    const accounts = store.list();
     sendHtml(
       res,
       200,
-      renderMailboxList({ csrf: assertion.csrf, stamp, accounts: store.list() })
+      renderMailboxList({
+        csrf: assertion.csrf,
+        stamp,
+        accounts,
+        // An account that predates the create-time check (or was hand-written
+        // into accounts.json) keeps a broken in-place edit, and the list page is
+        // the one place its operator is certain to look. See RESERVED_IDS in
+        // accounts.ts for why the file is still loaded rather than refused.
+        rowNotices: Object.fromEntries(
+          reservedIdAccounts(accounts).map((a) => [a.id, reservedIdNotice(a.id)])
+        ),
+      })
     );
   });
 

@@ -18,6 +18,10 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
   The directory must be group-owned by gid 105 and **setgid**: `chgrp 105 secrets && chmod 2770 secrets`. The setgid bit is what makes a file created by one service land in the shared group instead of the creator's own. `2770` also keeps other accounts on the host out — with "a present file wins", a directory anyone could write to would let a local user choose the `auth_token` the connector adopts. Pre-creating the files by hand and mounting `./secrets` read-only remains an option.
 
+### Fixed
+
+- **A mailbox already configured as `new` or `test` now says why editing it does nothing.** Those two ids are literal segments in the settings routes, so an account under one of them cannot be edited in place — the edit form for `test` posts to the create form's connection probe and silently never persists, and `new` opens the "Add mailbox" form instead. Creating such an account has been refused since 0.6.0, but one that already exists keeps loading on purpose (refusing the file would take every other mailbox down with it), and nothing told its operator what was wrong. The server now warns once at startup, naming the account, and the mailbox list page repeats it on that account's own row. Delete and "Make default" are unaffected and remain the way out: delete the mailbox and recreate it under another id.
+
 ## [0.6.3] — 2026-09-09
 
 Both fixes below are the same defect as 0.6.1 and 0.6.2, found by auditing every security header this project emits against what a browser actually does with it, rather than against what the string says.
