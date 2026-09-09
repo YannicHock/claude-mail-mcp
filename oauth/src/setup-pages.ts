@@ -914,7 +914,7 @@ export function renderMailboxProviderStep(data: MailboxProviderPageData): string
   return wizardPage("mailbox", body);
 }
 
-// ---- Step 3 — the MCP URL, PUBLIC_URL, and Finish -------------------------
+// ---- Step 3 — PUBLIC_URL, the MCP URL, and Finish -------------------------
 
 /** A mailbox the connector reports as configured. */
 export interface ConfiguredMailbox {
@@ -993,7 +993,7 @@ docker compose up -d</pre>
 }
 
 /**
- * Step 3 — the MCP URL, and the one value the container cannot check itself.
+ * Step 3 — the one value the container cannot check itself, and the MCP URL.
  *
  * `PUBLIC_URL` is confirmed rather than merely displayed because a wrong one
  * breaks the OAuth redirect at claude.ai rather than here: the operator sees a
@@ -1003,32 +1003,30 @@ docker compose up -d</pre>
  * The confirmation is `required` in the markup and checked again on the server,
  * because a browser that skips the first is not a reason to claim the instance
  * on an answer nobody gave.
+ *
+ * It is also asked *first*, before the MCP URL is offered for copying. The MCP
+ * URL is derived from `PUBLIC_URL`, and an operator who follows this screen in
+ * the order it is written must not have pasted the derived address into
+ * claude.ai before being asked whether the source of it is right — which is
+ * also why the No guidance sits above the address rather than below it. What
+ * the first half does show is `PUBLIC_URL` itself: a confirmation of a value
+ * the screen has not printed is not a confirmation.
  */
 export function renderConnectStep(data: ConnectPageData): string {
   const body = `
   <p class="lead">
-    Add this address as a custom connector in claude.ai — select it and copy it.
+    One thing to check first, then the address to give claude.ai.
   </p>
   ${noticeHtml(data.notice)}
-  ${urlField("mcp_url", "MCP URL", data.mcpUrl)}
-  <p class="muted">
-    In claude.ai: Settings → Connectors → Add custom connector, and paste it there.
-    Claude signs in against this same instance, with the operator account you
-    created in step 1.
-  </p>
-  ${mailboxSummary(data, {
-    known: "The mailbox list is on the settings page once you are signed in.",
-    unknown: "That does not stop you finishing, and it is not a sign of anything wrong here.",
-  })}
 
   <form method="post" action="${escapeHtml(data.action)}">
     <fieldset>
-    <legend>Is that the address you reach this instance at?</legend>
+    <legend>Is this the address you reach this instance at?</legend>
     <p class="muted">
-      It is built from PUBLIC_URL, currently <code>${escapeHtml(data.publicUrl)}</code>.
-      That is the one value this container cannot check for itself, and a wrong one
-      breaks the sign-in Claude does — with an error that surfaces at claude.ai, not
-      here.
+      PUBLIC_URL is currently <code>${escapeHtml(data.publicUrl)}</code>. That is the
+      one value this container cannot check for itself, and a wrong one breaks the
+      sign-in Claude does — with an error that surfaces at claude.ai, not here. The
+      address below is built from it.
     </p>
     <div class="checkbox-row">
       <input id="public_url_yes" type="radio" name="public_url_ok" value="yes" required>
@@ -1040,6 +1038,18 @@ export function renderConnectStep(data: ConnectPageData): string {
     </div>
     </fieldset>
     ${data.showPublicUrlHelp === true ? publicUrlHelp(data.publicUrl) : ""}
+
+    <h2>Then add this instance to claude.ai</h2>
+    ${urlField("mcp_url", "MCP URL", data.mcpUrl)}
+    <p class="muted">
+      Select the address above and copy it. In claude.ai: Settings → Connectors → Add
+      custom connector, and paste it there. Claude signs in against this same
+      instance, with the operator account you created in step 1.
+    </p>
+    ${mailboxSummary(data, {
+      known: "The mailbox list is on the settings page once you are signed in.",
+      unknown: "That does not stop you finishing, and it is not a sign of anything wrong here.",
+    })}
     <div class="actions">
       <a href="${escapeHtml(data.backHref)}">← Back</a>
       <button type="submit">Finish</button>
