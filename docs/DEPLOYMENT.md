@@ -133,8 +133,8 @@ sed -i "s/^SECRETS_GID=.*/SECRETS_GID=$(getent group mailsecrets | cut -d: -f3)/
 grep '^SECRETS_GID=' .env
 ```
 
-Then edit both files. **`PUBLIC_URL` must be byte-identical in the two of them** —
-see [the note below](#public_url-has-to-match-on-both-sides) — and `SECRETS_GID`
+Then edit both files. **`PUBLIC_URL` must name the same address in the two of
+them** — see [the note below](#public_url-has-to-match-on-both-sides) — and `SECRETS_GID`
 must be in `.env`, because Compose interpolates `${...}` from the project's `.env`
 only and never from a service's `env_file`.
 
@@ -1004,11 +1004,12 @@ makes every settings request fail closed with `401`, and the only trace is a
 `rejected settings request` line in the connector's log. Nothing else breaks —
 `/mcp` keeps working — which is what makes this one hard to spot.
 
-A trailing slash is the one difference both sides normalise away. **A difference in
-the host's case is not**: the OAuth layer lowercases the host when it canonicalises
-the issuer and the connector does not, so `https://MCP-Mail.example.com` on one
-side and `https://mcp-mail.example.com` on the other fail to compare. Write the two
-values identically and in lower case.
+A difference in *spelling* is not a mismatch. Both services now run the value
+through the same canonicalisation — lowercase scheme and host, no default port, no
+query, no trailing slash — so `https://MCP-Mail.example.com/`,
+`https://mcp-mail.example.com:443` and `https://mcp-mail.example.com` are one
+address to both of them. What must match is the address itself: a different host, a
+different path, or `http` against `https`.
 
 ### Where the operator password actually lives
 

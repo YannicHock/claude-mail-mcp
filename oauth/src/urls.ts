@@ -12,6 +12,15 @@
  *    `aud` rather than doing a strict byte-for-byte comparison against what the
  *    user typed", so both sides are canonicalised before comparison.
  *
+ *    That canonicalisation no longer lives here. It moved to `./canonical-url.js`
+ *    for #110, because the connector needs the identical rule for its own
+ *    `PUBLIC_URL` and the two packages have separate Docker build contexts: it is
+ *    now a mirrored module, `oauth/src/canonical-url.ts` and `src/canonical-url.ts`,
+ *    held byte-identical by a drift test the way `secrets.ts` and `settings-api.ts`
+ *    already are. The three functions are re-exported below so this file stays
+ *    the one place in this package that URL comparison is imported from, and so
+ *    the rule exists exactly once per package rather than twice.
+ *
  * 2. Loopback redirect URIs. RFC 8252 section 7.3 requires the port to be ignored
  *    when matching `127.0.0.1`, because a native client binds an ephemeral port at
  *    runtime. Claude Code declares `http://localhost/callback` and
@@ -19,6 +28,12 @@
  *    port-agnostic match has to apply to `localhost` too — RFC 8252 section 8.3
  *    discourages that hostname, but the client uses it regardless.
  */
+
+export {
+  canonicalResource,
+  normalisePublicUrl,
+  sameResource,
+} from "./canonical-url.js";
 
 /** Redirect URIs Claude's hosted surfaces use: claude.ai web, Desktop, mobile, Cowork. */
 export const HOSTED_CLAUDE_REDIRECT_URIS = [
@@ -35,52 +50,6 @@ export const LOOPBACK_REDIRECT_URIS = [
 ] as const;
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
-
-/**
- * Canonicalise a resource identifier per RFC 8707 section 2: lowercase scheme and
- * host, drop a default port, drop any fragment, and drop a bare trailing slash.
- *
- * Throws for input that is not a usable absolute URI — a fragment is rejected
- * outright rather than silently stripped, because a `resource` carrying one is a
- * client bug worth surfacing, not something to paper over.
- */
-export function canonicalResource(value: string): string {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error(`Not an absolute URI: ${value}`);
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`Resource URI must be http or https: ${value}`);
-  }
-  if (url.hash !== "") {
-    throw new Error(`Resource URI must not contain a fragment: ${value}`);
-  }
-  // `new URL` already lowercases scheme and host and elides the default port.
-  url.search = "";
-  const path = url.pathname === "/" ? "" : url.pathname.replace(/\/+$/, "");
-  return `${url.protocol}//${url.host}${path}`;
-}
-
-/** True when two resource identifiers denote the same resource. */
-export function sameResource(a: string, b: string): boolean {
-  try {
-    return canonicalResource(a) === canonicalResource(b);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Normalise a configured public base URL: no trailing slash, no query, no fragment.
- * Used as the OAuth issuer, so it must be stable and byte-identical everywhere it
- * appears — clients compare the `iss` in an authorization response against the
- * issuer from metadata with simple string comparison (RFC 9207 section 2.4).
- */
-export function normalisePublicUrl(value: string): string {
-  return canonicalResource(value);
-}
 
 /**
  * Match a requested redirect URI against the allowlist.
