@@ -497,9 +497,16 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   const { store, issuer, settingsKey, log } = deps;
   const router = express.Router();
   const formBody = express.urlencoded({ extended: false, limit: "64kb" });
-  // Chained ahead of `formBody` on the two routes that also answer JSON. Each
+  // Chained ahead of `formBody` on the routes that also answer JSON. Each
   // parser ignores a body of the other's content type, so the pair is exactly
   // "read whichever of the two this is" and neither route grew a branch for it.
+  //
+  // The pair only *is* that, rather than looking like it, because nothing
+  // upstream parses JSON first: body-parser sets `req._body` and every later
+  // json() short-circuits on it, so an app-wide express.json() would make this
+  // one dead code and its 64 KB a fiction — which it was until #137. src/app.ts
+  // now scopes its 5 MB parser to the single route that needs that size. Both
+  // branches of a settings route cap here, at the same number.
   const jsonBody = express.json({ limit: "64kb" });
   const guardAssertion = requireSettingsAssertion({ key: settingsKey, issuer, log });
   const guardCsrf = requireFormCsrf();
