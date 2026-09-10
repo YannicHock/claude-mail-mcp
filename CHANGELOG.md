@@ -4,6 +4,10 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `/authorize` redirects carry the security headers, and no longer echo the authorization code.** The two redirects on the authorization path — the success hand-off back to the client, and the OAuth error response — went out through `res.redirect()`, which sets none of this service's headers and renders a body when the client accepts HTML. That body repeated the target URL: for the success redirect, the one-time authorization code; for the error redirect, the `error_description`. Both now go out through the same `sendRedirect()` helper every other redirect in the service uses, so they carry `Cache-Control: no-store`, the CSP, `X-Frame-Options` and `Referrer-Policy`, and end with no body at all. `page-headers.test.ts` gained a case per redirect, which is what the file was missing: every case in it reached a *rendered page*, so the one credential-carrying response in the service was outside the invariant the file exists to assert.
+
 ## [0.7.0] — 2026-09-10
 
 **An instance sets itself up.** Start the two containers, read one URL out of the log, and three

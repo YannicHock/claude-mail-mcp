@@ -30,6 +30,12 @@
  * nothing in this package ever asked. So: one case per error-page entry point,
  * written out by hand, so that a seventh added later has a visibly empty slot
  * next to it.
+ *
+ * #136 is why there is a third part. Every case above reaches a response that
+ * renders *something*, and the two redirects on the authorization path render
+ * nothing — which is exactly why nobody thought to ask what headers they carry.
+ * They carried none, and Express put the authorization code in the body it
+ * renders for a redirect. The last section covers both.
  */
 
 import { strict as assert } from "node:assert";
@@ -294,5 +300,88 @@ describe("the settings layer's error page serves it too", () => {
     assert.equal(res.status, 403);
     assert.match(await res.text(), /Request blocked/);
     assertHeaders(res, SELF_CSP, "the settings origin-check refusal");
+  });
+});
+
+// ---- The redirects --------------------------------------------------------
+
+/**
+ * The two responses on the authorization path that are not pages at all.
+ *
+ * #80 made "every HTML response goes out through `sendPage()`" true and left a
+ * gap that sentence does not cover: a *redirect* is an HTML response too.
+ * Express renders a body for one — `<p>Found. Redirecting to …</p>` when the
+ * client accepts `text/html`, the bare URL when it does not — and
+ * `res.redirect()` sets none of this service's headers. The success redirect's
+ * body carried the one-time authorization code; `redirectWithError`'s carried
+ * the `error_description`.
+ *
+ * So both halves are asserted here: the whole header set on a redirect, and an
+ * empty body. The body assertion is deliberately stronger than "does not contain
+ * the code" — nothing at all is the only shape that cannot leak the next
+ * parameter someone adds to the target URL.
+ *
+ * `Accept: text/html` on both requests, because that is what a browser sends and
+ * it is the header that selects Express's HTML body. A request without it gets
+ * the `text/plain` branch, which leaks exactly the same values.
+ */
+const BROWSER_ACCEPT = "text/html,application/xhtml+xml";
+
+/** GET /authorize as a browser would, with whatever parameters the caller says. */
+async function getAuthorizeAsBrowser(params: Record<string, string>): Promise<Response> {
+  const url = new URL(`${harness.baseUrl}/authorize`);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("code_challenge", makePkce().challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  for (const [name, value] of Object.entries(params)) {
+    if (value === "") url.searchParams.delete(name);
+    else url.searchParams.set(name, value);
+  }
+  return fetch(url, { redirect: "manual", headers: { Accept: BROWSER_ACCEPT } });
+}
+
+describe("the /authorize redirects serve the header set and no body", () => {
+  it("does on the success redirect, and does not echo the code", async () => {
+    // The one credential-carrying response in this service. Its Location has the
+    // authorization code in it, which is correct and unavoidable; its *body* had
+    // it too, on a response carrying no `Cache-Control: no-store`.
+    const res = await postAuthorizeForm(harness, TEST_USERNAME, TEST_PASSWORD, {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Origin: harness.baseUrl,
+        Accept: BROWSER_ACCEPT,
+      },
+    });
+    assert.equal(res.status, 302);
+
+    const location = res.headers.get("location");
+    assert.ok(location, "the success redirect must carry a Location");
+    const code = new URL(location).searchParams.get("code");
+    assert.ok(code, "the success redirect must carry a code in its Location");
+
+    assertHeaders(res, SELF_CSP, "the /authorize success redirect");
+
+    const body = await res.text();
+    assert.ok(!body.includes(code), "the authorization code must not appear in the body");
+    assert.equal(body, "", "a redirect must send no body");
+  });
+
+  it("does on an OAuth error redirect, and does not echo the description", async () => {
+    // Past the redirect-URI validation, so the refusal goes back to the client
+    // as an OAuth error rather than rendering a page. `error_description` in an
+    // unprotected body is the same defect one value down.
+    const res = await getAuthorizeAsBrowser({
+      client_id: await registeredClientId(),
+      redirect_uri: CLAUDE_CALLBACK,
+      response_type: "token",
+    });
+    assert.equal(res.status, 302);
+
+    const location = res.headers.get("location");
+    assert.ok(location, "the error redirect must carry a Location");
+    assert.equal(new URL(location).searchParams.get("error"), "unsupported_response_type");
+
+    assertHeaders(res, SELF_CSP, "the /authorize error redirect");
+    assert.equal(await res.text(), "", "a redirect must send no body");
   });
 });

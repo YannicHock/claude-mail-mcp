@@ -41,7 +41,7 @@ import { OperatorRecord } from "./operator.js";
 import { constantTimeEquals, verifyPassword } from "./passwords.js";
 import { CODE_CHALLENGE_METHOD, isValidCodeChallenge, verifyChallenge } from "./pkce.js";
 import { createProxy } from "./proxy.js";
-import { sendPage } from "./settings-pages.js";
+import { sendPage, sendRedirect } from "./settings-pages.js";
 import {
   createSettingsRouter,
   requireSession,
@@ -527,7 +527,13 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
     if (request.state !== undefined) target.searchParams.set("state", request.state);
     // RFC 9207: advertised in the metadata, so it must actually be sent.
     target.searchParams.set("iss", config.issuer);
-    res.redirect(302, target.toString());
+    // Through the same helper every page goes through, and for a sharper reason
+    // than the pages have. `res.redirect()` renders a body when the client
+    // accepts HTML — `<p>Found. Redirecting to …?code=…</p>` — so the one-time
+    // authorization code went out a second time, in a response carrying no
+    // `Cache-Control: no-store`, no CSP and no `X-Frame-Options` (#136).
+    // `sendRedirect` sets the set and ends with no body at all.
+    sendRedirect(res, 302, target.toString());
   });
 
   /**
@@ -955,6 +961,15 @@ function sendLoginPage(
   sendPage(res, status, renderLoginPage(options), csp);
 }
 
+/**
+ * The refusals that go back to the client as an OAuth error response.
+ *
+ * Reached only once the redirect URI has been validated — everything before that
+ * renders a page, above. Like the success redirect it goes out through
+ * `sendRedirect`, so it carries the header set and no body: Express's rendered
+ * redirect body repeated `error_description` in a response nothing protected
+ * (#136).
+ */
 function redirectWithError(
   res: Response,
   redirectUri: string,
@@ -970,7 +985,7 @@ function redirectWithError(
   // RFC 9207 requires `iss` on error responses too, so a client can tell which
   // authorization server rejected it before acting on the error.
   target.searchParams.set("iss", issuer);
-  res.redirect(302, target.toString());
+  sendRedirect(res, 302, target.toString());
 }
 
 function describeTokenFailure(reason: string): string {
