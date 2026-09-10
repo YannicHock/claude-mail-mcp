@@ -1,13 +1,16 @@
 /**
  * The precedence rule from shared/secrets.ts, pinned.
  *
- * One suite, not two: oauth/test/unit/secrets.test.ts was 530 lines byte-for-byte
- * identical to this file, maintained by hand and pinned by nothing. #126 deleted
- * it along with the second copy of the module it tested.
+ * One suite, not two. oauth/test/unit/secrets.test.ts was a hand-maintained second
+ * copy pinned by nothing, and #126 deleted it along with the second copy of the
+ * module it tested. It was 822 lines against this file's 686 and differed in 258
+ * of them — near-identical, not byte-for-byte, which the #126 review corrected.
+ * Its one unique block, covering createExclusively's non-default file mode, is
+ * covered through the real claim-token path by oauth/test/unit/bootstrap.test.ts
+ * ("is written 0600, not at the shared secrets' mode"); nothing else was lost.
  *
- * Deliberately a near-copy of oauth/test/unit/secrets.test.ts: the module under
- * test is duplicated across the two packages, so the guarantee has to be pinned
- * on both sides rather than on whichever one a contributor happens to run.
+ * There is nothing to keep in sync any more. shared/secrets.ts has one home and
+ * this file is the only suite that pins it.
  *
  * "A present file wins, an absent one is generated" is the entire safety
  * property of self-generating secrets: get it backwards and every already-running
