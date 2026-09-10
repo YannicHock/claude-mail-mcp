@@ -199,19 +199,11 @@ test("removing an unknown id is refused and touches neither disk nor memory", as
   }
 });
 
-test("setDefault moves the flag rather than adding a second one", async () => {
-  const store = new AccountsStore(await tempAccounts());
-  await store.start();
-  try {
-    await store.create({ ...sampleAccount("work"), default: true }, await store.stamp());
-    await store.create(sampleAccount("home"), await store.stamp());
-    await store.setDefault("home", await store.stamp());
-    assert.equal(store.list().filter((a) => a.default).length, 1);
-    assert.equal(store.resolve().id, "home");
-  } finally {
-    store.stop();
-  }
-});
+// The single-default invariant is asserted in one place, and it is not this
+// file: `accounts.test.ts` — "AccountsStore — at most one default" — owns it
+// across create, update and setDefault. A `setDefault` case lived here too
+// until #139, which is how one rule ends up with two homes and a change to it
+// gets found in only one of them.
 
 test("a stale stamp is refused instead of clobbering the other edit", async () => {
   const path = await tempAccounts();
