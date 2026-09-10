@@ -69,7 +69,7 @@ Four steps, about ten minutes. You will not build anything, write any JSON, or g
 Three things this project assumes and cannot arrange for you:
 
 - **A server with a public domain name.** The hostname needs an **A record** — Claude connectors are IPv4-only, and a name that publishes AAAA records only cannot be reached at all.
-- **A reverse proxy terminating TLS in front of it,** forwarding to `127.0.0.1:8080` — nginx, Caddy, Traefik, Nginx Proxy Manager, whichever you already run. **claude.ai will not connect over plain HTTP**, and this is the single most likely reason a first attempt fails. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has a working nginx recipe, and the variant for a proxy that runs in a container itself and so cannot reach the host's loopback.
+- **A reverse proxy terminating TLS in front of it,** forwarding to `127.0.0.1:8080` — nginx, Caddy, Traefik, Nginx Proxy Manager, whichever you already run. **claude.ai will not connect over plain HTTP**, and this is the single most likely reason a first attempt fails. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has a working nginx recipe, and what to do when the proxy runs in a container itself — give it `network_mode: host`, or it will see Docker's bridge gateway instead of your visitors and the per-client rate limits will bucket the whole internet together.
 - **Docker Engine with the Compose plugin.** No Node toolchain on the server — the two images are pulled from GHCR.
 
 Port `8080` is the OAuth layer, and it is the one the proxy fronts. The connector on `3220` stays unreachable from outside; both are published to loopback only.

@@ -522,7 +522,10 @@ Claude touches lives there: `/mcp`, the two discovery documents, `/authorize`,
 `/settings`. The connector is never reachable from outside.
 
 TLS is yours. The recipe below is nginx on the host; anything that terminates TLS,
-forwards the original client address and preserves the request body will do.
+forwards the original client address and preserves the request body will do. That
+first requirement is stricter than it sounds if your terminator is a container —
+see [If your TLS terminator is itself a container](#if-your-tls-terminator-is-itself-a-container)
+below, and do not skip it.
 
 ### The rate-limit zones
 
@@ -727,11 +730,10 @@ The zone keys on `$binary_remote_addr` — the address **this** nginx sees. In t
 recipe it is the internet-facing edge, so that is the client. If you put anything
 in front of it that does not preserve the source address (another reverse proxy, or
 Docker's own port publishing), every request arrives from one address and the whole
-internet shares a single bucket. That is
-[issue #15](https://github.com/YannicHock/claude-mail-mcp/issues/15), which
-describes the same collapse happening to the application-side throttle; the
-configuration here neither depends on it being fixed nor makes it worse, and
-whatever fixes it there fixes it here.
+internet shares a single bucket. The application-side throttle collapses in exactly
+the same way and for the same reason, so this is one condition, not two:
+[The client address](HARDENING.md#the-client-address-15) in HARDENING.md states it
+in full, including how to recognise a deployment that does not meet it.
 
 `TRUST_PROXY` in `.env.oauth` is the other half of this. It is the number of proxy
 hops in front of the OAuth layer, and it decides which `X-Forwarded-For` entry
@@ -742,11 +744,46 @@ forge its own address again.
 
 ### If your TLS terminator is itself a container
 
-Nginx Proxy Manager, Traefik or Caddy running in Docker **cannot reach the host's
-`127.0.0.1`**. Drop the `ports:` block from `mail-oauth` entirely, put both
-services on the proxy's network, and have the proxy address `mail-oauth:8080` by
-service name. That variant publishes nothing to the host at all and is the tighter
-arrangement of the two.
+Nginx Proxy Manager, Traefik or Caddy running in Docker: **give it
+`network_mode: host`.** That is the supported arrangement, and it is what the
+reference deployment runs.
+
+```yaml
+services:
+  npm:
+    image: jc21/nginx-proxy-manager:latest
+    network_mode: host          # binds 80, 443 and 81 on the host itself
+    # no ports: block — on host networking there is nothing to publish
+```
+
+A host-networked proxy reaches `127.0.0.1:8080` like the host recipe above, so
+every `proxy_pass` in this section applies to it unchanged, and `TRUST_PROXY=1`
+stays correct.
+
+**Why not leave it on a bridge network and publish 80/443?** Because then it never
+sees a client. Docker's `docker-proxy` rewrites the source address to the bridge
+gateway before the proxy's socket, so `$remote_addr` — and therefore
+`X-Forwarded-For`, the `limit_req` zone above, the application's login throttle and
+the `ip` field a fail2ban jail reads — is one `172.x.x.x` address for the whole
+internet. [The client address](HARDENING.md#the-client-address-15) in HARDENING.md
+has the evidence, the one-line check in the proxy's own access log, and why
+`"userland-proxy": false` is not the shortcut it looks like.
+
+Two things change with host networking, and both bite on the first restart rather
+than later:
+
+- **Container names stop resolving.** Anything the proxy addressed as
+  `mail-oauth:8080`, or as a compose service name — including its *own* database,
+  if it has one — has to become a host-reachable address. Walk every proxy host on
+  the box before you switch, not only the one that fronts this stack.
+- **The `ports:` block has to go.** On host networking there is nothing to publish,
+  and leaving it in is a compose error rather than a no-op.
+
+If you genuinely cannot run the proxy on the host network, the alternative is to
+drop the `ports:` block from `mail-oauth`, put both services on the proxy's network
+and address `mail-oauth:8080` by service name. It publishes nothing to the host,
+which is tighter in one respect — and it keeps the client address problem above in
+full, which is why it is no longer the recommendation.
 
 ### If you also want static-Bearer clients
 
@@ -1195,7 +1232,8 @@ loopback.
 **Log lines worth an alert.** `secret file was empty, replaced` (a live secret was
 just rotated out from under something), `rejected settings request` (usually a
 `PUBLIC_URL` mismatch), the OAuth layer's login-failure lines (a fail2ban jail
-belongs on these — see [HARDENING.md](HARDENING.md)), and `refresh token reuse
+belongs on these, ban action and all — [HARDENING.md](HARDENING.md) has the filter,
+the jail and the two things that stop it matching), and `refresh token reuse
 detected, session revoked`.
 
 **Rotating the connector's Bearer token.** Clear `AUTH_TOKEN` in `.env` if you ever
