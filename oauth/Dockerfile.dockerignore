@@ -1,0 +1,64 @@
+# Ignore rules for `docker build -f oauth/Dockerfile .`.
+#
+# BuildKit resolves `<dockerfile path>.dockerignore` in preference to the
+# context's own `.dockerignore`, so this file — and not the root one — decides
+# what reaches the OAuth build. That is the mechanism behind #126: both images
+# now build from the repository root, the root `.dockerignore` still excludes
+# `oauth` so the connector image never carries this package, and this file
+# excludes the connector's tree so this image never carries that one.
+#
+# Neither file may exclude `shared` — it is the one directory both images
+# compile.
+#
+# It replaces oauth/.dockerignore, which applied only while the build context
+# was oauth/ and stopped being consulted the moment the context moved.
+
+# --- never in any image -----------------------------------------------------
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.git
+.gitignore
+.idea
+.vscode
+coverage
+*.log
+.DS_Store
+
+# --- the connector's tree ---------------------------------------------------
+# Its absence is what makes a stray `import "../src/…"` from oauth/src fail in
+# the build rather than in production. The oauth/ build context used to provide
+# that property; these lines provide it now.
+src
+test
+tsconfig.json
+tsconfig.test.json
+package.json
+package-lock.json
+ecosystem.config.cjs
+scripts
+
+# --- this package's own non-runtime files -----------------------------------
+oauth/test
+oauth/tsconfig.test.json
+
+# --- secrets and state ------------------------------------------------------
+secrets
+oauth-data
+data
+accounts.json
+**/.env
+**/.env.*
+
+# --- repository furniture ---------------------------------------------------
+.github
+docs
+Dockerfile
+docker-compose.yml
+docker-compose.test.yml
+CHANGELOG.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+SECURITY.md
+README.md
+LICENSE

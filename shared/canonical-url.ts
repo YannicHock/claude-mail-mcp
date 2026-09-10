@@ -1,32 +1,32 @@
 /**
  * URL canonicalisation, RFC 8707 section 2 — one rule, spelled once per package.
  *
- * `PUBLIC_URL` is written twice, once in `.env.oauth` for this service and once
- * in `.env` for the connector, and the two have to denote the same URL: it
- * travels as the settings assertion's `iss` claim and the connector's
- * src/settings-assertion.ts compares it with `!==`. That comparison stays
- * strict — teaching a security-relevant identifier's comparison to be lenient is
- * the worse of the two available fixes — so both sides canonicalise first, and
- * they must canonicalise *identically*. Until #110 they did not: this package ran
- * the value through `new URL`, which lowercases scheme and host and elides a
- * default port, while the connector only trimmed it and stripped trailing
- * slashes. `https://Mail.example.com` on one side against
- * `https://mail.example.com` on the other then answered 401 to every settings
- * request, with nothing anywhere naming the cause.
+ * `PUBLIC_URL` is written twice, once in `.env` for the connector and once in
+ * `.env.oauth` for the OAuth layer, and the two have to denote the same URL: it
+ * travels as the settings assertion's `iss` claim and src/settings-assertion.ts
+ * compares it with `!==`. That comparison stays strict — teaching a
+ * security-relevant identifier's comparison to be lenient is the worse of the two
+ * available fixes — so both sides canonicalise first, and they must canonicalise
+ * *identically*. Until #110 they did not: the OAuth layer ran the value through
+ * `new URL`, which lowercases scheme and host and elides a default port, while
+ * the connector only trimmed it and stripped trailing slashes.
+ * `https://Mail.example.com` on one side against `https://mail.example.com` on
+ * the other then answered 401 to every settings request, with nothing anywhere
+ * naming the cause.
  *
- * This file is the OAuth layer's copy. `src/canonical-url.ts` in the connector is
- * the other, and the two are identical below this comment; the drift test in the
- * connector's test/unit/canonical-url.test.ts fails if they part company, the
- * same way secrets.test.ts and settings-api.test.ts pin the two other mirrored
- * pairs. The packages have separate Docker build contexts and cannot import from
- * one another, so a mirrored module is the closest thing to a shared one they
- * have.
+ * That paragraph is the record of #110 and is the reason this file exists at
+ * all; it outlives the mirroring it was written under. Until #126 the rule was
+ * kept in two hand-maintained copies — `src/canonical-url.ts` and
+ * `oauth/src/canonical-url.ts` — compared by a drift test, because the two
+ * packages had separate Docker build contexts. They build from one context now,
+ * so "both sides canonicalise identically" is a property of the build rather
+ * than of a test.
  *
- * Only the canonicalisation is mirrored, not the rest of `urls.ts`: redirect-URI
- * matching and the Claude redirect allowlists are this service's own business and
- * the connector has no use for them. `urls.ts` re-exports the three functions
- * below, so this package keeps one URL module and neither package ends up holding
- * two copies of the rule.
+ * Only the canonicalisation lives here, not the rest of `oauth/src/urls.ts`:
+ * redirect-URI matching and the Claude redirect allowlists are the authorization
+ * server's own business and the connector has no use for them. `urls.ts`
+ * re-exports the three functions below, so that package keeps one URL module and
+ * neither package ends up holding two ways of spelling the rule.
  */
 
 /**

@@ -1,10 +1,16 @@
 {
+  // `rootDir` is the repository root, not `src`, because shared/ sits beside
+  // src/ and a rootDir of `src` cannot contain it (#126). The cost is one level
+  // of nesting in the output: this emits `dist/src/index.js` and
+  // `dist/shared/…`, so the entrypoint, `main`, `bin`, `start` and
+  // ecosystem.config.cjs all name `dist/src/index.js`. Relative imports between
+  // the two trees survive the move unchanged, because the tree is copied whole.
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": ".",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -13,6 +19,6 @@
     "sourceMap": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["src/**/*", "shared/**/*"],
+  "exclude": ["node_modules", "dist", "test"]
 }

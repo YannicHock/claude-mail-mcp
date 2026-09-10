@@ -200,10 +200,10 @@ volumes:
 #     auth_password_hash.txt  scrypt hash of the operator's password:
 #                               read -rs PW && printf '%s\n' "$PW" | \
 #                                 docker compose run --rm -T --entrypoint node \
-#                                 mail-oauth dist/hash-password.js \
+#                                 mail-oauth dist/oauth/src/hash-password.js \
 #                                 > secrets/oauth/auth_password_hash.txt; unset PW
 #                             The --entrypoint override is required: the image's
-#                             ENTRYPOINT is `node dist/index.js`, so a trailing
+#                             ENTRYPOINT is `node dist/oauth/src/index.js`, so a trailing
 #                             command is appended to it as arguments and starts
 #                             the server instead of the hashing tool. You can
 #                             skip this file entirely and let the setup wizard

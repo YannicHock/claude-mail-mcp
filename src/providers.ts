@@ -13,7 +13,7 @@
  * That premise is what #141 removed. The connector's own *Add mailbox* page now
  * offers the same cascade — it is where every mailbox after the first is added,
  * which is the mailbox an operator is *least* likely to know the settings for —
- * so there are two readers, in two packages that cannot import from one another.
+ * so there are two readers, one in each package.
  *
  * The reflex answer was to mirror the file and add a fourth drift test. #126 is
  * the argument against it: six cross-package duplicates protected four different
@@ -23,8 +23,9 @@
  * the list over the same JSON surface it already uses for the probe, the write,
  * the accounts stamp and the autoconfig lookup. `POST /settings/providers` in
  * settings-routes.ts is that answer; `ProviderPreset` in settings-api.ts is its
- * shape, and settings-api.ts is the module that was already mirrored for exactly
- * this kind of cross-package agreement.
+ * shape, and settings-api.ts is the module that already exists for exactly this
+ * kind of cross-package agreement — mirrored in both packages when this was
+ * written, and one shared/settings-api.ts since #126.
  *
  * What this table does *not* get to do is invent a second vocabulary: every
  * entry is turned into the `MAILBOX_FIELDS` names by {@link prefillFor} before
@@ -50,7 +51,7 @@ import {
   domainOf,
   MAILBOX_FIELDS,
   type ProviderPreset,
-} from "./settings-api.js";
+} from "../shared/settings-api.js";
 
 /**
  * The placeholders an entry may carry in a host or a URL, filled in from the

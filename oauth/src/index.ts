@@ -20,7 +20,7 @@ import { ConfigError, loadConfig } from "./config.js";
 import { createApp, SERVICE_NAME, VERSION } from "./app.js";
 import { createLogger } from "./logger.js";
 import { OperatorRecord } from "./operator.js";
-import { canCreateFilesIn, dataDirectoryAdvice, logSecretReport } from "./secrets.js";
+import { canCreateFilesIn, dataDirectoryAdvice, logSecretReport } from "../../shared/secrets.js";
 import { Store } from "./store.js";
 
 async function main(): Promise<void> {

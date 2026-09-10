@@ -19,6 +19,8 @@
 
 import { SignJWT, jwtVerify } from "jose";
 
+import { escapeHtml } from "../../shared/escape-html.js";
+
 /** How long the operator has to complete the sign-in form. */
 export const REQUEST_TOKEN_TTL_SECONDS = 10 * 60;
 
@@ -136,15 +138,13 @@ function safeOrigin(value: string): string | null {
   }
 }
 
-/** Escape text for interpolation into HTML element content or an attribute. */
-export function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
+/**
+ * Re-exported from shared/escape-html.ts, where the one declaration lives since
+ * #126 — the connector's src/settings-pages.ts had a character-identical copy
+ * with nothing comparing the two. Kept exported from here because this is the
+ * name every page in this service already imports.
+ */
+export { escapeHtml } from "../../shared/escape-html.js";
 
 const STYLE = `
 :root { color-scheme: light dark; }

@@ -1,10 +1,19 @@
 {
+  // `rootDir` is the *repository* root, one level above this package, because
+  // shared/ is a sibling of oauth/ and this package compiles it (#126). The
+  // output is therefore `dist/oauth/src/index.js` beside `dist/shared/…`, which
+  // is what `main`, `start` and oauth/Dockerfile's ENTRYPOINT name.
+  //
+  // oauth/Dockerfile reproduces that layout inside the image — WORKDIR
+  // /app/oauth with shared/ at /app/shared — so `../../shared/x.js` resolves
+  // identically in a checkout and in the container, and the compiler emits the
+  // same paths in both.
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": "..",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -13,6 +22,6 @@
     "sourceMap": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["src/**/*", "../shared/**/*"],
+  "exclude": ["node_modules", "dist", "test"]
 }

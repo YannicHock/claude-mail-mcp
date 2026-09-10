@@ -9,10 +9,10 @@
  *   echo 'secret' | npm run hash-password
  *
  * In the deployed container, note the --entrypoint override: the image's
- * ENTRYPOINT is `node dist/index.js`, so a trailing `node dist/hash-password.js`
+ * ENTRYPOINT is `node dist/oauth/src/index.js`, so a trailing `node dist/oauth/src/hash-password.js`
  * would be appended to it as arguments and start the server instead.
  *
- *   docker compose run --rm --entrypoint node mail-oauth dist/hash-password.js
+ *   docker compose run --rm --entrypoint node mail-oauth dist/oauth/src/hash-password.js
  */
 
 import { createInterface } from "node:readline";
@@ -62,7 +62,7 @@ async function main(): Promise<void> {
     "\nTo write it straight into the secret file, without the password reaching\n" +
       "your shell history:\n\n" +
       "  read -rs PW && printf '%s\\n' \"$PW\" | docker compose run --rm -T \\\n" +
-      "    --entrypoint node mail-oauth dist/hash-password.js \\\n" +
+      "    --entrypoint node mail-oauth dist/oauth/src/hash-password.js \\\n" +
       "    > secrets/oauth/auth_password_hash.txt; unset PW\n\n"
   );
 }

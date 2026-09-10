@@ -38,7 +38,7 @@ import {
   PROVIDER_OTHER,
   SHARED_PASSWORD_FIELD,
   type ProviderPreset,
-} from "../../src/settings-api.js";
+} from "../../../shared/settings-api.js";
 import {
   renderConnectStep,
   renderCredentialsStep,

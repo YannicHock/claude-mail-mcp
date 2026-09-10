@@ -1,24 +1,22 @@
 {
   // Typecheck-only project for the test suite.
   //
-  // tsconfig.json's `include` is ["src/**/*"], so `tsc --noEmit` compiles zero
-  // files under test/ — confirmed with `tsc --noEmit --listFiles`. The tests are
-  // run with `node --import tsx`, and tsx *strips* types without checking them,
-  // so before this file nothing anywhere typechecked the test suite.
+  // tsconfig.json's `include` is ["src/**/*", "shared/**/*"], so `tsc --noEmit`
+  // compiles zero files under test/ — confirmed with `tsc --noEmit --listFiles`.
+  // The tests are run with `node --import tsx`, and tsx *strips* types without
+  // checking them, so before this file nothing anywhere typechecked the test
+  // suite.
   //
-  // It is a separate project rather than a widened `include` in tsconfig.json
-  // because that file is also the build: `npm run build` (and the Dockerfile's
-  // builder stage) emits from it into dist/, and pulling test/ in would change
-  // rootDir to the repo root and emit dist/src/… instead of dist/… .
+  // It stays a separate project rather than a widened `include` in
+  // tsconfig.json because that file is also the build: `npm run build` (and the
+  // Dockerfile's builder stage) emits from it into dist/, and pulling test/ in
+  // would emit dist/test/… into the image alongside the code.
   //
   // Run with: npm run typecheck:test
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "noEmit": true,
-    // test/ sits outside src/, so the common root moves to the repo root.
-    // Harmless under noEmit; required for the files to be accepted at all.
-    "rootDir": "."
+    "noEmit": true
   },
-  "include": ["src/**/*", "test/**/*"],
+  "include": ["src/**/*", "shared/**/*", "test/**/*"],
   "exclude": ["node_modules", "dist"]
 }

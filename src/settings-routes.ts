@@ -127,7 +127,7 @@ import {
   type MailboxSetupStep,
   type MailboxStampAnswer,
   type ProvidersAnswer,
-} from "./settings-api.js";
+} from "../shared/settings-api.js";
 import {
   renderMailboxAddress,
   renderMailboxForm,

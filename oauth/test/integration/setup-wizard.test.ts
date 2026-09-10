@@ -65,7 +65,7 @@ import {
   type MailboxRequestBody,
   type MailboxSuggestion,
   type ProviderPreset,
-} from "../../src/settings-api.js";
+} from "../../../shared/settings-api.js";
 import {
   getSetup,
   postSetupForm,

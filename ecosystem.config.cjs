@@ -14,7 +14,7 @@ module.exports = {
       // Absolute path to your checkout — pm2 does not derive one from this
       // file's own location. Replace it with yours.
       cwd: "/home/you/claude-mail-mcp",
-      script: "dist/index.js",
+      script: "dist/src/index.js",
       // Node 20+ loads .env from --env-file natively, no dotenv dep needed.
       node_args: "--env-file=.env --enable-source-maps",
       instances: 1,

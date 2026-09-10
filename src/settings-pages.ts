@@ -25,13 +25,16 @@
  * every place that spells one rather than a field that silently goes missing
  * (#69).
  *
- * `escapeHtml` and the inline-CSS visual language (the `STYLE` constant, using
- * system colour keywords so both light and dark themes work without a media
- * query) are copied from `oauth/src/login.ts`. The two packages cannot share a
- * module — nothing under `src/` may import from `oauth/` — so this duplication is
- * deliberate, not an oversight.
+ * `escapeHtml`, `pageHeaders` and `SETTINGS_CSP` used to be copied from
+ * `oauth/src/login.ts` and `oauth/src/settings-pages.ts`, because the two
+ * packages could not share a module. They can now: those three live in shared/
+ * and are re-exported below (#126). The inline-CSS visual language — the
+ * `STYLE` constant, using system colour keywords so both light and dark themes
+ * work without a media query — is still a copy, and stays one: #72 is the issue
+ * for the three stylesheets, and it is a design question rather than a move.
  */
 
+import { escapeHtml } from "../shared/escape-html.js";
 import { RESERVED_IDS, reservedIdNotice, type Account } from "./accounts.js";
 import {
   ADDRESS_FIELD,
@@ -41,7 +44,7 @@ import {
   PROVIDER_OTHER,
   SHARED_PASSWORD_FIELD,
   type ProviderPreset,
-} from "./settings-api.js";
+} from "../shared/settings-api.js";
 
 /**
  * Mirrors `ProbeReport` from `./probe.ts`, which is not present in this file's
@@ -89,56 +92,17 @@ export interface MailboxListData {
   rowNotices?: Record<string, string>;
 }
 
-/** Escape text for interpolation into HTML element content or an attribute. */
-export function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
 /**
- * The response headers every settings page sets, with the CSP as the parameter.
+ * The header set, the CSP and the escaper are re-exported rather than declared:
+ * they live in shared/ now and the OAuth layer reads the same declarations
+ * (#126). Every importer of this module keeps the names it always used.
  *
- * Mirrors `pageHeaders` and `SETTINGS_CSP` in oauth/src/settings-pages.ts
- * byte-for-byte. The two packages have separate Docker build contexts and
- * cannot share a module, so this one duplication is required, not an oversight
- * — if you change one, change both, and test/unit/settings-headers.test.ts
- * fails if you forget. Every other copy of this set has been removed: inside
- * the OAuth layer the wizard and the /authorize consent screen both call its
- * `pageHeaders`, so this is the last pair left.
- *
- * The CSP is a parameter because the OAuth layer's consent screen needs a wider
- * `form-action` than a page that only posts back to itself. Nothing here needs
- * that, and nothing here should grow a second CSP: the connector's pages are
- * served through the OAuth proxy and post to their own origin.
- *
- * These pages carry a CSRF token and a mailbox password field, must not be
- * cached anywhere, and have no reason to be framed; the CSP allows inline
- * styles and nothing else, matching the no-JavaScript rule that governs every
- * settings page.
+ * The connector's pages are served through the OAuth proxy and post to their
+ * own origin, so nothing here needs a second CSP and nothing here should grow
+ * one.
  */
-export function pageHeaders(csp: string): Record<string, string> {
-  return {
-    "Cache-Control": "no-store",
-    "X-Frame-Options": "DENY",
-    "Content-Security-Policy": csp,
-    // same-origin, mirroring the OAuth layer. These pages' forms resolve relative
-    // to the browser's own origin, and the OAuth layer's own guards read Referer as
-    // a fallback when Chrome omits Origin on a same-origin form POST. Keeping this
-    // at no-referrer would be a trap for anyone who later adds such a check here.
-    "Referrer-Policy": "same-origin",
-  };
-}
-
-/** The CSP for a page whose forms only ever post back to their own origin. */
-export const SETTINGS_CSP =
-  "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
-
-/** The header set every settings response carries. */
-export const SETTINGS_HEADERS: Record<string, string> = pageHeaders(SETTINGS_CSP);
+export { escapeHtml } from "../shared/escape-html.js";
+export { pageHeaders, SETTINGS_CSP, SETTINGS_HEADERS } from "../shared/page-headers.js";
 
 const STYLE = `
 :root { color-scheme: light dark; }

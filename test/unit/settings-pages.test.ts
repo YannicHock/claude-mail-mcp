@@ -11,7 +11,7 @@ import {
   type MailboxProvidersData,
   type MailboxSuggestionData,
 } from "../../src/settings-pages.js";
-import { MAILBOX_FIELDS, type ProviderPreset } from "../../src/settings-api.js";
+import { MAILBOX_FIELDS, type ProviderPreset } from "../../shared/settings-api.js";
 
 function sampleAccount(id: string): Account {
   return {

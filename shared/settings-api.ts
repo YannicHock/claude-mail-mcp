@@ -2,14 +2,14 @@
  * The JSON shape of the connector's mailbox operations — probe a candidate
  * mailbox, and write one — and the field vocabulary both of them speak.
  *
- * This file is the connector's copy. `oauth/src/settings-api.ts` is the setup
- * wizard's, and the two are identical below this comment; the drift test in
- * test/unit/settings-api.test.ts fails if they part company, the same way
- * secrets.test.ts pins the two copies of secrets.ts. The packages have separate
- * Docker build contexts and cannot import from one another, so a mirrored
- * module is the closest thing to a shared one they can have — and unlike the
- * HTML readers it replaced (#69), a mirrored module is compared by a test
- * rather than by a comment saying "change one, change both".
+ * This is the wire contract between the connector, which serves it, and the
+ * OAuth layer's setup wizard, which speaks it. There is one copy: until #126 it
+ * was mirrored as `src/settings-api.ts` and `oauth/src/settings-api.ts` and
+ * compared by a whole-file drift test, because the two packages had separate
+ * Docker build contexts and could not import from one another. They build from
+ * one context now, so a contract that used to be identical by comparison is
+ * identical by construction — and the file that both sides read a rename out of
+ * (#69) is genuinely one file.
  *
  * Nothing here does any I/O, imports anything, or validates a mailbox. It is
  * types, one table of names, the translation between the nested document on the

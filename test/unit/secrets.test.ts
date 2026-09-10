@@ -1,5 +1,9 @@
 /**
- * The precedence rule from src/secrets.ts, pinned.
+ * The precedence rule from shared/secrets.ts, pinned.
+ *
+ * One suite, not two: oauth/test/unit/secrets.test.ts was 530 lines byte-for-byte
+ * identical to this file, maintained by hand and pinned by nothing. #126 deleted
+ * it along with the second copy of the module it tested.
  *
  * Deliberately a near-copy of oauth/test/unit/secrets.test.ts: the module under
  * test is duplicated across the two packages, so the guarantee has to be pinned
@@ -36,7 +40,7 @@ import {
   logSecretReport,
   resolveSecret,
   type SecretReportEntry,
-} from "../../src/secrets.js";
+} from "../../shared/secrets.js";
 
 /** Node reports a crude, non-POSIX mode on Windows; the mode only matters in the images. */
 const posixOnly = process.platform === "win32" ? { skip: "POSIX file modes only" } : {};
@@ -545,30 +549,6 @@ describe("logSecretReport", () => {
   });
 });
 
-describe("the two copies of this module", () => {
-  // Nothing in the build stops the connector's copy and the OAuth layer's from
-  // drifting, and drift here stays invisible until the day a settings assertion
-  // stops verifying between two services that derive their key differently.
-  it("stay identical below the header comment", () => {
-    const body = (url: URL): string =>
-      readFileSync(url, "utf8")
-        // Line endings first. On a CRLF checkout the header ends `*/\r\n`, the
-        // regex below does not match it, and the comparison then fails on the
-        // one paragraph that is supposed to differ.
-        .replace(/\r\n/g, "\n")
-        // The header names the *other* package, so it differs on purpose.
-        .replace(/^\/\*\*[\s\S]*?\*\/\n/, "")
-        // The Logger type lives in a different module in each package.
-        .replace('from "./app.js"', 'from "./logger.js"');
-
-    assert.equal(
-      body(new URL("../../src/secrets.ts", import.meta.url)),
-      body(new URL("../../oauth/src/secrets.ts", import.meta.url)),
-      "src/secrets.ts and oauth/src/secrets.ts have drifted — change one, change the other"
-    );
-  });
-});
-
 describe("the shared group contract", () => {
   // The two images still need one group in common — a mode-640 secret written by
   // one is unreadable to the other without it — but that group is *not* a
@@ -586,7 +566,7 @@ describe("the shared group contract", () => {
   // What has to be pinned is therefore the wiring: the two images must bake no
   // gid of their own, and both services must actually be put in the host's.
   //
-  // src/secrets.ts used to chown each secret it created to a `SHARED_SECRET_GID`
+  // shared/secrets.ts used to chown each secret it created to a `SHARED_SECRET_GID`
   // of its own, which made an image-side numeric `mailsecrets` riding alongside
   // the host-side `group_add` worse than either scheme alone. That constant is
   // gone (#89) — the setgid bit on secrets/shared and secrets/oauth is the only

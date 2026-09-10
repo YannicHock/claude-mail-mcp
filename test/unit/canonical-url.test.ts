@@ -1,19 +1,19 @@
 /**
- * The one canonicalisation both services apply to `PUBLIC_URL`, pinned from the
- * connector's side of it.
+ * The one canonicalisation both services apply to `PUBLIC_URL`.
  *
  * What is asserted here:
  *
- *  1. **The two copies have not drifted.** Same shape as the secrets.ts and
- *     settings-api.ts drift tests: everything below the header comment is
- *     compared byte for byte, so "identical" is a fact rather than a comment.
- *     This is the mechanism #110 asks for — a drift between the two
- *     normalisations is caught here rather than by a 401 nobody can read.
- *  2. **The spellings the issue names canonicalise to one string.** Host case
+ *  1. **The spellings the issue names canonicalise to one string.** Host case
  *     and an explicit default port are the two that used to 401.
- *  3. **The rule still refuses what it always refused.** Canonicalising is not
+ *  2. **The rule still refuses what it always refused.** Canonicalising is not
  *     the same as being lenient: a non-URL, a foreign scheme and a fragment are
  *     still errors, and a different host is still a different resource.
+ *
+ * There used to be a third: a byte-for-byte comparison of the connector's copy
+ * of the module against the OAuth layer's. #126 deleted it along with the
+ * second copy — there is one shared/canonical-url.ts now, compiled into both
+ * images, so "the two services canonicalise identically" is a property of the
+ * build and there is nothing left to compare.
  *
  * The end-to-end half of #110 — a connector configured with one spelling
  * accepting an assertion issued under the other — lives in
@@ -22,33 +22,13 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
   canonicalResource,
   normalisePublicUrl,
   sameResource,
-} from "../../src/canonical-url.js";
-
-describe("the two copies of canonical-url.ts", () => {
-  it("stay identical below the header comment", () => {
-    const body = (url: URL): string =>
-      readFileSync(url, "utf8")
-        // Line endings first: on a CRLF checkout the header ends `*/\r\n`, the
-        // regex below does not match it, and the comparison then fails on the
-        // one paragraph that is supposed to differ.
-        .replace(/\r\n/g, "\n")
-        // The header names the *other* package, so it differs on purpose.
-        .replace(/^\/\*\*[\s\S]*?\*\/\n/, "");
-
-    assert.equal(
-      body(new URL("../../src/canonical-url.ts", import.meta.url)),
-      body(new URL("../../oauth/src/canonical-url.ts", import.meta.url)),
-      "src/canonical-url.ts and oauth/src/canonical-url.ts have drifted — change one, change the other"
-    );
-  });
-});
+} from "../../shared/canonical-url.js";
 
 describe("canonicalResource", () => {
   it("lowercases the scheme and the host", () => {

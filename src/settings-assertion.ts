@@ -12,15 +12,18 @@
  * arrived, compares in constant time, and only then parses the JSON — so no
  * attacker-controlled bytes reach JSON.parse until the signature has held.
  *
- * The format is mirrored in oauth/src/assertion.ts. The two packages have separate
- * Docker build contexts and cannot share a module; if you change one, change both.
+ * The format is mirrored in oauth/src/assertion.ts, and stays mirrored on
+ * purpose: two independent implementations of a security format are a
+ * cross-check, and the minting and verifying halves are not the same code. #126
+ * gave the two packages a shared/ they *could* import from — this pair is
+ * deliberately not in it. If you change one, change both.
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { RequestHandler } from "express";
 
 import type { Logger } from "./app.js";
-import { normalisePublicUrl } from "./canonical-url.js";
+import { normalisePublicUrl } from "../shared/canonical-url.js";
 
 /** Header the assertion travels in. Mirrored in oauth/src/assertion.ts. */
 export const ASSERTION_HEADER = "x-settings-assertion";
@@ -58,7 +61,7 @@ declare global {
  * path. Never throws: a malformed header is a 401, not a 500.
  *
  * `issuer` must already be canonical — `normalisePublicUrl` from
- * src/canonical-url.ts, which is what {@link requireSettingsAssertion} applies to
+ * shared/canonical-url.ts, which is what {@link requireSettingsAssertion} applies to
  * the configured `PUBLIC_URL` before it gets here. The comparison below is byte
  * equality on purpose and stays that way: canonicalising both sides is the fix
  * for two spellings of one URL (#110); making the comparison itself lenient would

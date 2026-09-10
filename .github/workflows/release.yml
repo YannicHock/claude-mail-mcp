@@ -81,7 +81,7 @@ jobs:
             cache_scope: connector
           - component: oauth
             image: ghcr.io/yannichock/claude-mail-mcp-oauth
-            context: oauth
+            context: .
             file: oauth/Dockerfile
             cache_scope: oauth
     steps:

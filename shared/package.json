@@ -1,0 +1,6 @@
+{
+  "name": "claude-mail-mcp-shared",
+  "private": true,
+  "type": "module",
+  "description": "Not an installed package — neither manifest depends on this and neither lockfile mentions it. It exists for one line: \"type\": \"module\". Under module/moduleResolution NodeNext, TypeScript decides a file's module format from the nearest package.json, and the OAuth image compiles shared/ from a directory that has none above it (WORKDIR /app/oauth, shared/ at /app/shared). Without this marker these files emit as CommonJS in that image while emitting as ESM everywhere else, and the container dies at startup on a named import the compiler was perfectly happy with. See #126."
+}

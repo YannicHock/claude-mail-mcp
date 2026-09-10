@@ -68,13 +68,15 @@ jobs:
             context: .
             file: Dockerfile
             cache_scope: connector
-          # The OAuth layer is self-contained: its build context is oauth/, not the
-          # repository root, so nothing from the connector's tree can end up in it.
-          # That is also what makes a stray `import "../src/..."` fail here rather
-          # than in production.
+          # The OAuth layer builds from the repository root as well, because it
+          # compiles shared/ and a context rooted at oauth/ cannot reach a sibling
+          # directory (#126). What keeps the connector's tree out of it is
+          # oauth/Dockerfile.dockerignore, which BuildKit resolves in preference to
+          # the root .dockerignore — so a stray `import "../src/..."` from oauth/src
+          # still fails here rather than in production.
           - component: oauth
             image: ghcr.io/yannichock/claude-mail-mcp-oauth
-            context: oauth
+            context: .
             file: oauth/Dockerfile
             cache_scope: oauth
     steps:
