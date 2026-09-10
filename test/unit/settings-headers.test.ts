@@ -29,8 +29,6 @@
 
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import type { Server } from "node:http";
-import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
 import express from "express";
@@ -38,6 +36,7 @@ import express from "express";
 import { createSettingsRouter } from "../../src/settings-routes.js";
 import { ASSERTION_HEADER } from "../../src/settings-assertion.js";
 import { makeAccount, withAccountsStore } from "../helpers/fixtures.js";
+import { withServer } from "../helpers/running-app.js";
 
 const ISSUER = "https://mail-mcp.example.invalid";
 const SETTINGS_KEY = "s".repeat(32);
@@ -81,9 +80,13 @@ function mint(method: string, path: string): string {
  * GET `path` off the settings router, mounted at `/` as
  * {@link requireSettingsAssertion} requires, over one mailbox.
  *
- * The server is closed in a `finally` opened before the caller's assertions run:
- * a failing assertion would otherwise leave a listening socket behind and
- * `node --test` hangs instead of reporting the failure.
+ * The listener's lifecycle belongs to `withServer` (test/helpers/running-app.ts),
+ * which closes it in a `finally` opened before the caller's assertions run: a
+ * failing assertion would otherwise leave a listening socket behind and
+ * `node --test` hangs instead of reporting the failure. Not `withRunningApp`,
+ * which builds the whole connector app — this suite deliberately mounts only the
+ * settings router, so a header set by anything else in the chain cannot stand in
+ * for the one it is asserting.
  */
 async function getSettings(path: string): Promise<Response> {
   return withAccountsStore([makeAccount({ id: "work", label: "Work", default: true })], async (store) => {
@@ -96,21 +99,14 @@ async function getSettings(path: string): Promise<Response> {
         log: () => {},
       })
     );
-    const server = await new Promise<Server>((resolve, reject) => {
-      const s: Server = app.listen(0, "127.0.0.1", () => resolve(s));
-      s.on("error", reject);
-    });
-    try {
-      const { port } = server.address() as AddressInfo;
-      const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+    return withServer(app, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${path}`, {
         headers: { [ASSERTION_HEADER]: mint("GET", path) },
       });
       // Drain the body so the socket does not keep the server from closing.
       await res.text();
       return res;
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
+    });
   });
 }
 

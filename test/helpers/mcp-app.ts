@@ -17,11 +17,10 @@
  * loopback port, and a `close()` that tears all three down.
  */
 
-import type { Server } from "node:http";
-import type { AddressInfo } from "node:net";
 import { AccountsStore } from "../../src/accounts.js";
 import { ClientPool } from "../../src/client-pool.js";
 import { createApp, SERVER_NAME, VERSION } from "../../src/app.js";
+import { closeServer, listenOnLoopback } from "./running-app.js";
 
 // Re-exported so a test can assert against the values the server actually
 // reports without reaching into src/ itself.
@@ -53,6 +52,24 @@ export interface McpTestApp {
  * mirrors that same guarantee, just anchored to a try/catch since only the
  * failure path needs cleanup here (the success path deliberately leaves the
  * store running until the caller's `close()`).
+ *
+ * Not folded into `withRunningApp` (test/helpers/running-app.ts), which the three
+ * unit suites now share, because the two guarantee different things and one
+ * cannot be expressed as the other:
+ *
+ *   - `withRunningApp` owns the accounts file. It writes fixtures into a temp
+ *     directory it created and removes that directory afterwards. This harness
+ *     takes an `accountsFile` from the caller, because the integration tests
+ *     *rewrite* that file mid-test and assert the store's `fs.watch` picked the
+ *     change up. A helper that owned the file could not offer that.
+ *   - `withRunningApp` is scoped: the server exists for the duration of one
+ *     callback. This returns a handle whose `store` and `pool` outlive the call
+ *     and stay usable until `close()`, which is what an integration test needs to
+ *     drive the store and the MCP session across several steps.
+ *
+ * What they genuinely share — binding a free loopback port with the `error`
+ * listener attached, and waiting for the close — is imported from that module
+ * rather than written here again.
  */
 export async function startMcpApp(opts: {
   accountsFile: string;
@@ -77,19 +94,19 @@ export async function startMcpApp(opts: {
       // src/index.ts passes its own structured logger here.
     });
 
-    const server = await new Promise<Server>((resolve, reject) => {
-      const s: Server = app.listen(0, "127.0.0.1", () => resolve(s));
-      s.on("error", reject);
-    });
-    const { port } = server.address() as AddressInfo;
+    // The bind and the teardown are running-app.ts's, so the EADDRINUSE-as-an-
+    // event trap and the wait-for-close are solved in one place for every harness
+    // in this suite. What stays here is the part that is genuinely this harness's
+    // own — see the note on `withRunningApp` below.
+    const { server, url, port } = await listenOnLoopback(app);
 
     return {
-      url: `http://127.0.0.1:${port}`,
+      url,
       port,
       store,
       pool,
       close: async () => {
-        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await closeServer(server);
         store.stop();
         await pool.closeAll().catch(() => {});
       },
