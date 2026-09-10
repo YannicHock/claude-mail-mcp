@@ -495,6 +495,35 @@ export function credentialRejectionRefusesSave(report: MailboxProbeReport): bool
 }
 
 /**
+ * True when any probed service failed at all — including CalDAV, which cannot
+ * refuse a save.
+ *
+ * The routes that only *test* need a wider question than the ones that write.
+ * A save is refused by IMAP or SMTP alone, so {@link probeRefusesSave} walks
+ * those two; but *Test connection* stores nothing, and a CalDAV row glowing red
+ * with no explanation beside it is exactly the silence #146 was filed about.
+ */
+export function probeFailed(report: MailboxProbeReport): boolean {
+  return !report.imap.ok || !report.smtp.ok || (report.caldav !== null && !report.caldav.ok);
+}
+
+/**
+ * True when any probed service refused the credentials, CalDAV included.
+ *
+ * The counterpart of {@link credentialRejectionRefusesSave} for those same
+ * test-only routes. The two scopes are deliberately different and the
+ * difference is load-bearing: a Fastmail mailbox whose *CalDAV* password is
+ * wrong while IMAP and SMTP answer is not a refused save — nothing was being
+ * saved — but it is a rejected password, and Fastmail's note is the sentence
+ * that explains it. Reusing the save-scoped predicate there dropped that note.
+ */
+export function anyCredentialRejection(report: MailboxProbeReport): boolean {
+  return [report.imap, report.smtp, report.caldav].some(
+    (outcome) => outcome !== null && !outcome.ok && outcome.credentialRejection === true
+  );
+}
+
+/**
  * What the operator is told when a probe refused their save, or null when the
  * report is not a refusal at all.
  *
@@ -553,7 +582,16 @@ export function saveRefusedNotice(
   // The note is the targeted form of the generic sentence below it, so it takes
   // that sentence's place — never both. An empty string is read as no note, the
   // way `ProviderPreset.note` already spells "nothing to say".
-  const targeted = rejected && credentialNote !== undefined && credentialNote !== "";
+  //
+  // Whether a note applies is the caller's question, not this one's. It used to
+  // be gated on `rejected` here as well, on the reasoning that a note is always
+  // about a password and there is no generic password sentence to replace when
+  // no server complained about one. That is true of a `credentialNote` and
+  // false of an `unsupported` warning, which is a fact about the address and
+  // holds however the probe failed — Proton answers no IMAP from the internet
+  // at all, so its refusal is connectivity, and gating here swallowed the one
+  // entry that explains it.
+  const targeted = credentialNote !== undefined && credentialNote !== "";
   const remedy = targeted
     ? credentialNote
     : rejected

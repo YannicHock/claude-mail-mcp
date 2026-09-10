@@ -45,7 +45,9 @@ import {
   parseMailboxDraft,
   parseProbeAnswer,
   parseProvidersAnswer,
+  anyCredentialRejection,
   credentialRejectionRefusesSave,
+  probeFailed,
   probeRefusesSave,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
@@ -771,13 +773,16 @@ describe("what a probe report means for a save", () => {
   });
 
   it("is false for a CalDAV rejection beside an unreachable IMAP, as the notice already was", () => {
-    // The drift, spelled out. The duplicate answered true here, so the caller
-    // looked a provider note up and handed it to `saveRefusedNotice` — which
-    // walks these same two services and discarded it. Harmless in what it
-    // rendered, and one edit away from not being.
+    // The save-scoped question, and it stays false: a CalDAV rejection cannot
+    // refuse a save, whatever else is wrong. What changed is the second half of
+    // this test, which used to assert that `saveRefusedNotice` discarded a note
+    // handed to it here. It no longer does — the two scopes now live in the
+    // caller, because the test-only routes need the wider one. See
+    // `anyCredentialRejection`, which answers true for this same report.
     const drifted = report({ imap: UNREACHABLE, caldav: REJECTED });
     assert.equal(credentialRejectionRefusesSave(drifted), false);
-    assert.equal((saveRefusedNotice(drifted, "a note") ?? "").includes("a note"), false);
+    assert.equal(anyCredentialRejection(drifted), true, "CalDAV did reject a password");
+    assert.equal(probeFailed(drifted), true);
   });
 });
 

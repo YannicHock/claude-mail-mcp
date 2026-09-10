@@ -506,10 +506,23 @@ ${
 }
 </fieldset>`;
 
-  const sub = anyCarried
-    ? "The password you entered has been carried over rather than asked for again. " +
-      "Change it here if this mailbox takes a different one for IMAP and SMTP."
-    : "Password fields are always blank here. Leave one blank to keep the stored value.";
+  // Two forms, not one. This pair was written for the create cascade, where a
+  // blank box has no second meaning and "carried over" is the whole story. On
+  // the edit form a blank box means *keep the stored password*, and that rule is
+  // stated in exactly one place — this sentence. Printing only the carry half
+  // there would drop it precisely when the boxes arrive pre-filled and the
+  // operator is likeliest to clear one; and the carry half's own advice, about
+  // IMAP and SMTP wanting different passwords, is wrong above two boxes that are
+  // empty because only CalDAV was carried.
+  const sub = isNew
+    ? anyCarried
+      ? "The password you entered has been carried over rather than asked for again. " +
+        "Change it here if this mailbox takes a different one for IMAP and SMTP."
+      : "Password fields are always blank here. Leave one blank to keep the stored value."
+    : anyCarried
+      ? "A password you just entered has been carried back into its box. Any box left " +
+        "blank still keeps the password already stored for it."
+      : "Password fields are always blank here. Leave one blank to keep the stored value.";
 
   // Said by the caller, not deduced from what else is on the page. See
   // `probeSectionHtml` for what the three states are for.

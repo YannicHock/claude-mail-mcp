@@ -245,11 +245,18 @@ describe("saveRefusedNotice takes the note in place of its generic sentence", ()
     assert.match(notice, /Save anyway/, "the way past the gate must survive it");
   });
 
-  it("ignores a note on a connectivity failure, which has no such sentence", () => {
+  it("takes a note on a connectivity failure too, because the caller decides", () => {
+    // This used to assert the opposite, on the reasoning that a note is always
+    // about a password and a host that never answered said nothing about one.
+    // True of a `credentialNote`, false of an `unsupported` warning — Proton
+    // answers no IMAP from the internet at all, so its refusal *is*
+    // connectivity, and gating here swallowed the one entry that explains it.
+    // Whether a note applies is now the caller's question; this function only
+    // puts the one it is given in place of its own generic sentence.
     const notice = saveRefusedNotice(report(UNREACHABLE), NOTE) ?? "";
-    assert.equal(notice.includes(NOTE), false, notice);
-    assert.match(notice, /did not answer/);
-    assert.match(notice, /Check what failed above/);
+    assert.ok(notice.includes(NOTE), notice);
+    assert.match(notice, /did not answer/, "it still names what failed");
+    assert.doesNotMatch(notice, /Check what failed above/, "never the note and the generic one");
   });
 
   it("reads an empty note as no note, the way ProviderPreset.note already does", () => {

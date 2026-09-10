@@ -111,11 +111,13 @@ import {
   ADDRESS_FIELD,
   caldavFailureNotice,
   CHECKBOX_ON,
+  anyCredentialRejection,
   credentialRejectionRefusesSave,
   flattenDraft,
   MAILBOX_FIELDS,
   MAILBOX_SECRET_FIELDS,
   parseMailboxDraft,
+  probeFailed,
   probeRefusesSave,
   PROVIDER_FIELD,
   readSaveAnyway,
@@ -431,9 +433,15 @@ function toWireReport(report: ProbeReport): MailboxProbeReport {
  * `@outlook.com` refusal fell through to the generic app-password sentence and
  * sent its operator hunting for a passcode Microsoft does not issue.
  */
-function rejectionNoteFor(wire: MailboxProbeReport, email: string): string | null {
-  if (!credentialRejectionRefusesSave(wire)) return null;
-  return unsupportedNoticeFor(email) ?? credentialNoteFor(email);
+function rejectionNoteFor(email: string, rejected: boolean): string | null {
+  // The two halves are gated differently, and that is the correction #184's
+  // first attempt got wrong. An `unsupported` entry is a fact about the
+  // *address* — it holds however the probe failed, and Proton is the reason it
+  // has to: Proton answers no IMAP from the internet, so its failure is
+  // connectivity and a rejection-only gate hid the one note that explains it.
+  // A `credentialNote` is about a password, so it needs a server to have
+  // actually complained about one.
+  return unsupportedNoticeFor(email) ?? (rejected ? credentialNoteFor(email) : null);
 }
 
 /**
@@ -447,16 +455,27 @@ function rejectionNoteFor(wire: MailboxProbeReport, email: string): string | nul
  * or its entry carries neither an `unsupported` warning nor a note.
  */
 function refusalNotice(wire: MailboxProbeReport, email: string): string {
-  return saveRefusedNotice(wire, rejectionNoteFor(wire, email) ?? undefined) ?? "";
+  const note = probeRefusesSave(wire)
+    ? rejectionNoteFor(email, credentialRejectionRefusesSave(wire))
+    : null;
+  return saveRefusedNotice(wire, note ?? undefined) ?? "";
 }
 
 /**
  * The same note on the routes that only test, which store nothing and so have
- * no refusal sentence for it to replace. Nothing when the failure was not a
- * rejection, which is the whole of #148's rule.
+ * no refusal sentence for it to replace.
+ *
+ * The scope is wider here than on a save, deliberately. A save is refused by
+ * IMAP or SMTP alone, so that path asks {@link credentialRejectionRefusesSave};
+ * *Test connection* stores nothing, so the honest question is whether **any**
+ * probed server refused a password — CalDAV included. Asking the save-scoped
+ * question here silently dropped the note from a Fastmail mailbox whose CalDAV
+ * password was wrong while IMAP and SMTP answered, which is the one case where
+ * Fastmail's note is the whole explanation.
  */
 function credentialAdvice(report: ProbeReport, email: string): { notice?: string } {
-  const note = rejectionNoteFor(toWireReport(report), email);
+  const wire = toWireReport(report);
+  const note = probeFailed(wire) ? rejectionNoteFor(email, anyCredentialRejection(wire)) : null;
   return note === null ? {} : { notice: note };
 }
 
