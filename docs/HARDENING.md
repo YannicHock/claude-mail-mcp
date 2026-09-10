@@ -10,10 +10,10 @@ step, the reasoning is here and the procedure is there.
 
 **Every claim below names the code or the test that makes it true.** A hardening
 document whose claims nobody checked is worse than none, because it is believed.
-Claims are stated against the repository as it stands; where the deployment and
-the repository disagree — and in one important place they do, see
-[The client address problem](#the-client-address-problem-15) — that is said
-plainly rather than papered over.
+Claims are stated against the repository as it stands; where one of them also
+depends on something the repository cannot establish — the per-client controls
+depend on the topology in [The client address](#the-client-address-15) — that
+dependency is named rather than assumed.
 
 ---
 
@@ -554,60 +554,129 @@ not one the client picked"* in `test/unit/app-trust-proxy.test.ts`.
 
 ---
 
-## The client address problem (#15)
+## The client address (#15)
 
-**Everything in the previous section that says "per client" is, on the deployment
-this project actually runs on, per *gateway*.**
+Everything in the previous section that says "per client" means it — on a
+deployment whose TLS terminator sees the real source address. That is a
+**topology requirement**, and it is the one property those controls depend on
+that cannot be established from inside this repository. So it is stated here in
+full, with the way to check that your deployment holds it.
 
-The condition is a TLS terminator that itself runs in a container and reaches the
-internet through Docker's published ports — Nginx Proxy Manager, Traefik or Caddy
-in Docker. `docker-proxy` SNATs the source address to the Docker bridge gateway
-*before* the proxy sees it. The proxy then faithfully forwards what it observed:
-`$proxy_add_x_forwarded_for` resolves to the gateway, because that **is**
-`$remote_addr` from its point of view. Nothing in this repository is
-misconfigured; the address is already lost one layer below it. Confirmed on the
-reference deployment in the OAuth layer's own logs and in the proxy's access log,
-which records the bridge gateway for every request, including ones from outside the
-network.
+### What the topology has to be
 
-An nginx running on the host rather than in a container — the TLS recipe in
-[DEPLOYMENT.md](DEPLOYMENT.md), which terminates on the host — does not have this
-problem: it sees the real source address, and everything the previous section
-claims holds as written.
+**The terminator must not sit behind `docker-proxy`.** A TLS terminator that runs
+in a container and reaches the internet through Docker's *published ports* never
+sees a client at all: `docker-proxy` SNATs the source address to the Docker bridge
+gateway before the proxy's listening socket, so `$remote_addr` — and with it
+`$proxy_add_x_forwarded_for`, and with it `req.ip` in both services — is a single
+`172.x.x.x` address for the entire internet. Nothing in this repository is
+misconfigured when that happens; the address is already gone one layer below it,
+and no `TRUST_PROXY` value recovers what was never forwarded.
 
-Two consequences, and neither is theoretical:
+Two arrangements hold the requirement:
 
-- **The login throttle buckets everyone together.** Five failed attempts from
-  anyone lock out everyone — and because the settings sign-in shares its budget
-  with `/authorize`, that also blocks connecting a new Claude client for fifteen
-  minutes. A distributed guesser, meanwhile, is not slowed per-source at all.
-- **A fail2ban jail would ban the gateway.** The `login failed` line carries `ip`,
-  and on this deployment that value is the address *every* request arrives from.
-  Banning it takes the whole host's proxying down — not just this stack.
+- **A terminator on the host.** The nginx recipe in
+  [DEPLOYMENT.md](DEPLOYMENT.md): its listening socket is the host's, so
+  `$remote_addr` is the client.
+- **A containerised terminator on `network_mode: host`** — Nginx Proxy Manager,
+  Traefik or Caddy. On host networking it binds 80/443 on the host directly
+  rather than through a published port, which removes the same hop.
 
-Neither is a vulnerability on its own. Both silently do not do what they were built
-to do, which is worse than not existing, because the documentation that describes
-them is what an operator plans around.
+The reference deployment runs the second: Nginx Proxy Manager, host-networked, in
+front of `mail-oauth` on `127.0.0.1:8080`.
 
-**So, today:**
+### How to tell which one you have
 
-- Treat the throttle as a global cap on sign-in attempts, not as per-client
-  protection. It still bounds a guessing rate against the operator password; it
-  does not isolate one client from another.
-- Do the same with the nginx zone. It keys on `$binary_remote_addr` — the address
-  *that* nginx sees — which behind a containerised terminator is one address for
-  the whole internet.
-- **Do not arm a banning fail2ban action against these log lines.** Write the
-  filter, run the jail in report-only mode if you want the visibility, and leave
-  the ban action off until the topology below is in place.
+Read the **terminator's own** access log, not the application's. The source
+address is the first thing on the line; Nginx Proxy Manager labels it:
 
-### The log line a jail would match
+```
+[Client 2a02:810b:4312:e700:55cb:e26f:9162:277f] … [Sent-to 127.0.0.1]
+[Client 172.21.0.1] …                                ← the bridge gateway
+```
+
+A `172.x.x.x` or `10.x.x.x` client on a request you made from *outside* the
+network is the broken case, every time, however many hops are configured
+downstream of it. The application says the same thing a layer later: a failed
+sign-in logs `"ip":"172.21.0.1"` rather than an address you recognise.
+
+If that is what you see, move the terminator onto the host network — everything
+below assumes you have. Until you do, treat the login throttle and the nginx zone
+as one global cap rather than as per-client protection, and leave the ban action
+off the jail below: the address in those log lines is the gateway that every
+proxied service on the box is reached through, and banning it takes all of them
+down.
+
+### What moving Nginx Proxy Manager to host networking cost
+
+Three things, on the reference deployment, and none of them was large. The survey
+that came first is why:
+
+- **The upstreams.** 15 of the 16 proxy hosts already forwarded to the host's own
+  public IP and a published port, so host networking changed nothing for them.
+  Exactly one addressed a container by name — `mail-oauth:8080` — and became
+  `127.0.0.1:8080`, which `docker-compose.yml` already publishes. Container names
+  stop resolving on host networking, so check every proxy host for one *before*
+  the switch, not after.
+- **Its database.** NPM reached MariaDB by the compose service name `db`, which is
+  a container name like any other. The database container now publishes
+  `127.0.0.1:3306:3306`, and NPM's `DB_MYSQL_HOST` is `127.0.0.1`.
+- **Its `ports:` block, which had to go.** On host networking there is nothing to
+  publish — NPM binds 80, 443 and 81 itself — and leaving the block in place is a
+  compose error rather than a no-op.
+
+Nothing in this repository changed with it. `TRUST_PROXY=1` was right before and
+is right after: one terminator, one hop, and the OAuth layer standing between it
+and the connector costs no hop, because its proxy forwards `X-Forwarded-For`
+unchanged rather than appending to it.
+
+### Why not `"userland-proxy": false`
+
+It is the cheaper-looking answer — one line in `/etc/docker/daemon.json`, no proxy
+rework — and the next person to read this will think of it too, so here is why the
+reference deployment refused it.
+
+With the userland proxy disabled, published ports are DNAT'd by iptables and the
+source address does survive **for IPv4**. On that host, `ip6tables -t nat -L
+DOCKER` was **empty** while the IPv4 `DOCKER` chain carried a full set of DNAT
+rules: IPv6 publishing was being done entirely by `docker-proxy`. Disabling it
+would have taken IPv6 down for every published port on the box, and the public
+hostname has an AAAA record. Check both families before believing the one-line
+fix — the verification request below arrived over IPv6.
+
+Host networking sidesteps the question: a host-networked terminator is not
+published at all, so which mechanism publishes ports stops mattering to it.
+
+### What that buys
+
+- **The login throttle buckets per client again.** Five failed attempts from one
+  address no longer spend anybody else's budget, and connecting a new Claude
+  client is no longer blocked for fifteen minutes by a stranger's typo. The
+  settings sign-in still shares its budget with `/authorize` — same credential, on
+  purpose — but it shares it per address.
+- **The nginx zone keys on a real client.** `$binary_remote_addr` is the client's
+  own address, so the edge limit caps a flood per source instead of in aggregate.
+- **A fail2ban jail bans the client, and the ban lands where it works.** A
+  host-networked terminator's sockets are the host's, so packets traverse the
+  host's `INPUT` chain and fail2ban's stock actions apply to them.
+
+Verified on the reference deployment after the change, in both layers, for one
+request from outside the network:
+
+```
+NPM access log:  [Client 2a02:810b:4312:e700:55cb:e26f:9162:277f] … [Sent-to 127.0.0.1]
+OAuth layer:     {…,"msg":"settings login rejected by origin check","ip":"2a02:810b:4312:e700:55cb:e26f:9162:277f"}
+```
+
+Older lines in the same OAuth log still read `"ip":"172.21.0.1"`. The before and
+the after sit in one file.
+
+### The log line a jail matches
 
 Failed logins emit a single line in a fixed shape — `LOGIN_FAILURE_EVENT` in
 `oauth/src/logger.ts`, used at all three sites. The shape is a deployment API: an
-operator's jail may already match on it, so changing it is a deployment change
-rather than a cosmetic one. This repository ships no filter; this is the shape one
-would match.
+operator's jail matches on it, so changing it is a deployment change rather than a
+cosmetic one. This repository ships no filter; this is the shape one matches.
 
 JSON, one object per line, `warn` to stderr:
 
@@ -620,37 +689,56 @@ JSON, one object per line, `warn` to stderr:
 `failures`. `ip` immediately follows `msg` in all three.
 
 ```ini
-# fail2ban filter — matches the shape above.
-# Ban action intentionally omitted: see #15.
+# /etc/fail2ban/filter.d/claude-mail-oauth.conf
 [Definition]
 failregex = "msg":"login failed","ip":"<HOST>"
 ```
+
+```ini
+# /etc/fail2ban/jail.d/claude-mail-oauth.local
+[claude-mail-oauth]
+enabled      = true
+filter       = claude-mail-oauth
+backend      = systemd
+journalmatch = CONTAINER_NAME=mail-oauth
+maxretry     = 10
+findtime     = 900
+bantime      = 3600
+```
+
+**What it protects.** The operator password, which is the only human-facing
+credential in the deployment: it opens `/settings`, where mailboxes are added and
+removed and connected Claude clients are revoked, and it is what the `/authorize`
+consent screen asks for. The application already stops at five failures in fifteen
+minutes and says so on the page, so `maxretry = 10` deliberately sits above that —
+an operator who mistypes, gets locked out and waits it out is not banned, while
+somebody still trying after the lockout is. It bans the address in the line, which
+on the topology above is a client rather than the gateway; that is the whole
+difference this section is about.
+
+**Two things that go wrong in practice.**
+
+- **Docker's default log driver escapes the quotes.** Under `json-file` the line
+  reaches `/var/lib/docker/containers/<id>/<id>-json.log` as
+  `\"msg\":\"login failed\"`, and the filter above does not match it. Give
+  `mail-oauth` the journald driver — a `logging: driver: journald` block in your
+  own compose override — and use the `backend = systemd` jail above, or keep the
+  file and match the escaped shape instead:
+  `failregex = \\?"msg\\?":\\?"login failed\\?",\\?"ip\\?":\\?"<HOST>\\?"`.
+- **IPv6.** `<HOST>` has matched IPv6 addresses since fail2ban 0.10, and the stock
+  `nftables` and `iptables-multiport` actions ban both families — but the
+  reference deployment's clients arrive over IPv6, so confirm it rather than
+  assume it. Fail a sign-in deliberately and read
+  `fail2ban-client status claude-mail-oauth`. An empty jail after a genuine
+  failure is almost always the log source rather than the filter; check
+  `journalctl CONTAINER_NAME=mail-oauth | grep 'login failed'` first.
 
 No password, token, authorization code or code verifier is ever a log field, in
 any line — rule 1 of `oauth/src/logger.ts`, and the claim token itself is likewise
 never logged (only its source and path, asserted by *"is written to the data volume
 and reported like every other secret"*).
 
-### What changes when #15 lands
-
-The maintainer has decided on **`network_mode: host` for the proxy**: it removes
-the `docker-proxy` hop, and `req.ip` becomes the client's real address for the
-first time. That is a **deployment** change with a repository note attached, not
-the other way round — on host networking the proxy binds 80/443 directly and its
-container-name upstreams stop resolving, so every service proxied on that box has
-to be re-addressed, not just this one.
-
-It has not been made, and it cannot be verified from this repository. When it has:
-
-- The five-attempt bucket becomes per client again, and a failed sign-in from one
-  address stops spending another's budget.
-- The fail2ban line names a real client, and the ban action can be armed.
-- The nginx zone keys on a real client address.
-- This section, and the sentence in [DEPLOYMENT.md](DEPLOYMENT.md) that points at
-  the same issue, should be rewritten to describe host networking as the supported
-  topology — and only then.
-
-Tracking: <https://github.com/YannicHock/claude-mail-mcp/issues/15>.
+History: <https://github.com/YannicHock/claude-mail-mcp/issues/15>.
 
 ---
 
@@ -708,10 +796,13 @@ both read it.
 fifteen minutes, an nginx zone on exactly the two POSTs that verify it, and a
 minimum length of 12 refused at the wizard rather than after exposure. A wrong
 username and a wrong password produce the same response (*"refuses a wrong username
-with the same response as a wrong password"*). **Residual risk is higher than those
-controls suggest, today**, because the per-IP framing is per-gateway — see #15.
-Choose a password sized for a global cap of five attempts per fifteen minutes with
-no per-source isolation.
+with the same response as a wrong password"*). Those controls are per client only
+where the terminator sees the client — the topology requirement in
+[The client address](#the-client-address-15), which is a property of your
+deployment rather than of this repository, and worth confirming before you rely on
+it. Even satisfied, it bounds *each* source at five attempts per fifteen minutes,
+so a distributed guesser is not slowed in aggregate: size the password for that,
+and put the fail2ban jail from that section on the log lines.
 
 **An attacker who reads the boot logs of an unclaimed instance.** They claim it.
 Accepted, stated in the banner, and the reason the wizard exists at all is to
