@@ -7,12 +7,19 @@
  *
  * Destructive operations (delete_message) document irreversibility in their
  * description so Claude.ai surfaces a confirmation step in the UI.
+ *
+ * v0.7.1 (#146): every call that reaches a mailbox runs inside
+ * `reportingFailures()`, so a failure names the account and says whether the
+ * server rejected the credentials or was never reached — and leaves one `warn`
+ * line saying the same. `pool.for()` stays outside that wrapper on purpose: an
+ * unknown account id is the caller's mistake, not a mailbox that failed.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ClientPool } from "./client-pool.js";
 import { AccountsStore } from "./accounts.js";
+import { reportingFailures, logToolFailure } from "./tool-errors.js";
 
 function asJson(value: unknown): { content: { type: "text"; text: string }[] } {
   return {
@@ -69,8 +76,10 @@ export function registerMailTools(
       },
     },
     async ({ account }) => {
-      const { imap } = pool.for(account);
-      return asJson(await imap.listMailboxes());
+      const { imap, id } = pool.for(account);
+      return asJson(
+        await reportingFailures(pool, "list_folders", id, () => imap.listMailboxes())
+      );
     }
   );
 
@@ -98,12 +107,11 @@ export function registerMailTools(
       },
     },
     async ({ mailbox, limit, unread_only, account }) => {
-      const { imap } = pool.for(account);
-      const list = await imap.listMessages(mailbox, {
-        limit,
-        unreadOnly: unread_only,
-      });
-      return asJson({ mailbox, account: account ?? "(default)", count: list.length, messages: list });
+      const { imap, id } = pool.for(account);
+      const list = await reportingFailures(pool, "list_messages", id, () =>
+        imap.listMessages(mailbox, { limit, unreadOnly: unread_only })
+      );
+      return asJson({ mailbox, account: id, count: list.length, messages: list });
     }
   );
 
@@ -144,9 +152,11 @@ export function registerMailTools(
       },
     },
     async ({ mailbox, limit, account, ...criteria }) => {
-      const { imap } = pool.for(account);
-      const list = await imap.searchMessages(mailbox, criteria, limit ?? 25);
-      return asJson({ mailbox, account: account ?? "(default)", count: list.length, messages: list });
+      const { imap, id } = pool.for(account);
+      const list = await reportingFailures(pool, "search_messages", id, () =>
+        imap.searchMessages(mailbox, criteria, limit ?? 25)
+      );
+      return asJson({ mailbox, account: id, count: list.length, messages: list });
     }
   );
 
@@ -166,8 +176,10 @@ export function registerMailTools(
       },
     },
     async ({ mailbox, uid, account }) => {
-      const { imap } = pool.for(account);
-      return asJson(await imap.getMessage(mailbox, uid));
+      const { imap, id } = pool.for(account);
+      return asJson(
+        await reportingFailures(pool, "get_message", id, () => imap.getMessage(mailbox, uid))
+      );
     }
   );
 
@@ -210,23 +222,25 @@ export function registerMailTools(
       if (!args.text && !args.html) {
         throw new Error("Provide at least one of `text` or `html`.");
       }
-      const { smtp, imap, sentFolder } = pool.for(args.account);
-      const result = await smtp.send({
-        to: args.to,
-        cc: args.cc,
-        bcc: args.bcc,
-        subject: args.subject,
-        text: args.text,
-        html: args.html,
-        replyTo: args.reply_to,
-        inReplyTo: args.in_reply_to,
-        references: args.references,
-        attachments: args.attachments?.map((a) => ({
-          filename: a.filename,
-          contentBase64: a.content_base64,
-          contentType: a.content_type,
-        })),
-      });
+      const { smtp, imap, sentFolder, id } = pool.for(args.account);
+      const result = await reportingFailures(pool, "send_message", id, () =>
+        smtp.send({
+          to: args.to,
+          cc: args.cc,
+          bcc: args.bcc,
+          subject: args.subject,
+          text: args.text,
+          html: args.html,
+          replyTo: args.reply_to,
+          inReplyTo: args.in_reply_to,
+          references: args.references,
+          attachments: args.attachments?.map((a) => ({
+            filename: a.filename,
+            contentBase64: a.content_base64,
+            contentType: a.content_type,
+          })),
+        })
+      );
       // Best-effort copy to Sent folder.
       let savedToSent = false;
       if (sentFolder) {
@@ -249,8 +263,14 @@ export function registerMailTools(
           });
           await imap.append(sentFolder, raw, ["\\Seen"]);
           savedToSent = true;
-        } catch {
-          // Sent-folder copy is best effort; the actual send already succeeded.
+        } catch (err) {
+          // Sent-folder copy is best effort; the actual send already succeeded,
+          // so this must not fail the call. It must not be silent either — this
+          // is the bare `catch {}` #146 was filed against, and an IMAP password
+          // the server refuses shows up here while SMTP keeps working. One warn
+          // line, the classified reason, the account named, `saved_to_sent:
+          // false` in the answer as before.
+          logToolFailure(pool, "send_message", id, err, { stage: "save_to_sent" });
         }
       }
       return asJson({ ...result, saved_to_sent: savedToSent });
@@ -278,7 +298,7 @@ export function registerMailTools(
       if (!args.text && !args.html) {
         throw new Error("Provide at least one of `text` or `html`.");
       }
-      const { smtp, imap, draftsFolder } = pool.for(args.account);
+      const { smtp, imap, draftsFolder, id } = pool.for(args.account);
       const raw = await smtp.buildRawSource({
         to: args.to,
         cc: args.cc,
@@ -289,7 +309,9 @@ export function registerMailTools(
         inReplyTo: args.in_reply_to,
         references: args.references,
       });
-      await imap.append(draftsFolder, raw, ["\\Draft", "\\Seen"]);
+      await reportingFailures(pool, "create_draft", id, () =>
+        imap.append(draftsFolder, raw, ["\\Draft", "\\Seen"])
+      );
       return asJson({
         success: true,
         folder: draftsFolder,
@@ -311,8 +333,8 @@ export function registerMailTools(
       },
     },
     async ({ mailbox, uid, read, account }) => {
-      const { imap } = pool.for(account);
-      await imap.markRead(mailbox, uid, read);
+      const { imap, id } = pool.for(account);
+      await reportingFailures(pool, "mark_read", id, () => imap.markRead(mailbox, uid, read));
       return asJson({ success: true, mailbox, uid, read });
     }
   );
@@ -330,8 +352,10 @@ export function registerMailTools(
       },
     },
     async ({ source_mailbox, uid, destination_mailbox, account }) => {
-      const { imap } = pool.for(account);
-      await imap.moveMessage(source_mailbox, uid, destination_mailbox);
+      const { imap, id } = pool.for(account);
+      await reportingFailures(pool, "move_message", id, () =>
+        imap.moveMessage(source_mailbox, uid, destination_mailbox)
+      );
       return asJson({
         success: true,
         from: source_mailbox,
@@ -353,8 +377,10 @@ export function registerMailTools(
       },
     },
     async ({ mailbox, uid, account }) => {
-      const { imap } = pool.for(account);
-      await imap.deleteMessage(mailbox, uid);
+      const { imap, id } = pool.for(account);
+      await reportingFailures(pool, "delete_message", id, () =>
+        imap.deleteMessage(mailbox, uid)
+      );
       return asJson({ success: true, mailbox, uid });
     }
   );
