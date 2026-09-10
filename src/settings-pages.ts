@@ -40,6 +40,7 @@ import {
   ADDRESS_FIELD,
   CHECKBOX_ON,
   MAILBOX_FIELDS,
+  MAILBOX_SECRET_FIELDS,
   SAVE_ANYWAY_FIELD,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
@@ -443,8 +444,13 @@ export function renderMailboxForm(opts: MailboxFormData): string {
   // this form is built either by `sanitize()`, which strips every secret field,
   // or by the cascade's `carrying()`, which puts back only what was just typed.
   const carried = (name: string): string => values?.[name] ?? "";
-  const anyCarried =
-    carried(MAILBOX_FIELDS.imapPass) !== "" || carried(MAILBOX_FIELDS.smtpPass) !== "";
+  // Over every secret field, not the two that were obvious. `withCarriedPasswords`
+  // carries all of MAILBOX_SECRET_FIELDS, so a submission that filled only the
+  // CalDAV password used to print "Password fields are always blank here"
+  // directly above a visible, populated CalDAV box. Harmless while both create
+  // forms mark IMAP and SMTP `required`; ordinary on the edit form, where
+  // changing only the CalDAV password is a normal thing to do.
+  const anyCarried = MAILBOX_SECRET_FIELDS.some((name) => carried(name) !== "");
 
   // An account already stored under a reserved id cannot be edited in place:
   // the form action built just below is a literal settings route, not this
