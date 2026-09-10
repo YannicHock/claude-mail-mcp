@@ -32,14 +32,29 @@
 
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
+import { join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
 const repoRoot = new URL("../../", import.meta.url);
 
+/**
+ * Every .ts file under `dir`, at any depth.
+ *
+ * Recursive on purpose. A non-recursive walk fails *open*: both source trees are
+ * flat today, so it looks complete, and the first `src/mail/` a later wave adds
+ * takes everything inside it out of this guard with no test failure and no signal
+ * of any kind. A duplicate-detector that can be switched off by creating a
+ * directory is worse than none, because it reads as coverage.
+ */
 function tsFilesIn(dir: string): string[] {
-  return readdirSync(new URL(dir, repoRoot), { withFileTypes: true })
+  const base = fileURLToPath(new URL(dir, repoRoot));
+  return readdirSync(base, { withFileTypes: true, recursive: true })
     .filter((entry) => entry.isFile() && entry.name.endsWith(".ts"))
-    .map((entry) => `${dir}${entry.name}`)
+    .map((entry) => {
+      const full = join(entry.parentPath, entry.name);
+      return `${dir}${relative(base, full).split(sep).join("/")}`;
+    })
     .sort();
 }
 

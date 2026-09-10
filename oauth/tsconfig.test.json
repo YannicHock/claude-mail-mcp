@@ -3,5 +3,13 @@
   "compilerOptions": {
     "noEmit": true
   },
-  "include": ["src/**/*", "../shared/**/*", "test/**/*"]
+  "include": ["src/**/*", "../shared/**/*", "test/**/*"],
+  // Declared here rather than inherited. `exclude` filters `include`, and it comes
+  // from whichever config declares it last — so a `"test"` entry in the config this
+  // extends would cancel the `test/**/*` above and leave this project typechecking
+  // nothing at all, silently and green. That is exactly what happened between #126
+  // and this line: `tsc -p tsconfig.test.json --listFiles` listed zero files under
+  // test/, and `tsx` strips types without checking them, so nothing anywhere
+  // typechecked this package's ~30 test files.
+  "exclude": ["node_modules", "dist"]
 }
