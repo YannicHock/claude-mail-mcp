@@ -29,6 +29,7 @@ import { describe, it } from "node:test";
 import {
   ADDRESS_FIELD,
   ADDRESS_REQUIRED,
+  caldavFailureNotice,
   carrying,
   CHECKBOX_ON,
   draftFromFields,
@@ -37,18 +38,25 @@ import {
   MAILBOX_FIELD_NAMES,
   MAILBOX_SECRET_FIELDS,
   parseAutoconfigAnswer,
+  parseCreatedAnswer,
+  parseErrorAnswer,
   parseMailboxDraft,
   parseProbeAnswer,
   parseProvidersAnswer,
+  probeRefusesSave,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
   PROVIDER_REQUIRED,
+  readSaveAnyway,
+  SAVE_ANYWAY_FIELD,
+  saveRefusedNotice,
   SHARED_PASSWORD_FIELD,
   stepFromEdit,
   stepFromLookup,
   stepFromProvider,
   withSharedPassword,
   type MailboxDraft,
+  type MailboxProbeReport,
   type MailboxSuggestion,
   type ProviderPreset,
 } from "../../shared/settings-api.js";
@@ -674,5 +682,176 @@ describe("the CalDAV clause — a password only where a server was named", () =>
     );
     assert.equal(parsed[MAILBOX_FIELDS.caldavPass], "its-own");
     assert.equal(rendered[MAILBOX_FIELDS.caldavPass], "its-own");
+  });
+});
+
+// ---- The save that probes first (#147) -------------------------------------
+//
+// The rule the connector's two write routes enforce, and the sentences both
+// UIs say about it, live in this module because they are the one thing that
+// must not be decided twice. Before #147 the setup wizard decided it — it
+// called the probe route, read the result and only then called the write route
+// — and the settings UI, which has no such caller, decided nothing at all: a
+// mailbox whose password the server rejects was stored without ever having
+// authenticated once. What follows pins the rule itself; the routes that apply
+// it are exercised in test/integration/settings-mailboxes.test.ts.
+
+/** A report with everything working, unless a case says otherwise. */
+function report(overrides: Partial<MailboxProbeReport> = {}): MailboxProbeReport {
+  return { imap: { ok: true }, smtp: { ok: true }, caldav: null, ...overrides };
+}
+
+const REJECTED = {
+  ok: false as const,
+  message: "the server rejected these credentials",
+  credentialRejection: true,
+};
+const UNREACHABLE = { ok: false as const, message: "connect ECONNREFUSED 127.0.0.1:993" };
+
+describe("the *Save anyway* override, as the wire carries it", () => {
+  it("is a field of the request body, not a second vocabulary", () => {
+    // Typed as `keyof MailboxRequestBody`, so this is the name both content
+    // types use and the one the connector's own button submits.
+    assert.equal(SAVE_ANYWAY_FIELD, "save_anyway");
+  });
+
+  it("reads a JSON `true` and a ticked form field as the same answer", () => {
+    assert.equal(readSaveAnyway({ [SAVE_ANYWAY_FIELD]: true }), true);
+    assert.equal(readSaveAnyway({ [SAVE_ANYWAY_FIELD]: CHECKBOX_ON }), true);
+  });
+
+  it("is never a default, and never inferred from something that merely looks like one", () => {
+    // Everything here must probe. The escape hatch is a deliberate act; a body
+    // this build cannot read is not that act.
+    for (const value of [undefined, false, "0", "", "true", 1, null, {}]) {
+      assert.equal(
+        readSaveAnyway({ [SAVE_ANYWAY_FIELD]: value }),
+        false,
+        `${JSON.stringify(value)} must not be read as Save anyway`
+      );
+    }
+    assert.equal(readSaveAnyway({}), false);
+  });
+});
+
+describe("what a probe report means for a save", () => {
+  it("refuses the write when IMAP failed", () => {
+    assert.equal(probeRefusesSave(report({ imap: REJECTED })), true);
+  });
+
+  it("refuses the write when SMTP failed", () => {
+    assert.equal(probeRefusesSave(report({ smtp: UNREACHABLE })), true);
+  });
+
+  it("does not refuse the write when only CalDAV failed", () => {
+    // The whole of the CalDAV rule, in one assertion. It is optional in the
+    // account model and fails for benign reasons far too often to gate a
+    // mailbox on: showing it is right, refusing on it is not.
+    assert.equal(probeRefusesSave(report({ caldav: REJECTED })), false);
+    assert.equal(probeRefusesSave(report({ caldav: UNREACHABLE })), false);
+  });
+
+  it("does not refuse a write nothing objected to", () => {
+    assert.equal(probeRefusesSave(report()), false);
+    assert.equal(saveRefusedNotice(report()), null);
+  });
+});
+
+describe("what the operator is told when a probe refused the save", () => {
+  it("names the service that refused, not just that something did", () => {
+    const notice = saveRefusedNotice(report({ imap: REJECTED })) ?? "";
+    assert.match(notice, /IMAP/);
+    assert.equal(notice.includes("SMTP"), false, notice);
+    assert.match(notice, /nothing was saved/i);
+  });
+
+  it("tells a rejected password apart from a host that never answered", () => {
+    // The distinction shared/credential-failure.ts exists to draw, spent here:
+    // one of these is fixed by typing a different password and the other is
+    // not, and telling an operator to check their password when the server is
+    // down is the confusion #146 was filed about.
+    const rejected = saveRefusedNotice(report({ imap: REJECTED })) ?? "";
+    const unreachable = saveRefusedNotice(report({ imap: UNREACHABLE })) ?? "";
+    assert.match(rejected, /rejected these credentials/);
+    assert.match(rejected, /app password/);
+    assert.match(unreachable, /did not answer/);
+    assert.equal(unreachable.includes("app password"), false, unreachable);
+  });
+
+  it("names both services when both failed, and says which did what", () => {
+    const notice = saveRefusedNotice(report({ imap: REJECTED, smtp: UNREACHABLE })) ?? "";
+    assert.match(notice, /IMAP rejected these credentials/);
+    assert.match(notice, /SMTP did not answer/);
+  });
+
+  it("points at the way past it", () => {
+    assert.match(saveRefusedNotice(report({ smtp: UNREACHABLE })) ?? "", /Save anyway/);
+  });
+
+  it("never names CalDAV, however badly CalDAV went", () => {
+    const notice = saveRefusedNotice(report({ imap: UNREACHABLE, caldav: REJECTED })) ?? "";
+    assert.equal(notice.includes("CalDAV"), false, notice);
+  });
+});
+
+describe("what the operator is told about a CalDAV failure that did not stop the save", () => {
+  it("says the mailbox was saved and what is missing until it is fixed", () => {
+    const notice = caldavFailureNotice(report({ caldav: UNREACHABLE })) ?? "";
+    assert.match(notice, /saved/);
+    assert.match(notice, /calendar tools/i);
+    assert.ok(notice.includes(UNREACHABLE.message), notice);
+  });
+
+  it("has nothing to say when there was no CalDAV block, or it worked", () => {
+    assert.equal(caldavFailureNotice(report()), null);
+    assert.equal(caldavFailureNotice(report({ caldav: { ok: true } })), null);
+  });
+});
+
+describe("the classification, on the wire", () => {
+  it("survives a round trip through the probe answer", () => {
+    const parsed = parseProbeAnswer({ probe: { imap: REJECTED, smtp: { ok: true }, caldav: null } });
+    assert.equal(parsed?.imap.ok, false);
+    assert.equal(parsed?.imap.ok === false && parsed.imap.credentialRejection, true);
+  });
+
+  it("reads an outcome that does not state it as 'not a rejection', never as one", () => {
+    // A connector that predates #147 answers without the field. That must read
+    // as a connectivity failure, which is the safe half of the distinction.
+    const parsed = parseProbeAnswer({
+      probe: { imap: { ok: false, message: "nope" }, smtp: { ok: true } },
+    });
+    assert.equal(parsed?.imap.ok === false && parsed.imap.credentialRejection, undefined);
+    assert.equal(probeRefusesSave(parsed!), true);
+    assert.match(saveRefusedNotice(parsed!) ?? "", /did not answer/);
+  });
+
+  it("carries the report out of a refusal, so a caller need not probe twice", () => {
+    const answer = parseErrorAnswer({
+      message: "IMAP rejected these credentials, so nothing was saved.",
+      errors: {},
+      probe: { imap: REJECTED, smtp: { ok: true }, caldav: null },
+    });
+    assert.equal(answer.probe?.imap.ok, false);
+    assert.match(answer.message ?? "", /nothing was saved/);
+  });
+
+  it("leaves a refusal readable when the report inside it is not", () => {
+    const answer = parseErrorAnswer({ message: "no", errors: {}, probe: { imap: "?" } });
+    assert.equal(answer.probe, undefined);
+    assert.equal(answer.message, "no");
+  });
+
+  it("carries the report out of a 201 as well, and stays readable without one", () => {
+    const withProbe = parseCreatedAnswer({
+      id: "work",
+      stamp: "1-2",
+      probe: { imap: { ok: true }, smtp: { ok: true }, caldav: UNREACHABLE },
+    });
+    assert.equal(withProbe?.probe?.caldav?.ok, false);
+    assert.deepEqual(parseCreatedAnswer({ id: "work", stamp: "1-2" }), {
+      id: "work",
+      stamp: "1-2",
+    });
   });
 });

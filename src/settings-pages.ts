@@ -40,6 +40,7 @@ import {
   ADDRESS_FIELD,
   CHECKBOX_ON,
   MAILBOX_FIELDS,
+  SAVE_ANYWAY_FIELD,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
   SHARED_PASSWORD_FIELD,
@@ -272,6 +273,34 @@ function probeRowHtml(name: string, result: ProbeResultView): string {
   return `<div class="probe-row ${result.ok ? "ok" : "fail"}"><strong>${escapeHtml(
     name
   )}</strong><span>${status}</span></div>`;
+}
+
+/**
+ * *Save anyway* — the escape hatch in front of the probing save (#147).
+ *
+ * Written **after** Save in the DOM, and never given `formaction` or any other
+ * way of being the form's first submit button. That ordering is the whole
+ * constraint: a form submitted implicitly — Enter in a text box — is submitted
+ * as if its *first* submit button had been pressed, which is how #140 turned
+ * Enter in the wizard's address field into "skip this mailbox". Enter here
+ * presses Save, which probes; reaching this one takes a deliberate click.
+ *
+ * It carries its own field name rather than an `_action` value, because that
+ * name is the wire contract's — {@link SAVE_ANYWAY_FIELD} — and a
+ * `<button name value>` contributes its pair only when it is the button that
+ * was activated. So the field arrives exactly when the operator pressed this
+ * and never otherwise, in the same body shape a JSON caller sends.
+ *
+ * Always rendered, not only after a refusal. The probe budget is 25 seconds,
+ * and an operator who already knows their server is in a maintenance window
+ * should not have to sit through it to be shown the way past it.
+ */
+function saveAnywayButton(): string {
+  return `<button type="submit" name="${escapeHtml(SAVE_ANYWAY_FIELD)}" value="${escapeHtml(
+    CHECKBOX_ON
+  )}" title="Store this mailbox without testing the connection first">
+    Save anyway
+  </button>`;
 }
 
 /**
@@ -579,6 +608,7 @@ ${probeSectionHtml(opts.probe, !reserved)}
   <button type="submit" formaction="${escapeHtml(testPath)}" name="_action" value="test">
     Test connection
   </button>
+  ${saveAnywayButton()}
 </form>
 ${isNew ? otherWaysIn("manual") : ""}
 <p><a href="/settings">Back to settings</a></p>`;

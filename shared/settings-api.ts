@@ -228,12 +228,60 @@ export interface MailboxRequestBody {
   /** The stamp the write must still be against. Ignored by the probe route. */
   _stamp: string;
   mailbox: MailboxDraft;
+  /**
+   * *Save anyway*: store this mailbox without probing it first (#147).
+   *
+   * The write routes probe before they write, and a rejected IMAP or SMTP
+   * refuses the write. That rule is the connector's, in one place, and this
+   * field is how a caller says the operator has deliberately asked to bypass
+   * it - a server in maintenance, a network blip, or an operator who knows
+   * better. It is never a default: absent, `false`, and anything unrecognised
+   * all mean "probe first".
+   *
+   * The key is {@link SAVE_ANYWAY_FIELD}, which is also the name the two HTML
+   * forms' *Save anyway* buttons submit - one field name for both content
+   * types, read by {@link readSaveAnyway}, so the form path and the JSON path
+   * cannot drift into disagreeing about what a save means.
+   */
+  save_anyway?: boolean;
+}
+
+/**
+ * The name {@link MailboxRequestBody.save_anyway} travels under, in JSON and in
+ * a form body alike.
+ *
+ * Typed against the interface rather than merely spelled the same as it:
+ * rename the field and this line stops compiling.
+ */
+export const SAVE_ANYWAY_FIELD: keyof MailboxRequestBody & string = "save_anyway";
+
+/**
+ * Did this submission ask for *Save anyway*?
+ *
+ * `true` from a JSON body, {@link CHECKBOX_ON} from the button a browser posts.
+ * Everything else - absent, `false`, `"0"`, a number, a string nobody meant -
+ * is "probe first", because the escape hatch has to be an explicit act and a
+ * value this build cannot read is not one.
+ */
+export function readSaveAnyway(body: Record<string, unknown>): boolean {
+  const value = body[SAVE_ANYWAY_FIELD];
+  return value === true || value === CHECKBOX_ON;
 }
 
 // ---- The answers -----------------------------------------------------------
 
-/** One service's verdict. Mirrors `ProbeResult` in the connector's probe.ts. */
-export type MailboxProbeOutcome = { ok: true } | { ok: false; message: string };
+/**
+ * One service's verdict. Mirrors `ProbeResult` in the connector's probe.ts.
+ *
+ * `credentialRejection` is the classification `shared/credential-failure.ts`
+ * makes: the server was reached, answered, and refused the login. It is
+ * optional on the wire so an answer from a build that predates #147 still
+ * parses - absent means "not stated", which is read as "not a rejection",
+ * never as one.
+ */
+export type MailboxProbeOutcome =
+  | { ok: true }
+  | { ok: false; message: string; credentialRejection?: boolean };
 
 /**
  * The three services, reported one by one.
@@ -262,6 +310,15 @@ export interface MailboxStampAnswer {
 export interface MailboxCreatedAnswer {
   id: string;
   stamp: string;
+  /**
+   * What the probe found on the way in (#147), when there was one.
+   *
+   * A 201 carrying a report means the mailbox was stored *and* something the
+   * save does not gate on — CalDAV — has something to say about itself. Absent
+   * when the operator asked for *Save anyway*, since then nothing was probed
+   * and there is nothing to state.
+   */
+  probe?: MailboxProbeReport;
 }
 
 /**
@@ -274,6 +331,19 @@ export interface MailboxCreatedAnswer {
 export interface MailboxErrorAnswer {
   message?: string;
   errors: Record<string, string>;
+  /**
+   * Present when the refusal was the probe's (#147): the write routes probe
+   * before they write, and a rejected IMAP or SMTP refuses the write. What the
+   * operator has to see to act on that is the report, per service, so it
+   * travels with the refusal rather than costing a second round trip against
+   * credentials the caller would have to send again.
+   *
+   * Absent for every other refusal - a field the parser did not accept, a
+   * stale stamp, a body that was not a draft - and absent from a build that
+   * predates the probing save. A caller reads it as "the probe is why nothing
+   * was stored", never as "the probe passed".
+   */
+  probe?: MailboxProbeReport;
 }
 
 // ---- Reading them ----------------------------------------------------------
@@ -299,13 +369,21 @@ function parseProbeOutcome(value: unknown): MailboxProbeOutcome | null {
   if (obj === null || typeof obj.ok !== "boolean") return null;
   if (obj.ok) return { ok: true };
   const message = asString(obj.message);
-  return message === null ? null : { ok: false, message };
+  if (message === null) return null;
+  // A boolean is carried through as it was stated, `false` included, so a
+  // report survives this reader unchanged. Anything else — absent, a string, a
+  // number — is dropped rather than coerced, and an outcome with nothing stated
+  // reads as "not a rejection". That is the safe half of the distinction:
+  // saying a server refused a password when it was merely unreachable is
+  // exactly the confusion #146 exists to prevent.
+  return typeof obj.credentialRejection === "boolean"
+    ? { ok: false, message, credentialRejection: obj.credentialRejection }
+    : { ok: false, message };
 }
 
-/** The probe answer, or null when IMAP and SMTP are not both in it. */
-export function parseProbeAnswer(value: unknown): MailboxProbeReport | null {
-  const body = asObject(value);
-  const probe = body === null ? null : asObject(body.probe);
+/** The three services out of one document, or null when IMAP and SMTP are not both in it. */
+function parseProbeReport(value: unknown): MailboxProbeReport | null {
+  const probe = asObject(value);
   if (probe === null) return null;
   const imap = parseProbeOutcome(probe.imap);
   const smtp = parseProbeOutcome(probe.smtp);
@@ -318,6 +396,101 @@ export function parseProbeAnswer(value: unknown): MailboxProbeReport | null {
   return caldav === null ? null : { imap, smtp, caldav };
 }
 
+/** The probe answer, or null when IMAP and SMTP are not both in it. */
+export function parseProbeAnswer(value: unknown): MailboxProbeReport | null {
+  const body = asObject(value);
+  return body === null ? null : parseProbeReport(body.probe);
+}
+
+// ---- What a probe means for a save ----------------------------------------
+
+/**
+ * The two services a mailbox is not a mailbox without.
+ *
+ * CalDAV is deliberately absent. It is optional in the account model and it
+ * fails for benign reasons far too often to gate a mailbox on: showing the
+ * failure is right, refusing the save on it is not (#147, spec §4.2). The
+ * names are the ones both probe panels already print, so a notice and the rows
+ * above it name the same thing.
+ */
+const SAVE_BLOCKING_SERVICES = ["IMAP", "SMTP"] as const;
+
+/** One blocking service that failed, and how. */
+interface BlockedService {
+  name: string;
+  credentialRejection: boolean;
+}
+
+function blockedServices(report: MailboxProbeReport): BlockedService[] {
+  const outcomes: Record<(typeof SAVE_BLOCKING_SERVICES)[number], MailboxProbeOutcome> = {
+    IMAP: report.imap,
+    SMTP: report.smtp,
+  };
+  const blocked: BlockedService[] = [];
+  for (const name of SAVE_BLOCKING_SERVICES) {
+    const outcome = outcomes[name];
+    if (outcome.ok) continue;
+    blocked.push({ name, credentialRejection: outcome.credentialRejection === true });
+  }
+  return blocked;
+}
+
+/** True when this report is a reason to refuse a write. */
+export function probeRefusesSave(report: MailboxProbeReport): boolean {
+  return blockedServices(report).length > 0;
+}
+
+/**
+ * What the operator is told when a probe refused their save, or null when the
+ * report is not a refusal at all.
+ *
+ * One sentence, written once, for both UIs. The connector renders it above its
+ * own probe panel and the wizard renders it above its own, and neither writes a
+ * second account of the same fact — which is the point of the rule moving into
+ * the connector rather than being enforced twice.
+ *
+ * It names the services, because a refusal that says only "the connection test
+ * failed" sends an operator to look at all three. And it tells a rejection
+ * apart from a host that never answered — the distinction
+ * `shared/credential-failure.ts` exists to draw — because the two have
+ * completely different remedies: one is the password, the other is the host,
+ * the port, or a server that is simply down.
+ */
+/**
+ * What the operator is told about a CalDAV failure that did *not* stop the save,
+ * or null when there is nothing to say.
+ *
+ * The other half of the CalDAV rule. Refusing on it would be wrong; saying
+ * nothing would be worse, because the calendar tools will then be quietly
+ * missing for a mailbox the operator was just told was saved. So the write goes
+ * through and this is shown on the way out.
+ */
+export function caldavFailureNotice(report: MailboxProbeReport): string | null {
+  const caldav = report.caldav;
+  if (caldav === null || caldav.ok) return null;
+  return (
+    `The mailbox was saved. Its CalDAV server did not work: ${caldav.message}. ` +
+    "Mail is unaffected; the calendar tools stay unavailable for this mailbox until " +
+    "that is fixed, which can be done by editing it here at any time."
+  );
+}
+
+export function saveRefusedNotice(report: MailboxProbeReport): string | null {
+  const blocked = blockedServices(report);
+  if (blocked.length === 0) return null;
+  const clauses = blocked.map((service) =>
+    service.credentialRejection
+      ? `${service.name} rejected these credentials`
+      : `${service.name} did not answer`
+  );
+  const remedy = blocked.some((service) => service.credentialRejection)
+    ? "Check the password this mailbox needs — some providers want an app password " +
+      "rather than the account one — then try again"
+    : "Check what failed above, then try again";
+  return `${clauses.join(", and ")}, so nothing was saved. ${remedy}, or press ` +
+    "Save anyway to store it without testing it.";
+}
+
 export function parseStampAnswer(value: unknown): string | null {
   const body = asObject(value);
   return body === null ? null : asString(body.stamp);
@@ -328,7 +501,11 @@ export function parseCreatedAnswer(value: unknown): MailboxCreatedAnswer | null 
   if (body === null) return null;
   const id = asString(body.id);
   const stamp = asString(body.stamp);
-  return id === null || stamp === null ? null : { id, stamp };
+  if (id === null || stamp === null) return null;
+  // The account is stored whether or not the report is readable; an unreadable
+  // one is dropped rather than turned into a failure to have written it.
+  const probe = parseProbeReport(body.probe);
+  return probe === null ? { id, stamp } : { id, stamp, probe };
 }
 
 /**
@@ -351,7 +528,11 @@ export function parseErrorAnswer(value: unknown): MailboxErrorAnswer {
     }
   }
   const message = asString(body.message);
-  return message === null ? { errors } : { message, errors };
+  const answer: MailboxErrorAnswer = message === null ? { errors } : { message, errors };
+  // Unreadable is absent, not a failure: the refusal stands whatever shape the
+  // report arrived in, and a caller with no report says so rather than guessing.
+  const probe = parseProbeReport(body.probe);
+  return probe === null ? answer : { ...answer, probe };
 }
 
 /**

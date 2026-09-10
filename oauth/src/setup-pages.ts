@@ -617,6 +617,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
       <span class="buttons">
         <button type="submit" name="_action" value="save">Save and continue</button>
         <button type="submit" name="_action" value="test" class="secondary">Test connection</button>
+        ${saveAnywayButton()}
       </span>
       ${skipButton()}
     </div>
@@ -676,6 +677,39 @@ export interface StepTwoLinks {
   providersHref: string;
   /** Tier 3, the full form, for an operator who would rather just type it all. */
   manualHref: string;
+}
+
+/**
+ * The `_action` value *Save anyway* submits.
+ *
+ * The wizard's screens dispatch on `_action` and its buttons already carry one,
+ * so the override cannot ride on the wire contract's own field name here the
+ * way it does on the connector's form — one button submits one name/value pair.
+ * `handleMailbox` translates this into `SAVE_ANYWAY_FIELD` on the request it
+ * makes, which is where the two paths meet.
+ */
+export const SAVE_ANYWAY_ACTION = "save_anyway";
+
+/**
+ * *Save anyway* — store the mailbox without probing it first (#147).
+ *
+ * Written after *Save and continue* and after *Test connection*, and — unlike
+ * {@link skipButton} — not pulled to the front by any CSS either. Only the
+ * *first* submit button in the DOM is what a form submitted implicitly (Enter
+ * in a text box) acts as, so Enter on this screen presses Save, which probes.
+ * This one takes a deliberate click, which is the whole of #140's lesson
+ * applied before the fact rather than after it.
+ *
+ * It is on the screen from the start rather than appearing after a refusal: the
+ * connector's probe budget is 25 seconds, and an operator who already knows
+ * their server is in a maintenance window should not have to sit through it to
+ * be shown the way past it.
+ */
+function saveAnywayButton(): string {
+  return `<button type="submit" name="_action" value="${escapeHtml(SAVE_ANYWAY_ACTION)}"
+        class="secondary" title="Store this mailbox without testing the connection first">
+        Save anyway
+      </button>`;
 }
 
 /**

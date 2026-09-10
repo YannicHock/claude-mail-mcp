@@ -612,4 +612,42 @@ describe("what pressing Enter in an Add mailbox field does", () => {
       assert.equal(buttons[0]?.novalidate, false, `Enter bypasses validation on ${screen}`);
     }
   });
+
+  it("never lets Enter reach Save anyway", () => {
+    // #147's escape hatch, held to #140's rule before it can break it. Save
+    // anyway stores a mailbox nothing has authenticated against, so the one
+    // property it must have is that it takes a deliberate click: it is neither
+    // the first submit button (which is what Enter presses) nor the only one.
+    for (const { screen, html } of ADD_MAILBOX_SCREENS) {
+      const buttons = submitButtons(formBodies(html)[0] ?? "");
+      const index = buttons.findIndex((button) => button.label === "Save anyway");
+      if (index === -1) continue;
+      assert.ok(index > 0, `Save anyway is what Enter presses on ${screen}`);
+    }
+  });
+});
+
+describe("Save anyway, on the full form", () => {
+  const html = renderMailboxForm({ csrf: "c", stamp: "1-2", account: null });
+
+  it("is on the form, under the field name the wire contract declares", () => {
+    assert.match(html, /name="save_anyway" value="1"/);
+    assert.match(html, />\s*Save anyway\s*</);
+  });
+
+  it("is written after Save, which is what makes Enter press Save", () => {
+    assert.ok(
+      html.indexOf('value="save"') < html.indexOf('name="save_anyway"'),
+      "Save anyway must not precede Save in the DOM"
+    );
+  });
+
+  it("is on an edit form too, since an edit can break a working mailbox", () => {
+    const editing = renderMailboxForm({
+      csrf: "c",
+      stamp: "1-2",
+      account: sampleAccount("work"),
+    });
+    assert.match(editing, /name="save_anyway"/);
+  });
 });

@@ -27,15 +27,18 @@ import { createApp } from "../../src/app.js";
 import { ASSERTION_HEADER } from "../../src/settings-assertion.js";
 import { MAIL_PROVIDERS } from "../../src/providers.js";
 import {
+  CHECKBOX_ON,
   draftFromFields,
   MAILBOX_FIELDS,
   parseCreatedAnswer,
   parseErrorAnswer,
   parseProbeAnswer,
   parseProvidersAnswer,
+  SAVE_ANYWAY_FIELD,
   type MailboxDraft,
   type MailboxProbeReport,
 } from "../../shared/settings-api.js";
+import { startRejectingImapServer } from "../helpers/fake-imap.js";
 import { readStamp } from "../../src/accounts-writer.js";
 import { makeAccount, makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
 
@@ -220,8 +223,31 @@ function escapeRe(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Attach `_stamp` from the connector's current on-disk stamp. */
+/**
+ * Attach `_stamp` from the connector's current on-disk stamp, and the *Save
+ * anyway* override.
+ *
+ * The override is here rather than at every call site because of what these
+ * hosts are: `imap.example.invalid` and its siblings are guaranteed not to
+ * resolve, and since #147 both write routes probe before they write. Every
+ * case below that is about the write — the round trip, the CalDAV block, the
+ * stale stamp, the shared password — would otherwise be refused by a probe it
+ * is not about, and would be asserting the gate over and over instead of the
+ * thing it was written for.
+ *
+ * So they say what an operator says by pressing the second button: store this
+ * without testing it. The gate itself has a file of its own,
+ * settings-save-probe.test.ts, which has real servers to point at.
+ */
 async function withStamp(
+  accountsPath: string,
+  fields: Record<string, string>
+): Promise<Record<string, string>> {
+  return { ...fields, _stamp: await stamp(accountsPath), [SAVE_ANYWAY_FIELD]: CHECKBOX_ON };
+}
+
+/** The same, for a case that wants the probe to run. */
+async function withStampProbed(
   accountsPath: string,
   fields: Record<string, string>
 ): Promise<Record<string, string>> {
@@ -560,6 +586,8 @@ test("a stale stamp is reported rather than clobbering", async () => {
     const res = await post(url, "/settings/mailboxes", {
       ...validForm({ id: "work" }),
       _stamp: stale,
+      // See `withStamp`: this case is about the stamp, not about the probe.
+      [SAVE_ANYWAY_FIELD]: CHECKBOX_ON,
     });
     assert.equal(res.status, 409);
     assert.match(await res.text(), /changed on disk/i);
@@ -939,6 +967,7 @@ test("a JSON create stores the account and answers 201 with the id and the new s
       _csrf: CSRF,
       _stamp: before,
       mailbox: validDraft(),
+      [SAVE_ANYWAY_FIELD]: true,
     });
 
     // 201 and not the browser's 303: there is nowhere to redirect a caller that
@@ -973,6 +1002,7 @@ test("a JSON create carries a CalDAV block through when the draft has one", asyn
       mailbox: validDraft({
         caldav: { url: "https://dav.example.invalid/", user: "dav-user", pass: "dav-secret" },
       }),
+      [SAVE_ANYWAY_FIELD]: true,
     });
 
     assert.equal(res.status, 201);
@@ -1021,6 +1051,7 @@ test("a JSON create against a stale stamp is refused, not allowed to clobber", a
       _csrf: CSRF,
       _stamp: "0-0",
       mailbox: validDraft(),
+      [SAVE_ANYWAY_FIELD]: true,
     });
 
     assert.equal(res.status, 409);
@@ -1711,5 +1742,145 @@ test("a rejected save never echoes the shared password back into the page", asyn
     assert.equal(html.includes("must-not-be-echoed"), false, html);
   } finally {
     await close();
+  }
+});
+
+// ---- The save that probes first (#147) -------------------------------------
+//
+// The two cases here are the ones a fake server can carry on its own: a real
+// IMAP rejection, and the override that skips the probe entirely. The rest of
+// the gate — a save that goes through, and a CalDAV failure that does not stop
+// one — needs servers that *work*, and lives in settings-save-probe.test.ts
+// against GreenMail.
+
+/** The full form, pointed at a server that refuses every login. */
+function formAgainst(port: number, overrides: Record<string, string> = {}): Record<string, string> {
+  return validForm({
+    id: "work",
+    "imap.host": "127.0.0.1",
+    "imap.port": String(port),
+    "imap.tls": "",
+    // Nothing is listening here, so SMTP is a connectivity failure — a
+    // different half of the same classification, on the same submission.
+    "smtp.host": "127.0.0.1",
+    "smtp.port": "1",
+    "smtp.tls": "",
+    ...overrides,
+  });
+}
+
+test("a mailbox whose IMAP the server rejects is not written, and the page says which", async () => {
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(accountsPath, formAgainst(imap.port))
+    );
+
+    assert.equal(res.status, 400, "the write must be refused, not merely reported on");
+    const page = await res.text();
+    // Per service, and told apart: the IMAP server answered and said no, the
+    // SMTP port has nothing behind it at all. Collapsing those two into "the
+    // connection test failed" is the confusion #146 exists to prevent.
+    assert.match(page, /IMAP rejected these credentials/);
+    assert.match(page, /SMTP did not answer/);
+    assert.match(page, /the server rejected these credentials/);
+    assert.match(page, /Save anyway/, "the way past the gate has to be on the page");
+
+    assert.deepEqual(
+      JSON.parse(await readFile(accountsPath, "utf8")).accounts,
+      [],
+      "nothing may be stored by a submission the probe refused"
+    );
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("the same submission in JSON is refused with the report, not just a message", async () => {
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await postJson(url, "/settings/mailboxes", {
+      _csrf: CSRF,
+      _stamp: await stamp(accountsPath),
+      mailbox: draftFromFields(formAgainst(imap.port)),
+    });
+
+    assert.equal(res.status, 400);
+    const answer = parseErrorAnswer(await res.json());
+    assert.equal(answer.probe?.imap.ok, false);
+    // The classification, on the wire — which is what lets the wizard say the
+    // same sentence this connector's own page says.
+    assert.equal(
+      answer.probe?.imap.ok === false && answer.probe.imap.credentialRejection,
+      true
+    );
+    assert.equal(answer.probe?.smtp.ok, false);
+    assert.match(answer.message ?? "", /nothing was saved/i);
+    assert.deepEqual(answer.errors, {}, "no field the operator typed is wrong");
+    assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("Save anyway writes the very same mailbox, and probes nothing", async () => {
+  // Same credentials, same servers, one extra field — and the operator gets
+  // their mailbox. That is the escape hatch: a server in maintenance, a
+  // network blip, or someone who knows better is not stuck behind a probe.
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const started = Date.now();
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(accountsPath, {
+        ...formAgainst(imap.port),
+        [SAVE_ANYWAY_FIELD]: CHECKBOX_ON,
+      })
+    );
+
+    assert.equal(res.status, 303);
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")).accounts as Account[];
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0]?.id, "work");
+    // Nothing was probed, so nothing waited on a socket: a probe against the
+    // dead SMTP port alone would have cost seconds. This is the observable
+    // difference between "the probe passed" and "there was no probe".
+    assert.ok(Date.now() - started < 2000, "Save anyway must not have probed anything");
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("an edit is gated the same way, and leaves the stored mailbox alone", async () => {
+  // The route an operator uses for every mailbox they already have. An edit
+  // that replaces a working password with one the server refuses leaves
+  // exactly the mailbox #147 is about.
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector([
+    makeAccount({ id: "work", label: "Work" }),
+  ]);
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes/work",
+      await withStampProbed(accountsPath, formAgainst(imap.port, { "imap.pass": "changed" }))
+    );
+
+    assert.equal(res.status, 400);
+    assert.match(await res.text(), /rejected these credentials/);
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")).accounts as Account[];
+    assert.equal(stored[0]?.imap.pass, makeAccount({ id: "work" }).imap.pass, "unchanged");
+  } finally {
+    await close();
+    await imap.close();
   }
 });
