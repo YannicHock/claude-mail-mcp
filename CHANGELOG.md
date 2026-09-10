@@ -4,6 +4,14 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/PROVIDERS.md` — what each provider wants from a *password*, not just where it lives.** The provider table has always said hosts, ports and TLS; it never said that Fastmail and iCloud refuse the account password outright, or that Gmail refuses it as soon as 2-Step Verification is on. Fourteen providers checked against their own current documentation, every claim carrying the URL it was read off, and the answers sorted into four kinds: the ordinary password works (Migadu, Hetzner, iRedMail); an app password once 2FA is on (Gmail, mailbox.org, Zoho, mailcow); an app password always (Fastmail, iCloud, Yahoo, AOL, and Posteo, which documents it as *the* credential without saying the account password is refused); and **cannot be served at all** — Outlook.com and Microsoft 365, where Microsoft has removed IMAP basic authentication and says no one can re-enable it, and Proton, whose servers answer no IMAP without the Bridge.
+
+  Three of the things "everybody knows" did not survive the sources. Yahoo and AOL require an app password for **any** client that does not use their branded sign-in page, with no two-step-verification precondition — they are not the conditional case they were assumed to be. Gmail's IMAP on/off switch is gone: Google documents that since January 2025 IMAP is always on, so advice to go and enable it sends an operator hunting for a setting that no longer exists. And that Google shows the app password as four groups of four to be pasted without the spaces is not in Google's documentation, so this page does not claim it — the page has a section for what it could not verify, and that is the point of it.
+
+  `DEPLOYMENT.md` stops carrying three providers' worth of app-password knowledge in passing inside a section about revoking them, and points here.
+
 ### Fixed
 
 - **The `/authorize` redirects carry the security headers, and no longer echo the authorization code.** The two redirects on the authorization path — the success hand-off back to the client, and the OAuth error response — went out through `res.redirect()`, which sets none of this service's headers and renders a body when the client accepts HTML. That body repeated the target URL: for the success redirect, the one-time authorization code; for the error redirect, the `error_description`. Both now go out through the same `sendRedirect()` helper every other redirect in the service uses, so they carry `Cache-Control: no-store`, the CSP, `X-Frame-Options` and `Referrer-Policy`, and end with no body at all. `page-headers.test.ts` gained a case per redirect, which is what the file was missing: every case in it reached a *rendered page*, so the one credential-carrying response in the service was outside the invariant the file exists to assert.
