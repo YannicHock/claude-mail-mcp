@@ -1,5 +1,6 @@
 /**
- * Rendering for the mailbox settings pages — the list and the editor form.
+ * Rendering for the mailbox settings pages — the list, the editor form, and the
+ * three screens of the address-first *Add mailbox* cascade (#141).
  *
  * Pure functions: plain data in, an HTML string out. No I/O, no Express — that
  * lives in settings-routes.ts, which mounts these. Every interaction is a form
@@ -8,11 +9,14 @@
  * every settings page.
  *
  * This is also the file that makes "no stored password ever reaches the browser"
- * true by construction rather than by care: password inputs always render
- * `value=""` with `placeholder="unchanged"` and `autocomplete="new-password"`,
- * regardless of what the underlying `Account` holds. The router applies the other
- * half of that rule on save — an empty submitted field keeps the stored value, a
- * non-empty one replaces it — but the browser never sees the old value either way.
+ * true by construction rather than by care: a password input renders `value=""`
+ * with `placeholder="unchanged"` and `autocomplete="new-password"` regardless of
+ * what the underlying `Account` holds. The router applies the other half of that
+ * rule on save — an empty submitted field keeps the stored value, a non-empty one
+ * replaces it — but the browser never sees the old value either way. The one
+ * value a password box may be rendered with is the operator's own submission on
+ * its way through the cascade to the form that will send it (#120), which comes
+ * from `carrying()` in settings-api.ts and never from an account.
  *
  * The mailbox form's field names are not written here. They come from
  * `MAILBOX_FIELDS` in settings-api.ts, which is also what `parseAccountForm`
@@ -29,7 +33,15 @@
  */
 
 import { RESERVED_IDS, reservedIdNotice, type Account } from "./accounts.js";
-import { MAILBOX_FIELDS } from "./settings-api.js";
+import {
+  ADDRESS_FIELD,
+  CHECKBOX_ON,
+  MAILBOX_FIELDS,
+  PROVIDER_FIELD,
+  PROVIDER_OTHER,
+  SHARED_PASSWORD_FIELD,
+  type ProviderPreset,
+} from "./settings-api.js";
 
 /**
  * Mirrors `ProbeReport` from `./probe.ts`, which is not present in this file's
@@ -55,6 +67,12 @@ export interface MailboxFormData {
   values?: Record<string, string>;
   errors?: Record<string, string>;
   probe?: ProbeReportView;
+  /**
+   * A message across the top of the form: what happened, and to what. Used by
+   * the cascade, which arrives here having filled the form in from a provider
+   * preset or from a lookup the operator has just read.
+   */
+  notice?: string;
 }
 
 export interface MailboxListData {
@@ -150,11 +168,19 @@ button {
   padding: .65rem 1.1rem; border: 0; border-radius: 6px; font: inherit;
   font-weight: 600; cursor: pointer; margin-right: .75rem;
 }
-button[name="_action"][value="save"] { background: AccentColor; color: AccentColorText; }
-button[name="_action"][value="test"] {
+button[name="_action"][value="save"],
+button[name="_action"][value="lookup"],
+button[name="_action"][value="provider"] { background: AccentColor; color: AccentColorText; }
+button[name="_action"][value="test"],
+button[name="_action"][value="edit"] {
   background: Canvas; color: CanvasText;
   border: 1px solid color-mix(in srgb, CanvasText 30%, transparent);
 }
+p.muted { font-size: .85rem; opacity: .75; margin: -.5rem 0 1.25rem; }
+p.ways { font-size: .85rem; margin: 1.5rem 0 0; }
+.choice { margin-bottom: .75rem; }
+.choice .checkbox-row { margin-bottom: .25rem; }
+.choice-note { margin: 0 0 .25rem 1.6rem; font-size: .8rem; opacity: .75; }
 .error { padding: .6rem .7rem; margin-bottom: 1rem; border-radius: 6px; font-size: .9rem;
   background: color-mix(in srgb, #d33 15%, Canvas); color: CanvasText; }
 .notice { padding: .6rem .7rem; margin-bottom: 1rem; border-radius: 6px; font-size: .9rem;
@@ -235,16 +261,36 @@ function textField(opts: {
 ${fieldErrorHtml(opts.errors, opts.errorKey ?? opts.name)}`;
 }
 
+/**
+ * A password box — empty, unless the operator's own submission is being carried
+ * into it.
+ *
+ * The rule this file has always kept is that no *stored* password reaches the
+ * browser, and that is untouched: `values` on this form is never built out of an
+ * `Account`. What it can hold is the one password typed on the address screen a
+ * moment ago, on its way to the form that is about to send it — #120, and the
+ * same carry the wizard makes. Every other path renders `value=""` because
+ * `sanitize()` in settings-routes.ts strips the secret fields out of a
+ * re-rendered submission before it ever gets here.
+ *
+ * `placeholder="unchanged"` goes with the empty box and not with a filled one:
+ * on a new mailbox there is nothing to leave unchanged, and over a value the
+ * operator can see it would be a caption contradicting the box it sits in.
+ */
 function passwordField(opts: {
   id: string;
   name: string;
   label: string;
   required?: boolean;
   errors?: Record<string, string>;
+  /** Carried forward from the screen it was typed on. "" for every other path. */
+  carried?: string;
 }): string {
+  const carried = opts.carried ?? "";
+  const placeholder = carried === "" ? `placeholder="unchanged" ` : "";
   return `<label for="${escapeHtml(opts.id)}">${escapeHtml(opts.label)}</label>
-<input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="password" value=""
-       placeholder="unchanged" autocomplete="new-password"${opts.required ? " required" : ""}>
+<input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="password" value="${escapeHtml(carried)}"
+       ${placeholder}autocomplete="new-password"${opts.required ? " required" : ""}>
 ${fieldErrorHtml(opts.errors, opts.name)}`;
 }
 
@@ -352,6 +398,14 @@ export function renderMailboxForm(opts: MailboxFormData): string {
   const mail = account?.mail;
   const caldav = account?.caldav;
 
+  // The one password the operator typed on the address screen, on its way to
+  // the boxes that are about to send it (#120). Never an account's: `values` on
+  // this form is built either by `sanitize()`, which strips every secret field,
+  // or by the cascade's `carrying()`, which puts back only what was just typed.
+  const carried = (name: string): string => values?.[name] ?? "";
+  const anyCarried =
+    carried(MAILBOX_FIELDS.imapPass) !== "" || carried(MAILBOX_FIELDS.smtpPass) !== "";
+
   // An account already stored under a reserved id cannot be edited in place:
   // the form action built just below is a literal settings route, not this
   // account's own. The list page already says so on that account's row; the
@@ -387,7 +441,13 @@ ${textField({
   value: fieldValue(values, MAILBOX_FIELDS.caldavUser, caldav?.user ?? ""),
   errors,
 })}
-${passwordField({ id: "caldav_pass", name: MAILBOX_FIELDS.caldavPass, label: "Password", errors })}
+${passwordField({
+  id: "caldav_pass",
+  name: MAILBOX_FIELDS.caldavPass,
+  label: "Password",
+  errors,
+  carried: carried(MAILBOX_FIELDS.caldavPass),
+})}
 ${
   caldav
     ? checkboxField({
@@ -400,8 +460,14 @@ ${
 }
 </fieldset>`;
 
+  const sub = anyCarried
+    ? "The password you entered has been carried over rather than asked for again. " +
+      "Change it here if this mailbox takes a different one for IMAP and SMTP."
+    : "Password fields are always blank here. Leave one blank to keep the stored value.";
+
   const body = `<h1>${isNew ? "Add mailbox" : `Edit mailbox — ${escapeHtml(account.label)}`}</h1>
-<p class="sub">Password fields are always blank here. Leave one blank to keep the stored value.</p>
+<p class="sub">${escapeHtml(sub)}</p>
+${opts.notice === undefined ? "" : `<div class="notice">${escapeHtml(opts.notice)}</div>`}
 ${reservedNotice}
 ${probeSectionHtml(opts.probe, !reserved)}
 <form method="post" action="${escapeHtml(actionPath)}" autocomplete="off">
@@ -449,7 +515,14 @@ ${probeSectionHtml(opts.probe, !reserved)}
     required: true,
     errors,
   })}
-  ${passwordField({ id: "imap_pass", name: MAILBOX_FIELDS.imapPass, label: "Password", required: isNew, errors })}
+  ${passwordField({
+    id: "imap_pass",
+    name: MAILBOX_FIELDS.imapPass,
+    label: "Password",
+    required: isNew,
+    errors,
+    carried: carried(MAILBOX_FIELDS.imapPass),
+  })}
   ${checkboxField({
     id: "imap_tls",
     name: MAILBOX_FIELDS.imapTls,
@@ -487,7 +560,14 @@ ${probeSectionHtml(opts.probe, !reserved)}
     required: true,
     errors,
   })}
-  ${passwordField({ id: "smtp_pass", name: MAILBOX_FIELDS.smtpPass, label: "Password", required: isNew, errors })}
+  ${passwordField({
+    id: "smtp_pass",
+    name: MAILBOX_FIELDS.smtpPass,
+    label: "Password",
+    required: isNew,
+    errors,
+    carried: carried(MAILBOX_FIELDS.smtpPass),
+  })}
   ${checkboxField({
     id: "smtp_tls",
     name: MAILBOX_FIELDS.smtpTls,
@@ -536,7 +616,380 @@ ${probeSectionHtml(opts.probe, !reserved)}
     Test connection
   </button>
 </form>
+${isNew ? otherWaysIn("manual") : ""}
 <p><a href="/settings">Back to settings</a></p>`;
 
   return page(isNew ? "Add mailbox" : "Edit mailbox", body);
+}
+
+// ---- Add mailbox, address first --------------------------------------------
+//
+// Three more screens, all of them *Add mailbox*, and all of them served from
+// `/settings/mailboxes/new`:
+//
+//   the address screen   →  a lookup, and what it found, for confirmation
+//                        →  or, when it found nothing, the provider list
+//                        →  or, from either, the full form above
+//
+// The full form is the last of them rather than the first. That is the whole of
+// #141: the wizard has run this cascade since #70, but only once, for the
+// mailbox an operator is most likely to know the settings for — and every
+// mailbox after it got eighteen empty boxes.
+//
+// The branching between them is not here and is not the wizard's either. It is
+// `stepFromLookup` / `stepFromProvider` / `stepFromEdit` in settings-api.ts,
+// which both entry points call; these functions render one screen each from what
+// those decided. What differs between the two entry points, and is why there are
+// two sets of renderers rather than a mirrored one, is exactly the chrome: the
+// wizard has a step counter and a Skip button on every screen, and these have a
+// CSRF token, an accounts stamp and a way back to the mailbox list.
+
+/** Which of the four screens is being looked at, for the links out of it. */
+type AddMailboxView = "address" | "suggestion" | "providers" | "manual";
+
+/** The three ways in, as URLs. `?view=` is how the last two are reached. */
+const ADD_MAILBOX = "/settings/mailboxes/new";
+const ADD_MAILBOX_PROVIDERS = `${ADD_MAILBOX}?view=providers`;
+const ADD_MAILBOX_MANUAL = `${ADD_MAILBOX}?view=manual`;
+
+/**
+ * The other tiers, as links.
+ *
+ * Every screen offers the ones it is not, which is what makes this a cascade
+ * rather than a funnel: the lookup is a convenience, and an operator who already
+ * knows their settings must never have to walk through it to reach the form. The
+ * confirmation screen counts as the address screen here — it is what that screen
+ * turned into, and offering "look it up from the address" on it would be a link
+ * back to where they just were.
+ */
+function otherWaysIn(current: AddMailboxView): string {
+  const all: Array<{ view: AddMailboxView; href: string; text: string }> = [
+    { view: "address", href: ADD_MAILBOX, text: "Look it up from the address" },
+    { view: "providers", href: ADD_MAILBOX_PROVIDERS, text: "Choose provider manually" },
+    { view: "manual", href: ADD_MAILBOX_MANUAL, text: "Enter all the settings myself" },
+  ];
+  const shown = current === "suggestion" ? "address" : current;
+  const links = all
+    .filter((entry) => entry.view !== shown)
+    .map((entry) => `<a href="${escapeHtml(entry.href)}">${escapeHtml(entry.text)}</a>`)
+    .join(" · ");
+  return `<p class="ways">${links}</p>`;
+}
+
+function noticeHtml(notice: string | undefined): string {
+  return notice === undefined ? "" : `<div class="notice">${escapeHtml(notice)}</div>`;
+}
+
+export interface MailboxAddressData {
+  csrf: string;
+  /** What to put back in the address box after a rejected submission. */
+  email: string;
+  /** Keyed by field name, so the address's own rejection sits against its box. */
+  errors?: Record<string, string>;
+  notice?: string;
+}
+
+/**
+ * Tier 1 — an address and a password, and nothing else on the screen.
+ *
+ * On Continue the connector looks the domain up — autoconfig, then the ISPDB,
+ * then RFC 6186 SRV records, all of it `src/autoconfig.ts` and none of it new
+ * here — and what it finds is shown for confirmation. A lookup that finds
+ * nothing is not a failure and is never reported as one: the next screen is
+ * simply the provider list.
+ *
+ * The password is asked for here rather than after the lookup because it is the
+ * other half of the same thought — "this is my mailbox" — and because a screen
+ * that asks for an address, goes away for up to ten seconds and then asks for a
+ * password reads as two steps rather than one.
+ */
+export function renderMailboxAddress(opts: MailboxAddressData): string {
+  const emailError = opts.errors?.[ADDRESS_FIELD] ?? "";
+  const body = `<h1>Add mailbox</h1>
+<p class="sub">Start with the address. Most providers publish their own settings, so the
+servers, ports and encryption can usually be worked out from it.</p>
+${noticeHtml(opts.notice)}
+<form method="post" action="${escapeHtml(ADD_MAILBOX)}" autocomplete="off">
+  <input type="hidden" name="_csrf" value="${escapeHtml(opts.csrf)}">
+  <label for="mail_from">Email address</label>
+  <input id="mail_from" name="${escapeHtml(ADDRESS_FIELD)}" type="text"
+         value="${escapeHtml(opts.email)}" required autofocus
+         autocapitalize="none" autocorrect="off" spellcheck="false">
+  ${fieldErrorHtml(opts.errors, ADDRESS_FIELD)}
+  <label for="mailbox_password">Password</label>
+  <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
+         value="" autocomplete="new-password" required>
+  <p class="muted">The password for the mailbox itself. Some providers want an app password
+  here rather than the one you sign in to their website with.</p>
+  <button type="submit" name="_action" value="lookup">Continue</button>
+</form>
+${otherWaysIn("address")}
+<p><a href="/settings/mailboxes">Back to mailboxes</a></p>`;
+
+  return page("Add mailbox", body);
+}
+
+export interface MailboxSuggestionData {
+  csrf: string;
+  /** The stamp the save must still be against, read when this page was built. */
+  stamp: string;
+  /** The domain the settings were found for, for the heading. */
+  domain: string;
+  /** Where the answer came from, in words the operator can act on. */
+  sourceLabel: string;
+  /**
+   * The settings themselves, under `MAILBOX_FIELDS` names — both what the rows
+   * are rendered from and what the hidden inputs carry into the save, so there
+   * is one copy of them on the screen rather than two that could disagree.
+   * Never contains a password.
+   */
+  values: Record<string, string>;
+  /**
+   * The password the operator typed on the address screen, or "" when the
+   * submission that triggered the lookup did not carry one.
+   *
+   * Not part of {@link MailboxSuggestionData.values}: those are the connector's
+   * field names and the rows on the screen are rendered from them, which is the
+   * last place a password belongs.
+   */
+  password: string;
+  errors?: Record<string, string>;
+  notice?: string;
+}
+
+/** `imap.example.com:993`, or "" when there is no host to show. */
+function endpoint(values: Record<string, string>, hostKey: string, portKey: string): string {
+  const host = values[hostKey] ?? "";
+  const port = values[portKey] ?? "";
+  if (host === "") return "";
+  return port === "" ? host : `${host}:${port}`;
+}
+
+function suggestionRow(name: string, detail: string, encryption: string): string {
+  const right = encryption === "" ? detail : `${detail} · ${encryption}`;
+  return `<div class="probe-row ok"><strong>${escapeHtml(name)}</strong><span>${escapeHtml(
+    right
+  )}</span></div>`;
+}
+
+/**
+ * The password, carried rather than asked for a second time.
+ *
+ * #120: the operator typed it on the address screen, that submission is what
+ * produced this one, and asking again — on a screen that until now said nothing
+ * about the first answer — is the page forgetting something the operator can
+ * plainly see it was told.
+ *
+ * A hidden input is the shape, because that is how the rest of this screen
+ * already travels: the settings it is confirming are hidden inputs too, and the
+ * page is `Cache-Control: no-store`. It is stated in words as well — a screen
+ * that has silently acquired a credential is one an operator cannot reason
+ * about.
+ *
+ * The empty case is not hypothetical. `required` on the address screen is the
+ * browser's promise, not this module's, and a POST that skipped it still has to
+ * produce a screen the operator can finish on.
+ */
+function suggestionPassword(password: string): string {
+  if (password === "") {
+    return `<label for="mailbox_password">Password</label>
+  <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
+         value="" autocomplete="new-password" required autofocus>
+  <p class="muted">Passwords are never written back into this page, so it has to be typed
+  here. It is used to log in to the servers above, and stored with the mailbox.</p>`;
+  }
+  return `<input type="hidden" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" value="${escapeHtml(
+    password
+  )}">
+  <p class="muted">The password you entered is carried with this form, so there is nothing to
+  type here — press Edit these to change it, or to give IMAP and SMTP different ones.</p>`;
+}
+
+/**
+ * Tier 1's answer: what the lookup found, shown before any of it is used.
+ *
+ * The whole point of this screen is that it exists. Applying an autoconfig
+ * answer silently would be less typing and much worse: a wrong host produces a
+ * connection failure minutes later, on a screen that says nothing about where
+ * the host came from, and an operator who never saw it has no reason to suspect
+ * it. Here they read it once, and `Edit these` is one press away.
+ *
+ * The ID and the name are boxes rather than rows, unlike the wizard's version of
+ * this screen. The wizard's first mailbox is `main` and there is nothing to
+ * collide with; a second mailbox needs an id of its own, and one derived from
+ * the address is a suggestion — shown, not applied — that the operator can
+ * change here rather than meeting it as a rejection after pressing Save.
+ *
+ * CalDAV missing is stated as ordinary, because it is. Most mail providers
+ * publish nothing for it, calendars are optional in the account model, and an
+ * operator who reads "not found" as a problem will go looking for one.
+ */
+export function renderMailboxSuggestion(opts: MailboxSuggestionData): string {
+  const { values, errors } = opts;
+
+  // Everything except the two the operator is being shown as boxes, which the
+  // form submits under the same names anyway — a hidden twin would send the
+  // field twice and `draftFromFields` reads a repeated field as absent.
+  const shown = new Set<string>([MAILBOX_FIELDS.id, MAILBOX_FIELDS.label]);
+  const hidden = Object.entries(values)
+    .filter(([name]) => !shown.has(name))
+    .map(
+      ([name, value]) =>
+        `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`
+    )
+    .join("\n  ");
+
+  const caldavUrl = values[MAILBOX_FIELDS.caldavUrl] ?? "";
+  const caldavRow =
+    caldavUrl === ""
+      ? `<div class="probe-row"><strong>CalDAV</strong><span>not found — calendars can be added later</span></div>`
+      : suggestionRow("CalDAV", caldavUrl, "");
+
+  const body = `<h1>Add mailbox</h1>
+<p class="sub">Found settings for ${escapeHtml(opts.domain)}. Check them before they are used —
+nothing has been stored, and nothing has been contacted with your password yet.</p>
+${noticeHtml(opts.notice)}
+<div class="notice">
+${suggestionRow(
+  "IMAP",
+  endpoint(values, MAILBOX_FIELDS.imapHost, MAILBOX_FIELDS.imapPort),
+  values[MAILBOX_FIELDS.imapTls] === CHECKBOX_ON ? "TLS" : "STARTTLS"
+)}
+${suggestionRow(
+  "SMTP",
+  endpoint(values, MAILBOX_FIELDS.smtpHost, MAILBOX_FIELDS.smtpPort),
+  values[MAILBOX_FIELDS.smtpTls] === CHECKBOX_ON ? "TLS" : "STARTTLS"
+)}
+${caldavRow}
+</div>
+<p class="muted">${escapeHtml(opts.sourceLabel)}</p>
+<form method="post" action="/settings/mailboxes" autocomplete="off">
+  <input type="hidden" name="_csrf" value="${escapeHtml(opts.csrf)}">
+  <input type="hidden" name="_stamp" value="${escapeHtml(opts.stamp)}">
+  ${hidden}
+  ${textField({
+    id: "label",
+    name: MAILBOX_FIELDS.label,
+    label: "Name for this mailbox",
+    value: values[MAILBOX_FIELDS.label] ?? "",
+    required: true,
+    errors,
+  })}
+  ${textField({
+    id: "id",
+    name: MAILBOX_FIELDS.id,
+    label: "ID",
+    value: values[MAILBOX_FIELDS.id] ?? "",
+    required: true,
+    errors,
+  })}
+  <p class="muted">How the mail tools refer to this mailbox. Lowercase letters, digits, _ or -.</p>
+  ${suggestionPassword(opts.password)}
+  <button type="submit" name="_action" value="save">Save mailbox</button>
+  <button type="submit" name="_action" value="edit"
+          formaction="${escapeHtml(ADD_MAILBOX)}" formnovalidate>
+    Edit these
+  </button>
+</form>
+${otherWaysIn("suggestion")}
+<p><a href="/settings/mailboxes">Back to mailboxes</a></p>`;
+
+  return page("Add mailbox", body);
+}
+
+export interface MailboxProvidersData {
+  csrf: string;
+  /** The table, as the connector's own `providerPresets` produced it. */
+  providers: readonly ProviderPreset[];
+  /** The domain the lookup found nothing for, or "" when reached from the link. */
+  domain: string;
+  /** Carried across so the address is typed once, not once per screen. */
+  email: string;
+  /** Which radio is on, when a submission is being re-rendered. */
+  selected: string;
+  /**
+   * The password the operator typed on the address screen, or "" when this
+   * screen was reached from its own link and nobody has typed one yet.
+   */
+  password: string;
+  errors?: Record<string, string>;
+  notice?: string;
+}
+
+/**
+ * The password on the way through tier 2, on the one route that has one.
+ *
+ * This screen is reached two ways, and #120 is only about one of them. From a
+ * lookup that found nothing, the operator typed a password a moment ago and this
+ * screen is on the way to the form that will use it. From the `Choose provider
+ * manually` link, nobody has typed anything, so there is nothing to carry and
+ * nothing to say about it — and a note claiming otherwise would be the worse
+ * half of the bug.
+ */
+function providerPassword(password: string): string {
+  if (password === "") return "";
+  return `<input type="hidden" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" value="${escapeHtml(
+    password
+  )}">
+  <p class="muted">The password you entered is carried with this form, so the next screen has
+  it already.</p>`;
+}
+
+/**
+ * Tier 2 — the list, when the lookup found nothing or the operator asked for it.
+ *
+ * The opening line is about the domain, not about the lookup: "we could not
+ * detect settings for example.com" is a fact, where "the autoconfig lookup
+ * failed" is a failure the operator can neither confirm nor act on, and no
+ * autoconfig failure is ever shown as an error.
+ *
+ * Radios rather than a `<select>`, because each entry has a caveat next to it
+ * and a dropdown has nowhere to put one. Those caveats are the point of the
+ * list: iCloud's IMAP login is not the whole address, Fastmail refuses the
+ * account password outright, and an operator who meets either of those as a bare
+ * "authentication failed" two screens later will conclude they typed their
+ * password wrong.
+ */
+export function renderMailboxProviders(opts: MailboxProvidersData): string {
+  const choice = (id: string, label: string, note: string): string => {
+    const inputId = `provider_${id.replace(/[^a-z0-9]+/gi, "_")}`;
+    return `<div class="choice">
+    <div class="checkbox-row">
+      <input id="${escapeHtml(inputId)}" name="${escapeHtml(PROVIDER_FIELD)}" type="radio"
+             value="${escapeHtml(id)}"${opts.selected === id ? " checked" : ""} required>
+      <label for="${escapeHtml(inputId)}">${escapeHtml(label)}</label>
+    </div>
+    ${note === "" ? "" : `<p class="choice-note">${escapeHtml(note)}</p>`}
+  </div>`;
+  };
+
+  const lead =
+    opts.domain === ""
+      ? "Pick your provider and the servers, ports and encryption are filled in for you."
+      : `We could not detect settings for ${opts.domain}. Pick your provider and the ` +
+        "servers, ports and encryption are filled in for you.";
+
+  const body = `<h1>Add mailbox</h1>
+<p class="sub">${escapeHtml(lead)}</p>
+${noticeHtml(opts.notice)}
+<form method="post" action="${escapeHtml(ADD_MAILBOX)}" autocomplete="off">
+  <input type="hidden" name="_csrf" value="${escapeHtml(opts.csrf)}">
+  <label for="mail_from">Email address</label>
+  <input id="mail_from" name="${escapeHtml(ADDRESS_FIELD)}" type="text"
+         value="${escapeHtml(opts.email)}" required
+         autocapitalize="none" autocorrect="off" spellcheck="false">
+  ${fieldErrorHtml(opts.errors, ADDRESS_FIELD)}
+  <fieldset>
+  <legend>Provider</legend>
+  ${opts.providers.map((p) => choice(p.id, p.label, p.note)).join("\n  ")}
+  ${choice(PROVIDER_OTHER, "Other — enter the settings myself", "")}
+  ${fieldErrorHtml(opts.errors, PROVIDER_FIELD)}
+  </fieldset>
+  ${providerPassword(opts.password)}
+  <button type="submit" name="_action" value="provider">Continue</button>
+</form>
+${otherWaysIn("providers")}
+<p><a href="/settings/mailboxes">Back to mailboxes</a></p>`;
+
+  return page("Add mailbox", body);
 }

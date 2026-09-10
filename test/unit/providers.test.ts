@@ -28,9 +28,9 @@ import {
   LOCALPART_PLACEHOLDER,
   MAIL_PROVIDERS,
   prefillFor,
-  domainOf,
+  providerPresets,
 } from "../../src/providers.js";
-import { CHECKBOX_ON, MAILBOX_FIELDS } from "../../src/settings-api.js";
+import { CHECKBOX_ON, domainOf, MAILBOX_FIELDS } from "../../src/settings-api.js";
 
 const EMAIL = "Anna.Example@Example.Com";
 
@@ -272,6 +272,78 @@ describe("domainOf", () => {
     assert.equal(domainOf('"weird@local"@example.com'), "example.com");
     for (const value of ["", "anna", "anna@", "@example.com"]) {
       assert.equal(domainOf(value), "", JSON.stringify(value));
+    }
+  });
+});
+
+describe("providerPresets — the table, as both readers get it", () => {
+  // The one shape the table leaves this module in. The settings UI calls it
+  // directly and the setup wizard reads the same thing off
+  // `POST /settings/providers`, so an entry that is wrong here is wrong in both
+  // places at once — which is the point of there being one table (#141).
+
+  it("offers every entry the table has, in the table's own order", () => {
+    assert.deepEqual(
+      providerPresets(EMAIL).map((preset) => preset.id),
+      MAIL_PROVIDERS.map((provider) => provider.id)
+    );
+  });
+
+  it("carries the same values prefillFor produces, resolved for the address", () => {
+    // Resolved on this side, not the caller's: a caller that had to substitute
+    // %DOMAIN% itself would be a second implementation of the one thing this
+    // table does, in the package that cannot see the placeholders.
+    for (const provider of MAIL_PROVIDERS) {
+      const preset = providerPresets(EMAIL).find((entry) => entry.id === provider.id);
+      assert.ok(preset, provider.id);
+      assert.deepEqual(preset.values, prefillFor(provider, EMAIL));
+    }
+  });
+
+  it("leaves no placeholder in anything it sends", () => {
+    for (const placeholder of [DOMAIN_PLACEHOLDER, LOCALPART_PLACEHOLDER, EMAIL_PLACEHOLDER]) {
+      for (const preset of providerPresets(EMAIL)) {
+        for (const [name, value] of Object.entries(preset.values)) {
+          assert.equal(
+            value.includes(placeholder),
+            false,
+            `${preset.id}'s ${name} still has ${placeholder} in it`
+          );
+        }
+      }
+    }
+  });
+
+  it("still answers for an address nobody has typed yet", () => {
+    // The provider list is reachable from its own link, before there is an
+    // address. An entry whose host is a template has nothing to become then,
+    // and an empty required box is a prompt where `mail.` is a puzzle.
+    const presets = providerPresets("");
+    assert.equal(presets.length, MAIL_PROVIDERS.length);
+    const mailcow = presets.find((preset) => preset.id === "mailcow");
+    assert.ok(mailcow);
+    assert.equal(mailcow.values[MAILBOX_FIELDS.imapHost], "");
+    // A literal host is not a template and survives having no address.
+    const posteo = presets.find((preset) => preset.id === "posteo");
+    assert.ok(posteo);
+    assert.equal(posteo.values[MAILBOX_FIELDS.imapHost], "posteo.de");
+  });
+
+  it("sends no password field, under any name, for any provider", () => {
+    // The same property `prefillFor` has, restated at the boundary the values
+    // actually cross. A preset is something to confirm, not to connect with.
+    const serialised = JSON.stringify(providerPresets(EMAIL));
+    for (const secret of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass, MAILBOX_FIELDS.caldavPass]) {
+      assert.equal(serialised.includes(secret), false, `${secret} is on the wire`);
+    }
+  });
+
+  it("does not send the documentation URL each entry was verified against", () => {
+    // `source` is for whoever checks the table next, not for the operator, and
+    // nothing renders it. What is not rendered is not sent.
+    const serialised = JSON.stringify(providerPresets(EMAIL));
+    for (const provider of MAIL_PROVIDERS) {
+      assert.equal(serialised.includes(provider.source), false, `${provider.id}'s source is sent`);
     }
   });
 });

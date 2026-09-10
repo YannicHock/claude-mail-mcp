@@ -25,12 +25,14 @@ import { AccountsStore, type Account } from "../../src/accounts.js";
 import { ClientPool } from "../../src/client-pool.js";
 import { createApp } from "../../src/app.js";
 import { ASSERTION_HEADER } from "../../src/settings-assertion.js";
+import { MAIL_PROVIDERS } from "../../src/providers.js";
 import {
   draftFromFields,
   MAILBOX_FIELDS,
   parseCreatedAnswer,
   parseErrorAnswer,
   parseProbeAnswer,
+  parseProvidersAnswer,
   type MailboxDraft,
   type MailboxProbeReport,
 } from "../../src/settings-api.js";
@@ -212,6 +214,11 @@ const EXPECTED_HEADERS = {
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
   "referrer-policy": "same-origin",
 };
+
+/** A literal, escaped so it can be dropped into a RegExp without meaning anything. */
+function escapeRe(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /** Attach `_stamp` from the connector's current on-disk stamp. */
 async function withStamp(
@@ -807,16 +814,28 @@ test("the new-mailbox route states the accounts stamp when asked for JSON", asyn
   }
 });
 
-test("a browser still gets the form from the very same route", async () => {
+test("a browser still gets a page from the very same route", async () => {
   // Content negotiation, not a replacement. The settings UI posts to these
   // routes unchanged and must go on getting a page.
+  //
+  // Which page it is changed with #141: a bare GET is now the address screen,
+  // and the eighteen-field form it used to be is `?view=manual`. Both are
+  // asserted, because "html rather than a document" is what this case is about
+  // and the full form still has to be one press away.
   const { url, close } = await startConnector();
   try {
     const res = await get(url, "/settings/mailboxes/new", mint("GET", "/settings/mailboxes/new"));
-
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type")?.split(";")[0].trim(), "text/html");
-    assert.match(await res.text(), /<form method="post" action="\/settings\/mailboxes"/);
+    assert.match(await res.text(), /<form method="post" action="\/settings\/mailboxes\/new"/);
+
+    const manual = await get(
+      url,
+      "/settings/mailboxes/new?view=manual",
+      mint("GET", "/settings/mailboxes/new")
+    );
+    assert.equal(manual.status, 200);
+    assert.match(await manual.text(), /<form method="post" action="\/settings\/mailboxes"/);
   } finally {
     await close();
   }
@@ -1150,6 +1169,489 @@ test("the autoconfig answer carries the settings header set", async () => {
     // suggestion names an operator's mail hosts and their login.
     assert.equal(res.headers.get("cache-control"), "no-store");
     assert.equal(res.headers.get("x-frame-options"), "DENY");
+  } finally {
+    await close();
+  }
+});
+
+// ---- Add mailbox, address first (#141) -------------------------------------
+//
+// The guided path used to be the setup wizard's alone, which meant it ran once
+// — for the mailbox the operator is most likely to know the settings for. These
+// are the same four screens served from `/settings/mailboxes/new`, where every
+// mailbox after the first is added.
+//
+// Every case here stays offline. The lookup uses `operator@localhost`, which
+// `parseAddress` refuses before it opens a socket, so what is exercised is the
+// route and the cascade rather than anybody's autoconfig document.
+
+test("Add mailbox opens on the address screen, not on eighteen empty boxes", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await get(url, "/settings/mailboxes/new", mint("GET", "/settings/mailboxes/new"));
+    assert.equal(res.status, 200);
+    const html = await res.text();
+
+    assert.match(html, /name="mail\.defaultFrom"/);
+    assert.match(html, /name="password"/);
+    // The whole of #141: the eighteen-field form is no longer what this URL is.
+    assert.equal(html.includes('name="imap.host"'), false, html);
+    // And it is still one press away.
+    assert.match(html, /href="\/settings\/mailboxes\/new\?view=manual"/);
+  } finally {
+    await close();
+  }
+});
+
+test("?view= reaches the provider list and the full form at any time", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const providers = await get(
+      url,
+      "/settings/mailboxes/new?view=providers",
+      mint("GET", "/settings/mailboxes/new")
+    );
+    assert.equal(providers.status, 200);
+    const providerHtml = await providers.text();
+    // Served from the connector's own table, as a function call rather than a
+    // round trip — this is the package the table lives in.
+    assert.match(providerHtml, /value="mailbox-org"/);
+    assert.match(providerHtml, /value="other"/);
+
+    const manual = await get(
+      url,
+      "/settings/mailboxes/new?view=manual",
+      mint("GET", "/settings/mailboxes/new")
+    );
+    assert.equal(manual.status, 200);
+    assert.match(await manual.text(), /name="imap\.host"/);
+
+    // A mistyped query is not a reason to show someone eighteen boxes.
+    const mistyped = await get(
+      url,
+      "/settings/mailboxes/new?view=nonsense",
+      mint("GET", "/settings/mailboxes/new")
+    );
+    assert.match(await mistyped.text(), /name="password"/);
+  } finally {
+    await close();
+  }
+});
+
+test("the JSON caller still gets the stamp from that URL, cascade or no cascade", async () => {
+  // The setup wizard reads the accounts stamp here and does not go through the
+  // cascade at all. Adding three screens behind this URL must not have moved it.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await fetch(`${url}/settings/mailboxes/new`, {
+      headers: {
+        authorization: `Bearer ${AUTH_TOKEN}`,
+        [ASSERTION_HEADER]: mint("GET", "/settings/mailboxes/new"),
+        accept: "application/json",
+      },
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { stamp: await stamp(accountsPath) });
+  } finally {
+    await close();
+  }
+});
+
+test("a lookup that finds nothing shows the provider list and calls it no failure", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "lookup",
+      "mail.defaultFrom": UNRESOLVABLE,
+      password: "hunter2",
+    });
+
+    // Not a 4xx and not an error box: §7 says no autoconfig failure is ever
+    // shown to the operator as one, and "nothing published" arrives here the
+    // same way every refusal inside the cascade does.
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /value="mailbox-org"/);
+    assert.equal(/class="error"/.test(html), false, html);
+    // #120: the password came in on this submission and goes on to the form.
+    assert.match(html, /<input type="hidden" name="password" value="hunter2">/);
+  } finally {
+    await close();
+  }
+});
+
+test("an address the screen cannot read is the one thing it does report", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "lookup",
+      "mail.defaultFrom": "anna",
+      password: "hunter2",
+    });
+
+    assert.equal(res.status, 400);
+    const html = await res.text();
+    assert.match(html, /Enter a full email address/);
+    assert.match(html, /value="anna"/);
+  } finally {
+    await close();
+  }
+});
+
+test("choosing a provider fills the form in and stores nothing", async () => {
+  const { url, accountsPath, close } = await startConnector();
+  const before = await stamp(accountsPath);
+  try {
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "provider",
+      "mail.defaultFrom": "anna@posteo.net",
+      provider: "posteo",
+      password: "hunter2",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    // The values are the reason to pick a provider, and this is the only screen
+    // that shows them — including the ones a reader would have guessed wrong.
+    assert.match(html, /value="posteo\.de"/);
+    assert.match(html, new RegExp(escapeRe("https://posteo.de:8443/calendars/anna/default")));
+    assert.match(html, /Posteo settings have been filled in/);
+    // Derived, shown, and not applied: the id box is filled in and editable.
+    assert.match(html, /<input id="id" name="id" type="text" value="anna"/);
+    // And the password the operator typed a screen ago is in the boxes that
+    // will send it, rather than being asked for a second time.
+    assert.match(html, /type="password" value="hunter2"/);
+    assert.equal(await stamp(accountsPath), before, "nothing was written");
+  } finally {
+    await close();
+  }
+});
+
+test("Other leads to an empty form with TLS still on and the address kept", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "provider",
+      "mail.defaultFrom": "anna@example.com",
+      provider: "other",
+      password: "hunter2",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /value="anna@example\.com"/);
+    // An absent checkbox is how a browser submits an unticked one, so a form
+    // rendered from any submitted values would otherwise come back with TLS off
+    // — a default nobody chose, on the one setting worth defaulting.
+    assert.match(html, /name="imap\.tls"[^>]*checked/);
+    assert.match(html, /name="smtp\.tls"[^>]*checked/);
+  } finally {
+    await close();
+  }
+});
+
+test("a provider this build does not have is a question, not a crash", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "provider",
+      "mail.defaultFrom": "anna@example.com",
+      provider: "a-provider-from-another-release",
+      password: "hunter2",
+    });
+
+    assert.equal(res.status, 400);
+    assert.match(await res.text(), /Choose a provider, or pick Other\./);
+  } finally {
+    await close();
+  }
+});
+
+test("Edit these opens the form on what was found, with no password from a file", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "edit",
+      id: "anna",
+      label: "anna@example.com",
+      "mail.defaultFrom": "anna@example.com",
+      "imap.host": "imap.example.com",
+      "imap.port": "993",
+      "imap.user": "anna@example.com",
+      "imap.tls": "1",
+      "smtp.host": "smtp.example.com",
+      "smtp.port": "587",
+      "smtp.user": "anna@example.com",
+      password: "hunter2",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /value="imap\.example\.com"/);
+    assert.match(html, /value="587"/);
+    // The one password on the page is the one that arrived on this submission.
+    assert.match(html, /type="password" value="hunter2"/);
+    assert.match(html, /Nothing has been saved/);
+  } finally {
+    await close();
+  }
+});
+
+test("the cascade route is behind the same CSRF check every write is", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const noCsrf = await post(
+      url,
+      "/settings/mailboxes/new",
+      { _action: "provider", "mail.defaultFrom": "anna@example.com", provider: "posteo" },
+      { csrf: "" }
+    );
+    assert.equal(noCsrf.status, 403);
+
+    const wrongCsrf = await post(
+      url,
+      "/settings/mailboxes/new",
+      { _action: "provider", "mail.defaultFrom": "anna@example.com", provider: "posteo" },
+      { csrf: "not-it" }
+    );
+    assert.equal(wrongCsrf.status, 403);
+
+    const wrongPath = await post(
+      url,
+      "/settings/mailboxes/new",
+      { _action: "provider", "mail.defaultFrom": "anna@example.com", provider: "posteo" },
+      { assertion: mint("POST", "/settings/mailboxes") }
+    );
+    assert.equal(wrongPath.status, 401);
+  } finally {
+    await close();
+  }
+});
+
+test("every Add mailbox screen carries the settings header set", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const screens = [
+      await get(url, "/settings/mailboxes/new", mint("GET", "/settings/mailboxes/new")),
+      await get(
+        url,
+        "/settings/mailboxes/new?view=providers",
+        mint("GET", "/settings/mailboxes/new")
+      ),
+      await post(url, "/settings/mailboxes/new", {
+        _action: "provider",
+        "mail.defaultFrom": "anna@posteo.net",
+        provider: "posteo",
+      }),
+    ];
+    for (const res of screens) {
+      for (const [header, value] of Object.entries(EXPECTED_HEADERS)) {
+        assert.equal(res.headers.get(header), value, header);
+      }
+    }
+  } finally {
+    await close();
+  }
+});
+
+// ---- The provider table, for the wizard ------------------------------------
+
+test("the provider route answers the table as a document, filled in for the address", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const res = await postJson(url, "/settings/providers", {
+      _csrf: CSRF,
+      email: "anna@posteo.net",
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+
+    const answer = parseProvidersAnswer(await res.json());
+    assert.ok(answer, "the connector's own answer must be readable by the shared reader");
+    assert.deepEqual(
+      answer.providers.map((p) => p.id),
+      MAIL_PROVIDERS.map((p) => p.id)
+    );
+    const posteo = answer.providers.find((p) => p.id === "posteo");
+    assert.ok(posteo);
+    // Resolved on this side: the wizard never sees a placeholder.
+    assert.equal(
+      posteo.values[MAILBOX_FIELDS.caldavUrl],
+      "https://posteo.de:8443/calendars/anna/default"
+    );
+    // And no password field, at any depth, for any entry. (The word appears in
+    // the caveats — several providers want an app password — so the assertion
+    // is about the field names, which are the things that could carry one.)
+    const serialised = JSON.stringify(answer);
+    for (const secret of [
+      MAILBOX_FIELDS.imapPass,
+      MAILBOX_FIELDS.smtpPass,
+      MAILBOX_FIELDS.caldavPass,
+    ]) {
+      assert.equal(serialised.includes(secret), false, secret);
+    }
+  } finally {
+    await close();
+  }
+});
+
+test("the provider route is behind exactly the credentials the others are", async () => {
+  const { url, close } = await startConnector();
+  const body = { _csrf: CSRF, email: "anna@example.com" };
+  try {
+    const noBearer = await fetch(`${url}/settings/providers`, {
+      method: "POST",
+      headers: {
+        [ASSERTION_HEADER]: mint("POST", "/settings/providers"),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    assert.equal(noBearer.status, 401);
+
+    const noAssertion = await fetch(`${url}/settings/providers`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${AUTH_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(noAssertion.status, 401);
+
+    const wrongKey = await postJson(url, "/settings/providers", body, {
+      assertion: mint("POST", "/settings/providers", OTHER_KEY),
+    });
+    assert.equal(wrongKey.status, 401);
+
+    const wrongPath = await postJson(url, "/settings/providers", body, {
+      assertion: mint("POST", "/settings/autoconfig"),
+    });
+    assert.equal(wrongPath.status, 401);
+
+    const expired = await postJson(url, "/settings/providers", body, {
+      assertion: mintExpired("POST", "/settings/providers"),
+    });
+    assert.equal(expired.status, 401);
+
+    const wrongCsrf = await postJson(url, "/settings/providers", { ...body, _csrf: "not-it" });
+    assert.equal(wrongCsrf.status, 403);
+  } finally {
+    await close();
+  }
+});
+
+// ---- The confirmation screen's Save, end to end ----------------------------
+
+test("one password, asked once, reaches both services in the stored account", async () => {
+  // What the confirmation screen submits: hidden settings, an id and a label in
+  // boxes, and one `password` field — the #120 rule that the operator is asked
+  // for a mailbox password once. `withSharedPassword` is what spreads it, and
+  // this is the only place that is visible end to end.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStamp(accountsPath, {
+        _action: "save",
+        id: "anna",
+        label: "anna@example.com",
+        "mail.defaultFrom": "anna@example.com",
+        "imap.host": "imap.example.invalid",
+        "imap.port": "993",
+        "imap.user": "anna@example.com",
+        "imap.tls": "1",
+        "smtp.host": "smtp.example.invalid",
+        "smtp.port": "465",
+        "smtp.user": "anna@example.com",
+        "smtp.tls": "1",
+        password: "one-password-asked-once",
+      })
+    );
+    assert.equal(res.status, 303);
+
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")) as {
+      accounts: Array<{ id: string; imap: { pass: string }; smtp: { pass: string } }>;
+    };
+    const account = stored.accounts.find((a) => a.id === "anna");
+    assert.ok(account, "the mailbox was stored");
+    assert.equal(account.imap.pass, "one-password-asked-once");
+    assert.equal(account.smtp.pass, "one-password-asked-once");
+  } finally {
+    await close();
+  }
+});
+
+test("a save with no CalDAV URL gets no CalDAV block from the shared password", async () => {
+  // A CalDAV block that is nothing but a password is a probe against a server
+  // nobody named, and the account model treats CalDAV as optional.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStamp(accountsPath, {
+        ...validForm({ id: "anna" }),
+        "imap.pass": "",
+        "smtp.pass": "",
+        password: "one-password-asked-once",
+      })
+    );
+    assert.equal(res.status, 303);
+
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")) as {
+      accounts: Array<{ id: string; caldav?: unknown }>;
+    };
+    assert.equal(stored.accounts.find((a) => a.id === "anna")?.caldav, undefined);
+  } finally {
+    await close();
+  }
+});
+
+test("the full form's own passwords still win over a shared one", async () => {
+  // The full form is where a mailbox whose IMAP and SMTP logins take different
+  // passwords is expressed. Spreading one over it would silently destroy that.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStamp(accountsPath, {
+        ...validForm({ id: "anna" }),
+        "imap.pass": "different-for-imap",
+        "smtp.pass": "different-for-smtp",
+        password: "would-have-overwritten-both",
+      })
+    );
+    assert.equal(res.status, 303);
+
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")) as {
+      accounts: Array<{ id: string; imap: { pass: string }; smtp: { pass: string } }>;
+    };
+    const account = stored.accounts.find((a) => a.id === "anna");
+    assert.ok(account);
+    assert.equal(account.imap.pass, "different-for-imap");
+    assert.equal(account.smtp.pass, "different-for-smtp");
+  } finally {
+    await close();
+  }
+});
+
+test("a rejected save never echoes the shared password back into the page", async () => {
+  // `sanitize()` strips every password field out of a re-rendered submission,
+  // and the cascade's own single box is one of them — otherwise it would be the
+  // one secret the strip missed.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStamp(accountsPath, {
+        ...validForm({ id: "Not A Valid Id" }),
+        password: "must-not-be-echoed",
+      })
+    );
+    assert.equal(res.status, 400);
+    const html = await res.text();
+    assert.equal(html.includes("must-not-be-echoed"), false, html);
   } finally {
     await close();
   }

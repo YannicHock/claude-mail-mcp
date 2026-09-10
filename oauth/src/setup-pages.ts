@@ -22,7 +22,15 @@
 import { escapeHtml } from "./login.js";
 import type { CredentialField, CredentialProblem } from "./operator.js";
 import { MIN_PASSWORD_LENGTH } from "./operator.js";
-import { CHECKBOX_ON, MAILBOX_FIELDS } from "./settings-api.js";
+import {
+  ADDRESS_FIELD,
+  CHECKBOX_ON,
+  MAILBOX_FIELDS,
+  PROVIDER_FIELD,
+  PROVIDER_OTHER,
+  SHARED_PASSWORD_FIELD,
+  type ProviderPreset,
+} from "./settings-api.js";
 import { stepNumber, SETUP_STEPS, type SetupStep } from "./setup-state.js";
 
 /** The title of each screen, used in the header line and the document title. */
@@ -647,17 +655,12 @@ export function renderMailboxStep(data: MailboxPageData): string {
 // the thing should not need mail credentials to hand" has to be true of whatever
 // screen they happen to be looking at.
 
-/** The wizard's own name for the one password box tiers 1 and 2 have. */
-export const SHARED_PASSWORD_FIELD = "password";
-
-/** The name the address box submits: the connector's own, so it carries onward. */
-export const ADDRESS_FIELD = MAILBOX_FIELDS.mailDefaultFrom;
-
-/** The name the provider list submits. */
-export const PROVIDER_FIELD = "provider";
-
-/** What `Other (enter manually)` submits: no preset, straight to the full form. */
-export const PROVIDER_OTHER = "other";
+// The four field names these screens submit under used to be declared here, and
+// are now `ADDRESS_FIELD`, `SHARED_PASSWORD_FIELD`, `PROVIDER_FIELD` and
+// `PROVIDER_OTHER` in settings-api.ts — imported above, alongside the cascade
+// that reads them. The connector's own *Add mailbox* page renders the same four
+// screens (#141), and a name one side spells for itself is a name the two sides
+// can disagree about.
 
 /** Which of step 2's screens is being looked at. Also the `view` query value. */
 export type MailboxView = "address" | "providers" | "manual";
@@ -929,16 +932,14 @@ ${caldavRow}
   return wizardPage("mailbox", body);
 }
 
-/** One row of the provider list, as this screen needs it. */
-export interface ProviderChoice {
-  id: string;
-  label: string;
-  /** What the operator has to know before this preset works. "" for nothing. */
-  note: string;
-}
-
 export interface MailboxProviderPageData extends StepTwoLinks {
-  providers: readonly ProviderChoice[];
+  /**
+   * The table, as the connector answered `POST /settings/providers` with. This
+   * screen renders `id`, `label` and `note`; the `values` beside them are what
+   * `stepFromProvider` fills the full form in from once one is chosen, and are
+   * never rendered here.
+   */
+  providers: readonly ProviderPreset[];
   /** The domain the lookup found nothing for, or "" when reached from the link. */
   domain: string;
   /** Carried across so the address is typed once, not once per screen. */

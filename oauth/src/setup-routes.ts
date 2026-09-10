@@ -105,29 +105,38 @@ import type { OAuthConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { isSameOrigin, renderErrorPage } from "./login.js";
 import { OperatorRecord, validateNewCredentials } from "./operator.js";
-import { domainOf, findProvider, MAIL_PROVIDERS, prefillFor } from "./providers.js";
 import {
+  ADDRESS_FIELD,
+  carrying,
   CHECKBOX_ON,
+  domainOf,
   draftFromFields,
-  flattenDraft,
+  emptyMailboxValues,
+  formValues,
   MAILBOX_FIELDS,
-  MAILBOX_SECRET_FIELDS,
   parseAutoconfigAnswer,
   parseErrorAnswer,
   parseProbeAnswer,
+  parseProvidersAnswer,
   parseStampAnswer,
+  PROVIDER_FIELD,
+  SHARED_PASSWORD_FIELD,
+  stepFromEdit,
+  stepFromLookup,
+  stepFromProvider,
+  withSharedPassword,
   type AutoconfigRequestBody,
   type MailboxDraft,
   type MailboxProbeOutcome,
   type MailboxProbeReport,
   type MailboxRequestBody,
+  type MailboxSetupStep,
   type MailboxSuggestion,
+  type ProviderPreset,
+  type ProvidersRequestBody,
 } from "./settings-api.js";
 import {
-  ADDRESS_FIELD,
   MAILBOX_DEFAULTS,
-  PROVIDER_FIELD,
-  PROVIDER_OTHER,
   renderConnectStep,
   renderCredentialsStep,
   renderMailboxAddressStep,
@@ -135,7 +144,6 @@ import {
   renderMailboxStep,
   renderMailboxSuggestionStep,
   renderSetupComplete,
-  SHARED_PASSWORD_FIELD,
   type ConfiguredMailbox,
   type ConnectPageData,
   type MailboxAddressPageData,
@@ -391,6 +399,81 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       page(200, {});
       return;
     }
+    // Re-bound now that the null case is behind us: the closures below outlive
+    // the narrowing above, and two of them call the connector.
+    const client = mailboxes;
+
+    /**
+     * One step of the cascade, in this wizard's chrome.
+     *
+     * Which step it is was decided by `stepFrom*` in settings-api.ts, which the
+     * connector's own *Add mailbox* page calls too (#141). What is decided here
+     * is only how it is painted and what status it goes out under — and the
+     * switch is total, so a screen added to the cascade stops this file
+     * compiling rather than falling through to a blank page.
+     */
+    const sendStep = async (
+      decided: MailboxSetupStep,
+      opts: {
+        /** Already fetched by the caller, when the caller needed them anyway. */
+        presets?: readonly ProviderPreset[];
+        notice?: MailboxPageData["notice"];
+      } = {}
+    ): Promise<void> => {
+      switch (decided.view) {
+        case "address":
+          // The only way back to tier 1 is an address that could not be read.
+          // That *is* shown as an error, and it is not an autoconfig failure: it
+          // is about what the operator typed, on a submission that never became
+          // a lookup at all.
+          addressPage(400, { email: decided.email, errors: decided.errors });
+          return;
+
+        case "suggestion":
+          sendPage(
+            res,
+            200,
+            renderMailboxSuggestionStep({
+              ...links,
+              domain: decided.domain,
+              sourceLabel: decided.sourceLabel,
+              values: decided.values,
+              password: decided.password,
+              errors: {},
+            })
+          );
+          return;
+
+        case "providers": {
+          const presets = opts.presets ?? (await client.providers(decided.email));
+          if (presets === null) {
+            // The connector could not say what its table holds. There is no list
+            // to show, so this falls to the tier below rather than rendering an
+            // empty one — the same shape of degradation a lookup that answers
+            // nothing gets, and for the same reason: a screen offering nothing
+            // is worse than the form the operator can always fill in.
+            page(200, { values: carrying(emptyMailboxValues(decided.email), decided.password) });
+            return;
+          }
+          providerPage(Object.keys(decided.errors).length === 0 ? 200 : 400, {
+            providers: presets,
+            email: decided.email,
+            domain: decided.domain,
+            selected: decided.selected,
+            password: decided.password,
+            errors: decided.errors,
+          });
+          return;
+        }
+
+        case "manual":
+          page(200, {
+            values: decided.values,
+            ...(opts.notice === undefined ? {} : { notice: opts.notice }),
+          });
+          return;
+      }
+    };
 
     if (action === "lookup") {
       const email = stringField(body[ADDRESS_FIELD]).trim();
@@ -402,42 +485,19 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       // state is still `{version, furthest}` and nothing about a mailbox is
       // written anywhere until `save` has been through the connector's probe.
       const password = stringField(body[SHARED_PASSWORD_FIELD]);
-      if (domainOf(email) === "") {
-        // This one *is* shown as an error, and it is not an autoconfig failure:
-        // it is about what the operator typed, which they can see and fix. The
-        // rule §7 states is that no failure of the lookup is surfaced — and
-        // this is a submission that never became one.
-        addressPage(400, {
-          email,
-          errors: { [ADDRESS_FIELD]: "Enter a full email address, like anna@example.com." },
-        });
-        return;
+
+      // Guarded here rather than left to `stepFromLookup`, which checks the
+      // address again for its own reasons: an address with no domain in it has
+      // nothing to look up, and this is the one call in step 2 that reaches out
+      // to the internet on the strength of what somebody typed.
+      const askable = domainOf(email) !== "";
+      const found = askable ? await client.lookup(email) : null;
+      if (askable) {
+        // A boolean and nothing else. Not the address, and not the hosts.
+        log("info", "setup step 2 looked up an address", { found: found !== null });
       }
 
-      const found = await mailboxes.lookup(email);
-      // A boolean and nothing else. Not the address, and not the hosts.
-      log("info", "setup step 2 looked up an address", { found: found !== null });
-
-      if (found === null) {
-        // Not an error, and not reported as one. The domain published nothing
-        // this build could use, and the answer to that is the next tier — with
-        // the password, because tier 2 leads to the same form tier 1 does.
-        providerPage(200, { email, domain: domainOf(email), password });
-        return;
-      }
-
-      sendPage(
-        res,
-        200,
-        renderMailboxSuggestionStep({
-          ...links,
-          domain: found.domain,
-          sourceLabel: sourceLabel(found),
-          values: suggestedValues(found),
-          password,
-          errors: {},
-        })
-      );
+      await sendStep(stepFromLookup({ email, password, found, defaults: stepDefaults() }));
       return;
     }
 
@@ -448,55 +508,43 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       // lookup, which is the only difference the two routes make here.
       const password = stringField(body[SHARED_PASSWORD_FIELD]);
 
-      if (domainOf(email) === "") {
-        providerPage(400, {
-          email,
-          selected: chosen,
-          password,
-          errors: { [ADDRESS_FIELD]: "Enter a full email address, like anna@example.com." },
-        });
-        return;
-      }
-
-      if (chosen === PROVIDER_OTHER) {
+      const presets = await client.providers(email);
+      if (presets === null) {
+        // Same fallback the provider screen itself has: with no table there is
+        // nothing to resolve the chosen id against, and the form is where the
+        // operator was heading anyway.
         page(200, { values: carrying(emptyMailboxValues(email), password) });
         return;
       }
 
-      const provider = findProvider(chosen);
-      if (provider === null) {
-        providerPage(400, {
-          email,
-          selected: "",
-          password,
-          errors: { [PROVIDER_FIELD]: "Choose a provider, or pick Other." },
-        });
-        return;
+      const decided = stepFromProvider({
+        email,
+        password,
+        chosen,
+        presets,
+        defaults: stepDefaults(),
+      });
+      if (decided.view === "manual" && decided.preset !== null) {
+        log("info", "setup step 2: a provider preset was chosen", { provider: decided.preset.id });
       }
-
-      log("info", "setup step 2: a provider preset was chosen", { provider: provider.id });
-      page(200, {
-        values: carrying(prefillFor(provider, email), password),
-        notice: {
-          kind: "info",
-          message:
-            `${provider.label} settings have been filled in. Check them` +
-            (password === "" ? ", add the passwords" : "") +
-            ", and test the connection before saving.",
-        },
+      await sendStep(decided, {
+        presets,
+        ...(decided.view === "manual" && decided.preset !== null
+          ? { notice: presetNotice(decided.preset.label, password) }
+          : {}),
       });
       return;
     }
 
     if (action === "edit") {
       // `Edit these` on the confirmation screen: the same values, in the form
-      // that can change them. `formValues` is what strips the passwords, which
-      // is why this goes through a draft rather than echoing the body back —
-      // and `carrying` then puts back the one the operator typed, which came in
-      // on this submission rather than out of anything the wizard stored.
+      // that can change them. `formValues` inside `stepFromEdit` is what strips
+      // the passwords, which is why this goes through a draft rather than
+      // echoing the body back — and `carrying` then puts back the one the
+      // operator typed, which came in on this submission rather than out of
+      // anything the wizard stored.
       const password = stringField(body[SHARED_PASSWORD_FIELD]);
-      page(200, {
-        values: carrying(formValues(draftFromFields(body)), password),
+      await sendStep(stepFromEdit({ fields: body, password, defaults: stepDefaults() }), {
         notice: {
           kind: "info",
           message: "Nothing has been saved. Change whatever is wrong and test the connection.",
@@ -853,7 +901,15 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         return renderMailboxStep({ ...links, values: {}, errors: {} });
       }
       if (view === "providers") {
-        return renderMailboxProviderStep(providerPageData(links, {}));
+        // The table is the connector's (#126 / #141), so tier 2 is one more
+        // question over the same hop the probe and the lookup already go over.
+        // A connector that cannot answer it leaves nothing to list, and the
+        // answer to that is the tier below rather than an empty fieldset.
+        const presets = await mailboxes.providers("");
+        if (presets === null) {
+          return renderMailboxStep({ ...links, values: {}, errors: {} });
+        }
+        return renderMailboxProviderStep(providerPageData(links, { providers: presets }));
       }
       return renderMailboxAddressStep({ ...links, email: "", errors: {} });
     }
@@ -992,18 +1048,14 @@ function viewOf(req: Request): MailboxView {
   return "address";
 }
 
-/** The provider screen's data, with the table and the defaults filled in. */
+/** The provider screen's data, with the wizard's own blanks filled in. */
 function providerPageData(
   links: StepTwoLinks,
   data: Partial<MailboxProviderPageData>
 ): MailboxProviderPageData {
   return {
     ...links,
-    providers: MAIL_PROVIDERS.map((provider) => ({
-      id: provider.id,
-      label: provider.label,
-      note: provider.note,
-    })),
+    providers: [],
     domain: "",
     email: "",
     selected: "",
@@ -1013,132 +1065,28 @@ function providerPageData(
   };
 }
 
-/** Where a suggestion came from, said so an operator could go and check it. */
-function sourceLabel(suggestion: MailboxSuggestion): string {
-  switch (suggestion.source) {
-    case "autoconfig-subdomain":
-      return `Published by autoconfig.${suggestion.domain}.`;
-    case "autoconfig-well-known":
-      return `Published by ${suggestion.domain} itself.`;
-    case "ispdb":
-      return "From the Mozilla ISP database, not from the provider directly.";
-    case "dns-srv":
-      return `From ${suggestion.domain}'s DNS service records.`;
-  }
+/**
+ * What step 2's mailbox starts out as, before a lookup or a preset fills it in.
+ *
+ * This is the wizard's half of the one thing the two entry points genuinely
+ * disagree about. Its mailbox is the *first* one — `main`, and the account the
+ * mail tools reach for when none is named — where the connector's *Add mailbox*
+ * page derives an id from the address and makes it the default only on an empty
+ * instance. Everything else about the cascade is the same code (#141).
+ */
+function stepDefaults(): Record<string, string> {
+  return { ...MAILBOX_DEFAULTS, [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON };
 }
 
-/**
- * A suggestion, as the values the confirmation screen shows and submits.
- *
- * Under `MAILBOX_FIELDS` names because that is the only vocabulary that reaches
- * the connector, and with the same `id` and label the full form would have
- * defaulted to — this screen renders explicit hidden inputs rather than relying
- * on the form's own defaults, so it has to state them.
- *
- * There is no password in it, and there is nowhere in a suggestion for one to
- * come from: a {@link MailboxSuggestion} has hosts and ports and no password
- * field at any depth. The one the operator typed is carried beside these rather
- * than mixed into them — {@link MailboxSuggestionPageData.password} — so the
- * rows this screen renders from the connector's own field names stay what they
- * have always been.
- */
-function suggestedValues(suggestion: MailboxSuggestion): Record<string, string> {
-  const values: Record<string, string> = {
-    ...MAILBOX_DEFAULTS,
-    [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON,
-    [MAILBOX_FIELDS.mailDefaultFrom]: suggestion.email,
-    [MAILBOX_FIELDS.imapHost]: suggestion.imap.host,
-    [MAILBOX_FIELDS.imapPort]: String(suggestion.imap.port),
-    [MAILBOX_FIELDS.imapUser]: suggestion.imap.user,
-    [MAILBOX_FIELDS.imapTls]: suggestion.imap.tls ? CHECKBOX_ON : "",
-    [MAILBOX_FIELDS.smtpHost]: suggestion.smtp.host,
-    [MAILBOX_FIELDS.smtpPort]: String(suggestion.smtp.port),
-    [MAILBOX_FIELDS.smtpUser]: suggestion.smtp.user,
-    [MAILBOX_FIELDS.smtpTls]: suggestion.smtp.tls ? CHECKBOX_ON : "",
-  };
-  if (suggestion.caldav !== null) {
-    values[MAILBOX_FIELDS.caldavUrl] = suggestion.caldav.url;
-    values[MAILBOX_FIELDS.caldavUser] = suggestion.caldav.user;
-  }
-  return values;
-}
-
-/**
- * The full form with only the address in it, for `Other (enter manually)`.
- *
- * The two TLS boxes are stated rather than left out. An absent checkbox is how a
- * browser submits an unticked one, so the form reads any non-empty `values` as a
- * previous submission and renders TLS off — which is the wrong default and, on
- * this path, one nobody chose.
- */
-function emptyMailboxValues(email: string): Record<string, string> {
+/** What the full form says when a provider preset has just filled it in. */
+function presetNotice(label: string, password: string): { kind: "info"; message: string } {
   return {
-    [MAILBOX_FIELDS.mailDefaultFrom]: email,
-    [MAILBOX_FIELDS.imapTls]: CHECKBOX_ON,
-    [MAILBOX_FIELDS.smtpTls]: CHECKBOX_ON,
+    kind: "info",
+    message:
+      `${label} settings have been filled in. Check them` +
+      (password === "" ? ", add the passwords" : "") +
+      ", and test the connection before saving.",
   };
-}
-
-/**
- * The one password the operator typed, put into the form that is about to ask
- * for three.
- *
- * The values twin of {@link withSharedPassword}, and deliberately the same
- * rule: IMAP and SMTP get it, and CalDAV only when there is a CalDAV URL beside
- * it, because a CalDAV block that is nothing but a password is a probe against
- * a server that was never named.
- *
- * The difference is which direction it runs. `withSharedPassword` fills in a
- * submission on its way to the connector; this fills in a page on its way to
- * the operator, so that a form they are being sent to does not open by asking
- * them for something they have already given it (#120). An empty password —
- * tier 2 reached from its own link — leaves the boxes as they were.
- */
-function carrying(values: Record<string, string>, password: string): Record<string, string> {
-  if (password === "") return values;
-
-  const filled = { ...values };
-  for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
-    if ((filled[name] ?? "") === "") filled[name] = password;
-  }
-  if (
-    (filled[MAILBOX_FIELDS.caldavUrl] ?? "") !== "" &&
-    (filled[MAILBOX_FIELDS.caldavPass] ?? "") === ""
-  ) {
-    filled[MAILBOX_FIELDS.caldavPass] = password;
-  }
-  return filled;
-}
-
-/**
- * Tiers 1 and 2 ask for one password; the connector's draft has three.
- *
- * A screen with two boxes cannot express a mailbox whose IMAP and SMTP logins
- * take different passwords, and does not try to: it collects the one password
- * an ordinary mailbox has and this spreads it across the services the draft
- * names. The full form is where the other case is expressed, and it sends no
- * `password` field at all, so this is inert there.
- *
- * A per-service password already in the body wins, and CalDAV is only filled in
- * when there is a CalDAV URL to go with it — `draftFromFields` builds a CalDAV
- * block as soon as any one of its three fields is non-empty, and a block that
- * is nothing but a password is a probe against a server that was never named.
- */
-function withSharedPassword(body: Record<string, unknown>): Record<string, unknown> {
-  const shared = stringField(body[SHARED_PASSWORD_FIELD]);
-  if (shared === "") return body;
-
-  const filled = { ...body };
-  for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
-    if (stringField(filled[name]) === "") filled[name] = shared;
-  }
-  if (
-    stringField(filled[MAILBOX_FIELDS.caldavUrl]) !== "" &&
-    stringField(filled[MAILBOX_FIELDS.caldavPass]) === ""
-  ) {
-    filled[MAILBOX_FIELDS.caldavPass] = shared;
-  }
-  return filled;
 }
 
 // The wizard's three send sites, each one line of delegation to the shared
@@ -1175,6 +1123,7 @@ const UPSTREAM_NEW = "/settings/mailboxes/new";
 const UPSTREAM_TEST = "/settings/mailboxes/test";
 const UPSTREAM_CREATE = "/settings/mailboxes";
 const UPSTREAM_AUTOCONFIG = "/settings/autoconfig";
+const UPSTREAM_PROVIDERS = "/settings/providers";
 
 /**
  * Who the assertion says is asking.
@@ -1246,6 +1195,13 @@ interface MailboxClient {
    */
   lookup(email: string): Promise<MailboxSuggestion | null>;
   /**
+   * Tier 2's table, with every entry already filled in for `email`, or null when
+   * the connector could not be asked or answered in a shape this build cannot
+   * read. The values live in the connector (`src/providers.ts`) rather than
+   * here, and #126 in settings-api.ts is the argument for that.
+   */
+  providers(email: string): Promise<readonly ProviderPreset[] | null>;
+  /**
    * The current `accounts.json` stamp, as the connector states it. Also what an
    * unanswered {@link MailboxClient.create} is settled by: asked a second time,
    * a stamp that has moved is the write, landed.
@@ -1276,7 +1232,9 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
      * or null for the read-only one, which sends no body at all. A function
      * rather than a value because `_csrf` does not exist until we are inside.
      */
-    payload: ((csrf: string) => MailboxRequestBody | AutoconfigRequestBody) | null;
+    payload:
+      | ((csrf: string) => MailboxRequestBody | AutoconfigRequestBody | ProvidersRequestBody)
+      | null;
     timeoutMs: number;
     /** The status that means the operation happened. */
     okStatus: number;
@@ -1385,6 +1343,36 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
       return null;
     },
 
+    /**
+     * Tier 2's table, asked for rather than kept.
+     *
+     * Unlike the lookup above, a failure here is *not* folded into the tier
+     * below silently by this function — `null` is distinguishable from an empty
+     * list, and the caller does something different with each: an empty list is
+     * a table with nothing in it, which cannot happen, and `null` is "we could
+     * not ask", which sends the operator to the full form. Both end up somewhere
+     * usable and neither is reported as an autoconfig failure, because neither
+     * is one.
+     */
+    async providers(email) {
+      const answer = await call({
+        method: "POST",
+        path: UPSTREAM_PROVIDERS,
+        payload: (csrf) => ({ _csrf: csrf, email }),
+        timeoutMs: QUICK_TIMEOUT_MS,
+        okStatus: 200,
+        read: parseProvidersAnswer,
+      });
+      if (answer.kind !== "ok") {
+        log("warn", "setup step 2 could not read the provider list", {
+          kind: answer.kind,
+          status: answer.kind === "rejected" || answer.kind === "refused" ? answer.status : 0,
+        });
+        return null;
+      }
+      return answer.value.providers;
+    },
+
     async stamp() {
       // Read immediately before the write rather than embedded in the wizard's
       // own form, so the connector's optimistic-concurrency check cannot fail
@@ -1415,13 +1403,6 @@ async function readJson(res: { json(): Promise<unknown> }): Promise<unknown> {
   } catch {
     return undefined;
   }
-}
-
-/** What may be put back into the page: everything the draft holds except passwords. */
-function formValues(draft: MailboxDraft): Record<string, string> {
-  const values = flattenDraft(draft);
-  for (const name of MAILBOX_SECRET_FIELDS) delete values[name];
-  return values;
 }
 
 /**

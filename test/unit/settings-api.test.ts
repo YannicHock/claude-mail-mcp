@@ -30,6 +30,8 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
+  ADDRESS_FIELD,
+  ADDRESS_REQUIRED,
   CHECKBOX_ON,
   draftFromFields,
   flattenDraft,
@@ -39,8 +41,18 @@ import {
   parseAutoconfigAnswer,
   parseMailboxDraft,
   parseProbeAnswer,
+  parseProvidersAnswer,
+  PROVIDER_FIELD,
+  PROVIDER_OTHER,
+  PROVIDER_REQUIRED,
+  SHARED_PASSWORD_FIELD,
+  stepFromEdit,
+  stepFromLookup,
+  stepFromProvider,
+  withSharedPassword,
   type MailboxDraft,
   type MailboxSuggestion,
+  type ProviderPreset,
 } from "../../src/settings-api.js";
 import { renderMailboxForm } from "../../src/settings-pages.js";
 
@@ -306,5 +318,300 @@ describe("parseAutoconfigAnswer", () => {
     // thing this type does not have anywhere in it.
     const json = JSON.stringify(parseAutoconfigAnswer({ suggestion: suggestion() }));
     assert.equal(/pass/i.test(json), false, json);
+  });
+});
+
+// ---- The provider list, over the wire --------------------------------------
+
+describe("parseProvidersAnswer", () => {
+  const preset = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: "posteo",
+    label: "Posteo",
+    note: "The server is posteo.de whatever your address ends in.",
+    values: { [MAILBOX_FIELDS.imapHost]: "posteo.de", [MAILBOX_FIELDS.imapPort]: "993" },
+    ...over,
+  });
+
+  it("reads a list back exactly as it went over the wire", () => {
+    const answer = parseProvidersAnswer({ providers: [preset()] });
+    assert.deepEqual(answer, {
+      providers: [
+        {
+          id: "posteo",
+          label: "Posteo",
+          note: "The server is posteo.de whatever your address ends in.",
+          values: { [MAILBOX_FIELDS.imapHost]: "posteo.de", [MAILBOX_FIELDS.imapPort]: "993" },
+        },
+      ],
+    });
+  });
+
+  it("reads an empty list as an empty list, not as a failure", () => {
+    assert.deepEqual(parseProvidersAnswer({ providers: [] }), { providers: [] });
+  });
+
+  it("refuses the whole answer rather than dropping one unreadable entry", () => {
+    // A list with a provider silently missing from it is a list an operator
+    // scrolls twice before concluding their provider is not supported. `null`
+    // at least sends them somewhere they can finish.
+    assert.equal(parseProvidersAnswer({ providers: [preset(), { id: "x" }] }), null);
+    assert.equal(parseProvidersAnswer({ providers: [preset({ label: 7 })] }), null);
+    assert.equal(parseProvidersAnswer({ providers: [preset({ values: "no" })] }), null);
+  });
+
+  it("reads anything that is not a list of presets as no answer at all", () => {
+    for (const body of [null, undefined, 3, "providers", {}, { providers: {} }, []]) {
+      assert.equal(parseProvidersAnswer(body), null, JSON.stringify(body ?? null));
+    }
+  });
+
+  it("drops values under names this build does not have", () => {
+    // The same rule parseErrorAnswer keeps: a connector on a different release
+    // cannot put arbitrary keys into a form this one renders.
+    const answer = parseProvidersAnswer({
+      providers: [preset({ values: { [MAILBOX_FIELDS.imapHost]: "posteo.de", "imap.sasl": "x" } })],
+    });
+    assert.deepEqual(answer?.providers[0]?.values, { [MAILBOX_FIELDS.imapHost]: "posteo.de" });
+  });
+});
+
+// ---- The cascade both entry points walk ------------------------------------
+//
+// #141: these screens existed only inside the setup wizard, which runs once.
+// The connector's own *Add mailbox* page runs the same cascade now, and what
+// follows is the branching both of them call — so a change to it is a change to
+// both, and there is nowhere for the two to disagree.
+
+const SUGGESTION: MailboxSuggestion = {
+  email: "anna@example.com",
+  domain: "example.com",
+  source: "autoconfig-subdomain",
+  imap: { host: "imap.example.com", port: 993, tls: true, socketType: "SSL", user: "anna" },
+  smtp: { host: "smtp.example.com", port: 587, tls: false, socketType: "STARTTLS", user: "anna" },
+  caldav: null,
+};
+
+const PRESETS: ProviderPreset[] = [
+  {
+    id: "posteo",
+    label: "Posteo",
+    note: "The server is posteo.de whatever your address ends in.",
+    values: {
+      [MAILBOX_FIELDS.mailDefaultFrom]: "anna@posteo.net",
+      [MAILBOX_FIELDS.imapHost]: "posteo.de",
+      [MAILBOX_FIELDS.imapPort]: "993",
+      [MAILBOX_FIELDS.imapTls]: CHECKBOX_ON,
+      [MAILBOX_FIELDS.smtpHost]: "posteo.de",
+      [MAILBOX_FIELDS.smtpPort]: "465",
+      [MAILBOX_FIELDS.smtpTls]: CHECKBOX_ON,
+      [MAILBOX_FIELDS.caldavUrl]: "https://posteo.de:8443/calendars/anna/default",
+    },
+  },
+];
+
+describe("stepFromLookup — tier 1's Continue", () => {
+  it("shows what was found, for confirmation, with the password beside it", () => {
+    const step = stepFromLookup({
+      email: "anna@example.com",
+      password: "hunter2",
+      found: SUGGESTION,
+    });
+    assert.equal(step.view, "suggestion");
+    if (step.view !== "suggestion") return;
+    assert.equal(step.domain, "example.com");
+    assert.equal(step.sourceLabel, "Published by autoconfig.example.com.");
+    assert.equal(step.values[MAILBOX_FIELDS.imapHost], "imap.example.com");
+    assert.equal(step.values[MAILBOX_FIELDS.smtpPort], "587");
+    // STARTTLS is `tls: false`, which is what the connector's own `imap.tls`
+    // means — and what the confirmation screen renders as "STARTTLS".
+    assert.equal(step.values[MAILBOX_FIELDS.smtpTls], "");
+    assert.equal(step.password, "hunter2");
+    // Never mixed into the values, which is what a screen renders its rows from.
+    for (const secret of MAILBOX_SECRET_FIELDS) {
+      assert.equal(secret in step.values, false, secret);
+    }
+  });
+
+  it("takes the caller's defaults and lets the answer win over them", () => {
+    // The one thing the two entry points disagree about: the wizard's mailbox
+    // is `main` and is the default account; a second mailbox added from the
+    // settings UI is neither.
+    const step = stepFromLookup({
+      email: "anna@example.com",
+      password: "",
+      found: SUGGESTION,
+      defaults: { [MAILBOX_FIELDS.id]: "anna", [MAILBOX_FIELDS.imapHost]: "ignored" },
+    });
+    assert.equal(step.view, "suggestion");
+    if (step.view !== "suggestion") return;
+    assert.equal(step.values[MAILBOX_FIELDS.id], "anna");
+    assert.equal(step.values[MAILBOX_FIELDS.imapHost], "imap.example.com");
+  });
+
+  it("sends a lookup that found nothing to the provider list, not to an error", () => {
+    // §7: no autoconfig failure is ever shown to the operator as an error, and
+    // "nothing published" and "the ISPDB returned 502" arrive here identically.
+    const step = stepFromLookup({ email: "anna@example.com", password: "hunter2", found: null });
+    assert.deepEqual(step, {
+      view: "providers",
+      email: "anna@example.com",
+      domain: "example.com",
+      selected: "",
+      password: "hunter2",
+      errors: {},
+    });
+  });
+
+  it("keeps the address and the password when it cannot read the address", () => {
+    // This one *is* an error, and it is not the lookup's: it is about what the
+    // operator typed, on a submission that never became a lookup at all.
+    for (const typed of ["anna", "@example.com", "anna@", ""]) {
+      const step = stepFromLookup({ email: typed, password: "hunter2", found: null });
+      assert.equal(step.view, "address", typed);
+      if (step.view !== "address") continue;
+      assert.equal(step.errors[ADDRESS_FIELD], ADDRESS_REQUIRED);
+      assert.equal(step.email, typed);
+      assert.equal(step.password, "hunter2");
+    }
+  });
+
+  it("trims the address before deciding anything about it", () => {
+    const step = stepFromLookup({ email: "  anna@example.com  ", password: "", found: null });
+    assert.equal(step.view, "providers");
+    if (step.view !== "providers") return;
+    assert.equal(step.email, "anna@example.com");
+  });
+});
+
+describe("stepFromProvider — tier 2's Continue", () => {
+  it("fills the full form in from the preset rather than saving behind anyone", () => {
+    const step = stepFromProvider({
+      email: "anna@posteo.net",
+      password: "hunter2",
+      chosen: "posteo",
+      presets: PRESETS,
+      defaults: { [MAILBOX_FIELDS.id]: "anna" },
+    });
+    assert.equal(step.view, "manual");
+    if (step.view !== "manual") return;
+    assert.equal(step.preset?.id, "posteo");
+    assert.equal(step.values[MAILBOX_FIELDS.id], "anna");
+    assert.equal(step.values[MAILBOX_FIELDS.imapHost], "posteo.de");
+    // #120: the password the operator typed a screen ago, in the boxes that are
+    // about to send it — and in CalDAV's too, because this preset names a
+    // CalDAV server. A block that were nothing but a password would be a probe
+    // against a server nobody named.
+    assert.equal(step.values[MAILBOX_FIELDS.imapPass], "hunter2");
+    assert.equal(step.values[MAILBOX_FIELDS.smtpPass], "hunter2");
+    assert.equal(step.values[MAILBOX_FIELDS.caldavPass], "hunter2");
+  });
+
+  it("carries nothing into a CalDAV block the preset did not name", () => {
+    const step = stepFromProvider({
+      email: "anna@example.com",
+      password: "hunter2",
+      chosen: PROVIDER_OTHER,
+      presets: PRESETS,
+    });
+    assert.equal(step.view, "manual");
+    if (step.view !== "manual") return;
+    assert.equal(step.preset, null);
+    assert.equal(step.values[MAILBOX_FIELDS.caldavPass], undefined);
+    // TLS is stated rather than left out: an absent checkbox is how a browser
+    // submits an unticked one, and a form reading these as a submission would
+    // otherwise render TLS off — a default nobody chose.
+    assert.equal(step.values[MAILBOX_FIELDS.imapTls], CHECKBOX_ON);
+    assert.equal(step.values[MAILBOX_FIELDS.smtpTls], CHECKBOX_ON);
+    assert.equal(step.values[MAILBOX_FIELDS.mailDefaultFrom], "anna@example.com");
+  });
+
+  it("asks again rather than crashing on a preset it does not have", () => {
+    const step = stepFromProvider({
+      email: "anna@example.com",
+      password: "hunter2",
+      chosen: "a-provider-from-another-release",
+      presets: PRESETS,
+    });
+    assert.equal(step.view, "providers");
+    if (step.view !== "providers") return;
+    assert.equal(step.errors[PROVIDER_FIELD], PROVIDER_REQUIRED);
+    assert.equal(step.selected, "");
+    assert.equal(step.password, "hunter2");
+  });
+
+  it("keeps the choice on screen when it is the address that is wrong", () => {
+    const step = stepFromProvider({
+      email: "anna",
+      password: "hunter2",
+      chosen: "posteo",
+      presets: PRESETS,
+    });
+    assert.equal(step.view, "providers");
+    if (step.view !== "providers") return;
+    assert.equal(step.errors[ADDRESS_FIELD], ADDRESS_REQUIRED);
+    assert.equal(step.selected, "posteo", "the radio the operator picked stays picked");
+  });
+});
+
+describe("stepFromEdit — the confirmation screen's Edit these", () => {
+  it("puts the settings in the form and no stored password anywhere near it", () => {
+    const step = stepFromEdit({
+      fields: submittedForm({ [MAILBOX_FIELDS.imapPass]: "typed-into-the-body" }),
+      password: "hunter2",
+    });
+    assert.equal(step.view, "manual");
+    if (step.view !== "manual") return;
+    assert.equal(step.values[MAILBOX_FIELDS.imapHost], "imap.example.invalid");
+    // Through a draft rather than by echoing the body back: `formValues` strips
+    // every secret, and `carrying` then puts back only the one the operator
+    // typed on this submission.
+    assert.equal(step.values[MAILBOX_FIELDS.imapPass], "hunter2");
+    assert.equal(step.values[MAILBOX_FIELDS.smtpPass], "hunter2");
+    assert.equal(step.email, "user@example.invalid");
+  });
+
+  it("leaves the boxes empty when there is no password to carry", () => {
+    // Absent rather than empty: `formValues` deletes the secret names outright,
+    // so there is not even a key for a later edit to accidentally fill in from
+    // something stored.
+    const step = stepFromEdit({ fields: submittedForm(), password: "" });
+    assert.equal(step.view, "manual");
+    if (step.view !== "manual") return;
+    for (const secret of MAILBOX_SECRET_FIELDS) {
+      assert.equal(secret in step.values, false, secret);
+    }
+  });
+});
+
+describe("withSharedPassword — one box, three services", () => {
+  it("spreads the one password across the services the submission names", () => {
+    const filled = withSharedPassword({
+      [SHARED_PASSWORD_FIELD]: "hunter2",
+      [MAILBOX_FIELDS.caldavUrl]: "https://dav.example.com/",
+    });
+    assert.equal(filled[MAILBOX_FIELDS.imapPass], "hunter2");
+    assert.equal(filled[MAILBOX_FIELDS.smtpPass], "hunter2");
+    assert.equal(filled[MAILBOX_FIELDS.caldavPass], "hunter2");
+  });
+
+  it("does not invent a CalDAV password for a server that was never named", () => {
+    const filled = withSharedPassword({ [SHARED_PASSWORD_FIELD]: "hunter2" });
+    assert.equal(MAILBOX_FIELDS.caldavPass in filled, false);
+  });
+
+  it("lets a per-service password already in the body win", () => {
+    const filled = withSharedPassword({
+      [SHARED_PASSWORD_FIELD]: "hunter2",
+      [MAILBOX_FIELDS.imapPass]: "different-for-imap",
+    });
+    assert.equal(filled[MAILBOX_FIELDS.imapPass], "different-for-imap");
+    assert.equal(filled[MAILBOX_FIELDS.smtpPass], "hunter2");
+  });
+
+  it("is inert for the full form, which sends no such field", () => {
+    // The full form is where a mailbox with two different passwords is
+    // expressed, and it must not have one of them quietly overwritten.
+    const body = submittedForm();
+    assert.deepEqual(withSharedPassword(body), body);
   });
 });
