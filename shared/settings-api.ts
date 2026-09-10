@@ -804,6 +804,30 @@ export interface AutoconfigRequestBody {
  */
 export interface AutoconfigAnswer {
   suggestion: MailboxSuggestion | null;
+  /**
+   * What the connector knows about the **address**, when it is that no password
+   * it can send will ever be accepted there — #180.
+   *
+   * This widens the route from "what does this domain publish" to "what does
+   * this connector know about this address", and that widening is the only real
+   * objection to carrying the warning here. It is answered by what the wizard is
+   * actually asking: it posts an address at the one moment the domain becomes
+   * known and before any password is typed, and "no password will work here" is
+   * knowledge about that address rather than about the DNS records under it.
+   *
+   * Independent of {@link AutoconfigAnswer.suggestion} in both directions.
+   * Microsoft publishes autoconfig and answers no password, so a warning arrives
+   * beside a suggestion; Proton publishes nothing and answers no password, so
+   * one arrives beside a miss — a shape this route did not have before, and the
+   * one the wizard's tier-2 fallback has to keep rather than drop.
+   *
+   * The sentence is the connector's, out of `PROVIDER_ADVICE` in
+   * `src/providers.ts`, and the domain match stays there beside the table.
+   * Sending it means the two UIs cannot disagree about which addresses are
+   * warned, and the wizard gets no second copy of the domain set. Absent from a
+   * connector that predates the field, which is what makes it optional.
+   */
+  unsupported?: string;
 }
 
 function parseSuggestedServer(value: unknown): SuggestedServer | null {
@@ -850,7 +874,24 @@ const SUGGESTION_SOURCES: readonly string[] = [
 export function parseAutoconfigAnswer(value: unknown): AutoconfigAnswer | null {
   const body = asObject(value);
   if (body === null) return null;
-  if (body.suggestion === null || body.suggestion === undefined) return { suggestion: null };
+
+  // Read before the suggestion is, because a warning arrives with a miss as
+  // readily as with a hit — Proton publishes nothing and still cannot be served.
+  // Absent, null and empty are all "nothing to say", the way `ProviderPreset.note`
+  // already spells it, and are what a connector predating #180 sends for every
+  // address. A value that is neither absent nor a string is a build disagreeing
+  // with this one about the wire, and is read the way an unreadable host is.
+  let unsupported: string | undefined;
+  if (body.unsupported !== null && body.unsupported !== undefined) {
+    const sentence = asString(body.unsupported);
+    if (sentence === null) return null;
+    if (sentence !== "") unsupported = sentence;
+  }
+  const warning = unsupported === undefined ? {} : { unsupported };
+
+  if (body.suggestion === null || body.suggestion === undefined) {
+    return { suggestion: null, ...warning };
+  }
 
   const raw = asObject(body.suggestion);
   if (raw === null) return null;
@@ -874,6 +915,7 @@ export function parseAutoconfigAnswer(value: unknown): AutoconfigAnswer | null {
 
   return {
     suggestion: { email, domain, source: source as SuggestionSource, imap, smtp, caldav },
+    ...warning,
   };
 }
 
@@ -1006,6 +1048,24 @@ export const SHARED_PASSWORD_FIELD = "password";
 
 /** The name the provider list submits. */
 export const PROVIDER_FIELD = "provider";
+
+/**
+ * The standing warning, carried from one cascade screen to the next.
+ *
+ * The two entry points get the sentence from different places, and only one of
+ * them needs this field. The connector holds `PROVIDER_ADVICE` and re-derives
+ * the warning from the submitted address on every step, so its own screens
+ * carry nothing. The setup wizard is *told* the sentence once, on the answer to
+ * `POST /settings/autoconfig` (#180), and must not grow a second copy of the
+ * domain set to work it out again — so its screens carry the connector's own
+ * words forward in a hidden input, the way they already carry the one password
+ * the operator typed.
+ *
+ * Not one of {@link MAILBOX_FIELDS}: it is not part of a mailbox and never
+ * reaches a draft. `draftFromFields` does not know the name, so a submission
+ * carrying it produces the same account as one that does not.
+ */
+export const UNSUPPORTED_FIELD = "_unsupported";
 
 /** What `Other` submits: no preset, straight to the full form. */
 export const PROVIDER_OTHER = "other";
@@ -1207,6 +1267,20 @@ export type MailboxSetupView = "address" | "suggestion" | "providers" | "manual"
  * a screen does not compile. `errors` is keyed by field name — either
  * {@link ADDRESS_FIELD} or {@link PROVIDER_FIELD} — so each one sits against the
  * box it is about.
+ *
+ * `unsupported` is on every variant, and #186 is why it is a field here at all.
+ * It used to be a fourth argument to each UI's own `sendStep`, sharing one slot
+ * with the screen's own notice — and the three branches fought over that slot,
+ * so an operator who was correctly warned about `anna@outlook.com` and pressed
+ * *Edit these* lost the warning to a sentence about nothing having been saved.
+ * The two are different kinds of thing: a notice is about **this submission**,
+ * the warning is about **the address** and stays true for every screen the
+ * address survives on. So it is decided here, where the cascade already decides
+ * what comes next, and each render site has two slots and shows both.
+ *
+ * Every variant carries it, including `address` — which can never have one,
+ * because an address with no domain in it matches no entry in the table — so
+ * that no render site has to narrow the union before reading it.
  */
 export type MailboxSetupStep =
   | {
@@ -1214,6 +1288,8 @@ export type MailboxSetupStep =
       email: string;
       password: string;
       errors: Record<string, string>;
+      /** Always null here: no domain was read, so nothing could be recognised. */
+      unsupported: string | null;
     }
   | {
       view: "suggestion";
@@ -1225,6 +1301,8 @@ export type MailboxSetupStep =
       values: Record<string, string>;
       /** Carried beside the values, not mixed into them (#120). */
       password: string;
+      /** What this connector knows about the address, or null. See above. */
+      unsupported: string | null;
     }
   | {
       view: "providers";
@@ -1235,6 +1313,8 @@ export type MailboxSetupStep =
       selected: string;
       password: string;
       errors: Record<string, string>;
+      /** What this connector knows about the address, or null. See above. */
+      unsupported: string | null;
     }
   | {
       view: "manual";
@@ -1243,6 +1323,8 @@ export type MailboxSetupStep =
       values: Record<string, string>;
       /** The preset these came from, or null when the operator chose `Other`. */
       preset: ProviderPreset | null;
+      /** What this connector knows about the address, or null. See above. */
+      unsupported: string | null;
     };
 
 /**
@@ -1259,9 +1341,17 @@ export function stepFromLookup(input: {
   password: string;
   found: MailboxSuggestion | null;
   defaults?: Record<string, string>;
+  /**
+   * What this connector knows about the address, from the caller that can
+   * answer it: the connector reads its own table, the wizard reads
+   * {@link AutoconfigAnswer.unsupported} off the answer to the same lookup.
+   * Neither works the domain match out for itself (#180).
+   */
+  unsupported?: string | null;
 }): MailboxSetupStep {
   const email = input.email.trim();
   const password = input.password;
+  const unsupported = input.unsupported ?? null;
 
   if (domainOf(email) === "") {
     return {
@@ -1269,6 +1359,9 @@ export function stepFromLookup(input: {
       email,
       password,
       errors: { [ADDRESS_FIELD]: ADDRESS_REQUIRED },
+      // Not the caller's value, even if one was handed in: there is no domain
+      // here to have recognised, so there is nothing true to say.
+      unsupported: null,
     };
   }
 
@@ -1280,6 +1373,7 @@ export function stepFromLookup(input: {
       selected: "",
       password,
       errors: {},
+      unsupported,
     };
   }
 
@@ -1290,6 +1384,7 @@ export function stepFromLookup(input: {
     sourceLabel: suggestionSourceLabel(input.found),
     values: suggestedValues(input.found, input.defaults ?? {}),
     password,
+    unsupported,
   };
 }
 
@@ -1307,10 +1402,13 @@ export function stepFromProvider(input: {
   chosen: string;
   presets: readonly ProviderPreset[];
   defaults?: Record<string, string>;
+  /** See {@link stepFromLookup}: the same fact, one screen further on. */
+  unsupported?: string | null;
 }): MailboxSetupStep {
   const email = input.email.trim();
   const password = input.password;
   const defaults = input.defaults ?? {};
+  const unsupported = input.unsupported ?? null;
 
   if (domainOf(email) === "") {
     return {
@@ -1320,6 +1418,9 @@ export function stepFromProvider(input: {
       selected: input.chosen,
       password,
       errors: { [ADDRESS_FIELD]: ADDRESS_REQUIRED },
+      // The address was edited into something with no domain in it, so whatever
+      // was known about the old one is no longer about what is on the screen.
+      unsupported: null,
     };
   }
 
@@ -1329,6 +1430,7 @@ export function stepFromProvider(input: {
       email,
       values: carrying({ ...defaults, ...emptyMailboxValues(email) }, password),
       preset: null,
+      unsupported,
     };
   }
 
@@ -1341,6 +1443,7 @@ export function stepFromProvider(input: {
       selected: "",
       password,
       errors: { [PROVIDER_FIELD]: PROVIDER_REQUIRED },
+      unsupported,
     };
   }
 
@@ -1349,6 +1452,7 @@ export function stepFromProvider(input: {
     email,
     values: carrying({ ...defaults, ...preset.values }, password),
     preset,
+    unsupported,
   };
 }
 
@@ -1365,6 +1469,12 @@ export function stepFromEdit(input: {
   fields: Record<string, unknown>;
   password: string;
   defaults?: Record<string, string>;
+  /**
+   * See {@link stepFromLookup}. This is the press #186 was filed about: the
+   * screen this leads to has its own sentence — "Nothing has been saved…" — and
+   * that sentence used to arrive in the same slot as the warning and win.
+   */
+  unsupported?: string | null;
 }): MailboxSetupStep {
   const values = formValues(draftFromFields(input.fields));
   return {
@@ -1372,5 +1482,6 @@ export function stepFromEdit(input: {
     email: values[MAILBOX_FIELDS.mailDefaultFrom] ?? "",
     values: carrying({ ...(input.defaults ?? {}), ...values }, input.password),
     preset: null,
+    unsupported: input.unsupported ?? null,
   };
 }

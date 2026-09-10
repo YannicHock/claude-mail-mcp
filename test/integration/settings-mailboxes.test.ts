@@ -34,6 +34,7 @@ import {
   parseErrorAnswer,
   parseProbeAnswer,
   parseProvidersAnswer,
+  PROVIDER_OTHER,
   SAVE_ANYWAY_FIELD,
   type MailboxDraft,
   type MailboxProbeReport,
@@ -2329,6 +2330,141 @@ test("a warned provider is still savable, because Proton's Bridge is real", asyn
     assert.equal(res.status, 303);
     const stored = JSON.parse(await readFile(accountsPath, "utf8")).accounts as Account[];
     assert.equal(stored.length, 1, "the unsupported entry must not refuse the write");
+  } finally {
+    await close();
+  }
+});
+
+// ---- #186: the warning survives the screen it was shown on ------------------
+//
+// These follow one address across two or three screens, which is the only way
+// the defect is visible at all: every single screen rendered the warning
+// correctly, and the address lost it on the way to the next one. A test that
+// renders one screen cannot see that.
+
+/**
+ * Every hidden input on a screen, as the browser would submit them.
+ *
+ * Read out of the page rather than assembled from what the test knows: what a
+ * screen carries onward is exactly the thing these cases are about.
+ */
+function hiddenFields(html: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (const match of html.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)) {
+    fields[match[1]!] = match[2]!;
+  }
+  return fields;
+}
+
+test("a warned address still carries its warning on the screen after the lookup", async () => {
+  // The journey #186 is about, walked one press at a time. Which screen the
+  // lookup leads to is the one thing here that is not this suite's to decide —
+  // outlook.com publishes autoconfig, so a connector with a working DNS
+  // resolver reaches the suggestion screen and one without reaches the provider
+  // list — so this follows whichever came back and presses the button that is
+  // on it. Both continuations end on the full form, and the warning has to be
+  // on it either way.
+  const { url, accountsPath, close } = await startConnector();
+  const before = await stamp(accountsPath);
+  try {
+    const first = await post(url, "/settings/mailboxes/new", {
+      _action: "lookup",
+      "mail.defaultFrom": "anna@outlook.com",
+      password: "hunter2",
+    });
+    assert.equal(first.status, 200);
+    const firstHtml = await first.text();
+    assert.match(firstHtml, /no password will connect/, "the screen the lookup led to");
+
+    const carried = hiddenFields(firstHtml);
+    const onProviderList = firstHtml.includes('name="provider"');
+    const second = await post(
+      url,
+      "/settings/mailboxes/new",
+      onProviderList
+        ? {
+            _action: "provider",
+            "mail.defaultFrom": "anna@outlook.com",
+            provider: "gmail",
+            password: "hunter2",
+          }
+        : { ...carried, _action: "edit" }
+    );
+
+    assert.equal(second.status, 200);
+    const secondHtml = await second.text();
+    // The full form, one press further on, still saying what it said.
+    assert.match(secondHtml, /name="imap\.host"/, "this is the full form");
+    assert.match(secondHtml, /no password will connect/, "the warning did not survive Edit these");
+    // And the screen's own sentence is still there beside it: the two do not
+    // share a slot any more, so neither displaces the other.
+    assert.match(
+      secondHtml,
+      onProviderList ? /settings have been filled in/ : /Nothing has been saved/,
+      "the screen's own notice was displaced by the warning"
+    );
+    assert.equal(await stamp(accountsPath), before, "nothing was written on the way");
+  } finally {
+    await close();
+  }
+});
+
+test("a warned address that falls to the provider list keeps the warning through a preset", async () => {
+  // Proton's own path, and the second of #186's two named journeys. Proton
+  // publishes no autoconfig, so a proton.me address lands on the provider list;
+  // an operator running Bridge picks a preset from there and must still be able
+  // to read the Bridge sentence on the form they are about to fill in.
+  //
+  // Driven from the provider list rather than through the lookup, so it pins
+  // the hop it is about rather than what DNS answered today: the list is
+  // reachable by its own link with no lookup behind it, which is a real way in.
+  const { url, close } = await startConnector();
+  try {
+    const list = await post(url, "/settings/mailboxes/new", {
+      _action: "lookup",
+      "mail.defaultFrom": "anna@proton.me",
+      password: "hunter2",
+    });
+    assert.equal(list.status, 200);
+    assert.match(await list.text(), /Bridge/, "the sentence the table holds for this address");
+
+    const form = await post(url, "/settings/mailboxes/new", {
+      _action: "provider",
+      "mail.defaultFrom": "anna@proton.me",
+      provider: PROVIDER_OTHER,
+      password: "hunter2",
+    });
+
+    assert.equal(form.status, 200);
+    const html = await form.text();
+    assert.match(html, /name="imap\.host"/, "this is the full form");
+    assert.match(html, /Bridge/, "the warning did not survive the provider list");
+    assert.match(html, /Nothing has been saved/, "the screen's own notice is still shown");
+    // It warns and does not block: the form it leads to is a form, with a Save
+    // button on it, not a dead end.
+    assert.match(html, /name="_action" value="save"|type="submit"/);
+  } finally {
+    await close();
+  }
+});
+
+test("an ordinary address picks up no warning anywhere in the cascade", async () => {
+  // The other half of the field being a fact about the address: a domain the
+  // table does not know gets nothing, on every screen, so the warning cannot
+  // become chrome that everybody learns to ignore.
+  const { url, close } = await startConnector();
+  try {
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "provider",
+      "mail.defaultFrom": "anna@example.com",
+      provider: PROVIDER_OTHER,
+      password: "hunter2",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.equal(/no password will connect/.test(html), false, html);
+    assert.match(html, /Nothing has been saved/);
   } finally {
     await close();
   }

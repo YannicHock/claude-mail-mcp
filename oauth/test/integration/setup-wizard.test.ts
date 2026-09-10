@@ -63,6 +63,7 @@ import {
   SAVE_ANYWAY_FIELD,
   saveRefusedNotice,
   SHARED_PASSWORD_FIELD,
+  UNSUPPORTED_FIELD,
   type MailboxProbeReport,
   type MailboxRequestBody,
   type MailboxSuggestion,
@@ -454,6 +455,16 @@ interface ConnectorBehaviour {
   providersBody?: unknown;
   /** Drop the provider list's connection, the way `autoconfigAnswer` does. */
   providersAnswer?: "reset";
+  /**
+   * What the connector knows about the *address*, as opposed to what its domain
+   * publishes — #180's field on the autoconfig answer.
+   *
+   * Independent of {@link ConnectorBehaviour.suggestion} on purpose: outlook.com
+   * publishes autoconfig and refuses every password, proton.me publishes nothing
+   * and refuses every password, and the wizard has to render the sentence on
+   * whichever screen the lookup leads to.
+   */
+  unsupported?: string;
 }
 
 /**
@@ -556,7 +567,13 @@ function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): vo
       json(
         res,
         behaviour.autoconfigStatus ?? 200,
-        behaviour.autoconfigBody ?? { suggestion: behaviour.suggestion ?? null }
+        behaviour.autoconfigBody ?? {
+          suggestion: behaviour.suggestion ?? null,
+          // Sent only when there is something to say, the way the connector
+          // sends it: an absent field is the ordinary answer and is what a
+          // connector that predates #180 sends for every address.
+          ...(behaviour.unsupported === undefined ? {} : { unsupported: behaviour.unsupported }),
+        }
       );
       return;
     }
@@ -2302,6 +2319,237 @@ test("every step 2 screen the wizard serves submits its own action on Enter", as
     });
     assert.equal(suggested.status, 200);
     assert.equal(implicitAction(await suggested.text()), "save", "the confirmation screen");
+  } finally {
+    await harness.close();
+  }
+});
+
+// ---- #180 and #186: the warning reaches the wizard, and survives ------------
+//
+// #180 is the carrier — `POST /settings/autoconfig` had nowhere to put "no
+// password will connect", so the wizard's step 2, the screen the feature was
+// designed around, never showed it. #186 is the survival: the warning is a
+// field of the step now, decided in the same cascade that decides which screen
+// comes next, so it is still there one press later.
+//
+// The sentences below are the connector's, not this package's. The domain set
+// lives in `src/providers.ts` and is matched there; what this side owns is that
+// whatever the connector says about the address reaches every screen the
+// address survives on, which is why the stub simply hands one over.
+
+/** What the connector says about an outlook.com address. Abridged; the wording is its own. */
+const MICROSOFT_WARNING =
+  "Microsoft has removed password authentication for IMAP. You can carry on, but no " +
+  "password will connect.";
+
+/** And about a Proton one, worded so a Bridge operator recognises their own case. */
+const PROTON_WARNING =
+  "Proton's servers answer no IMAP or SMTP from the internet: a desktop client reaches " +
+  "Proton through Proton Mail Bridge. If you are running Bridge, carry on.";
+
+test("an outlook.com address is called out at the lookup, on the screen it leads to", async () => {
+  // Acceptance point 4 of the milestone spec's §6, on the UI it was written
+  // for. It failed here before #180: the connector's own Add mailbox page
+  // warned and the wizard, where a brand-new operator adds their first mailbox,
+  // did not.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      suggestion: suggestionFor({ email: "anna@outlook.com", domain: "outlook.com" }),
+      unsupported: MICROSOFT_WARNING,
+    });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@outlook.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+
+    assert.equal(res.status, 200, "a warning is not a refusal");
+    assert.match(await res.text(), /no password will connect/);
+    // One call went out and it was the lookup — the moment §5.3 says already
+    // exists. Nothing was probed and nothing was written to be told this.
+    assert.deepEqual(
+      harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
+      ["POST /settings/autoconfig"]
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a miss that still carries a warning lands on the provider list with it", async () => {
+  // The shape #180 flags as the only real objection to option B: the route
+  // answers 200-with-a-miss for a domain that publishes nothing, and a miss
+  // that *also* carries a warning is a shape it did not have. Proton is exactly
+  // that address, and the tier the miss leads to is where the Bridge sentence
+  // has to be.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { unsupported: PROTON_WARNING });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@proton.me",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+
+    assert.equal(res.status, 200, "a miss is not an error status, warning or no warning");
+    const html = await res.text();
+    assert.match(html, /value="mailbox-org"/, "the provider list, as a miss always leads to");
+    assert.match(html, /Bridge/, "the warning fell out with the miss");
+    // §7 stands: the miss itself is still not reported as a failure.
+    const body = html.slice(html.indexOf("</style>"));
+    assert.equal(/class="error"/.test(body), false, body);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a warned address keeps its warning through Edit these", async () => {
+  // #186's first named journey, walked in the wizard: lookup, confirmation
+  // screen, Edit these, full form. The warning is about the address and holds
+  // on all three; "Nothing has been saved" is about this submission and belongs
+  // only to the last. They had one slot between them, and the last screen chose
+  // the wrong one.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      suggestion: suggestionFor({ email: "anna@outlook.com", domain: "outlook.com" }),
+      unsupported: MICROSOFT_WARNING,
+    });
+
+    const looked = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@outlook.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    assert.equal(looked.status, 200);
+    const suggestion = await looked.text();
+    assert.match(suggestion, /no password will connect/);
+
+    // Exactly what the browser would send: the screen's own hidden inputs.
+    const edited = await postSetupForm(harness, "/mailbox", {
+      ...hiddenFields(suggestion),
+      _action: "edit",
+    });
+
+    assert.equal(edited.status, 200);
+    const form = await edited.text();
+    assert.match(form, new RegExp(`name="${MAILBOX_FIELDS.imapHost}"`), "this is the full form");
+    assert.match(form, /no password will connect/, "the warning did not survive Edit these");
+    assert.match(form, /Nothing has been saved/, "the screen's own notice was displaced");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a warned address keeps its warning through the provider list and a preset", async () => {
+  // #186's second named journey: a miss, tier 2, a chosen preset, the full
+  // form. Proton's is the case that matters — the operator picking a preset
+  // here is the one running Bridge, and the sentence they need is the one that
+  // tells them to point the mailbox at it.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { unsupported: PROTON_WARNING });
+
+    const listed = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@proton.me",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    assert.equal(listed.status, 200);
+    const list = await listed.text();
+    assert.match(list, /Bridge/);
+
+    const chosen = await postSetupForm(harness, "/mailbox", {
+      ...hiddenFields(list),
+      [ADDRESS_FIELD]: "anna@proton.me",
+      [PROVIDER_FIELD]: "posteo",
+      _action: "provider",
+    });
+
+    assert.equal(chosen.status, 200);
+    const form = await chosen.text();
+    assert.match(form, new RegExp(`name="${MAILBOX_FIELDS.imapHost}"`), "this is the full form");
+    assert.match(form, /Bridge/, "the warning did not survive the provider list");
+    assert.match(form, /Posteo settings have been filled in/, "the screen's own notice too");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a warning is not dropped when the provider table cannot be read either", async () => {
+  // The one path a miss-plus-warning could still fall through: the wizard asks
+  // the connector for tier 2's table, cannot get it, and goes straight to the
+  // full form. That fallback is where a warning would quietly disappear —
+  // "found nothing, here is the manual form" — and it is the exact shape #180
+  // says to watch.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { unsupported: PROTON_WARNING, providersAnswer: "reset" });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@proton.me",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, new RegExp(`name="${MAILBOX_FIELDS.imapHost}"`), "the full form fallback");
+    assert.match(html, /Bridge/, "the warning went down with the table");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a warned mailbox still saves in the wizard, because Bridge is a real setup", async () => {
+  // It warns and does not block, on this UI as on the other. A Proton mailbox
+  // pointed at a local Bridge is a working configuration, and step 2 has to be
+  // completable with one.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { unsupported: PROTON_WARNING });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields({ [ADDRESS_FIELD]: "anna@proton.me" }),
+      [UNSUPPORTED_FIELD]: PROTON_WARNING,
+      _action: "save",
+    });
+
+    assert.equal(res.status, 303, "the warning refused a save it only warns about");
+    assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 1);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a connector that predates the field warns about nothing at all", async () => {
+  // #180's last acceptance line, from the wizard's side: the stub sends the
+  // answer a 0.7.0 connector sends, and the screens are the screens they were.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { suggestion: suggestionFor() });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /Found settings for example\.com/);
+    assert.equal(/no password will connect/.test(html), false, html);
   } finally {
     await harness.close();
   }

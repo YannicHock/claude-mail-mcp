@@ -895,14 +895,16 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
    * the wizard calls; what is decided here is only how it looks and what status
    * it goes out under.
    *
-   * `notice` is one slot for two different kinds of sentence, and #186 is filed
-   * about it: `lookup` puts #151's "no password will connect" there, `edit`
-   * puts "Nothing has been saved…" there, and `provider` puts nothing — so a
-   * warned address loses its warning the moment the operator presses *Edit
-   * these*. One of those sentences is about the address and stays true for
-   * every screen it survives on; the other is about this submission. Making the
-   * warning survive means a field on {@link MailboxSetupStep}, which the
-   * wizard's copy of the cascade reads too, rather than a fourth argument here.
+   * Two slots, not one, which is #186. `notice` is the screen's own sentence
+   * about **this submission** — "Nothing has been saved…", "…settings have been
+   * filled in…" — and stays a parameter, because only the caller knows what it
+   * just did. The warning is about **the address**, stays true for every screen
+   * that address survives on, and travels on the step itself, decided by the
+   * `stepFrom*` functions in settings-api.ts that the wizard calls too. They
+   * shared this one parameter until #186, and the three `_action` branches
+   * fought over it: an operator who typed `anna@outlook.com`, was correctly
+   * warned, and pressed *Edit these* got a sentence about nothing having been
+   * saved in its place.
    */
   async function sendStep(
     res: Response,
@@ -910,10 +912,17 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     step: MailboxSetupStep,
     notice?: string
   ): Promise<void> {
+    // Rendered as its own box above the screen's own notice, on every screen
+    // that can carry one. Absent rather than empty, the way `notice` is, so a
+    // page never paints a box with nothing in it.
+    const warning = step.unsupported === null ? {} : { warning: step.unsupported };
+
     switch (step.view) {
       case "address":
         // The only way back to tier 1 is an address that could not be read, so
-        // this is a rejected submission rather than a fresh screen.
+        // this is a rejected submission rather than a fresh screen. Nothing is
+        // known about an address with no domain in it, which is why this screen
+        // is the one variant with no warning slot on it.
         sendHtml(
           res,
           400,
@@ -934,6 +943,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
             password: step.password,
             // #151 arrives here: a domain whose autoconfig answers — Microsoft's
             // does — but whose server will refuse every password anyway.
+            ...warning,
             ...(notice === undefined ? {} : { notice }),
           })
         );
@@ -954,6 +964,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
             // #151's other landing: Proton publishes no autoconfig, so an
             // address there falls to the provider list, and this is where the
             // Bridge sentence has to be.
+            ...warning,
             ...(notice === undefined ? {} : { notice }),
           })
         );
@@ -968,6 +979,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
             stamp: await store.stamp(),
             account: null,
             values: step.values,
+            ...warning,
             notice:
               notice ??
               (step.preset === null
@@ -1115,6 +1127,18 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       const action = raw(body, "_action");
       const email = raw(body, ADDRESS_FIELD);
       const password = raw(body, SHARED_PASSWORD_FIELD);
+      // #151 and #186. The warning is a fact about the address, so it is read
+      // once here for every branch rather than at one of them: the address is
+      // in the body of all three submissions, and re-deriving it is a table
+      // lookup in this package. Nothing is carried between screens for it,
+      // which is the difference between this UI and the wizard — the wizard is
+      // *told* the sentence over the wire (#180) because it must not grow a
+      // second copy of the domain set, and carries it forward from there.
+      //
+      // It warns and nothing else: the save is never blocked, because an
+      // operator running a Proton Mail Bridge has a configuration that works
+      // and must be able to carry on.
+      const unsupported = unsupportedNoticeFor(email);
 
       if (action === "lookup") {
         // Reached as a function call, not over a hop: `src/autoconfig.ts` is in
@@ -1124,19 +1148,21 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         const found = await lookupMailboxSettings(email);
         // A boolean and nothing else. Not the address, and not the hosts.
         log("info", "settings: add mailbox looked up an address", { found: found !== null });
-        // #151. The domain is known for the first time here, which is the
-        // earliest this connector can say that no password will work at this
-        // provider — and it is said now rather than after the save, because
-        // telling somebody that once they have typed a password is worse than
-        // not telling them at all. It warns and nothing else: the save is not
-        // blocked, because an operator running a Proton Mail Bridge has a
-        // configuration that works and must be able to carry on.
-        const unsupported = unsupportedNoticeFor(email);
+        // The domain is known for the first time here, which is the earliest
+        // this connector can say that no password will work at this provider —
+        // and it is said now rather than after the save, because telling
+        // somebody that once they have typed a password is worse than not
+        // telling them at all.
         await sendStep(
           res,
           assertion.csrf,
-          stepFromLookup({ email, password, found, defaults: newMailboxDefaults(email) }),
-          unsupported ?? undefined
+          stepFromLookup({
+            email,
+            password,
+            found,
+            defaults: newMailboxDefaults(email),
+            unsupported,
+          })
         );
         return;
       }
@@ -1152,6 +1178,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
             chosen,
             presets: providerPresets(email),
             defaults: newMailboxDefaults(email),
+            unsupported,
           })
         );
         return;
@@ -1161,7 +1188,12 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         await sendStep(
           res,
           assertion.csrf,
-          stepFromEdit({ fields: body, password, defaults: newMailboxDefaults(email) }),
+          stepFromEdit({
+            fields: body,
+            password,
+            defaults: newMailboxDefaults(email),
+            unsupported,
+          }),
           "Nothing has been saved. Change whatever is wrong and test the connection."
         );
         return;
@@ -1393,6 +1425,21 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
    * autoconfig failure is ever shown to the operator as an error, and the
    * wizard's response to `null` — the provider list — is the same one it has for
    * a domain that simply publishes nothing.
+   *
+   * ## What this route answers, since #180
+   *
+   * Not "what does this domain publish" but **"what does this connector know
+   * about this address"**. The `unsupported` field on the answer is the
+   * widening, and it is a widening worth making: the wizard posts an address
+   * here at the one moment the domain becomes known and before any password is
+   * typed, and "no password will work here" is knowledge about that address
+   * rather than about the DNS records under it — which is arguably what an
+   * operator was asking in the first place.
+   *
+   * The consequence to hold on to is that a **miss can carry a warning**. A
+   * domain that publishes nothing and cannot be served — Proton — answers 200
+   * with `suggestion: null` and a sentence, which is a shape this route did not
+   * have before. Whatever the wizard does with a miss has to keep it.
    */
   router.post("/settings/autoconfig", guardAssertion, jsonBody, formBody, guardCsrf, async (req, res) => {
     const email = raw(req.body as FormBody, "email");
@@ -1403,10 +1450,27 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     // wizard a document it will read as unreadable.
     const suggestion: LookupSuggestion | null = await lookupMailboxSettings(email);
 
+    // #180. This is what widens the route from "what does this domain publish"
+    // to "what does this connector know about this address" — which is what the
+    // wizard was asking it, and is the objection option B has to answer. "No
+    // password will work here" is knowledge about the address, not about the
+    // DNS records under it, and this is the one moment the wizard already has
+    // the address in hand and has not yet asked for a password.
+    //
+    // The domain match stays here, beside the table it reads, so the two UIs
+    // cannot disagree about which addresses are warned and the wizard gets no
+    // second copy of the domain set. Sent only when there is something to say:
+    // an absent field is what a wizard on an older release already handles, and
+    // what the field means for every ordinary address.
+    const unsupported = unsupportedNoticeFor(email);
+
     // The address is not logged — nothing an operator types into the wizard is,
     // and an email address is the one field here that identifies a person.
     log("info", "settings: autoconfig lookup", { found: suggestion !== null });
-    sendJson(res, 200, { suggestion });
+    sendJson(res, 200, {
+      suggestion,
+      ...(unsupported === null ? {} : { unsupported }),
+    });
   });
 
   router.post("/settings/mailboxes/:id", guardAssertion, formBody, guardCsrf, async (req, res) => {
