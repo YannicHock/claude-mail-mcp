@@ -1273,6 +1273,26 @@ describe("what pressing Enter in a wizard field does", () => {
     assert.deepEqual(withOverride, ["step 2 — the full form"]);
   });
 
+  it("paints Save anyway to the right of the screen's primary button", () => {
+    // #173. Enter was never the problem here — implicit submission reads DOM
+    // order, and every test above asserts DOM order. What `.secondary` alone
+    // did was carry `order: 1` along with the looks, painting the button that
+    // stores untested credentials ahead of the primary while those tests
+    // stayed green. A DOM-index assertion cannot see that, which is how it got
+    // in; this one reads the CSS the browser will actually sort by.
+    for (const { screen, html } of WIZARD_SCREENS) {
+      if (!/value="save_anyway"/.test(html)) continue;
+      assert.match(html, /class="secondary save-anyway"/, `${screen}: Save anyway has no ordering class`);
+      assert.match(
+        html,
+        /\.buttons > button\.save-anyway \{ order: 3; \}/,
+        `${screen}: Save anyway has no ordering rule`
+      );
+      const primary = /\.buttons > button \{ order: (\d+); \}/.exec(html)?.[1];
+      assert.ok(primary !== undefined && Number(primary) < 3, `${screen}: Save anyway does not sort last`);
+    }
+  });
+
   it("still paints Skip to the left of the screen's primary button", () => {
     // Skip is last in the DOM now, so what puts it back on the left is CSS.
     // That rule is the other half of the fix and belongs under test with it.
