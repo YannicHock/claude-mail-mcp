@@ -20,49 +20,25 @@
  */
 
 import assert from "node:assert/strict";
-import type { Server } from "node:http";
-import type { AddressInfo } from "node:net";
-import path from "node:path";
 import { describe, it } from "node:test";
 
-import { createApp } from "../../src/app.js";
-import { ClientPool } from "../../src/client-pool.js";
-import { makeAccount, withAccountsStore } from "../helpers/fixtures.js";
+import { withRunningApp } from "../helpers/running-app.js";
 
 const AUTH_TOKEN = "body-limit-unit-test-token";
 
 /** Post `body` to `/mcp` with a valid Bearer token and report what came back. */
 async function postToMcp(body: string): Promise<{ status: number; text: string }> {
-  return withAccountsStore([makeAccount({ id: "work", label: "Work", default: true })], async (store, dir) => {
-    const pool = new ClientPool(store);
-    const app = createApp({
-      store,
-      pool,
-      authToken: AUTH_TOKEN,
-      accountsFile: path.join(dir, "accounts.json"),
-      publicUrl: "http://localhost.invalid",
+  return withRunningApp({ authToken: AUTH_TOKEN }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${AUTH_TOKEN}`,
+      },
+      body,
     });
-
-    const server = await new Promise<Server>((resolve, reject) => {
-      const s: Server = app.listen(0, "127.0.0.1", () => resolve(s));
-      s.on("error", reject);
-    });
-    try {
-      const { port } = server.address() as AddressInfo;
-      const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-          authorization: `Bearer ${AUTH_TOKEN}`,
-        },
-        body,
-      });
-      return { status: response.status, text: await response.text() };
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await pool.closeAll().catch(() => {});
-    }
+    return { status: response.status, text: await response.text() };
   });
 }
 

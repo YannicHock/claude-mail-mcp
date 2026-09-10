@@ -31,10 +31,11 @@
  */
 
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
-import { describe, it } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { after, describe, it } from "node:test";
 
 const repoRoot = new URL("../../", import.meta.url);
 
@@ -46,6 +47,16 @@ const repoRoot = new URL("../../", import.meta.url);
  * takes everything inside it out of this guard with no test failure and no signal
  * of any kind. A duplicate-detector that can be switched off by creating a
  * directory is worse than none, because it reads as coverage.
+ *
+ * That argument applies to this function too, which is why `describe("tsFilesIn")`
+ * below walks a temp directory that really does have a subdirectory in it:
+ * against the flat trees this repository ships, dropping `recursive: true` breaks
+ * nothing and every other test here stays green.
+ *
+ * `dir` is resolved against the repository root, so it is normally a relative
+ * prefix like `"src/"` — but any absolute `file:` URL ending in `/` works too,
+ * since `new URL()` ignores the base for those. The returned paths are that same
+ * prefix plus a forward-slash-separated remainder, on every platform.
  */
 function tsFilesIn(dir: string): string[] {
   const base = fileURLToPath(new URL(dir, repoRoot));
@@ -58,50 +69,83 @@ function tsFilesIn(dir: string): string[] {
     .sort();
 }
 
-function read(relative: string): string {
-  return readFileSync(new URL(relative, repoRoot), "utf8").replace(/\r\n/g, "\n");
+function read(file: string): string {
+  return readFileSync(new URL(file, repoRoot), "utf8").replace(/\r\n/g, "\n");
 }
 
 /**
- * Names declared at the top level of a module.
+ * The `export …` forms that bind a name locally.
  *
  * `export { name } from "…"` and `export type { name } from "…"` are deliberately
- * not matched: they bind nothing locally, which is exactly the difference
- * between re-exporting the shared declaration and writing a second one.
+ * absent: they bind nothing locally, which is exactly the difference between
+ * re-exporting the shared declaration and writing a second one.
  */
-function declaredNames(source: string): Set<string> {
+const EXPORTED_DECLARATION_PATTERNS = [
+  /^export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
+  /^export\s+(?:const|let|var|class|abstract\s+class|interface|enum)\s+([A-Za-z_$][\w$]*)/gm,
+  /^export\s+type\s+([A-Za-z_$][\w$]*)\s*[=<]/gm,
+] as const;
+
+/** The same forms without the `export`, for declarations a module keeps to itself. */
+const LOCAL_DECLARATION_PATTERNS = [
+  /^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
+  /^(?:const|let|var|class|interface|enum)\s+([A-Za-z_$][\w$]*)/gm,
+  /^type\s+([A-Za-z_$][\w$]*)\s*[=<]/gm,
+] as const;
+
+function namesMatching(source: string, patterns: readonly RegExp[]): Set<string> {
   const names = new Set<string>();
-  const patterns = [
-    /^export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
-    /^export\s+(?:const|let|var|class|abstract\s+class|interface|enum)\s+([A-Za-z_$][\w$]*)/gm,
-    /^export\s+type\s+([A-Za-z_$][\w$]*)\s*[=<]/gm,
-    /^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
-    /^(?:const|let|var|class|interface|enum)\s+([A-Za-z_$][\w$]*)/gm,
-    /^type\s+([A-Za-z_$][\w$]*)\s*[=<]/gm,
-  ];
   for (const pattern of patterns) {
     for (const match of source.matchAll(pattern)) {
       if (match[1] !== undefined) names.add(match[1]);
     }
   }
   return names;
+}
+
+/**
+ * Names declared at the top level of a module, exported or not.
+ *
+ * The two tables are shared with {@link exportedNames} rather than spelled out
+ * twice: this is the file whose entire subject is refusing a rule written in two
+ * places, and it had the three `^export …` regexes character-for-character in
+ * both functions.
+ */
+function declaredNames(source: string): Set<string> {
+  return namesMatching(source, [...EXPORTED_DECLARATION_PATTERNS, ...LOCAL_DECLARATION_PATTERNS]);
 }
 
 /** The same, restricted to what a module actually exports. */
 function exportedNames(source: string): Set<string> {
-  const names = new Set<string>();
-  const patterns = [
-    /^export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
-    /^export\s+(?:const|let|var|class|abstract\s+class|interface|enum)\s+([A-Za-z_$][\w$]*)/gm,
-    /^export\s+type\s+([A-Za-z_$][\w$]*)\s*[=<]/gm,
-  ];
-  for (const pattern of patterns) {
-    for (const match of source.matchAll(pattern)) {
-      if (match[1] !== undefined) names.add(match[1]);
-    }
-  }
-  return names;
+  return namesMatching(source, EXPORTED_DECLARATION_PATTERNS);
 }
+
+describe("tsFilesIn", () => {
+  // A fixture with a subdirectory, which neither src/ nor oauth/src/ has. Without
+  // it, `recursive: true` is unpinned: remove it and this whole file still passes.
+  const fixture = mkdtempSync(join(tmpdir(), "shared-modules-walk-"));
+  mkdirSync(join(fixture, "nested"));
+  writeFileSync(join(fixture, "a.ts"), "export const a = 1;\n", "utf8");
+  writeFileSync(join(fixture, "nested", "b.ts"), "export const b = 2;\n", "utf8");
+  writeFileSync(join(fixture, "nested", "notes.md"), "not typescript\n", "utf8");
+  const dir = pathToFileURL(join(fixture, "/")).href;
+
+  after(() => rmSync(fixture, { recursive: true, force: true }));
+
+  it("finds a .ts file inside a subdirectory, not just the top level", () => {
+    assert.deepEqual(tsFilesIn(dir), [`${dir}a.ts`, `${dir}nested/b.ts`]);
+  });
+
+  it("separates the nested path with forward slashes on every platform", () => {
+    // `relative()` yields backslashes on Windows; the guard below compares these
+    // strings against literals like "src/autoconfig.ts", so the split/join is not
+    // cosmetic.
+    const nested = tsFilesIn(dir).find((file) => file.endsWith("b.ts"));
+    assert.ok(nested, "the nested file is found at all");
+    assert.ok(nested.endsWith("nested/b.ts"), `expected forward slashes, got ${nested}`);
+    assert.ok(!nested.includes("\\"), `expected no backslashes, got ${nested}`);
+  });
+});
 
 const sharedFiles = tsFilesIn("shared/");
 

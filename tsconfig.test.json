@@ -18,5 +18,16 @@
     "noEmit": true
   },
   "include": ["src/**/*", "shared/**/*", "test/**/*"],
+  // Load-bearing, despite looking byte-identical to the parent's and therefore
+  // removable. `exclude` is not merged across `extends`: it comes from whichever
+  // config declares it last, so this line is what stops a future `"test"` entry
+  // in tsconfig.json's exclude from cancelling the `test/**/*` above. Delete it,
+  // or add `"test"` there, and this project typechecks *nothing* — silently, and
+  // green, because `npm run typecheck:test` reports success over an empty file
+  // list and `tsx` strips types at runtime without checking them.
+  //
+  // Verify with `tsc -p tsconfig.test.json --listFiles`: the connector's test
+  // files must appear in it. oauth/tsconfig.test.json carries the same line for
+  // the same reason, and there the trap was not hypothetical — see its comment.
   "exclude": ["node_modules", "dist"]
 }

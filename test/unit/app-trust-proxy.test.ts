@@ -23,14 +23,10 @@
  */
 
 import assert from "node:assert/strict";
-import type { Server } from "node:http";
-import type { AddressInfo } from "node:net";
-import path from "node:path";
 import { describe, it } from "node:test";
 
-import { createApp, type LogLevel } from "../../src/app.js";
-import { ClientPool } from "../../src/client-pool.js";
-import { makeAccount, withAccountsStore } from "../helpers/fixtures.js";
+import type { LogLevel } from "../../src/app.js";
+import { withRunningApp } from "../helpers/running-app.js";
 
 /** The address the client wrote into the header itself. Never a valid answer. */
 const FORGED = "198.51.100.9";
@@ -45,25 +41,13 @@ const OBSERVED = "203.0.113.7";
 async function rejectedRequestIp(trustProxy?: number): Promise<unknown> {
   const lines: { level: LogLevel; message: string; extra?: Record<string, unknown> }[] = [];
 
-  return withAccountsStore([makeAccount({ id: "work", label: "Work", default: true })], async (store, dir) => {
-    const pool = new ClientPool(store);
-    const app = createApp({
-      store,
-      pool,
-      authToken: "unit-test-token",
-      accountsFile: path.join(dir, "accounts.json"),
-      publicUrl: "http://localhost.invalid",
+  return withRunningApp(
+    {
       trustProxy,
       log: (level, message, extra) => lines.push({ level, message, extra }),
-    });
-
-    const server = await new Promise<Server>((resolve, reject) => {
-      const s: Server = app.listen(0, "127.0.0.1", () => resolve(s));
-      s.on("error", reject);
-    });
-    try {
-      const { port } = server.address() as AddressInfo;
-      const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+    },
+    async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/mcp`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -76,11 +60,8 @@ async function rejectedRequestIp(trustProxy?: number): Promise<unknown> {
       const rejection = lines.find((l) => l.message === "rejected unauthenticated MCP request");
       assert.ok(rejection, "the rejection is logged");
       return rejection.extra?.ip;
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await pool.closeAll().catch(() => {});
     }
-  });
+  );
 }
 
 describe("trust proxy", () => {

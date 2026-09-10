@@ -3,8 +3,21 @@
  *
  * One suite, not two. oauth/test/unit/secrets.test.ts was a hand-maintained second
  * copy pinned by nothing, and #126 deleted it along with the second copy of the
- * module it tested. It was 822 lines against this file's 686 and differed in 258
- * of them — near-identical, not byte-for-byte, which the #126 review corrected.
+ * module it tested. It was the *shorter* of the two: 686 lines against this
+ * file's 822 at e680dd2^, the tree #126 deleted it from (805 here today, after
+ * later edits). 258 lines differ between them — near-identical, not
+ * byte-for-byte.
+ *
+ * Re-derive all three rather than trusting this paragraph, which said 822
+ * against 686 until a review checked it:
+ *
+ *   git show e680dd2^:oauth/test/unit/secrets.test.ts | wc -l   # 686
+ *   git show e680dd2^:test/unit/secrets.test.ts       | wc -l   # 822
+ *   diff <deleted> <kept> | grep -c '^[<>]'                     # 258
+ *
+ * — `diff` counting added and removed lines together, so 258 is lines-that-
+ * differ across both files, not 258 pairs.
+ *
  * Its one unique block, covering createExclusively's non-default file mode, is
  * covered through the real claim-token path by oauth/test/unit/bootstrap.test.ts
  * ("is written 0600, not at the shared secrets' mode"); nothing else was lost.
