@@ -689,17 +689,7 @@ test("the edit form for that mailbox repeats the notice instead of promising a S
 test("an oversized settings form body gets a clean JSON 4xx, not an HTML error page", async () => {
   const { url, accountsPath, close } = await startConnector();
   try {
-    const oversized = "x".repeat(80 * 1024); // over the settings routes' 64kb cap
-    const assertion = mint("POST", "/settings/mailboxes");
-    const res = await fetch(`${url}/settings/mailboxes`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${AUTH_TOKEN}`,
-        [ASSERTION_HEADER]: assertion,
-        "content-type": "application/x-www-form-urlencoded",
-      },
-      body: `label=${oversized}`,
-    });
+    const res = await oversizedPost(url, "application/x-www-form-urlencoded");
     assert.ok(res.status >= 400 && res.status < 500, `expected a 4xx, got ${res.status}`);
     assert.equal(res.headers.get("content-type")?.split(";")[0].trim(), "application/json");
     const body = await res.json();
@@ -709,6 +699,73 @@ test("an oversized settings form body gets a clean JSON 4xx, not an HTML error p
     await close();
   }
 });
+
+/**
+ * #137. The same route, the same handler, two content types — and, until this
+ * pair of tests existed, two limits eighty times apart. `express.json({ limit:
+ * "5mb" })` used to be mounted app-wide ahead of the settings router, and
+ * body-parser short-circuits on `req._body`, so the router's own 64 KB
+ * `jsonBody` never ran: a JSON draft of up to 5 MB reached `parseAccountForm`
+ * and `store.create`, while the browser form of the *same* route was refused at
+ * 64 KB. The test above covers the form half only, which is why the suite could
+ * not see it.
+ */
+test("an oversized settings JSON body gets the same clean JSON 4xx the form body gets", async () => {
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await oversizedPost(url, "application/json");
+    assert.ok(res.status >= 400 && res.status < 500, `expected a 4xx, got ${res.status}`);
+    assert.equal(res.headers.get("content-type")?.split(";")[0].trim(), "application/json");
+    const body = await res.json();
+    assert.equal(body.error, "bad_request");
+    assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
+  } finally {
+    await close();
+  }
+});
+
+/**
+ * The defect was never a missing rejection on one side; it was the two sides
+ * disagreeing. Asserted as a pair so neither limit can drift away from the
+ * other again — #147 adds a field to exactly this JSON surface.
+ */
+test("both branches of one settings route refuse an oversized body identically", async () => {
+  const { url, close } = await startConnector();
+  try {
+    const asJson = await oversizedPost(url, "application/json");
+    const asForm = await oversizedPost(url, "application/x-www-form-urlencoded");
+    assert.equal(
+      asJson.status,
+      asForm.status,
+      "the JSON branch and the form branch of the same route cap at the same size"
+    );
+    assert.deepEqual(await asJson.json(), await asForm.json(), "and refuse in the same shape");
+  } finally {
+    await close();
+  }
+});
+
+/**
+ * One POST to `/settings/mailboxes` carrying ~80 KB — over the settings routes'
+ * 64 KB cap, and far under the 5 MB `/mcp` keeps — in whichever of the two
+ * content types that route accepts.
+ */
+async function oversizedPost(url: string, contentType: string): Promise<Response> {
+  const oversized = "x".repeat(80 * 1024);
+  const body =
+    contentType === "application/json"
+      ? JSON.stringify({ label: oversized, _csrf: CSRF })
+      : `label=${oversized}`;
+  return fetch(`${url}/settings/mailboxes`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${AUTH_TOKEN}`,
+      [ASSERTION_HEADER]: mint("POST", "/settings/mailboxes"),
+      "content-type": contentType,
+    },
+    body,
+  });
+}
 
 /**
  * Mounting the settings router (scoped bearerAuth on /settings, the router

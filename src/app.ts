@@ -137,7 +137,22 @@ export function createApp(opts: CreateAppOptions): express.Express {
   // OAuth layer in between, where there is one, forwards X-Forwarded-For
   // unchanged rather than appending to it, so it costs no hop.
   app.set("trust proxy", opts.trustProxy ?? 1);
-  app.use(express.json({ limit: "5mb" }));
+
+  // Scoped to /mcp, never mounted app-wide (#137).
+  //
+  // body-parser sets `req._body` once it has parsed a request, and every later
+  // json() short-circuits on that flag. An app-wide parser is therefore not
+  // "the default limit" — it is the *only* limit, silently overriding any
+  // tighter one a router further down declares for itself. That is exactly what
+  // happened here: the settings router's own 64 KB express.json() never ran, so
+  // the JSON branch of a settings route accepted 5 MB while the form branch of
+  // the same route refused at 64 KB.
+  //
+  // 5 MB is what /mcp genuinely needs — a `send_message` carries its
+  // attachments base64-encoded inside the JSON-RPC body — and it is the only
+  // route here that posts anything near it, so it is the only route that gets
+  // it. Everything else parses its own body at its own limit, or none.
+  const mcpBody = express.json({ limit: "5mb" });
 
   app.get("/health", (_req, res) => {
     res.json({
@@ -166,7 +181,7 @@ export function createApp(opts: CreateAppOptions): express.Express {
     next();
   }
 
-  app.post("/mcp", bearerAuth, async (req, res) => {
+  app.post("/mcp", bearerAuth, mcpBody, async (req, res) => {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -215,9 +230,9 @@ export function createApp(opts: CreateAppOptions): express.Express {
     });
   });
 
-  // App-wide rather than router-only: the global express.json() above (on
-  // /mcp) and the settings router's express.urlencoded() both call next(err)
-  // on a malformed or oversized body, and neither is a route handler that can
+  // App-wide rather than router-only: the /mcp parser above and the settings
+  // router's own express.json()/express.urlencoded() pair all call next(err)
+  // on a malformed or oversized body, and none is a route handler that can
   // catch that itself — it never reaches one. Without this, such an error
   // falls through to Express 5's default handler, which renders an HTML page
   // (including a stack trace unless NODE_ENV=production, which nothing here
