@@ -1,6 +1,9 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import {
+  AccountsStore,
   AccountsStoreError,
   NoSuchAccountError,
   RESERVED_IDS,
@@ -305,5 +308,163 @@ describe("AccountsStore — reserved ids that are already on disk", () => {
     assert.match(reservedIdNotice("test"), /never persists/i);
     // "new": the literal GET route wins, so the page is never reached at all.
     assert.match(reservedIdNotice("new"), /Add mailbox/);
+  });
+});
+
+describe("AccountsStore — at most one default", () => {
+  /**
+   * The invariant these cases pin: after *any* sequence of create/update
+   * calls, at most one account carries `default: true` — and when a call
+   * asked for a default, that account is the one that has it.
+   *
+   * The wizard is what made this unavoidable rather than a choice: its
+   * mailbox step emits a hidden `default=1` with no way to untick it, and
+   * step 2 is re-enterable, so a second mailbox arrived asking to be a
+   * second default. The store is the one place that already knows the whole
+   * list, so it is where the flag is made to move rather than accumulate.
+   */
+  function defaultIds(store: AccountsStore): string[] {
+    return store
+      .list()
+      .filter((a) => a.default === true)
+      .map((a) => a.id);
+  }
+
+  test("create(default) moves the flag off the existing default", async () => {
+    const work = makeAccount({ id: "work", label: "Work", default: true });
+    await withAccountsStore([work], async (store) => {
+      await store.create(
+        makeAccount({ id: "home", label: "Home", default: true }),
+        await store.stamp()
+      );
+
+      assert.deepEqual(defaultIds(store), ["home"]);
+      assert.equal(store.resolve().id, "home");
+      assert.deepEqual(
+        store
+          .publicSummaries()
+          .filter((s) => s.default)
+          .map((s) => s.id),
+        ["home"]
+      );
+    });
+  });
+
+  test("create(non-default) leaves the existing default alone", async () => {
+    const work = makeAccount({ id: "work", label: "Work", default: true });
+    await withAccountsStore([work], async (store) => {
+      await store.create(makeAccount({ id: "home", label: "Home" }), await store.stamp());
+
+      assert.deepEqual(defaultIds(store), ["work"]);
+      assert.equal(store.resolve().id, "work");
+    });
+  });
+
+  test("a run of wizard-shaped creates, each asking to be default, leaves exactly one", async () => {
+    await withAccountsStore([], async (store) => {
+      for (const id of ["work", "home", "side"]) {
+        await store.create(makeAccount({ id, label: id, default: true }), await store.stamp());
+      }
+
+      assert.deepEqual(store.ids(), ["work", "home", "side"]);
+      assert.deepEqual(defaultIds(store), ["side"]);
+      assert.equal(store.resolve().id, "side");
+    });
+  });
+
+  test("update(default) clears the flag on every other account", async () => {
+    const work = makeAccount({ id: "work", label: "Work", default: true });
+    const home = makeAccount({ id: "home", label: "Home" });
+    await withAccountsStore([work, home], async (store) => {
+      await store.update(
+        "home",
+        makeAccount({ id: "home", label: "Home", default: true }),
+        await store.stamp()
+      );
+
+      assert.deepEqual(defaultIds(store), ["home"]);
+      assert.equal(store.resolve().id, "home");
+    });
+  });
+
+  test("update(default) on the account that already is default keeps exactly one", async () => {
+    const work = makeAccount({ id: "work", label: "Work", default: true });
+    const home = makeAccount({ id: "home", label: "Home" });
+    await withAccountsStore([work, home], async (store) => {
+      await store.update(
+        "work",
+        makeAccount({ id: "work", label: "Work renamed", default: true }),
+        await store.stamp()
+      );
+
+      assert.deepEqual(defaultIds(store), ["work"]);
+      assert.equal(store.list()[0]?.label, "Work renamed");
+    });
+  });
+
+  test("update(non-default) does not promote anyone else", async () => {
+    const work = makeAccount({ id: "work", label: "Work", default: true });
+    const home = makeAccount({ id: "home", label: "Home" });
+    await withAccountsStore([work, home], async (store) => {
+      await store.update("home", makeAccount({ id: "home", label: "Home 2" }), await store.stamp());
+
+      assert.deepEqual(defaultIds(store), ["work"]);
+    });
+  });
+
+  test("a file that already carries two defaults is repaired by the next default-bearing write", async () => {
+    // Hand-edited files, and files written before this fix, can hold two.
+    const work = makeAccount({ id: "work", label: "Work", default: true });
+    const home = makeAccount({ id: "home", label: "Home", default: true });
+    await withAccountsStore([work, home], async (store) => {
+      assert.deepEqual(defaultIds(store), ["work", "home"]);
+
+      await store.create(
+        makeAccount({ id: "side", label: "Side", default: true }),
+        await store.stamp()
+      );
+
+      assert.deepEqual(defaultIds(store), ["side"]);
+    });
+  });
+
+  test("the surviving default is what lands on disk, not just in memory", async () => {
+    const work = makeAccount({ id: "work", label: "Work", default: true });
+    await withAccountsStore([work], async (store, dir) => {
+      await store.create(
+        makeAccount({ id: "home", label: "Home", default: true }),
+        await store.stamp()
+      );
+
+      const raw = await fs.readFile(path.join(dir, "accounts.json"), "utf8");
+      const parsed = JSON.parse(raw) as { accounts: Array<{ id: string; default?: boolean }> };
+      assert.deepEqual(
+        parsed.accounts.filter((a) => a.default === true).map((a) => a.id),
+        ["home"]
+      );
+    });
+  });
+
+  test("mixed create/update/setDefault sequences never leave two defaults", async () => {
+    await withAccountsStore([], async (store) => {
+      await store.create(makeAccount({ id: "a", default: true }), await store.stamp());
+      await store.create(makeAccount({ id: "b", default: true }), await store.stamp());
+      await store.setDefault("a", await store.stamp());
+      await store.update(
+        "b",
+        makeAccount({ id: "b", label: "B2", default: true }),
+        await store.stamp()
+      );
+      await store.create(makeAccount({ id: "c" }), await store.stamp());
+      await store.setDefault("c", await store.stamp());
+      await store.update(
+        "a",
+        makeAccount({ id: "a", label: "A2", default: true }),
+        await store.stamp()
+      );
+
+      assert.deepEqual(defaultIds(store), ["a"]);
+      assert.equal(store.resolve().id, "a");
+    });
   });
 });
