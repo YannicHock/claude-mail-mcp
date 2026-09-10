@@ -32,6 +32,8 @@ import {
   caldavFailureNotice,
   carrying,
   CHECKBOX_ON,
+  CONNECTOR_AUTOCONFIG_BUDGET_MS,
+  CONNECTOR_PROBE_BUDGET_MS,
   draftFromFields,
   flattenDraft,
   MAILBOX_FIELDS,
@@ -54,6 +56,7 @@ import {
   stepFromEdit,
   stepFromLookup,
   stepFromProvider,
+  stringField,
   withSharedPassword,
   type MailboxDraft,
   type MailboxProbeReport,
@@ -853,5 +856,52 @@ describe("the classification, on the wire", () => {
       id: "work",
       stamp: "1-2",
     });
+  });
+});
+
+// ---- The connector's budgets (#134) ----------------------------------------
+//
+// Two of the wizard's timeouts have to stay above the connector's own, or the
+// wizard abandons work that is still running and tells the operator the
+// connector never answered — #82's failure, arrived at from the other end. The
+// two packages cannot see each other's numbers, so three comments said this and
+// nothing checked it. The numbers live here now, in the one file both sides
+// already import, and each wizard budget is derived from one of them by
+// addition. oauth/test/unit/setup-wizard.test.ts pins that half.
+
+describe("the connector's timeout budgets", () => {
+  it("are the values they have always been", () => {
+    // Deliberately dumb assertions against literals, kept from the two budget
+    // tests in test/unit/timeout.test.ts that used to say this about the
+    // connector's own constants. Changing one of these is a decision about how
+    // long an operator waits, and it should have to be made twice.
+    assert.equal(CONNECTOR_PROBE_BUDGET_MS, 25_000);
+    assert.equal(CONNECTOR_AUTOCONFIG_BUDGET_MS, 10_000);
+  });
+
+  it("are numbers, in a module whose every other map is strings", () => {
+    // Why the `as T` cast in the password spread had to go before these
+    // arrived: `carrying` is declared as returning Record<string, string> and
+    // received its answer through that cast with nothing checking it. A field
+    // map here that can hold a number made the declaration a lie at compile
+    // time, with no error.
+    assert.equal(typeof CONNECTOR_PROBE_BUDGET_MS, "number");
+    assert.equal(typeof CONNECTOR_AUTOCONFIG_BUDGET_MS, "number");
+  });
+});
+
+describe("stringField — the coercion this module owns", () => {
+  it("reads a string through, and anything else as absent", () => {
+    assert.equal(stringField("value"), "value");
+    assert.equal(stringField(["a", "b"]), "");
+    assert.equal(stringField(undefined), "");
+    assert.equal(stringField(7), "");
+  });
+
+  it("is what draftFromFields reads a repeated field through", () => {
+    // The third copy #128's review found: draftFromFields declared the same
+    // coercion as its own closure, 630 lines above the module-private one.
+    const draft = draftFromFields({ [MAILBOX_FIELDS.imapHost]: ["a", "b"] });
+    assert.equal(draft.imap.host, "");
   });
 });

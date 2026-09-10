@@ -72,6 +72,41 @@ export const MAILBOX_SECRET_FIELDS: readonly MailboxFieldName[] = [
 /** What a ticked checkbox submits, which is also what the connector reads. */
 export const CHECKBOX_ON = "1";
 
+// ---- The connector's budgets -----------------------------------------------
+
+/**
+ * How long the connector gives itself to probe one candidate mailbox.
+ *
+ * Here rather than in `src/probe.ts`, where it was, because it is not only the
+ * connector's business: the setup wizard waits on this call, and a wizard that
+ * gives up first abandons work that is still running and tells the operator
+ * *"the connector did not answer"* about a probe that was going to succeed —
+ * #82's failure, reached from the other end. The two constants lived in
+ * different npm packages, so no compiler and no single suite saw both, and the
+ * rule "the wizard waits longer" was three comments in `setup-routes.ts` and
+ * nothing else. Raising this to 40 s used to break the wizard silently.
+ *
+ * The wizard derives its own budget by adding slack to this number, so raising
+ * it now raises the wizard's with it. `src/probe.ts` takes it as its default —
+ * it is still `TOTAL_TIMEOUT_MS` there, for every caller that has always
+ * imported that name.
+ */
+export const CONNECTOR_PROBE_BUDGET_MS = 25_000;
+
+/**
+ * How long the connector gives the whole autoconfig cascade before it answers
+ * `null`. Shared for the same reason, and used the same way: `src/autoconfig.ts`
+ * takes it as `AUTOCONFIG_TOTAL_TIMEOUT_MS`, and the wizard's lookup timeout is
+ * this plus slack.
+ *
+ * The slack matters more here than the arithmetic does. A cascade that runs to
+ * the end of its deadline still has an answer to send — "nothing found" is an
+ * answer, and the screen after it is the provider list. Aborting at exactly this
+ * number turns that into no answer at all: the same screen for the operator, and
+ * a warning in the log about a connector that did precisely what it promised.
+ */
+export const CONNECTOR_AUTOCONFIG_BUDGET_MS = 10_000;
+
 // ---- The draft -------------------------------------------------------------
 
 /**
@@ -172,10 +207,7 @@ export function flattenDraft(draft: MailboxDraft): Record<string, string> {
  * CalDAV section comes back to the operator with what they typed still in it.
  */
 export function draftFromFields(fields: Record<string, unknown>): MailboxDraft {
-  const text = (name: MailboxFieldName): string => {
-    const value = fields[name];
-    return typeof value === "string" ? value : "";
-  };
+  const text = (name: MailboxFieldName): string => stringField(fields[name]);
   const flag = (name: MailboxFieldName): boolean => text(name) === CHECKBOX_ON;
 
   const caldav: MailboxCalDavDraft = {
@@ -988,8 +1020,17 @@ export function emptyMailboxValues(email: string): Record<string, string> {
   };
 }
 
-/** A field of a form body, or "" for a missing one or a repeated one. */
-function stringField(value: unknown): string {
+/**
+ * A field of a form body, or "" for a missing one or a repeated one.
+ *
+ * Exported since #134 because it was not only this module's coercion: the setup
+ * wizard declared it byte-for-byte in `oauth/src/setup-routes.ts` and called its
+ * own copy eleven times, in the two packages #126 spent 1,650 lines
+ * de-mirroring. {@link draftFromFields} had a third copy as a local closure.
+ * There is one now, and `test/unit/shared-modules.test.ts` sees private
+ * declarations too, which is why nothing noticed the first two.
+ */
+export function stringField(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
@@ -1009,23 +1050,32 @@ function stringField(value: unknown): string {
  * any one of its three fields is non-empty, so a block that is nothing but a
  * password is a probe against a server that was never named.
  *
- * Generic over the field map because the same rule runs in both directions —
- * see {@link carrying} and {@link withSharedPassword} — and the two directions
- * disagree about nothing except whether the values have already been narrowed to
- * strings. Reading through {@link stringField} covers both.
+ * Returns **only the fields it adds**, rather than a filled-in copy of the map
+ * it was given, and that is what lets the same rule run in both directions
+ * without a cast. It used to be generic over the field map and end
+ * `return filled as T`, which was sound only for as long as every value in every
+ * map here was a string: {@link carrying} is declared as returning
+ * `Record<string, string>` and got its answer through that cast unchecked, so
+ * the first number in this module — {@link CONNECTOR_PROBE_BUDGET_MS}, one
+ * section up — would have made that declaration a lie at compile time with no
+ * error anywhere. Reading through {@link stringField} and writing only strings
+ * keeps both callers honest at their own boundary.
  */
-function spreadSharedPassword<T extends Record<string, unknown>>(fields: T, shared: string): T {
-  if (shared === "") return fields;
+function spreadSharedPassword(
+  fields: Record<string, unknown>,
+  shared: string
+): Record<string, string> {
+  if (shared === "") return {};
 
   const text = (name: string): string => stringField(fields[name]);
-  const filled: Record<string, unknown> = { ...fields };
+  const filled: Record<string, string> = {};
   for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
     if (text(name) === "") filled[name] = shared;
   }
   if (text(MAILBOX_FIELDS.caldavUrl) !== "" && text(MAILBOX_FIELDS.caldavPass) === "") {
     filled[MAILBOX_FIELDS.caldavPass] = shared;
   }
-  return filled as T;
+  return filled;
 }
 
 /**
@@ -1041,7 +1091,7 @@ export function carrying(
   values: Record<string, string>,
   password: string
 ): Record<string, string> {
-  return spreadSharedPassword(values, password);
+  return { ...values, ...spreadSharedPassword(values, password) };
 }
 
 /**
@@ -1051,9 +1101,13 @@ export function carrying(
  * on its way to the connector's parser. The full form is where a mailbox with
  * two different passwords is expressed, and it sends no
  * {@link SHARED_PASSWORD_FIELD} at all, so this is inert there.
+ *
+ * The widening happens here rather than inside the rule: a body's other values
+ * are whatever the form parser produced — an array for a repeated field — and
+ * they are carried through untouched.
  */
 export function withSharedPassword(body: Record<string, unknown>): Record<string, unknown> {
-  return spreadSharedPassword(body, stringField(body[SHARED_PASSWORD_FIELD]));
+  return { ...body, ...spreadSharedPassword(body, stringField(body[SHARED_PASSWORD_FIELD])) };
 }
 
 /**

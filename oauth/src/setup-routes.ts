@@ -118,6 +118,8 @@ import {
   ADDRESS_FIELD,
   carrying,
   CHECKBOX_ON,
+  CONNECTOR_AUTOCONFIG_BUDGET_MS,
+  CONNECTOR_PROBE_BUDGET_MS,
   domainOf,
   draftFromFields,
   emptyMailboxValues,
@@ -135,6 +137,7 @@ import {
   stepFromEdit,
   stepFromLookup,
   stepFromProvider,
+  stringField,
   withSharedPassword,
   type AutoconfigRequestBody,
   type MailboxDraft,
@@ -1036,11 +1039,6 @@ function parseForm(req: Request, res: Response): Promise<void> {
   });
 }
 
-/** A submitted field, or "" for a missing one or a repeated one. */
-function stringField(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
 // ---- Step 2's three screens ------------------------------------------------
 
 /** Every URL step 2's screens link to, built once from the token'd base. */
@@ -1151,8 +1149,39 @@ const UPSTREAM_PROVIDERS = "/settings/providers";
  */
 const SETUP_SUBJECT = "setup-wizard";
 
-/** Longer than the connector's own 25-second probe budget, and not much longer. */
-const PROBE_TIMEOUT_MS = 30_000;
+/**
+ * The two budgets below are the connector's own plus this, and that addition is
+ * the whole of #134.
+ *
+ * A wizard budget under the connector's abandons a call that is still running
+ * and shows the operator *"the connector did not answer"* about work that was
+ * going to succeed — #82's failure, reached from the other end. The rule used to
+ * be three comments in this file naming numbers that lived in the other package,
+ * where no compiler and no single suite could see both. Now the connector's
+ * budgets are imported and the wizard's are arithmetic on them, so raising one
+ * over there raises this one with it. What is left to get wrong is the slack
+ * itself, and `oauth/test/unit/setup-wizard.test.ts` pins that it is positive.
+ *
+ * Both are exported for that test and for nothing else.
+ */
+export const PROBE_SLACK_MS = 5_000;
+
+/**
+ * Less slack than the probe gets, because the cascade is likelier to use all of
+ * its budget: a lookup that runs to the end of it still has an answer to send —
+ * `null`, and the screen after that is the provider list. Aborting at exactly
+ * the connector's number would turn that into no answer, which is the same
+ * screen for the operator but a warning in the log about a connector that did
+ * precisely what it promised.
+ */
+export const LOOKUP_SLACK_MS = 3_000;
+
+/** Longer than the connector's own probe budget, and not much longer. */
+export const PROBE_TIMEOUT_MS = CONNECTOR_PROBE_BUDGET_MS + PROBE_SLACK_MS;
+
+/** The autoconfig cascade's own budget plus the slack to hear about it. */
+export const LOOKUP_TIMEOUT_MS = CONNECTOR_AUTOCONFIG_BUDGET_MS + LOOKUP_SLACK_MS;
+
 /**
  * Everything else upstream is a file read and a render.
  *
@@ -1164,22 +1193,30 @@ const PROBE_TIMEOUT_MS = 30_000;
  * genuinely is only a file write: *Save anyway*, which asks the connector not
  * to probe at all.
  *
- * The number itself was weighed under #82 and stands: raising it would only
+ * Not derived from anything, unlike the two above, and that is the honest shape
+ * of it: there is no connector-side deadline on the other end of these calls to
+ * be above. The number was weighed under #82 and stands — raising it would only
  * hold an operator in front of a blank screen when the connector is genuinely
  * wedged, and what hurt there was never the length of the wait but what the
  * screen claimed at the end of it.
  */
-const QUICK_TIMEOUT_MS = 5_000;
+export const QUICK_TIMEOUT_MS = 5_000;
+
 /**
- * The autoconfig cascade's own budget plus the slack to hear about it.
+ * Which of the two `POST /settings/mailboxes` is, since #147 made that one route
+ * two different calls.
  *
- * `AUTOCONFIG_TOTAL_TIMEOUT_MS` in the connector is 10 seconds and is the
- * deadline for the whole cascade, so a lookup that runs to the end of it still
- * has an answer to send — `null`. Aborting at 10 here would turn that answer
- * into no answer, which is the same screen for the operator but a warning in the
- * log about a connector that did exactly what it promised.
+ * *Save anyway* asks the connector to write without probing, and a write does
+ * not need the long budget. That reasoning is sound and this keeps it — but it
+ * made the route a third site where a probe budget is chosen, coupled to the
+ * connector's by nothing but the comment above, in a line younger than the issue
+ * that exists to remove exactly that. Choosing here, once, is what lets the test
+ * assert the invariant over the branch that probes instead of over a constant
+ * that some call sites use and one does not.
  */
-const LOOKUP_TIMEOUT_MS = 13_000;
+export function saveTimeoutMs(saveAnyway: boolean): number {
+  return saveAnyway ? QUICK_TIMEOUT_MS : PROBE_TIMEOUT_MS;
+}
 
 /**
  * What one call to the connector came back as.
@@ -1354,7 +1391,7 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
         // The write probes now (#147), so it is a probe-then-write after all
         // and gets the probe's budget — unless the operator asked for it not to
         // be, which is the one case that really is just a file write.
-        timeoutMs: saveAnyway ? QUICK_TIMEOUT_MS : PROBE_TIMEOUT_MS,
+        timeoutMs: saveTimeoutMs(saveAnyway),
         okStatus: 201,
         // Not `parseCreatedAnswer`. The 201 is what says the account is there,
         // and nothing on this screen depends on the id or the stamp it echoes.
