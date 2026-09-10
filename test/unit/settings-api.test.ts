@@ -45,6 +45,7 @@ import {
   parseMailboxDraft,
   parseProbeAnswer,
   parseProvidersAnswer,
+  credentialRejectionRefusesSave,
   probeRefusesSave,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
@@ -757,6 +758,26 @@ describe("what a probe report means for a save", () => {
   it("does not refuse a write nothing objected to", () => {
     assert.equal(probeRefusesSave(report()), false);
     assert.equal(saveRefusedNotice(report()), null);
+  });
+
+  it("says a refusal was about the credentials only when a blocking service said so", () => {
+    // The one predicate for "is anything about a password worth saying here".
+    // settings-routes.ts had a second one that scanned all three services, and
+    // the case below is where the two disagreed (#184).
+    assert.equal(credentialRejectionRefusesSave(report({ imap: REJECTED })), true);
+    assert.equal(credentialRejectionRefusesSave(report({ smtp: REJECTED })), true);
+    assert.equal(credentialRejectionRefusesSave(report({ imap: UNREACHABLE })), false);
+    assert.equal(credentialRejectionRefusesSave(report()), false);
+  });
+
+  it("is false for a CalDAV rejection beside an unreachable IMAP, as the notice already was", () => {
+    // The drift, spelled out. The duplicate answered true here, so the caller
+    // looked a provider note up and handed it to `saveRefusedNotice` — which
+    // walks these same two services and discarded it. Harmless in what it
+    // rendered, and one edit away from not being.
+    const drifted = report({ imap: UNREACHABLE, caldav: REJECTED });
+    assert.equal(credentialRejectionRefusesSave(drifted), false);
+    assert.equal((saveRefusedNotice(drifted, "a note") ?? "").includes("a note"), false);
   });
 });
 

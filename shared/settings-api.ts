@@ -473,6 +473,28 @@ export function probeRefusesSave(report: MailboxProbeReport): boolean {
 }
 
 /**
+ * True when one of the services that *can* refuse a save refused it over the
+ * credentials — the one condition under which anything about a password is
+ * worth saying.
+ *
+ * Exported because settings-routes.ts had its own copy of this question and the
+ * two answered it differently: that one scanned all three services, this one
+ * walks {@link SAVE_BLOCKING_SERVICES}. A report where IMAP was merely
+ * unreachable while CalDAV rejected its credentials came out true there and
+ * false here, so the provider note was looked up, handed to
+ * {@link saveRefusedNotice} — and discarded by it. Harmless in what it
+ * rendered, and exactly the kind of two-predicates-one-question drift that
+ * stops being harmless the moment either side is edited.
+ *
+ * The IMAP/SMTP scope is the same deliberate one `blockedServices` has: a
+ * CalDAV block that refused a password does not refuse the save, so it is not
+ * what the sentence above a refused save is about.
+ */
+export function credentialRejectionRefusesSave(report: MailboxProbeReport): boolean {
+  return blockedServices(report).some((service) => service.credentialRejection);
+}
+
+/**
  * What the operator is told when a probe refused their save, or null when the
  * report is not a refusal at all.
  *

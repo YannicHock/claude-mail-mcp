@@ -111,6 +111,7 @@ import {
   ADDRESS_FIELD,
   caldavFailureNotice,
   CHECKBOX_ON,
+  credentialRejectionRefusesSave,
   flattenDraft,
   MAILBOX_FIELDS,
   MAILBOX_SECRET_FIELDS,
@@ -224,25 +225,37 @@ function sanitize(body: FormBody): Record<string, string> {
 /**
  * The same values, with the submitted passwords kept rather than stripped.
  *
- * Only the **create** form uses this, and it is not a convenience.
+ * Every re-render of a mailbox form uses this, and it is not a convenience.
  * {@link sanitize} strips every password, and `renderMailboxForm` marks the IMAP
  * and SMTP boxes `required` when there is no account behind the form — so any
- * re-render of that form handed the operator two empty, mandatory password
- * boxes. On the probe-refusal page, whose notice ends "…or press Save anyway to
- * store it without testing it", pressing that button did nothing but pop the
- * browser's "Please fill out this field" bubble on a box the server had just
- * cleared: the advertised escape hatch was a dead end, on the exact screen the
- * milestone's deployment failure happened on. The *Test connection* answer had
- * the same shape — probe, then a form you cannot save.
+ * re-render of the **create** form handed the operator two empty, mandatory
+ * password boxes. On the probe-refusal page, whose notice ends "…or press Save
+ * anyway to store it without testing it", pressing that button did nothing but
+ * pop the browser's "Please fill out this field" bubble on a box the server had
+ * just cleared: the advertised escape hatch was a dead end, on the exact screen
+ * the milestone's deployment failure happened on. The *Test connection* answer
+ * had the same shape — probe, then a form you cannot save.
  *
  * Carrying them is the rule the cascade already follows (#120): they came from
  * this operator over this session, they are already in memory, and the form says
- * on its face that the password is carried rather than asked for again. The edit
- * form needs none of it — blank there means "keep the stored one", so its boxes
- * are not `required` and clearing them is right.
+ * on its face that the password is carried rather than asked for again.
+ *
+ * This used to say the **edit** form needed none of it, because blank there
+ * means "keep the stored one", so its boxes are not `required` and clearing them
+ * is right. The first half of that is still true and is why this function
+ * carries only the *submitted* non-empty secrets — a box the operator left blank
+ * stays blank, and still means "unchanged". The second half was the browser's
+ * half of the question and missed the data half (#184): a cleared box on the
+ * edit form does not merely fail to be re-typed, it *resubmits as blank*, and
+ * `mergedPassword` reads blank as the stored password. So *Save anyway* on a
+ * refused edit stored the password that was already there — the one the server
+ * had just refused — while telling the operator the one they typed had been
+ * stored without testing it. Carrying the submitted secrets is what makes a
+ * blank box mean "unchanged" and a filled one mean what they typed.
  *
  * `fields` is the *flattened* submission: the cascade's single password box has
  * already been spread across the services it names, which raw `body` has not.
+ * The edit routes have no such box, and pass `body` itself.
  */
 function withCarriedPasswords(body: FormBody, fields: FormBody): Record<string, string> {
   const values = sanitize(body);
@@ -399,16 +412,28 @@ function toWireReport(report: ProbeReport): MailboxProbeReport {
 }
 
 /**
- * True when any probed service was refused *by the server* rather than
- * unreachable — the distinction `shared/credential-failure.ts` draws and the
- * only thing that makes a `credentialNote` relevant (#148). A host that never
- * answered has said nothing about which password it wanted.
+ * What the provider table has to say to somebody whose password was just
+ * refused, or null.
+ *
+ * Whether to say anything at all is `credentialRejectionRefusesSave`, in the
+ * wire contract, walking the same two services `saveRefusedNotice` walks. This
+ * file used to answer that question for itself, over all three services, and
+ * the two disagreed about CalDAV — see that function's comment. A host that
+ * never answered has said nothing about which password it wanted, which is the
+ * distinction `shared/credential-failure.ts` exists to draw (#148, #146).
+ *
+ * `unsupported` comes first, and that ordering is the whole of #184's second
+ * half. An entry that carries one says no password this connector can send will
+ * ever be accepted; an entry that carries a `credentialNote` says which password
+ * to go and find. Where the table has both kinds of knowledge about an address
+ * it only ever has the stronger one — `microsoft` and `proton` carry
+ * `unsupported` and deliberately carry no note — so without this line an
+ * `@outlook.com` refusal fell through to the generic app-password sentence and
+ * sent its operator hunting for a passcode Microsoft does not issue.
  */
-function credentialRejected(wire: MailboxProbeReport): boolean {
-  return [wire.imap, wire.smtp, wire.caldav].some(
-    (outcome) =>
-      outcome !== null && outcome.ok === false && outcome.credentialRejection === true
-  );
+function rejectionNoteFor(wire: MailboxProbeReport, email: string): string | null {
+  if (!credentialRejectionRefusesSave(wire)) return null;
+  return unsupportedNoticeFor(email) ?? credentialNoteFor(email);
 }
 
 /**
@@ -419,11 +444,10 @@ function credentialRejected(wire: MailboxProbeReport): boolean {
  * rather than printing both — see its own comment. Three ways to get the
  * untargeted sentence back, all of them deliberate: the failure was
  * connectivity rather than credentials, the domain is not in the advice table,
- * or its entry carries no note.
+ * or its entry carries neither an `unsupported` warning nor a note.
  */
 function refusalNotice(wire: MailboxProbeReport, email: string): string {
-  const note = credentialRejected(wire) ? credentialNoteFor(email) : null;
-  return saveRefusedNotice(wire, note ?? undefined) ?? "";
+  return saveRefusedNotice(wire, rejectionNoteFor(wire, email) ?? undefined) ?? "";
 }
 
 /**
@@ -432,8 +456,7 @@ function refusalNotice(wire: MailboxProbeReport, email: string): string {
  * rejection, which is the whole of #148's rule.
  */
 function credentialAdvice(report: ProbeReport, email: string): { notice?: string } {
-  if (!credentialRejected(toWireReport(report))) return {};
-  const note = credentialNoteFor(email);
+  const note = rejectionNoteFor(toWireReport(report), email);
   return note === null ? {} : { notice: note };
 }
 
@@ -707,8 +730,9 @@ interface DraftRefusal {
   notice?: string;
   /**
    * The submitted fields, flattened, whose passwords the re-rendered form keeps.
-   * Set on the **create** form and nowhere else — see {@link withCarriedPasswords}, which is
-   * where the reasoning lives.
+   * Set on every route that re-renders a mailbox form — see
+   * {@link withCarriedPasswords}, which is where the reasoning lives. Leaving it
+   * unset on the edit routes is what #184 was.
    */
   carry?: FormBody;
 }
@@ -851,6 +875,15 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
    * page. Which step it is was decided in settings-api.ts, by the same functions
    * the wizard calls; what is decided here is only how it looks and what status
    * it goes out under.
+   *
+   * `notice` is one slot for two different kinds of sentence, and #186 is filed
+   * about it: `lookup` puts #151's "no password will connect" there, `edit`
+   * puts "Nothing has been saved…" there, and `provider` puts nothing — so a
+   * warned address loses its warning the moment the operator presses *Edit
+   * these*. One of those sentences is about the address and stays true for
+   * every screen it survives on; the other is about this submission. Making the
+   * warning survive means a field on {@link MailboxSetupStep}, which the
+   * wizard's copy of the cascade reads too, rather than a fourth argument here.
    */
   async function sendStep(
     res: Response,
@@ -1379,6 +1412,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         body,
         account: existing,
         errors: parsed.errors,
+        carry: body,
       });
       return;
     }
@@ -1387,6 +1421,12 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     // replaces a working password with one the server refuses leaves exactly
     // the mailbox #147 is about, and this is the route an operator uses for
     // every mailbox they already have.
+    //
+    // `carry` is what makes the refusal it produces honest (#184). Without it
+    // the re-rendered form has empty password boxes, blank resubmits as "keep
+    // the stored one", and *Save anyway* wrote back the very password the
+    // server had just refused. `body` rather than a flattened draft: these
+    // routes have no shared-password box to spread.
     const gate = await gateOnProbe({
       res,
       json: false,
@@ -1394,7 +1434,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       action: "edit",
       id: existing.id,
       candidate: parsed.account,
-      draft: { csrf: assertion.csrf, stamp: submittedStamp, body, account: existing },
+      draft: { csrf: assertion.csrf, stamp: submittedStamp, body, account: existing, carry: body },
     });
     if (!gate.proceed) return;
 
@@ -1411,6 +1451,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
           body,
           account: existing,
           errors: { id: err.message },
+          carry: body,
         });
         return;
       }
@@ -1422,6 +1463,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
           body,
           account: existing,
           errors: { id: err.message },
+          carry: body,
         });
         return;
       }
@@ -1448,6 +1490,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         body,
         account: existing,
         errors: parsed.errors,
+        carry: body,
       });
       return;
     }
@@ -1463,7 +1506,12 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         csrf: assertion.csrf,
         stamp: submittedStamp,
         account: existing,
-        values: sanitize(body),
+        // Carried, not stripped, for the same reason as the refusal above it
+        // (#184): the operator's next action here is Save, and a password box
+        // this answer emptied resubmits as blank, which `mergedPassword` reads
+        // as the stored password. A box they left blank is still carried as
+        // blank and still means "unchanged".
+        values: withCarriedPasswords(body, body),
         probe: toProbeView(report),
         // #148, on the edit form's own Test connection.
         ...credentialAdvice(report, raw(body, ADDRESS_FIELD)),

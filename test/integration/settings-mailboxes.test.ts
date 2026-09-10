@@ -1860,25 +1860,95 @@ test("Save anyway writes the very same mailbox, and probes nothing", async () =>
   }
 });
 
-test("an edit is gated the same way, and leaves the stored mailbox alone", async () => {
+test("an edit is gated the same way, and Save anyway then stores what was typed", async () => {
   // The route an operator uses for every mailbox they already have. An edit
   // that replaces a working password with one the server refuses leaves
-  // exactly the mailbox #147 is about.
+  // exactly the mailbox #147 is about — and the refusal is only half the case.
+  //
+  // The other half is #184, and it is the worse defect: this test used to stop
+  // at the 400. `sendDraftRefusal` renders the edit form through `sanitize()`,
+  // which strips every password, so the refusal page came back with empty
+  // password boxes — and blank on the edit form means "keep the stored one".
+  // Press the *Save anyway* the notice advertises and `mergedPassword` wrote
+  // the password that was already there straight back, the operator was
+  // redirected to the list, and the mailbox still held the credential the
+  // server had just refused. A save that appeared to work and changed nothing.
+  //
+  // So the case is walked to its end, the resubmission carries the values the
+  // refusal page actually rendered rather than the ones this test would like
+  // it to have, and the assertion is about what is in accounts.json.
   const imap = await startRejectingImapServer();
   const { url, accountsPath, close } = await startConnector([
     makeAccount({ id: "work", label: "Work" }),
   ]);
   try {
+    const typed = formAgainst(imap.port, { "imap.pass": "changed", "smtp.pass": "changed-too" });
     const res = await post(
       url,
       "/settings/mailboxes/work",
-      await withStampProbed(accountsPath, formAgainst(imap.port, { "imap.pass": "changed" }))
+      await withStampProbed(accountsPath, typed)
     );
 
     assert.equal(res.status, 400);
-    assert.match(await res.text(), /rejected these credentials/);
+    const page = await res.text();
+    assert.match(page, /rejected these credentials/);
     const stored = JSON.parse(await readFile(accountsPath, "utf8")).accounts as Account[];
     assert.equal(stored[0]?.imap.pass, makeAccount({ id: "work" }).imap.pass, "unchanged");
+
+    // What the browser would resubmit, read off the page rather than assumed.
+    assert.match(page, /Save anyway/, "the way past the gate has to be on the page");
+    const again = await post(url, "/settings/mailboxes/work", {
+      ...typed,
+      "imap.pass": inputValue(page, "imap_pass"),
+      "smtp.pass": inputValue(page, "smtp_pass"),
+      _stamp: await stamp(accountsPath),
+      [SAVE_ANYWAY_FIELD]: CHECKBOX_ON,
+    });
+
+    assert.equal(again.status, 303, "Save anyway skips the probe and writes");
+    const after = JSON.parse(await readFile(accountsPath, "utf8")).accounts as Account[];
+    assert.equal(
+      after[0]?.imap.pass,
+      "changed",
+      "Save anyway stored the old password instead of the one the operator typed"
+    );
+    assert.equal(after[0]?.smtp.pass, "changed-too");
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("a password box the operator left alone on the edit form still means unchanged", async () => {
+  // The half of `withCarriedPasswords`'s reasoning that was always true, and
+  // which #184's fix must not cost: the edit form's boxes are not `required`
+  // because blank means "keep the stored one". Carrying only the *submitted*
+  // non-empty secrets is what keeps both meanings — a filled box is what they
+  // typed, an empty one is unchanged.
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector([
+    makeAccount({ id: "work", label: "Work" }),
+  ]);
+  try {
+    const blank = formAgainst(imap.port, { "imap.pass": "", "smtp.pass": "" });
+    const res = await post(
+      url,
+      "/settings/mailboxes/work",
+      await withStampProbed(accountsPath, blank)
+    );
+
+    assert.equal(res.status, 400);
+    const page = await res.text();
+    assert.equal(inputValue(page, "imap_pass"), "", "a box left blank comes back blank");
+
+    const again = await post(url, "/settings/mailboxes/work", {
+      ...blank,
+      _stamp: await stamp(accountsPath),
+      [SAVE_ANYWAY_FIELD]: CHECKBOX_ON,
+    });
+    assert.equal(again.status, 303);
+    const after = JSON.parse(await readFile(accountsPath, "utf8")).accounts as Account[];
+    assert.equal(after[0]?.imap.pass, makeAccount({ id: "work" }).imap.pass, "kept, as blank means");
   } finally {
     await close();
     await imap.close();
@@ -1904,6 +1974,21 @@ function inputTag(page: string, id: string): string {
   const match = new RegExp(`<input id="${escapeRe(id)}"[^>]*>`).exec(page);
   assert.ok(match, `expected an input with id="${id}" on the page`);
   return match[0];
+}
+
+/**
+ * What that input would resubmit — the `value` attribute, unescaped.
+ *
+ * Used where a case has to press a second button on a page the connector
+ * rendered, rather than posting what the case wishes the page had said. That
+ * distinction is the whole of #184: the values the refusal page carried are
+ * what *Save anyway* sends, and the defect was invisible to any test that
+ * supplied them itself.
+ */
+function inputValue(page: string, id: string): string {
+  const match = /value="([^"]*)"/.exec(inputTag(page, id));
+  assert.ok(match, `expected a value attribute on the input with id="${id}"`);
+  return match[1]!.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
 }
 
 test("the refusal page carries the passwords back, and says what Gmail wants", async () => {
@@ -2124,6 +2209,66 @@ test("an address at a provider that cannot be served is warned about at lookup",
     assert.equal(/class="error"/.test(html), false, "a warning is not an error box");
   } finally {
     await close();
+  }
+});
+
+test("a refusal at an unservable provider says no password will connect, not 'find an app password'", async () => {
+  // #184. `unsupportedNoticeFor` had exactly one call site — the address
+  // lookup — and `refusalNotice` consulted only `credentialNoteFor`. The
+  // `microsoft` entry carries an `unsupported` warning and deliberately carries
+  // no note, so an outlook.com save the server refused fell through to the
+  // generic sentence and sent its operator hunting for an app password
+  // Microsoft does not issue. The warning shown one screen earlier is gone by
+  // then: outlook.com publishes autoconfig, so the suggestion screen renders,
+  // and *Edit these* replaces the warning with its own notice.
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(
+        accountsPath,
+        formAgainst(imap.port, { "mail.defaultFrom": "anna@outlook.com" })
+      )
+    );
+
+    assert.equal(res.status, 400);
+    const page = await res.text();
+    assert.match(page, /IMAP rejected these credentials/, "the report is still the report");
+    assert.match(page, /no password will connect/, "the strongest thing the table knows");
+    assert.equal(
+      GENERIC_NOTE.test(page),
+      false,
+      "the operator was told to go and find an app password that cannot exist"
+    );
+    assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("Test connection at an unservable provider says the same thing", async () => {
+  // The same preference on `/test`, which stores nothing and so has no refusal
+  // sentence for the note to replace — it is the whole notice there.
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes/test",
+      await withStampProbed(
+        accountsPath,
+        formAgainst(imap.port, { "mail.defaultFrom": "anna@outlook.com" })
+      )
+    );
+
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /no password will connect/);
+  } finally {
+    await close();
+    await imap.close();
   }
 });
 
