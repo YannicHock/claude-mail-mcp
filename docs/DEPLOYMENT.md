@@ -1246,10 +1246,13 @@ restart `mail-oauth`. Every connected client is logged out and re-registers by
 itself. Do it deliberately: a rotation and a refresh-token replay look alike in the
 logs.
 
-**Revoking a provider password.** If you use an app-specific password (Gmail,
-iCloud, Fastmail), revoke it from the provider's own UI when a mailbox is removed
-or the connector is decommissioned. Deleting it from `accounts.json` stops this
-connector using it and nothing else.
+**Revoking a provider password.** If a mailbox authenticates with an app-specific
+password, revoke it from the provider's own UI when that mailbox is removed or the
+connector is decommissioned. Deleting it from `accounts.json` stops this connector
+using it and nothing else — the credential stays live at the provider until you
+revoke it there. Which providers issue such a password, and which of them accept
+nothing else, is in [PROVIDERS.md](PROVIDERS.md); that page also lists the providers
+this connector cannot authenticate to at all.
 
 **Connection idle.** The IMAP connection auto-reconnects on demand. If your
 provider closes idle connections aggressively — some do after ten minutes — the
