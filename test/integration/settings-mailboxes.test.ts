@@ -2249,6 +2249,45 @@ test("a refusal at an unservable provider says no password will connect, not 'fi
   }
 });
 
+test("an unservable provider that never answers is told so too, not just one that refuses", async () => {
+  // The half the first attempt at #184 missed. `rejectionNoteFor` gated *both*
+  // halves behind a credential rejection, which is right for a note about a
+  // password and wrong for an `unsupported` warning — that is a fact about the
+  // address and holds however the probe failed.
+  //
+  // Microsoft rejects the login, so it passed. Proton does not: its own entry
+  // says Proton's servers answer no IMAP from the internet at all, so a Proton
+  // save fails as connectivity, `credentialRejectionRefusesSave` is false, and
+  // the operator got "IMAP did not answer … Check what failed above" while the
+  // table held the Bridge remedy and said nothing. Nothing is listening on this
+  // port (1, the same dead port formAgainst already uses for SMTP), which is
+  // exactly the shape a real proton.me save has.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(
+        accountsPath,
+        formAgainst(1, { "mail.defaultFrom": "anna@proton.me" })
+      )
+    );
+
+    assert.equal(res.status, 400);
+    const page = await res.text();
+    assert.match(page, /did not answer/, "the report is still the report");
+    assert.match(page, /Bridge/, "the remedy the table holds for this address");
+    assert.equal(
+      /Check what failed above/.test(page),
+      false,
+      "the generic remedy stood where a specific one existed"
+    );
+    assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
+  } finally {
+    await close();
+  }
+});
+
 test("Test connection at an unservable provider says the same thing", async () => {
   // The same preference on `/test`, which stores nothing and so has no refusal
   // sentence for the note to replace — it is the whole notice there.
