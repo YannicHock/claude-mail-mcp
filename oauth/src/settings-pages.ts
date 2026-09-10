@@ -72,11 +72,30 @@ export function sendPage(
 }
 
 /**
- * Send a redirect with the same headers.
+ * Send a redirect with the same headers, and with no body.
  *
- * A 303 back to a page carries no body, but it does carry `Set-Cookie` at three
- * of its call sites — a session issued, a session cleared — and `Cache-Control:
- * no-store` on that response is the reason a shared cache cannot replay it.
+ * **The empty body is the contract, not a property of the status code.** That
+ * is the half of #136 that mattered. `res.redirect()` content-negotiates a
+ * courtesy `<p>See Other. Redirecting to …</p>` into the response and describes
+ * it with a `Content-Type`; `.end()` sends nothing. Anyone tidying this file who
+ * "simplifies" `.set().end()` back into `res.redirect()` reintroduces #136 —
+ * hence this sentence, in the place they would be standing.
+ *
+ * It matters most on the two 302s the `/authorize` path sends, whose `Location`
+ * carries a one-time authorization code: a body is one more copy of a URL that
+ * must be used once, written where a referrer, an error page or a proxy log can
+ * pick it up. Those two have no `Set-Cookie` at all. The other three do — a
+ * session issued, a session cleared — and there `Cache-Control: no-store` is the
+ * reason a shared cache cannot replay the response. Five callers, two distinct
+ * reasons, one helper.
+ *
+ * There is deliberately **no `csp` parameter**, unlike {@link sendPage}. That is
+ * not an oversight: a response with no body has no document for a CSP to govern,
+ * so the strict `SETTINGS_HEADERS` is the only correct choice and a caller has
+ * nothing to say about it. The header goes out anyway so that the set which must
+ * not drift stays one set — `oauth/test/integration/page-headers.test.ts` pins
+ * that, which is why the asymmetry needs explaining rather than fixing.
+ *
  * Anything else the route wants on the response (`Set-Cookie`, `Retry-After`)
  * goes on with its own `res.set()` before this call; `.set()` merges, so order
  * does not matter.

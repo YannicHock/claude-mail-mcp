@@ -209,6 +209,38 @@ function sanitize(body: FormBody): Record<string, string> {
   return values;
 }
 
+/**
+ * The same values, with the submitted passwords kept rather than stripped.
+ *
+ * Only the **create** form uses this, and it is not a convenience.
+ * {@link sanitize} strips every password, and `renderMailboxForm` marks the IMAP
+ * and SMTP boxes `required` when there is no account behind the form — so any
+ * re-render of that form handed the operator two empty, mandatory password
+ * boxes. On the probe-refusal page, whose notice ends "…or press Save anyway to
+ * store it without testing it", pressing that button did nothing but pop the
+ * browser's "Please fill out this field" bubble on a box the server had just
+ * cleared: the advertised escape hatch was a dead end, on the exact screen the
+ * milestone's deployment failure happened on. The *Test connection* answer had
+ * the same shape — probe, then a form you cannot save.
+ *
+ * Carrying them is the rule the cascade already follows (#120): they came from
+ * this operator over this session, they are already in memory, and the form says
+ * on its face that the password is carried rather than asked for again. The edit
+ * form needs none of it — blank there means "keep the stored one", so its boxes
+ * are not `required` and clearing them is right.
+ *
+ * `fields` is the *flattened* submission: the cascade's single password box has
+ * already been spread across the services it names, which raw `body` has not.
+ */
+function withCarriedPasswords(body: FormBody, fields: FormBody): Record<string, string> {
+  const values = sanitize(body);
+  for (const name of MAILBOX_SECRET_FIELDS) {
+    const submitted = raw(fields, name);
+    if (submitted !== "") values[name] = submitted;
+  }
+  return values;
+}
+
 type ParsedForm = { account: Account; errors?: undefined } | { account?: undefined; errors: Record<string, string> };
 
 /**
@@ -389,6 +421,65 @@ async function probeBeforeWrite(
   });
 }
 
+/**
+ * What {@link gateOnProbe} decided, for the route that has to act on it.
+ *
+ * `proceed: false` means the answer has already gone out; the route returns and
+ * writes nothing. `report` on the other branch is the wire-shaped report to
+ * carry into the response the write produces, and `undefined` when nothing was
+ * probed at all.
+ */
+type WriteGate = { proceed: false } | { proceed: true; report: MailboxProbeReport | undefined };
+
+/**
+ * Probe, decide, log, and answer a refusal — the whole of it, once.
+ *
+ * `probeBeforeWrite` above is the probe. This is the four steps around it, and
+ * it exists because create and edit ran those four steps *separately* and had
+ * already drifted apart doing so (#130, on the shape #147 left behind): one
+ * routed its refusal through a helper that answered both content types and the
+ * other inlined an HTML-only render; one sent `message` on the JSON path and the
+ * other had no equivalent; the two `log("warn", …)` lines were hand-written
+ * near-duplicates with different message strings; and `toWireReport(report)` was
+ * recomputed three times on each path. It is converted exactly once here, and
+ * the log line is one line with an `action` field rather than two strings that
+ * an operator grepping their log has to know both of.
+ */
+async function gateOnProbe(opts: {
+  res: Response;
+  json: boolean;
+  log: Logger;
+  /** Which write this is. The only thing the two paths legitimately differ on. */
+  action: "create" | "edit";
+  /** The id the mailbox is stored under — the existing one on an edit. */
+  id: string;
+  /** The account as submitted, which is what gets probed. */
+  candidate: Account;
+  /** Everything a refusal needs to re-render the form the submission came from. */
+  draft: Omit<DraftRefusal, "status" | "errors" | "probe" | "notice">;
+}): Promise<WriteGate> {
+  const { res, json, log, action, id, candidate, draft } = opts;
+  const report = await probeBeforeWrite(candidate, readSaveAnyway(draft.body));
+  // Null is *Save anyway*: nothing was probed, so there is nothing to refuse on
+  // and nothing to state afterwards either.
+  if (report === null) return { proceed: true, report: undefined };
+  const wire = toWireReport(report);
+  if (!probeRefusesSave(wire)) return { proceed: true, report: wire };
+  log("warn", "settings: a mailbox was refused by the connection test", {
+    action,
+    id,
+    imap: report.imap.ok,
+    smtp: report.smtp.ok,
+  });
+  sendDraftRefusal(res, json, {
+    ...draft,
+    status: 400,
+    probe: report,
+    notice: saveRefusedNotice(wire) ?? "",
+  });
+  return { proceed: false };
+}
+
 function findAccount(store: AccountsStore, id: string): Account | undefined {
   return store.list().find((a) => a.id === id);
 }
@@ -483,6 +574,33 @@ function sendJson(
 }
 
 /**
+ * The fourth send site: a redirect, with the same header set and no body.
+ *
+ * Every other answer this router gives goes out through one of the three above,
+ * each of which chains `.set(SETTINGS_HEADERS)`. The redirects did not: they
+ * were bare `res.redirect(303, …)` calls, so an operator's browser got the
+ * response after *Save*, *Make default* or *Delete* with no `Cache-Control:
+ * no-store`, no CSP, no `X-Frame-Options` and no `Referrer-Policy` (#127).
+ *
+ * `.end()` rather than `res.redirect()` for the same reason the OAuth layer's
+ * namesake uses it (#136): `res.redirect` content-negotiates a courtesy
+ * `<p>See Other. Redirecting to …</p>` into a response whose status says there
+ * is nothing to read. An empty body is the contract here, not an incidental
+ * property of a 303 — see `oauth/src/settings-pages.ts`.
+ *
+ * There is deliberately no `csp` parameter. `SETTINGS_HEADERS` is hardcoded
+ * because a response with no body has no document for a CSP to govern; the
+ * header rides along only so that a set which must not drift stays one set.
+ *
+ * This lives here beside its three siblings rather than in settings-pages.ts,
+ * where the OAuth package keeps its own. See the note on the re-exports in
+ * `src/settings-pages.ts` for why the two are not mirrored.
+ */
+function sendRedirect(res: Response, status: number, location: string): void {
+  res.status(status).set(SETTINGS_HEADERS).set("Location", location).end();
+}
+
+/**
  * Whether this caller wants JSON rather than a page.
  *
  * `req.accepts` decides it, which fails safe in the direction that matters: a
@@ -500,6 +618,74 @@ function wantsJson(req: Request): boolean {
 const MALFORMED_DRAFT =
   "The request body was not a mailbox draft: it needs a `mailbox` object with id, " +
   "label, default, mail, imap and smtp.";
+
+/**
+ * A refused write, said back to whoever asked for it.
+ *
+ * Everything below that says "no" to a mailbox draft says the same two things
+ * in the same two ways: as `MailboxErrorAnswer` for a JSON caller, and as the
+ * form re-rendered with the submission still in it for a browser. That fork was
+ * written out five separate times — a closure in `POST /settings/mailboxes`, a
+ * second closure beside it for the probe's refusal, and longhand in the three
+ * routes after (#130).
+ */
+interface DraftRefusal {
+  status: number;
+  csrf: string;
+  /** The stamp the re-rendered form resubmits under — the caller's, or a fresh one after a stale-stamp 409. */
+  stamp: string;
+  /** The submission, echoed back minus its passwords and bookkeeping fields. */
+  body: FormBody;
+  /** The account being edited, or null on the create routes. */
+  account: Account | null;
+  /** Per-field messages. Empty when no field the operator typed is wrong. */
+  errors?: Record<string, string>;
+  /**
+   * The probe report, when the probe is why nothing was stored (#147).
+   *
+   * `errors` stays empty in that case on purpose: what failed is the server on
+   * the other end, and marking a box red would send the operator to correct
+   * something that is already correct.
+   */
+  probe?: ProbeReport;
+  /** The sentence above the form. `saveRefusedNotice`'s, so the wizard says the same one. */
+  notice?: string;
+  /**
+   * The submitted fields, flattened, whose passwords the re-rendered form keeps.
+   * Set on the **create** form and nowhere else — see {@link withCarriedPasswords}, which is
+   * where the reasoning lives.
+   */
+  carry?: FormBody;
+}
+
+function sendDraftRefusal(res: Response, json: boolean, refusal: DraftRefusal): void {
+  const { status, csrf, stamp, body, account, errors = {}, probe, notice, carry } = refusal;
+  if (json) {
+    // Status and not a shape of its own: from a caller's side a probe refusal
+    // is the same class of answer as a field the parser would not take, which
+    // the wizard's `ConnectorAnswer` already reads as `rejected`. What makes it
+    // actionable is the report, so it travels with the refusal.
+    sendJson(res, status, {
+      ...(notice === undefined ? {} : { message: notice }),
+      errors,
+      ...(probe === undefined ? {} : { probe: toWireReport(probe) }),
+    });
+    return;
+  }
+  sendHtml(
+    res,
+    status,
+    renderMailboxForm({
+      csrf,
+      stamp,
+      account,
+      values: carry === undefined ? sanitize(body) : withCarriedPasswords(body, carry),
+      errors,
+      ...(probe === undefined ? {} : { probe: toProbeView(probe) }),
+      ...(notice === undefined ? {} : { notice }),
+    })
+  );
+}
 
 /**
  * The submitted mailbox, as `parseAccountForm` wants it.
@@ -692,7 +878,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   ): Promise<void> {
     const notice = report === undefined ? null : caldavFailureNotice(report);
     if (notice === null) {
-      res.redirect(303, "/settings/mailboxes");
+      sendRedirect(res, 303, "/settings/mailboxes");
       return;
     }
     const accounts = store.list();
@@ -921,58 +1107,18 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         return;
       }
 
-      const rejected = (status: number, errors: Record<string, string>, stamp: string): void => {
-        if (json) {
-          sendJson(res, status, { errors });
-          return;
-        }
-        sendHtml(
-          res,
+      // The one thing this route still binds for itself: which draft, whose
+      // CSRF, and which content type. The fork itself is `sendDraftRefusal`.
+      const rejected = (status: number, errors: Record<string, string>, stamp: string): void =>
+        sendDraftRefusal(res, json, {
           status,
-          renderMailboxForm({
-            csrf: assertion.csrf,
-            stamp,
-            account: null,
-            values: sanitize(body),
-            errors,
-          })
-        );
-      };
-
-      /**
-       * The probe refused, so nothing was stored — said per service, in both
-       * content types.
-       *
-       * 400 rather than a status of its own: from a caller's side this is the
-       * same class of answer as a field the parser would not take, which the
-       * wizard's `ConnectorAnswer` already reads as `rejected`. The report is
-       * what makes it actionable, and the notice above it is
-       * `saveRefusedNotice` — the wire contract's, so this page and the
-       * wizard's say the same sentence.
-       *
-       * `errors` is empty: no field the operator typed is wrong. What failed is
-       * the server on the other end of it, and marking a box red would send
-       * them to correct something that is already correct.
-       */
-      const refusedByProbe = (report: ProbeReport, stamp: string): void => {
-        const notice = saveRefusedNotice(toWireReport(report)) ?? "";
-        if (json) {
-          sendJson(res, 400, { message: notice, errors: {}, probe: toWireReport(report) });
-          return;
-        }
-        sendHtml(
-          res,
-          400,
-          renderMailboxForm({
-            csrf: assertion.csrf,
-            stamp,
-            account: null,
-            values: sanitize(body),
-            probe: toProbeView(report),
-            notice,
-          })
-        );
-      };
+          csrf: assertion.csrf,
+          stamp,
+          body,
+          account: null,
+          errors,
+          carry: fields,
+        });
 
       const parsed = parseAccountForm(fields, null);
       if (parsed.errors) {
@@ -980,18 +1126,18 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         return;
       }
 
-      // Before the write, not beside it. See `probeBeforeWrite`. Null means the
-      // operator pressed *Save anyway* and nothing was probed at all.
-      const report = await probeBeforeWrite(parsed.account, readSaveAnyway(body));
-      if (report !== null && probeRefusesSave(toWireReport(report))) {
-        log("warn", "settings: a mailbox was refused by the connection test", {
-          id: parsed.account.id,
-          imap: report.imap.ok,
-          smtp: report.smtp.ok,
-        });
-        refusedByProbe(report, submittedStamp);
-        return;
-      }
+      // Probe before the write, not beside it, and answer the refusal in one
+      // place both write routes share. See `gateOnProbe`.
+      const gate = await gateOnProbe({
+        res,
+        json,
+        log,
+        action: "create",
+        id: parsed.account.id,
+        candidate: parsed.account,
+        draft: { csrf: assertion.csrf, stamp: submittedStamp, body, account: null, carry: fields },
+      });
+      if (!gate.proceed) return;
 
       try {
         await store.create(parsed.account, submittedStamp);
@@ -1006,7 +1152,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         }
         throw err;
       }
-      const wireReport = report === null ? undefined : toWireReport(report);
+      const wireReport = gate.report;
       if (json) {
         // 201 and not the browser's 303: there is nowhere to send a caller that
         // is not a browser, and the two facts it wants are the id it now has
@@ -1046,21 +1192,17 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
 
       const parsed = parseAccountForm(fields, null);
       if (parsed.errors) {
-        if (json) {
-          sendJson(res, 400, { errors: parsed.errors });
-          return;
-        }
-        sendHtml(
-          res,
-          400,
-          renderMailboxForm({
-            csrf: assertion.csrf,
-            stamp: submittedStamp,
-            account: null,
-            values: sanitize(body),
-            errors: parsed.errors,
-          })
-        );
+        // The same refusal the create route gives, because it is the same
+        // refusal: this route is that one without the write (#130).
+        sendDraftRefusal(res, json, {
+          status: 400,
+          csrf: assertion.csrf,
+          stamp: submittedStamp,
+          body,
+          account: null,
+          errors: parsed.errors,
+          carry: fields,
+        });
         return;
       }
       const report = await probeAccount({
@@ -1082,7 +1224,10 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
           csrf: assertion.csrf,
           stamp: submittedStamp,
           account: null,
-          values: sanitize(body),
+          // Carried for the same reason a refusal carries them: this form's
+          // password boxes are `required`, and the panel below tells the
+          // operator to press Save next. See `withCarriedPasswords`.
+          values: withCarriedPasswords(body, fields),
           probe: toProbeView(report),
         })
       );
@@ -1141,81 +1286,68 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     const body = req.body as FormBody;
     const assertion = assertionOf(res);
     const submittedStamp = raw(body, "_stamp");
+    // `json` is false at every call below: this route is not negotiated — it has
+    // no second caller — so the only branch `sendDraftRefusal` ever takes here
+    // is the page one. It is used anyway so that the form a rejected edit comes
+    // back on is assembled in exactly one place.
     const parsed = parseAccountForm(body, existing);
     if (parsed.errors) {
-      sendHtml(
-        res,
-        400,
-        renderMailboxForm({
-          csrf: assertion.csrf,
-          stamp: submittedStamp,
-          account: existing,
-          values: sanitize(body),
-          errors: parsed.errors,
-        })
-      );
+      sendDraftRefusal(res, false, {
+        status: 400,
+        csrf: assertion.csrf,
+        stamp: submittedStamp,
+        body,
+        account: existing,
+        errors: parsed.errors,
+      });
       return;
     }
-    // The same gate the create route has, for the same reason: an edit that
+    // The same gate the create route has — literally the same function now, so
+    // the two cannot drift again — and for the same reason: an edit that
     // replaces a working password with one the server refuses leaves exactly
     // the mailbox #147 is about, and this is the route an operator uses for
     // every mailbox they already have.
-    const report = await probeBeforeWrite(parsed.account, readSaveAnyway(body));
-    if (report !== null && probeRefusesSave(toWireReport(report))) {
-      log("warn", "settings: a mailbox edit was refused by the connection test", {
-        id: existing.id,
-        imap: report.imap.ok,
-        smtp: report.smtp.ok,
-      });
-      sendHtml(
-        res,
-        400,
-        renderMailboxForm({
-          csrf: assertion.csrf,
-          stamp: submittedStamp,
-          account: existing,
-          values: sanitize(body),
-          probe: toProbeView(report),
-          notice: saveRefusedNotice(toWireReport(report)) ?? "",
-        })
-      );
-      return;
-    }
+    const gate = await gateOnProbe({
+      res,
+      json: false,
+      log,
+      action: "edit",
+      id: existing.id,
+      candidate: parsed.account,
+      draft: { csrf: assertion.csrf, stamp: submittedStamp, body, account: existing },
+    });
+    if (!gate.proceed) return;
 
     try {
       await store.update(existing.id, parsed.account, submittedStamp);
     } catch (err) {
       if (err instanceof StaleStampError) {
-        sendHtml(
-          res,
-          409,
-          renderMailboxForm({
-            csrf: assertion.csrf,
-            stamp: await store.stamp(),
-            account: existing,
-            values: sanitize(body),
-            errors: { id: err.message },
-          })
-        );
+        sendDraftRefusal(res, false, {
+          status: 409,
+          csrf: assertion.csrf,
+          // The stamp the file is on now, not the one that lost the race: the
+          // operator's next submission has to be able to win.
+          stamp: await store.stamp(),
+          body,
+          account: existing,
+          errors: { id: err.message },
+        });
         return;
       }
       if (err instanceof NoSuchAccountError || err instanceof AccountsStoreError) {
-        sendHtml(
-          res,
-          400,
-          renderMailboxForm({
-            csrf: assertion.csrf,
-            stamp: submittedStamp,
-            account: existing,
-            values: sanitize(body),
-            errors: { id: err.message },
-          })
-        );
+        sendDraftRefusal(res, false, {
+          status: 400,
+          csrf: assertion.csrf,
+          stamp: submittedStamp,
+          body,
+          account: existing,
+          errors: { id: err.message },
+        });
         return;
       }
       throw err;
     }
-    await sendSavedPage(res, assertion.csrf, report === null ? undefined : toWireReport(report));
+    await sendSavedPage(res, assertion.csrf, gate.report);
   });
 
   router.post("/settings/mailboxes/:id/test", guardAssertion, formBody, guardCsrf, async (req, res) => {
@@ -1229,17 +1361,14 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     const submittedStamp = raw(body, "_stamp");
     const parsed = parseAccountForm(body, existing);
     if (parsed.errors) {
-      sendHtml(
-        res,
-        400,
-        renderMailboxForm({
-          csrf: assertion.csrf,
-          stamp: submittedStamp,
-          account: existing,
-          values: sanitize(body),
-          errors: parsed.errors,
-        })
-      );
+      sendDraftRefusal(res, false, {
+        status: 400,
+        csrf: assertion.csrf,
+        stamp: submittedStamp,
+        body,
+        account: existing,
+        errors: parsed.errors,
+      });
       return;
     }
     const report = await probeAccount({
@@ -1295,7 +1424,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       }
       throw err;
     }
-    res.redirect(303, "/settings/mailboxes");
+    sendRedirect(res, 303, "/settings/mailboxes");
   });
 
   router.post("/settings/mailboxes/:id/delete", guardAssertion, formBody, guardCsrf, async (req, res) => {
@@ -1333,7 +1462,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       }
       throw err;
     }
-    res.redirect(303, "/settings/mailboxes");
+    sendRedirect(res, 303, "/settings/mailboxes");
   });
 
   return router;
