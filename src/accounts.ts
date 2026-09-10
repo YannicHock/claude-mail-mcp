@@ -308,6 +308,11 @@ export class AccountsStore {
    * accounts.json that already holds two (hand-edited, or written before
    * this rule existed) keeps them until the next default-bearing write, and
    * `resolve()` behaves as it always has in the meantime.
+   *
+   * {@link setDefault} is the third caller and the one that always claims —
+   * it promotes `id` and then comes through here, so the repair of a
+   * two-default file is *Make default*, and it is the same code path as
+   * every other write rather than a second reading of the rule.
    */
   private static withSingleDefault(accounts: Account[], writtenId: string): Account[] {
     const written = accounts.find((a) => a.id === writtenId);
@@ -361,8 +366,11 @@ export class AccountsStore {
     });
   }
 
-  /** Mark `id` as the default account, clearing the flag on every other one
-   * first — the flag moves rather than accumulating a second holder. */
+  /** Mark `id` as the default account: promote it, then apply the invariant
+   * through {@link withSingleDefault}, which is where "the flag moves rather
+   * than accumulating a second holder" is written down. This method used to
+   * state that rule itself, in its own `map` — two statements of one rule,
+   * which is the shape this milestone exists to remove. */
   async setDefault(id: string, stamp: string): Promise<void> {
     await this.mutate(stamp, (accounts) => {
       if (!accounts.some((a) => a.id === id)) {
@@ -371,7 +379,10 @@ export class AccountsStore {
           accounts.map((a) => a.id)
         );
       }
-      return accounts.map((a) => ({ ...a, default: a.id === id ? true : undefined }));
+      return AccountsStore.withSingleDefault(
+        accounts.map((a) => (a.id === id ? { ...a, default: true } : a)),
+        id
+      );
     });
   }
 
