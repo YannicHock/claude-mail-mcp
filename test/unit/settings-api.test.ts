@@ -29,6 +29,7 @@ import { describe, it } from "node:test";
 import {
   ADDRESS_FIELD,
   ADDRESS_REQUIRED,
+  carrying,
   CHECKBOX_ON,
   draftFromFields,
   flattenDraft,
@@ -586,5 +587,92 @@ describe("withSharedPassword — one box, three services", () => {
     // expressed, and it must not have one of them quietly overwritten.
     const body = submittedForm();
     assert.deepEqual(withSharedPassword(body), body);
+  });
+});
+
+describe("carrying — the same rule, running the other way", () => {
+  it("spreads the one password across the services the values name", () => {
+    const filled = carrying(
+      { [MAILBOX_FIELDS.caldavUrl]: "https://dav.example.invalid/" },
+      "hunter2"
+    );
+    assert.equal(filled[MAILBOX_FIELDS.imapPass], "hunter2");
+    assert.equal(filled[MAILBOX_FIELDS.smtpPass], "hunter2");
+    assert.equal(filled[MAILBOX_FIELDS.caldavPass], "hunter2");
+  });
+
+  it("does not invent a CalDAV password for a server that was never named", () => {
+    const filled = carrying({}, "hunter2");
+    assert.equal(MAILBOX_FIELDS.caldavPass in filled, false);
+  });
+
+  it("leaves the values alone when there is no password to carry", () => {
+    const values = { [MAILBOX_FIELDS.caldavUrl]: "https://dav.example.invalid/" };
+    assert.deepEqual(carrying(values, ""), values);
+  });
+
+  it("lets a per-service password already in the values win", () => {
+    const filled = carrying({ [MAILBOX_FIELDS.imapPass]: "different-for-imap" }, "hunter2");
+    assert.equal(filled[MAILBOX_FIELDS.imapPass], "different-for-imap");
+    assert.equal(filled[MAILBOX_FIELDS.smtpPass], "hunter2");
+  });
+});
+
+/**
+ * The clause the collapse into one rule could silently lose.
+ *
+ * `draftFromFields` builds a CalDAV block as soon as any one of its three fields
+ * is non-empty, so a `caldavPass` with no `caldavUrl` beside it is a probe
+ * against a server that was never named. Both directions of the rule owe this,
+ * and the reason it survived being written twice is that nothing failed when one
+ * copy drifted. It fails here now.
+ */
+describe("the CalDAV clause — a password only where a server was named", () => {
+  const NAMED = "https://dav.example.invalid/";
+
+  it("spreads no caldavPass when caldavUrl is absent — parsing", () => {
+    const filled = withSharedPassword({ [SHARED_PASSWORD_FIELD]: "hunter2" });
+    assert.equal(MAILBOX_FIELDS.caldavPass in filled, false);
+    assert.equal(filled[MAILBOX_FIELDS.imapPass], "hunter2", "IMAP still gets it");
+  });
+
+  it("spreads no caldavPass when caldavUrl is empty — rendering", () => {
+    const filled = carrying({ [MAILBOX_FIELDS.caldavUrl]: "" }, "hunter2");
+    assert.equal(filled[MAILBOX_FIELDS.caldavPass] ?? "", "");
+    assert.equal(filled[MAILBOX_FIELDS.imapPass], "hunter2", "IMAP still gets it");
+  });
+
+  it("spreads no caldavPass when caldavUrl is a non-string — parsing", () => {
+    // A repeated field arrives as an array. It is not a URL, so it names no
+    // server, and the shared password must not follow it.
+    const filled = withSharedPassword({
+      [SHARED_PASSWORD_FIELD]: "hunter2",
+      [MAILBOX_FIELDS.caldavUrl]: ["a", "b"],
+    });
+    assert.equal(MAILBOX_FIELDS.caldavPass in filled, false);
+  });
+
+  it("does spread caldavPass when a server was named — both directions agree", () => {
+    const parsed = withSharedPassword({
+      [SHARED_PASSWORD_FIELD]: "hunter2",
+      [MAILBOX_FIELDS.caldavUrl]: NAMED,
+    });
+    const rendered = carrying({ [MAILBOX_FIELDS.caldavUrl]: NAMED }, "hunter2");
+    assert.equal(parsed[MAILBOX_FIELDS.caldavPass], "hunter2");
+    assert.equal(rendered[MAILBOX_FIELDS.caldavPass], "hunter2");
+  });
+
+  it("never overwrites a CalDAV password the operator already gave", () => {
+    const parsed = withSharedPassword({
+      [SHARED_PASSWORD_FIELD]: "hunter2",
+      [MAILBOX_FIELDS.caldavUrl]: NAMED,
+      [MAILBOX_FIELDS.caldavPass]: "its-own",
+    });
+    const rendered = carrying(
+      { [MAILBOX_FIELDS.caldavUrl]: NAMED, [MAILBOX_FIELDS.caldavPass]: "its-own" },
+      "hunter2"
+    );
+    assert.equal(parsed[MAILBOX_FIELDS.caldavPass], "its-own");
+    assert.equal(rendered[MAILBOX_FIELDS.caldavPass], "its-own");
   });
 });

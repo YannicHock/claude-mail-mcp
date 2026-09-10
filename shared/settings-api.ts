@@ -807,73 +807,72 @@ export function emptyMailboxValues(email: string): Record<string, string> {
   };
 }
 
-/**
- * The one password the operator typed, put into the form that is about to ask
- * for three.
- *
- * The values twin of {@link withSharedPassword}, and deliberately the same rule:
- * IMAP and SMTP get it, and CalDAV only when there is a CalDAV URL beside it,
- * because a CalDAV block that is nothing but a password is a probe against a
- * server that was never named.
- *
- * The difference is which direction it runs. `withSharedPassword` fills in a
- * submission on its way to the connector's parser; this fills in a page on its
- * way to the operator, so that a form they are being sent to does not open by
- * asking them for something they have already given it (#120). An empty
- * password — tier 2 reached from its own link — leaves the boxes as they were.
- */
-export function carrying(
-  values: Record<string, string>,
-  password: string
-): Record<string, string> {
-  if (password === "") return values;
-
-  const filled = { ...values };
-  for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
-    if ((filled[name] ?? "") === "") filled[name] = password;
-  }
-  if (
-    (filled[MAILBOX_FIELDS.caldavUrl] ?? "") !== "" &&
-    (filled[MAILBOX_FIELDS.caldavPass] ?? "") === ""
-  ) {
-    filled[MAILBOX_FIELDS.caldavPass] = password;
-  }
-  return filled;
+/** A field of a form body, or "" for a missing one or a repeated one. */
+function stringField(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 
 /**
- * Tiers 1 and 2 ask for one password; a draft has three.
+ * The one password, spread across the services the fields name. The whole rule,
+ * in one place.
  *
- * A screen with one box cannot express a mailbox whose IMAP and SMTP logins take
- * different passwords, and does not try to: it collects the one password an
- * ordinary mailbox has, and this spreads it across the services the submission
- * names. The full form is where the other case is expressed, and it sends no
- * {@link SHARED_PASSWORD_FIELD} at all, so this is inert there.
+ * A screen with one password box cannot express a mailbox whose IMAP and SMTP
+ * logins take different passwords, and does not try to: it collects the one
+ * password an ordinary mailbox has, and this puts it wherever there is a service
+ * and no password of its own yet. A per-service password already present always
+ * wins, and an empty shared password changes nothing.
  *
- * A per-service password already in the body wins, and CalDAV is only filled in
- * when there is a CalDAV URL to go with it — {@link draftFromFields} builds a
- * CalDAV block as soon as any one of its three fields is non-empty, and a block
- * that is nothing but a password is a probe against a server that was never
- * named.
+ * **CalDAV is the clause that is not symmetrical with the other two**, and the
+ * reason this is worth having exactly once: it is filled in only when there is a
+ * CalDAV URL beside it. {@link draftFromFields} builds a CalDAV block as soon as
+ * any one of its three fields is non-empty, so a block that is nothing but a
+ * password is a probe against a server that was never named.
+ *
+ * Generic over the field map because the same rule runs in both directions —
+ * see {@link carrying} and {@link withSharedPassword} — and the two directions
+ * disagree about nothing except whether the values have already been narrowed to
+ * strings. Reading through {@link stringField} covers both.
  */
-export function withSharedPassword(body: Record<string, unknown>): Record<string, unknown> {
-  const submitted = body[SHARED_PASSWORD_FIELD];
-  const shared = typeof submitted === "string" ? submitted : "";
-  if (shared === "") return body;
+function spreadSharedPassword<T extends Record<string, unknown>>(fields: T, shared: string): T {
+  if (shared === "") return fields;
 
-  const text = (name: string): string => {
-    const value = body[name];
-    return typeof value === "string" ? value : "";
-  };
-
-  const filled = { ...body };
+  const text = (name: string): string => stringField(fields[name]);
+  const filled: Record<string, unknown> = { ...fields };
   for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
     if (text(name) === "") filled[name] = shared;
   }
   if (text(MAILBOX_FIELDS.caldavUrl) !== "" && text(MAILBOX_FIELDS.caldavPass) === "") {
     filled[MAILBOX_FIELDS.caldavPass] = shared;
   }
-  return filled;
+  return filled as T;
+}
+
+/**
+ * The one password the operator typed, put into the form that is about to ask
+ * for three.
+ *
+ * The values direction of {@link spreadSharedPassword}: it fills in a page on
+ * its way to the operator, so that a form they are being sent to does not open
+ * by asking them for something they have already given it (#120). An empty
+ * password — tier 2 reached from its own link — leaves the boxes as they were.
+ */
+export function carrying(
+  values: Record<string, string>,
+  password: string
+): Record<string, string> {
+  return spreadSharedPassword(values, password);
+}
+
+/**
+ * Tiers 1 and 2 ask for one password; a draft has three.
+ *
+ * The body direction of {@link spreadSharedPassword}: it fills in a submission
+ * on its way to the connector's parser. The full form is where a mailbox with
+ * two different passwords is expressed, and it sends no
+ * {@link SHARED_PASSWORD_FIELD} at all, so this is inert there.
+ */
+export function withSharedPassword(body: Record<string, unknown>): Record<string, unknown> {
+  return spreadSharedPassword(body, stringField(body[SHARED_PASSWORD_FIELD]));
 }
 
 /**
