@@ -2053,13 +2053,25 @@ test("the refusal page does not tell the operator to press Save", async () => {
     assert.match(refusedPage, /IMAP rejected these credentials/, "the panel is on the page");
     assert.doesNotMatch(refusedPage, /Press Save to store them/);
 
+    // The address matters. This half used to post `user@example.invalid`, a
+    // domain no provider entry matches, so the *Test connection* answer carried
+    // no notice — and the page inferred its panel state from whether a notice
+    // was present. Under a domain that does have advice (#148), a successful
+    // test grew a notice and was silently read as a refusal, losing this very
+    // sentence on the one page where it is true. The assertion could not see
+    // it. It posts Gmail now, which is the case that broke.
     const tested = await post(
       url,
       "/settings/mailboxes/test",
-      await withStampProbed(accountsPath, formAgainst(imap.port))
+      await withStampProbed(
+        accountsPath,
+        formAgainst(imap.port, { "mail.defaultFrom": "anna@gmail.com" })
+      )
     );
     assert.equal(tested.status, 200);
-    assert.match(await tested.text(), /Press Save to store them/);
+    const testedPage = await tested.text();
+    assert.match(testedPage, /Press Save to store them/, "nothing was refused here");
+    assert.match(testedPage, /app password/i, "and the provider note is still shown");
   } finally {
     await close();
     await imap.close();

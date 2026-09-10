@@ -738,6 +738,11 @@ function sendDraftRefusal(res: Response, json: boolean, refusal: DraftRefusal): 
       errors,
       ...(probe === undefined ? {} : { probe: toProbeView(probe) }),
       ...(notice === undefined ? {} : { notice }),
+      // This is the one function that refuses a draft, so it is the one place
+      // that says so. The form used to work it out from `notice` being set,
+      // which stopped being true the moment the /test routes gained a notice
+      // of their own.
+      refused: true,
     })
   );
 }

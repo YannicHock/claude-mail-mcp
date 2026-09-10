@@ -77,6 +77,18 @@ export interface MailboxFormData {
    * preset or from a lookup the operator has just read.
    */
   notice?: string;
+  /**
+   * The save was refused, so the probe panel must not end with "Press Save to
+   * store them" — pressing Save re-probes and refuses again.
+   *
+   * Stated by the caller rather than inferred. This used to be deduced from
+   * `notice` being present, on the reasoning that a panel *and* a notice could
+   * only mean a refusal; #148 then gave the /test routes a notice of their own
+   * (the provider's credential advice) and the deduction started calling a
+   * successful test a refusal. A field that carries two meanings answers the
+   * wrong question eventually.
+   */
+  refused?: boolean;
 }
 
 export interface MailboxListData {
@@ -493,15 +505,13 @@ ${
       "Change it here if this mailbox takes a different one for IMAP and SMTP."
     : "Password fields are always blank here. Leave one blank to keep the stored value.";
 
-  // A panel *and* a notice is the one combination that means "the save was
-  // refused": the /test routes send a report with nothing to say above it, and
-  // the cascade's manual step sends a notice with no report. See
-  // `probeSectionHtml` for what the third state is for.
+  // Said by the caller, not deduced from what else is on the page. See
+  // `probeSectionHtml` for what the three states are for.
   const panelState: ProbePanelState = reserved
     ? "unsavable"
-    : opts.notice === undefined
-      ? "savable"
-      : "refused";
+    : opts.refused === true
+      ? "refused"
+      : "savable";
 
   const body = `<h1>${isNew ? "Add mailbox" : `Edit mailbox — ${escapeHtml(account.label)}`}</h1>
 <p class="sub">${escapeHtml(sub)}</p>
