@@ -55,7 +55,7 @@ import { TokenIssuer } from "./tokens.js";
 import { redirectUriAllowed, sameResource } from "./urls.js";
 
 export const SERVICE_NAME = "claude-mail-mcp-oauth";
-export const VERSION = "0.6.3";
+export const VERSION = "0.7.0";
 
 export interface CreateAppOptions {
   config: OAuthConfig;
