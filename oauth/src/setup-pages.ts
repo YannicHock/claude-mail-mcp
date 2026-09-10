@@ -101,15 +101,27 @@ button.secondary {
 /*
  * #140. Every action row is written primary-button-first, because that is the
  * button a browser presses when the operator hits Enter in a text box, and the
- * one that used to be first was Skip. These three rules are what paints them
- * back in the order they read best in — Skip, then the secondary action, then
- * the primary one — without moving them in the DOM. Delete a rule and the
- * buttons move; delete a rule and reorder the markup to match, and Enter
- * silently throws away a mailbox again.
+ * one that used to be first was Skip. These four rules are what paints them
+ * back in the order they read best in — Skip, then Test connection, then the
+ * primary one, then Save anyway — without moving them in the DOM. Delete a
+ * rule and the buttons move; delete a rule and reorder the markup to match,
+ * and Enter silently throws away a mailbox again.
+ *
+ * .save-anyway is its own rule rather than sharing .secondary, and that is
+ * #173: when *Save anyway* arrived it was given .secondary for its looks and
+ * inherited order 1 along with them, which painted the button that stores
+ * untested credentials immediately to the left of the primary — ahead of it,
+ * in the place the eye goes first. Enter was never affected (implicit
+ * submission reads DOM order, not the order property), so nothing failed; it
+ * was simply the wrong button in the wrong place. It sorts last now, which is
+ * where an override belongs.
+ *
+ * (No backticks in this comment: it lives inside a template literal.)
  */
 .actions > .skip { order: -1; }
 .buttons > button { order: 2; }
 .buttons > button.secondary { order: 1; }
+.buttons > button.save-anyway { order: 3; }
 .probe-row {
   display: flex; justify-content: space-between; gap: 1rem;
   padding: .4rem .6rem; margin-bottom: .35rem; border-radius: 4px;
@@ -500,7 +512,9 @@ export function renderMailboxStep(data: MailboxPageData): string {
   const body = `
   <p class="lead">
     These credentials are tested against your mail server before anything is
-    stored. Nothing here is saved unless IMAP and SMTP both answer.
+    stored: unless IMAP and SMTP both answer, nothing here is saved. Use
+    <em>Save anyway</em> to store them untested — for a server you know is in
+    a maintenance window, say.
   </p>
   ${noticeHtml(data.notice)}
   ${probeSection(data.probe)}
@@ -693,12 +707,18 @@ export const SAVE_ANYWAY_ACTION = "save_anyway";
 /**
  * *Save anyway* — store the mailbox without probing it first (#147).
  *
- * Written after *Save and continue* and after *Test connection*, and — unlike
- * {@link skipButton} — not pulled to the front by any CSS either. Only the
- * *first* submit button in the DOM is what a form submitted implicitly (Enter
- * in a text box) acts as, so Enter on this screen presses Save, which probes.
- * This one takes a deliberate click, which is the whole of #140's lesson
- * applied before the fact rather than after it.
+ * Written after *Save and continue* and after *Test connection*, and painted
+ * after both by `.buttons > button.save-anyway`. Only the *first* submit
+ * button in the DOM is what a form submitted implicitly (Enter in a text box)
+ * acts as, so Enter on this screen presses Save, which probes. This one takes
+ * a deliberate click, which is the whole of #140's lesson applied before the
+ * fact rather than after it.
+ *
+ * The class is `secondary save-anyway`, not `secondary` alone. `.secondary`
+ * carries the looks and `order: 1` together, and taking both put this button
+ * ahead of the primary on screen while every DOM-index test stayed green —
+ * #173. An override should be the last thing the eye reaches, not the
+ * next-to-last.
  *
  * It is on the screen from the start rather than appearing after a refusal: the
  * connector's probe budget is 25 seconds, and an operator who already knows
@@ -707,7 +727,7 @@ export const SAVE_ANYWAY_ACTION = "save_anyway";
  */
 function saveAnywayButton(): string {
   return `<button type="submit" name="_action" value="${escapeHtml(SAVE_ANYWAY_ACTION)}"
-        class="secondary" title="Store this mailbox without testing the connection first">
+        class="secondary save-anyway" title="Store this mailbox without testing the connection first">
         Save anyway
       </button>`;
 }
