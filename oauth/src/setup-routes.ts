@@ -38,8 +38,17 @@
  * ```
  *   POST /settings/mailboxes/test  → the probe, one result per service
  *   GET  /settings/mailboxes/new   → the current accounts.json stamp
- *   POST /settings/mailboxes       → the write, only once the probe has held
+ *   POST /settings/mailboxes       → the write, which probes before it writes
  * ```
+ *
+ * The order in that last line used to be this file's to enforce: step 2 called
+ * the probe route, read the result and only then called the write route. #147
+ * moved the rule into the connector, where the thing being protected is. The
+ * probe route is still called by *Test connection*, which writes nothing and
+ * never was a gate; the save calls the write route and reads the refusal, and
+ * `Save anyway` is the operator asking for the gate to be skipped — a
+ * documented field in the shared wire contract rather than two paths quietly
+ * disagreeing about what a save means.
  *
  * Those three answer JSON when asked to — `Accept: application/json`, and a
  * `{ _csrf, _stamp, mailbox }` body on the two that take one, where `mailbox`
@@ -120,6 +129,8 @@ import {
   parseProvidersAnswer,
   parseStampAnswer,
   PROVIDER_FIELD,
+  SAVE_ANYWAY_FIELD,
+  saveRefusedNotice,
   SHARED_PASSWORD_FIELD,
   stepFromEdit,
   stepFromLookup,
@@ -144,6 +155,7 @@ import {
   renderMailboxStep,
   renderMailboxSuggestionStep,
   renderSetupComplete,
+  SAVE_ANYWAY_ACTION,
   type ConfiguredMailbox,
   type ConnectPageData,
   type MailboxAddressPageData,
@@ -553,7 +565,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    if (action !== "test" && action !== "save") {
+    if (action !== "test" && action !== "save" && action !== SAVE_ANYWAY_ACTION) {
       page(400, {
         notice: { kind: "error", message: "That form could not be read. Try again." },
       });
@@ -563,73 +575,74 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     const draft = draftFromFields(withSharedPassword(body));
     const values = formValues(draft);
 
-    const tested = await mailboxes.test(draft);
-    if (tested.kind === "unreachable") {
-      log("warn", "setup step 2 could not reach the connector", { error: tested.error });
-      page(502, {
-        values,
-        notice: {
-          kind: "error",
-          message:
-            "The connector did not answer, so nothing was tested and nothing was saved. " +
-            "Check that it is running, then try again.",
-        },
-      });
-      return;
-    }
-
-    if (tested.kind === "rejected") {
-      log("info", "setup step 2: the connector rejected the mailbox details", {
-        fields: Object.keys(tested.errors).length,
-      });
-      page(400, {
-        values,
-        errors: tested.errors,
-        notice: {
-          kind: "error",
-          message:
-            "These details were not accepted, so nothing was tested and nothing was saved.",
-        },
-      });
-      return;
-    }
-
-    if (tested.kind === "refused") {
-      log("error", "setup step 2: the connector refused the connection test", {
-        status: tested.status,
-      });
-      page(502, { values, notice: refusedNotice(tested.status) });
-      return;
-    }
-
-    if (tested.kind === "unreadable") {
-      // Fail closed. An answer this build cannot read is not evidence that the
-      // mailbox works, and the one thing this step must never do is store
-      // credentials it has no report for.
-      log("error", "setup step 2: the connection test result could not be read", {});
-      page(502, {
-        values,
-        notice: {
-          kind: "error",
-          message:
-            "The connector answered the connection test in a form this version does not " +
-            "understand, so nothing was saved. Check that both containers are on the same release.",
-        },
-      });
-      return;
-    }
-
-    const probe = probeView(tested.value);
-
-    // Booleans only. Nothing the operator typed is logged here, on any path.
-    log("info", "setup step 2 tested a mailbox", {
-      action,
-      imap: probe.imap.ok,
-      smtp: probe.smtp.ok,
-      caldav: probe.caldav.tested ? probe.caldav.ok : null,
-    });
-
+    // `Test connection`: probe, report, store nothing. Still the wizard's own
+    // call, because that is all this button is — a question with no write
+    // behind it, which is exactly why it never needed to be a gate.
     if (action === "test") {
+      const tested = await mailboxes.test(draft);
+      if (tested.kind === "unreachable") {
+        log("warn", "setup step 2 could not reach the connector", { error: tested.error });
+        page(502, {
+          values,
+          notice: {
+            kind: "error",
+            message:
+              "The connector did not answer, so nothing was tested and nothing was saved. " +
+              "Check that it is running, then try again.",
+          },
+        });
+        return;
+      }
+
+      if (tested.kind === "rejected") {
+        log("info", "setup step 2: the connector rejected the mailbox details", {
+          fields: Object.keys(tested.errors).length,
+        });
+        page(400, {
+          values,
+          errors: tested.errors,
+          notice: {
+            kind: "error",
+            message:
+              "These details were not accepted, so nothing was tested and nothing was saved.",
+          },
+        });
+        return;
+      }
+
+      if (tested.kind === "refused") {
+        log("error", "setup step 2: the connector refused the connection test", {
+          status: tested.status,
+        });
+        page(502, { values, notice: refusedNotice(tested.status) });
+        return;
+      }
+
+      if (tested.kind === "unreadable") {
+        // Fail closed. An answer this build cannot read is not evidence that
+        // the mailbox works, and nothing on this screen may claim an outcome it
+        // has not established.
+        log("error", "setup step 2: the connection test result could not be read", {});
+        page(502, {
+          values,
+          notice: {
+            kind: "error",
+            message:
+              "The connector answered the connection test in a form this version does not " +
+              "understand, so nothing was saved. Check that both containers are on the same release.",
+          },
+        });
+        return;
+      }
+
+      const probe = probeView(tested.value);
+      // Booleans only. Nothing the operator typed is logged here, on any path.
+      log("info", "setup step 2 tested a mailbox", {
+        action,
+        imap: probe.imap.ok,
+        smtp: probe.smtp.ok,
+        caldav: probe.caldav.tested ? probe.caldav.ok : null,
+      });
       page(200, {
         values,
         probe,
@@ -641,44 +654,36 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    if (!probe.imap.ok || !probe.smtp.ok) {
-      // A mailbox that cannot read or send is not a mailbox. CalDAV is not in
-      // this condition on purpose: it is optional in the account model, and
-      // treating it as fatal would lock out every IMAP-only provider.
-      page(400, {
-        values,
-        probe,
-        notice: {
-          kind: "error",
-          message:
-            "IMAP and SMTP must both answer before a mailbox is saved, so nothing was stored. " +
-            "Fix what failed above, retype the passwords and try again.",
-        },
-      });
-      return;
-    }
+    // Save, and `Save anyway`. Neither probes here: the write route does that
+    // itself since #147, refuses on a rejected IMAP or SMTP, and sends the
+    // report back with the refusal. What this used to do — call the probe
+    // route, read the result and only then call the write route — put the rule
+    // in the caller rather than in the thing being protected, so the settings
+    // UI, which never had that caller, had no rule at all. The operator sees
+    // the same screens either way; there is simply one fewer round trip and one
+    // fewer place for the two paths to disagree about what a save means.
+    const saveAnyway = action === SAVE_ANYWAY_ACTION;
 
     const stamp = await mailboxes.stamp();
     if (stamp === null) {
       log("error", "setup step 2: the connector would not say what accounts.json looks like", {});
       page(502, {
         values,
-        probe,
         notice: {
           kind: "error",
           message:
-            "The connection test passed, but the connector did not answer when asked to save. " +
-            "Nothing was stored. Try again.",
+            "The connector did not answer when asked what its account file looks like, so " +
+            "nothing was stored. Try again.",
         },
       });
       return;
     }
 
-    const created = await mailboxes.create(draft, stamp);
+    const created = await mailboxes.create(draft, stamp, saveAnyway);
     if (created.kind === "unreachable") {
-      // The one call in this step whose outcome no answer settles. The probe
-      // above can say "nothing was tested and nothing was saved" because it
-      // writes nothing whatever happens to it; this request does, and by the
+      // The one call in this step whose outcome no answer settles. `Test
+      // connection` can say "nothing was tested and nothing was saved" because
+      // it writes nothing whatever happens to it; this request does, and by the
       // time the signal fires it has already gone out. The connector may have
       // stored the mailbox and merely lost the answer on the way back.
       //
@@ -709,15 +714,13 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         log("error", "setup step 2 cannot say whether the mailbox was stored", {});
         page(502, {
           values,
-          probe,
           notice: {
             kind: "error",
             message:
-              "The connection test passed, but the connector did not answer when asked to " +
-              "save, and could not be asked afterwards what it did — so this may or may not " +
-              "have been saved. Get the connector answering again, then press Save and " +
-              "continue once more: a mailbox that is already stored is refused by its ID " +
-              "rather than stored twice.",
+              "The connector did not answer when asked to save, and could not be asked " +
+              "afterwards what it did — so this may or may not have been saved. Get the " +
+              "connector answering again, then press Save and continue once more: a mailbox " +
+              "that is already stored is refused by its ID rather than stored twice.",
           },
         });
         return;
@@ -726,32 +729,45 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       log("warn", "setup step 2: the save went unanswered and accounts.json did not move", {});
       page(502, {
         values,
-        probe,
         notice: {
           kind: "error",
           message:
-            "The connection test passed, but the connector did not answer when asked to save, " +
-            "and its account file is unchanged. Nothing was stored. Try again.",
+            "The connector did not answer when asked to save, and its account file is " +
+            "unchanged. Nothing was stored. Try again.",
         },
       });
       return;
     }
 
     if (created.kind === "rejected") {
+      // Two different refusals arrive here, and the operator's next move is not
+      // the same for them. A refusal carrying a probe report is the connector's
+      // save-path gate: the credentials themselves did not work, and the report
+      // is what says which service and why. Anything else is the connector
+      // objecting to a *field* — an id already taken, a port that is not a
+      // port — with nothing wrong with the servers at all.
+      const refusedByProbe = created.probe;
       log("error", "setup step 2: the connector refused to save the mailbox", {
         status: created.status,
         fields: Object.keys(created.errors).length,
+        probed: refusedByProbe !== undefined,
       });
       page(400, {
         values,
         errors: created.errors,
-        probe,
+        probe: refusedByProbe === undefined ? undefined : probeView(refusedByProbe),
         notice: {
           kind: "error",
           message:
-            "The connection test passed, but the connector refused to store these " +
-            "details, so this attempt added nothing. What it objected to is marked " +
-            "below; fix that, retype the passwords and try again.",
+            refusedByProbe === undefined
+              ? "The connector refused to store these details, so this attempt added " +
+                "nothing. What it objected to is marked below; fix that, retype the " +
+                "passwords and try again."
+              : // The connector's own sentence, from the shared wire contract, so
+                // this screen and the connector's settings form say the same
+                // thing about the same refusal.
+                (saveRefusedNotice(refusedByProbe) ??
+                "Nothing was saved. Fix what failed above, retype the passwords and try again."),
         },
       });
       return;
@@ -762,7 +778,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         status: created.status,
         fields: 0,
       });
-      page(502, { values, probe, notice: refusedNotice(created.status) });
+      page(502, { values, notice: refusedNotice(created.status) });
       return;
     }
 
@@ -770,7 +786,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     // what says the account is there. Reading an unreadable 201 as a failure is
     // the other half of #82: it would send the operator into a retry the
     // connector answers with "an account with id … already exists".
-    log("info", "setup step 2 completed: a verified mailbox was saved", {});
+    log("info", "setup step 2 completed: a mailbox was saved", { probed: !saveAnyway });
     await state.advanceTo("connect");
     redirect(res, `${base}/connect`, 303);
   }
@@ -1138,17 +1154,19 @@ const SETUP_SUBJECT = "setup-wizard";
 /** Longer than the connector's own 25-second probe budget, and not much longer. */
 const PROBE_TIMEOUT_MS = 30_000;
 /**
- * Everything else upstream is a file read and a render — the write included.
+ * Everything else upstream is a file read and a render.
  *
- * Weighed again for the save under #82, on the suspicion that 5 seconds was too
- * short for a probe-then-write. It is not one: `POST /settings/mailboxes` in the
- * connector parses the draft, checks the stamp, writes `accounts.json` and
- * renames it into place, and talks to no mail server at all. The probe is the
- * separate `/settings/mailboxes/test` call above, which already gets 30 seconds
- * — more than the 25 that `TOTAL_TIMEOUT_MS` in the connector's probe.ts allows
- * itself. So the budget stays: raising it would only hold an operator in front
- * of a blank screen for half a minute when the connector is genuinely wedged,
- * and what actually hurt here was never the length of the wait but what the
+ * The write used to be in that list. It is not since #147: `POST
+ * /settings/mailboxes` probes before it writes, so it is a probe-then-write and
+ * takes {@link PROBE_TIMEOUT_MS} — the same budget the separate
+ * `/settings/mailboxes/test` call gets, and for the same reason. What still
+ * belongs here is the stamp read, the lookup's siblings, and the one save that
+ * genuinely is only a file write: *Save anyway*, which asks the connector not
+ * to probe at all.
+ *
+ * The number itself was weighed under #82 and stands: raising it would only
+ * hold an operator in front of a blank screen when the connector is genuinely
+ * wedged, and what hurt there was never the length of the wait but what the
  * screen claimed at the end of it.
  */
 const QUICK_TIMEOUT_MS = 5_000;
@@ -1175,8 +1193,18 @@ const LOOKUP_TIMEOUT_MS = 13_000;
  */
 type ConnectorAnswer<T> =
   | { kind: "ok"; value: T }
-  /** 400 or 409, with whatever it said about which field. */
-  | { kind: "rejected"; status: number; errors: Record<string, string> }
+  /**
+   * 400 or 409, with whatever it said about which field — and, when the refusal
+   * was the connector's save-path probe, the report that explains it (#147).
+   * `probe` present means "the credentials are why nothing was stored"; absent
+   * means the connector objected to the request itself.
+   */
+  | {
+      kind: "rejected";
+      status: number;
+      errors: Record<string, string>;
+      probe?: MailboxProbeReport;
+    }
   /** Any other status: not about the mailbox, about the request. */
   | { kind: "refused"; status: number }
   /** The expected status, in a shape this build does not understand. */
@@ -1210,8 +1238,17 @@ interface MailboxClient {
   /**
    * Write the account. 201 means it is stored; anything else means it is not.
    * No answer at all means neither — see `handleMailbox`.
+   *
+   * `saveAnyway` is the operator having pressed the second button: it travels
+   * as {@link SAVE_ANYWAY_FIELD} and tells the connector to write without
+   * probing. Left false, the connector probes first and a rejected IMAP or SMTP
+   * comes back as a `rejected` answer carrying the report.
    */
-  create(draft: MailboxDraft, stamp: string): Promise<ConnectorAnswer<typeof STORED>>;
+  create(
+    draft: MailboxDraft,
+    stamp: string,
+    saveAnyway: boolean
+  ): Promise<ConnectorAnswer<typeof STORED>>;
 }
 
 /**
@@ -1275,10 +1312,12 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
         return value === null ? { kind: "unreadable" } : { kind: "ok", value };
       }
       if (res.status === 400 || res.status === 409) {
+        const answer = parseErrorAnswer(payload);
         return {
           kind: "rejected",
           status: res.status,
-          errors: parseErrorAnswer(payload).errors,
+          errors: answer.errors,
+          ...(answer.probe === undefined ? {} : { probe: answer.probe }),
         };
       }
       return { kind: "refused", status: res.status };
@@ -1299,12 +1338,23 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
         okStatus: 200,
         read: parseProbeAnswer,
       }),
-    create: (draft, stamp) =>
+    create: (draft, stamp, saveAnyway) =>
       call({
         method: "POST",
         path: UPSTREAM_CREATE,
-        payload: (csrf) => ({ _csrf: csrf, _stamp: stamp, mailbox: draft }),
-        timeoutMs: QUICK_TIMEOUT_MS,
+        payload: (csrf) => ({
+          _csrf: csrf,
+          _stamp: stamp,
+          mailbox: draft,
+          // Sent only when it is true. An absent field and a `false` one mean
+          // the same thing to the connector, and the absent one cannot be read
+          // as an override by anything in between.
+          ...(saveAnyway ? { [SAVE_ANYWAY_FIELD]: true } : {}),
+        }),
+        // The write probes now (#147), so it is a probe-then-write after all
+        // and gets the probe's budget — unless the operator asked for it not to
+        // be, which is the one case that really is just a file write.
+        timeoutMs: saveAnyway ? QUICK_TIMEOUT_MS : PROBE_TIMEOUT_MS,
         okStatus: 201,
         // Not `parseCreatedAnswer`. The 201 is what says the account is there,
         // and nothing on this screen depends on the id or the stamp it echoes.

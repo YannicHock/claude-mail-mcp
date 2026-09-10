@@ -45,7 +45,21 @@ export interface ProbeInput {
   caldav?: CalDavCreds;
 }
 
-export type ProbeResult = { ok: true } | { ok: false; message: string };
+/**
+ * One service's verdict.
+ *
+ * `credentialRejection` is {@link classifyFailure}'s answer, carried rather
+ * than dropped: the settings routes refuse a save on a failed IMAP or SMTP
+ * (#147) and the operator's next move depends entirely on which of the two
+ * things happened. A rejected password is fixed by typing a different one; a
+ * host that never answered is not, and telling an operator to check their
+ * password when the server is down is the confusion #146 exists to prevent.
+ *
+ * Always present on a failure, never inferred from the message. The wire copy
+ * in `shared/settings-api.ts` makes it optional so an older peer still parses;
+ * here, inside one package, there is no such peer.
+ */
+export type ProbeResult = { ok: true } | { ok: false; message: string; credentialRejection: boolean };
 
 export interface ProbeReport {
   imap: ProbeResult;
@@ -53,8 +67,14 @@ export interface ProbeReport {
   caldav: ProbeResult | null;
 }
 
+/**
+ * Every failure in this module goes through {@link classifyFailure}, which is
+ * the one place in the repository that decides whether a server refused a
+ * login or was never reached. Nothing here re-derives that from a message.
+ */
 function toFailure(err: unknown): ProbeResult {
-  return { ok: false, message: describeFailure(err) };
+  const { credentialRejection, reason } = classifyFailure(err);
+  return { ok: false, message: reason, credentialRejection };
 }
 
 /**
@@ -105,14 +125,14 @@ async function probeImap(creds: ImapCreds, perProbeMs: number): Promise<ProbeRes
     await withTimeout(client.connect(), perProbeMs, "IMAP", () => client.close());
     return { ok: true };
   } catch (err) {
-    // `classifyFailure` is the fork this catch used to spell out by hand: the
-    // fixed CREDENTIAL_REJECTION_MESSAGE when the server answered and refused
-    // the login, the bounded description of the error for everything else. Its
-    // `credentialRejection` flag is not part of a ProbeResult and is dropped
-    // here — the settings UI reads the message. The MCP tools, which log the
-    // flag, are the reason it exists.
-    const { reason } = classifyFailure(err);
-    return { ok: false, message: reason };
+    // `classifyFailure`, via toFailure, is the fork this catch used to spell
+    // out by hand: the fixed CREDENTIAL_REJECTION_MESSAGE when the server
+    // answered and refused the login, the bounded description of the error for
+    // everything else. Its `credentialRejection` flag is carried through to the
+    // caller since #147 — the settings routes refuse a save on this outcome and
+    // the operator is owed the difference between a wrong password and a host
+    // that was never there.
+    return toFailure(err);
   } finally {
     try {
       await client.logout();
@@ -241,7 +261,7 @@ async function caldavPreflight(
     // told which of two things went wrong; which library was involved is not
     // part of the answer, and the server's own wording is neither dependable
     // nor guaranteed free of the credentials it is complaining about.
-    return { ok: false, message: CREDENTIAL_REJECTION_MESSAGE };
+    return { ok: false, message: CREDENTIAL_REJECTION_MESSAGE, credentialRejection: true };
   }
   return null;
 }
@@ -323,7 +343,9 @@ async function probeCalDav(creds: CalDavCreds, perProbeMs: number): Promise<Prob
           // runs over the composed string, not just the library's half, so the
           // whole message stays inside MAX_MESSAGE_LENGTH.
           const detail = `${CALDAV_DISCOVERY_FAILURE_PREFIX}${describeFailure(err)}`;
-          return { ok: false, message: describeFailure(detail) };
+          // Not a credential rejection: the pre-flight above is what answers
+          // that question for CalDAV, and it already said no.
+          return { ok: false, message: describeFailure(detail), credentialRejection: false };
         }
         return { ok: true };
       })(),

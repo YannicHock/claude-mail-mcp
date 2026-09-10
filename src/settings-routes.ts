@@ -109,12 +109,17 @@ import { probeAccount, type ProbeReport } from "./probe.js";
 import { providerPresets } from "./providers.js";
 import {
   ADDRESS_FIELD,
+  caldavFailureNotice,
   CHECKBOX_ON,
   flattenDraft,
   MAILBOX_FIELDS,
   MAILBOX_SECRET_FIELDS,
   parseMailboxDraft,
+  probeRefusesSave,
   PROVIDER_FIELD,
+  readSaveAnyway,
+  SAVE_ANYWAY_FIELD,
+  saveRefusedNotice,
   SHARED_PASSWORD_FIELD,
   stepFromEdit,
   stepFromLookup,
@@ -127,6 +132,7 @@ import {
   type MailboxSetupStep,
   type MailboxStampAnswer,
   type ProvidersAnswer,
+  type MailboxProbeReport,
 } from "../shared/settings-api.js";
 import {
   renderMailboxAddress,
@@ -193,6 +199,10 @@ function sanitize(body: FormBody): Record<string, string> {
   const values: Record<string, string> = {};
   for (const [key, value] of Object.entries(body)) {
     if (key === "_csrf" || key === "_stamp" || key === "_action") continue;
+    // Not a field of the mailbox: the button that asked for *Save anyway*.
+    // Echoing it back into a re-rendered form would make the next submission
+    // an override the operator did not press anything for.
+    if (key === SAVE_ANYWAY_FIELD) continue;
     if (PASSWORD_FIELDS.has(key)) continue;
     if (typeof value === "string") values[key] = value;
   }
@@ -330,6 +340,53 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
  * structural, no-op conversion between the two. */
 function toProbeView(report: ProbeReport): ProbeReportView {
   return { imap: report.imap, smtp: report.smtp, caldav: report.caldav };
+}
+
+/**
+ * The same report, as the wire contract declares it.
+ *
+ * Also a no-op conversion: `ProbeResult` carries `credentialRejection` as a
+ * required boolean and `MailboxProbeOutcome` as an optional one, which is a
+ * widening. Spelled out so that a change to either shape fails here rather than
+ * silently sending the wizard a document it reads as unreadable.
+ */
+function toWireReport(report: ProbeReport): MailboxProbeReport {
+  return { imap: report.imap, smtp: report.smtp, caldav: report.caldav };
+}
+
+/**
+ * The gate #147 put in front of both write routes: test the credentials before
+ * anything is written, and hand the caller the report.
+ *
+ * `null` is "nothing was probed", which is the operator having pressed *Save
+ * anyway* — the whole of the escape hatch: a server in maintenance, a network
+ * blip, or someone who knows better is not made to argue with a probe. What
+ * makes a report a refusal is `probeRefusesSave`, which is in the wire contract
+ * rather than here, because the wizard has to reach the same verdict.
+ *
+ * The rule lives here, in the connector, and in one place. Before #147 it lived
+ * in the setup wizard — which called the probe route, read the result and only
+ * then called the create route — so the rule was in the caller rather than in
+ * the thing being protected, and the settings UI, the path an operator uses for
+ * every mailbox after the first, had no such rule at all. That is how a Gmail
+ * mailbox whose password the server rejects came to sit in `accounts.json`
+ * having never authenticated once.
+ *
+ * CalDAV is not in the condition. It is optional in the account model and fails
+ * for benign reasons far too often to gate a mailbox on; the report comes back
+ * either way, so the failure is *shown* on the page the save succeeded on
+ * rather than costing the operator their mailbox.
+ */
+async function probeBeforeWrite(
+  account: Account,
+  saveAnyway: boolean
+): Promise<ProbeReport | null> {
+  if (saveAnyway) return null;
+  return probeAccount({
+    imap: account.imap,
+    smtp: account.smtp,
+    caldav: account.caldav,
+  });
 }
 
 function findAccount(store: AccountsStore, id: string): Account | undefined {
@@ -618,6 +675,42 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     }
   }
 
+  /**
+   * Where a browser lands after a save: the mailbox list.
+   *
+   * Still a 303 when there is nothing extra to say, so a reload of the list
+   * cannot re-submit the form. The one exception is the failure the save
+   * deliberately does not refuse on — a CalDAV block that did not work. That
+   * has to be *shown*, and a redirect carries nothing, so the list is rendered
+   * here instead with the notice on it. The operator is on the same page either
+   * way; they are simply told the one thing a 303 could not have told them.
+   */
+  async function sendSavedPage(
+    res: Response,
+    csrf: string,
+    report: MailboxProbeReport | undefined
+  ): Promise<void> {
+    const notice = report === undefined ? null : caldavFailureNotice(report);
+    if (notice === null) {
+      res.redirect(303, "/settings/mailboxes");
+      return;
+    }
+    const accounts = store.list();
+    sendHtml(
+      res,
+      200,
+      renderMailboxList({
+        csrf,
+        stamp: await store.stamp(),
+        accounts,
+        notice,
+        rowNotices: Object.fromEntries(
+          reservedIdAccounts(accounts).map((a) => [a.id, reservedIdNotice(a.id)])
+        ),
+      })
+    );
+  }
+
   router.get("/settings/mailboxes", guardAssertion, async (_req, res) => {
     const assertion = assertionOf(res);
     const stamp = await store.stamp();
@@ -846,11 +939,60 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         );
       };
 
+      /**
+       * The probe refused, so nothing was stored — said per service, in both
+       * content types.
+       *
+       * 400 rather than a status of its own: from a caller's side this is the
+       * same class of answer as a field the parser would not take, which the
+       * wizard's `ConnectorAnswer` already reads as `rejected`. The report is
+       * what makes it actionable, and the notice above it is
+       * `saveRefusedNotice` — the wire contract's, so this page and the
+       * wizard's say the same sentence.
+       *
+       * `errors` is empty: no field the operator typed is wrong. What failed is
+       * the server on the other end of it, and marking a box red would send
+       * them to correct something that is already correct.
+       */
+      const refusedByProbe = (report: ProbeReport, stamp: string): void => {
+        const notice = saveRefusedNotice(toWireReport(report)) ?? "";
+        if (json) {
+          sendJson(res, 400, { message: notice, errors: {}, probe: toWireReport(report) });
+          return;
+        }
+        sendHtml(
+          res,
+          400,
+          renderMailboxForm({
+            csrf: assertion.csrf,
+            stamp,
+            account: null,
+            values: sanitize(body),
+            probe: toProbeView(report),
+            notice,
+          })
+        );
+      };
+
       const parsed = parseAccountForm(fields, null);
       if (parsed.errors) {
         rejected(400, parsed.errors, submittedStamp);
         return;
       }
+
+      // Before the write, not beside it. See `probeBeforeWrite`. Null means the
+      // operator pressed *Save anyway* and nothing was probed at all.
+      const report = await probeBeforeWrite(parsed.account, readSaveAnyway(body));
+      if (report !== null && probeRefusesSave(toWireReport(report))) {
+        log("warn", "settings: a mailbox was refused by the connection test", {
+          id: parsed.account.id,
+          imap: report.imap.ok,
+          smtp: report.smtp.ok,
+        });
+        refusedByProbe(report, submittedStamp);
+        return;
+      }
+
       try {
         await store.create(parsed.account, submittedStamp);
       } catch (err) {
@@ -864,16 +1006,23 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         }
         throw err;
       }
+      const wireReport = report === null ? undefined : toWireReport(report);
       if (json) {
         // 201 and not the browser's 303: there is nowhere to send a caller that
         // is not a browser, and the two facts it wants are the id it now has
         // and where accounts.json got to. The status is what says "stored" —
-        // the setup wizard reads nothing out of this body, and an answer that
-        // never arrives is settled by asking for the stamp again.
-        sendJson(res, 201, { id: parsed.account.id, stamp: await store.stamp() });
+        // the setup wizard reads nothing else out of this body, and an answer
+        // that never arrives is settled by asking for the stamp again. The
+        // report rides along so a caller that wants to say something about a
+        // CalDAV block that did not work can, without probing a second time.
+        sendJson(res, 201, {
+          id: parsed.account.id,
+          stamp: await store.stamp(),
+          ...(wireReport === undefined ? {} : { probe: wireReport }),
+        });
         return;
       }
-      res.redirect(303, "/settings/mailboxes");
+      await sendSavedPage(res, assertion.csrf, wireReport);
     }
   );
 
@@ -1007,6 +1156,32 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       );
       return;
     }
+    // The same gate the create route has, for the same reason: an edit that
+    // replaces a working password with one the server refuses leaves exactly
+    // the mailbox #147 is about, and this is the route an operator uses for
+    // every mailbox they already have.
+    const report = await probeBeforeWrite(parsed.account, readSaveAnyway(body));
+    if (report !== null && probeRefusesSave(toWireReport(report))) {
+      log("warn", "settings: a mailbox edit was refused by the connection test", {
+        id: existing.id,
+        imap: report.imap.ok,
+        smtp: report.smtp.ok,
+      });
+      sendHtml(
+        res,
+        400,
+        renderMailboxForm({
+          csrf: assertion.csrf,
+          stamp: submittedStamp,
+          account: existing,
+          values: sanitize(body),
+          probe: toProbeView(report),
+          notice: saveRefusedNotice(toWireReport(report)) ?? "",
+        })
+      );
+      return;
+    }
+
     try {
       await store.update(existing.id, parsed.account, submittedStamp);
     } catch (err) {
@@ -1040,7 +1215,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       }
       throw err;
     }
-    res.redirect(303, "/settings/mailboxes");
+    await sendSavedPage(res, assertion.csrf, report === null ? undefined : toWireReport(report));
   });
 
   router.post("/settings/mailboxes/:id/test", guardAssertion, formBody, guardCsrf, async (req, res) => {

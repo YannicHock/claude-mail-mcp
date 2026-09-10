@@ -60,6 +60,7 @@ import {
   MAILBOX_FIELD_NAMES,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
+  SAVE_ANYWAY_FIELD,
   SHARED_PASSWORD_FIELD,
   type MailboxProbeReport,
   type MailboxRequestBody,
@@ -583,6 +584,21 @@ function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): vo
   });
 }
 
+/**
+ * A connector that refuses the *write* because its own probe said no (#147).
+ *
+ * This is the shape the connector's `POST /settings/mailboxes` now answers with
+ * when IMAP or SMTP failed: a 400, no field to blame, and the report that says
+ * which service and why. The wizard no longer probes before it writes, so this
+ * — not the probe route's answer — is where a bad password is turned back.
+ */
+function refusedByProbe(probe: MailboxProbeReport): ConnectorBehaviour {
+  return {
+    createStatus: 400,
+    createBody: { message: "refused", errors: {}, probe },
+  };
+}
+
 /** How many times the wizard asked the connector what `accounts.json` looks like. */
 function stampReads(harness: Harness): number {
   return harness.upstream.requests.filter((r) => r.url === "/settings/mailboxes/new").length;
@@ -606,13 +622,18 @@ test("credentials that fail the probe are not saved", async () => {
   const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
   try {
     await reachStep2(harness);
-    stubConnector(harness, {
-      probe: {
-        imap: { ok: false, message: "the server rejected these credentials" },
+    stubConnector(
+      harness,
+      refusedByProbe({
+        imap: {
+          ok: false,
+          message: "the server rejected these credentials",
+          credentialRejection: true,
+        },
         smtp: { ok: true },
         caldav: null,
-      },
-    });
+      })
+    );
 
     const res = await postSetupForm(harness, "/mailbox", {
       ...mailboxFields(),
@@ -621,18 +642,68 @@ test("credentials that fail the probe are not saved", async () => {
 
     assert.equal(res.status, 400);
     const html = await res.text();
+    // The same two things the operator saw before #147 — the per-service rows
+    // and a sentence saying nothing was stored. What changed is who decided it.
     assert.match(html, /the server rejected these credentials/);
-    assert.match(html, /nothing was stored/i);
-    // The probe ran; the write did not, and no stamp was even asked for.
-    assert.equal(upstreamPosts(harness, "/settings/mailboxes/test"), 1);
-    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 0);
-    assert.equal(
-      harness.upstream.requests.some((r) => r.url === "/settings/mailboxes/new"),
-      false
-    );
+    assert.match(html, /nothing was saved/i);
+    // The wizard did not probe. It asked the connector to save, and the
+    // connector refused; the rule is in the thing being protected now.
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes/test"), 0);
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 1);
     // And the wizard has not moved on.
     const entry = await getSetup(harness);
     assert.equal(entry.headers.get("location"), `/setup/${harness.claimToken}/mailbox`);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("Save anyway asks the connector not to probe, and the mailbox is stored", async () => {
+  // The escape hatch, end to end: a server in maintenance, a network blip, or
+  // an operator who knows better is not stuck behind a probe. It is a distinct
+  // button — never the default, never what Enter presses (see the unit suite) —
+  // and it travels as the field the wire contract documents rather than as two
+  // packages quietly disagreeing about what a save means.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness);
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save_anyway",
+    });
+
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes/test"), 0);
+
+    const create = harness.upstream.requests.find(
+      (r) => r.method === "POST" && r.url === "/settings/mailboxes"
+    );
+    assert.ok(create, "the write was made");
+    const body = JSON.parse(create.body) as MailboxRequestBody;
+    assert.equal(body.save_anyway, true);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("an ordinary save carries no override at all", async () => {
+  // Absent, not `false`: the connector reads either as "probe first", and an
+  // override that is always in the body is one an intermediary could flip.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness);
+
+    await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
+
+    const create = harness.upstream.requests.find(
+      (r) => r.method === "POST" && r.url === "/settings/mailboxes"
+    );
+    assert.ok(create);
+    assert.equal(SAVE_ANYWAY_FIELD in (JSON.parse(create.body) as Record<string, unknown>), false);
   } finally {
     await harness.close();
   }
@@ -698,11 +769,18 @@ test("CalDAV alone failing does not stop a working mailbox being saved", async (
   const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
   try {
     await reachStep2(harness);
+    // The connector's own answer to this case: a 201, because CalDAV is not in
+    // the condition that refuses a write. The report rides along on the 201 so
+    // the failure is still stated, but it never becomes a refusal.
     stubConnector(harness, {
-      probe: {
-        imap: { ok: true },
-        smtp: { ok: true },
-        caldav: { ok: false, message: "404 Not Found" },
+      createBody: {
+        id: "main",
+        stamp: STAMP_AFTER,
+        probe: {
+          imap: { ok: true },
+          smtp: { ok: true },
+          caldav: { ok: false, message: "404 Not Found" },
+        },
       },
     });
 
@@ -719,7 +797,7 @@ test("CalDAV alone failing does not stop a working mailbox being saved", async (
   }
 });
 
-test("a verified mailbox is probed first, then stored, with the credentials the connector expects", async () => {
+test("a saved mailbox reaches the connector with the credentials it expects", async () => {
   const dir = dataDir();
   const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
   try {
@@ -740,14 +818,12 @@ test("a verified mailbox is probed first, then stored, with the credentials the 
     assert.equal(res.status, 303);
     assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
 
-    // The order is the requirement: probe, read the stamp, then write.
+    // Two calls, not three. The probe-then-write order is still the
+    // requirement; it is simply not this file's to arrange any more — the write
+    // route probes itself, so the wizard reads the stamp and writes (#147).
     assert.deepEqual(
       harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
-      [
-        "POST /settings/mailboxes/test",
-        "GET /settings/mailboxes/new",
-        "POST /settings/mailboxes",
-      ]
+      ["GET /settings/mailboxes/new", "POST /settings/mailboxes"]
     );
 
     for (const request of harness.upstream.requests) {
@@ -774,7 +850,7 @@ test("a verified mailbox is probed first, then stored, with the credentials the 
       assert.equal(request.headers.accept, "application/json");
     }
 
-    const create = harness.upstream.requests[2];
+    const create = harness.upstream.requests[1];
     const body = JSON.parse(create.body) as MailboxRequestBody;
     assert.equal(body.mailbox.imap.pass, MAILBOX_PASSWORD);
     // What the operator typed, under every name the contract has — the request
@@ -924,9 +1000,14 @@ test("a mailbox password is never written back into the page", async () => {
   const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
   try {
     await reachStep2(harness);
-    stubConnector(harness, {
-      probe: { imap: { ok: false, message: "no route to host" }, smtp: { ok: true }, caldav: null },
-    });
+    stubConnector(
+      harness,
+      refusedByProbe({
+        imap: { ok: false, message: "no route to host" },
+        smtp: { ok: true },
+        caldav: null,
+      })
+    );
 
     const res = await postSetupForm(harness, "/mailbox", {
       ...mailboxFields(),
@@ -949,9 +1030,12 @@ test("the connector's own rejection is shown against the field it rejected", asy
   const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
   try {
     await reachStep2(harness);
+    // A refusal with no probe report in it: the connector objecting to a field,
+    // not to the credentials. The screen has to say something different about
+    // it, because the operator's next move is different.
     stubConnector(harness, {
-      probeStatus: 400,
-      probeBody: { errors: { id: 'An account with id "main" already exists.' } },
+      createStatus: 400,
+      createBody: { errors: { id: 'An account with id "main" already exists.' } },
     });
 
     const res = await postSetupForm(harness, "/mailbox", {
@@ -960,8 +1044,10 @@ test("the connector's own rejection is shown against the field it rejected", asy
     });
 
     assert.equal(res.status, 400);
-    assert.match(await res.text(), /An account with id &quot;main&quot; already exists\./);
-    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 0);
+    const html = await res.text();
+    assert.match(html, /An account with id &quot;main&quot; already exists\./);
+    assert.match(html, /refused to store these details/);
+    assert.equal(/rejected these credentials/.test(html), false, html);
   } finally {
     await harness.close();
   }
@@ -972,19 +1058,21 @@ test("an unreadable or refused answer saves nothing, rather than assuming it pas
   try {
     await reachStep2(harness);
 
-    // A connector that answers with something this build cannot read …
+    // A connector whose connection test answers something this build cannot
+    // read. Test connection still fails closed: an answer nobody can read is
+    // not evidence that a mailbox works.
     stubConnector(harness, { probeBody: "<html><body>Bad Gateway</body></html>" });
-    let res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
+    let res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "test" });
     assert.equal(res.status, 502);
     assert.match(await res.text(), /nothing was saved/i);
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 0);
 
-    // … and one that refuses the request outright.
-    stubConnector(harness, { probeStatus: 401 });
+    // … and one that refuses the save outright, which is neither a field
+    // rejection nor a probe refusal and must not be dressed up as either.
+    stubConnector(harness, { createStatus: 401 });
     res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
     assert.equal(res.status, 502);
     assert.match(await res.text(), /HTTP 401/);
-
-    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 0);
   } finally {
     await harness.close();
   }
@@ -1678,18 +1766,13 @@ test("Continue on the confirmation screen probes and stores what was shown", asy
     assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
     assert.deepEqual(
       harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
-      [
-        "POST /settings/autoconfig",
-        "POST /settings/mailboxes/test",
-        "GET /settings/mailboxes/new",
-        "POST /settings/mailboxes",
-      ]
+      ["POST /settings/autoconfig", "GET /settings/mailboxes/new", "POST /settings/mailboxes"]
     );
 
     // The one password the screen asked for reaches both services. A screen
     // with two boxes cannot express a mailbox whose IMAP and SMTP logins take
     // different passwords, and the full form is where that case is expressed.
-    const create = harness.upstream.requests[3];
+    const create = harness.upstream.requests[2];
     const body = JSON.parse(create.body) as MailboxRequestBody;
     assert.equal(body.mailbox.imap.pass, MAILBOX_PASSWORD);
     assert.equal(body.mailbox.smtp.pass, MAILBOX_PASSWORD);
@@ -1727,7 +1810,7 @@ test("a found CalDAV endpoint is stored with the same password, and only then", 
     const res = await postSetupForm(harness, "/mailbox", { ...hidden, _action: "save" });
     assert.equal(res.status, 303);
 
-    const body = JSON.parse(harness.upstream.requests[3].body) as MailboxRequestBody;
+    const body = JSON.parse(harness.upstream.requests[2].body) as MailboxRequestBody;
     assert.deepEqual(body.mailbox.caldav, {
       url: "https://dav.example.com/",
       user: "anna@example.com",

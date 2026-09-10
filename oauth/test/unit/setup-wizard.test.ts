@@ -1248,6 +1248,31 @@ describe("what pressing Enter in a wizard field does", () => {
     }
   });
 
+  it("never lets Enter reach Save anyway", () => {
+    // #147's escape hatch, held to #140's rule rather than trusted to obey it.
+    // Save anyway stores a mailbox nothing has authenticated against; a screen
+    // where Enter reaches it is the same class of defect #140 was, with a
+    // worse outcome than a skipped step.
+    for (const { screen, html } of WIZARD_SCREENS) {
+      const buttons = submitButtons(formBodies(html)[0] ?? "");
+      const index = buttons.findIndex((button) => button.action === "save_anyway");
+      if (index === -1) continue;
+      assert.ok(index > 0, `Enter presses Save anyway on ${screen}`);
+      assert.equal(buttons[index]?.label, "Save anyway");
+    }
+  });
+
+  it("offers Save anyway on the full form, and only there", () => {
+    // The form is the one screen with all three passwords on it. The cascade's
+    // earlier screens have a Save that goes through this same form's action, so
+    // an override there would be an operator overriding a probe they have not
+    // been shown the result of yet.
+    const withOverride = WIZARD_SCREENS.filter(({ html }) =>
+      submitButtons(formBodies(html)[0] ?? "").some((b) => b.action === "save_anyway")
+    ).map(({ screen }) => screen);
+    assert.deepEqual(withOverride, ["step 2 — the full form"]);
+  });
+
   it("still paints Skip to the left of the screen's primary button", () => {
     // Skip is last in the DOM now, so what puts it back on the left is CSS.
     // That rule is the other half of the fix and belongs under test with it.
