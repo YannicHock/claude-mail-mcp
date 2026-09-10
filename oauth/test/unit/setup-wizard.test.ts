@@ -539,8 +539,10 @@ describe("the step 2 screen", () => {
   it("offers a way past it that does not need mail credentials to hand", () => {
     const html = mailboxPage();
     // formnovalidate, or the browser refuses to submit the empty required
-    // fields and Skip becomes a button that cannot be pressed.
-    assert.match(html, /name="_action" value="skip" class="secondary" formnovalidate/);
+    // fields and Skip becomes a button that cannot be pressed. It reaches that
+    // only from a press now, never from Enter: see "what pressing Enter in a
+    // wizard field does" below.
+    assert.match(html, /name="_action" value="skip" class="secondary skip" formnovalidate/);
   });
 
   it("reports the three services on three lines, not as one verdict", () => {
@@ -1052,5 +1054,178 @@ describe("tier 2 — the provider list", () => {
 
   it("can be skipped, like every other screen in step 2", () => {
     assert.match(render(), /value="skip"/);
+  });
+});
+
+// ---- What Enter does, on every wizard screen -------------------------------
+//
+// #140. A browser asked to submit a form implicitly — Enter in a text field —
+// behaves as if the form's *first* submit button had been pressed, and only
+// that button's `name`/`value` pair is sent. So "the screen has a Continue
+// button" says nothing whatever about what Enter does: on step 2's address
+// screen Continue was present, first was `Skip for now`, and Enter threw away
+// the address and the password the operator had just typed. The property that
+// broke is a position, so the tests below assert a position.
+
+interface SubmitButton {
+  /** The `_action` value this button contributes when it is the one activated. */
+  action: string;
+  /** Its own text, with runs of whitespace collapsed. */
+  label: string;
+  /** Whether it asks the browser to skip the form's `required` boxes. */
+  novalidate: boolean;
+}
+
+/** The bodies of every `<form>` on a page, in document order. */
+function formBodies(html: string): string[] {
+  return [...html.matchAll(/<form\b[^>]*>([\s\S]*?)<\/form>/g)].map((match) => match[1] ?? "");
+}
+
+/**
+ * A form's submit buttons, in DOM order — which is the order that decides
+ * implicit submission, and is no longer the order they are painted in.
+ *
+ * A `<button>` with no `type` is a submit button; that default is why the two
+ * screens whose primary button carries no `type="submit"` are in the table too.
+ */
+function submitButtons(formBody: string): SubmitButton[] {
+  const found: SubmitButton[] = [];
+  for (const match of formBody.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)) {
+    const attributes = match[1] ?? "";
+    const type = /\btype="([^"]*)"/.exec(attributes)?.[1] ?? "submit";
+    if (type !== "submit") continue;
+    found.push({
+      action: /\bname="_action"[^>]*?\bvalue="([^"]*)"/.exec(attributes)?.[1] ?? "",
+      label: (match[2] ?? "").replace(/\s+/g, " ").trim(),
+      novalidate: /\bformnovalidate\b/.test(attributes),
+    });
+  }
+  return found;
+}
+
+/** Every screen in the wizard that has a form, and the button Enter must press. */
+const WIZARD_SCREENS: Array<{
+  screen: string;
+  html: string;
+  primary: { action: string; label: string };
+}> = [
+  {
+    screen: "step 1 — the operator account",
+    html: renderCredentialsStep({ action: "/setup/tok/credentials", username: "", problems: [] }),
+    primary: { action: "", label: "Continue" },
+  },
+  {
+    screen: "step 2 — the address screen",
+    html: renderMailboxAddressStep({ ...STEP_TWO_LINKS, email: "", errors: {} }),
+    primary: { action: "lookup", label: "Continue" },
+  },
+  {
+    screen: "step 2 — the confirmation screen",
+    html: renderMailboxSuggestionStep({
+      ...STEP_TWO_LINKS,
+      domain: "example.com",
+      sourceLabel: "Published by autoconfig.example.com.",
+      values: {
+        [MAILBOX_FIELDS.imapHost]: "imap.example.com",
+        [MAILBOX_FIELDS.imapPort]: "993",
+        [MAILBOX_FIELDS.smtpHost]: "smtp.example.com",
+        [MAILBOX_FIELDS.smtpPort]: "587",
+      },
+      password: "the-mailbox-password-itself",
+      errors: {},
+    }),
+    primary: { action: "save", label: "Continue" },
+  },
+  {
+    screen: "step 2 — the provider list",
+    html: renderMailboxProviderStep({
+      ...STEP_TWO_LINKS,
+      providers: MAIL_PROVIDERS.map((p) => ({ id: p.id, label: p.label, note: p.note })),
+      domain: "",
+      email: "",
+      selected: "",
+      password: "",
+      errors: {},
+    }),
+    primary: { action: "provider", label: "Continue" },
+  },
+  {
+    screen: "step 2 — the full form",
+    html: renderMailboxStep({
+      action: "/setup/tok/mailbox",
+      backHref: "/setup/tok/credentials",
+      addressHref: "/setup/tok/mailbox",
+      providersHref: "/setup/tok/mailbox?view=providers",
+      values: {},
+      errors: {},
+    }),
+    primary: { action: "save", label: "Save and continue" },
+  },
+  {
+    // The one screen whose primary action *is* the skip: with no settings
+    // signing key there is no mailbox to add, and going on is all it offers.
+    screen: "step 2 — no settings signing key",
+    html: renderMailboxStep({
+      action: "/setup/tok/mailbox",
+      backHref: "/setup/tok/credentials",
+      values: {},
+      errors: {},
+      unavailable: true,
+    }),
+    primary: { action: "skip", label: "Continue without a mailbox" },
+  },
+  {
+    screen: "step 3 — connect Claude",
+    html: renderConnectStep({
+      action: "/setup/tok/connect",
+      backHref: "/setup/tok/mailbox",
+      mcpUrl: "https://mail.example.com/mcp",
+      publicUrl: "https://mail.example.com",
+      mailboxes: [],
+      connectorReachable: true,
+    }),
+    primary: { action: "", label: "Finish" },
+  },
+];
+
+describe("what pressing Enter in a wizard field does", () => {
+  for (const { screen, html, primary } of WIZARD_SCREENS) {
+    it(`presses ${primary.label} on ${screen}, because it is first`, () => {
+      const bodies = formBodies(html);
+      assert.equal(bodies.length, 1, `${screen} has ${bodies.length} forms, not one`);
+
+      const buttons = submitButtons(bodies[0] ?? "");
+      assert.ok(buttons.length > 0, `${screen} has no submit button at all`);
+
+      // Not `buttons.some(...)`: presence is what the address screen already
+      // had while Enter was skipping the mailbox. Position is the property.
+      assert.deepEqual(
+        { action: buttons[0]?.action, label: buttons[0]?.label },
+        primary,
+        `${screen} submits implicitly as ${buttons[0]?.label ?? "nothing"}`
+      );
+    });
+  }
+
+  it("never lets Enter skip a mailbox the operator has typed", () => {
+    for (const { screen, html, primary } of WIZARD_SCREENS) {
+      if (primary.action === "skip") continue;
+      const buttons = submitButtons(formBodies(html)[0] ?? "");
+      assert.notEqual(buttons[0]?.action, "skip", `Enter skips step 2 from ${screen}`);
+      // And it must not walk past the `required` boxes on the way either: #140
+      // was silent partly because Skip carried `formnovalidate`.
+      assert.equal(buttons[0]?.novalidate, false, `Enter bypasses validation on ${screen}`);
+    }
+  });
+
+  it("still paints Skip to the left of the screen's primary button", () => {
+    // Skip is last in the DOM now, so what puts it back on the left is CSS.
+    // That rule is the other half of the fix and belongs under test with it.
+    for (const { screen, html, primary } of WIZARD_SCREENS) {
+      if (primary.action === "skip") continue;
+      if (!/value="skip"/.test(html)) continue;
+      assert.match(html, /class="secondary skip"/, `${screen} has no ordering class on Skip`);
+      assert.match(html, /\.actions > \.skip \{ order: -1; \}/, `${screen} has no ordering rule`);
+    }
   });
 });
