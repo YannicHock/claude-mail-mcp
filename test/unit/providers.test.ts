@@ -49,9 +49,15 @@ describe("the provider table", () => {
     // be wrong by construction. Its CalDAV URL is real, and belongs wherever
     // calendars are set up on their own rather than on a screen whose output is
     // a mailbox.
+    //
+    // Gmail joined the list in #150. Its settings were never the problem — the
+    // deployment this milestone is named for found them by autoconfig — but the
+    // provider list is where an operator whose lookup was blocked ends up, and
+    // scrolling past eight entries without Gmail in them reads as "unsupported".
     assert.deepEqual(
       MAIL_PROVIDERS.map((provider) => provider.id),
       [
+        "gmail",
         "mailbox-org",
         "fastmail",
         "icloud",

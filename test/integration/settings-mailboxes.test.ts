@@ -1885,6 +1885,20 @@ test("an edit is gated the same way, and leaves the stored mailbox alone", async
   }
 });
 
+// ---- #148: the provider's own note, and only on a rejection ----------------
+//
+// The rule is one line long and the cases below are its corners: shown when the
+// server refused the password *and* the address's domain is one the table
+// knows; absent otherwise. The one that matters most is the connectivity case —
+// rendering provider advice on a host that never answered would undo the
+// distinction #146 exists to draw, by telling an operator their password is
+// wrong when the truth is that nothing was listening.
+
+/** A distinctive clause of the Gmail note, as it reaches the page. */
+const GMAIL_NOTE = /16-digit passcode created at myaccount\.google\.com/;
+/** The untargeted sentence the wire contract writes when no note applies. */
+const GENERIC_NOTE = /some providers want an app password rather than the account one/;
+
 /** The `<input>` tag with this `id`, from a rendered page. */
 function inputTag(page: string, id: string): string {
   const match = new RegExp(`<input id="${escapeRe(id)}"[^>]*>`).exec(page);
@@ -1892,11 +1906,13 @@ function inputTag(page: string, id: string): string {
   return match[0];
 }
 
-test("the refusal page carries the passwords back, so Save anyway can be pressed", async () => {
-  // The milestone's headline scenario, walked to its end. The operator types an
-  // account password Google will not take over IMAP, presses Save, waits out
-  // the probe, and lands on a 400 whose notice ends "…or press Save anyway to
-  // store it without testing it."
+test("the refusal page carries the passwords back, and says what Gmail wants", async () => {
+  // The milestone's headline scenario, walked to its end and asserted as one
+  // page, because it is one page. The operator types an account password Google
+  // will not take over IMAP, presses Save, waits out the probe, and lands on a
+  // 400 that has to do three things at once: name what Google actually wants
+  // (#148), keep the password boxes filled so *Save anyway* can be pressed
+  // (#130), and not tell them to press Save when Save has just been refused.
   //
   // `sanitize()` strips every password, and this form's boxes are `required`
   // because there is no account behind it — so that button used to do nothing
@@ -1909,34 +1925,108 @@ test("the refusal page carries the passwords back, so Save anyway can be pressed
     const res = await post(
       url,
       "/settings/mailboxes",
-      await withStampProbed(accountsPath, formAgainst(imap.port))
+      await withStampProbed(
+        accountsPath,
+        formAgainst(imap.port, { "mail.defaultFrom": "anna@gmail.com" })
+      )
     );
     assert.equal(res.status, 400);
     const page = await res.text();
 
+    assert.match(page, GMAIL_NOTE, "the note for the provider that just refused is missing");
+    // A replacement, not an addition. The generic sentence already says the
+    // untargeted version of this, and both on one screen reads as a bug.
+    assert.equal(GENERIC_NOTE.test(page), false, "the generic remedy was left beside the note");
+
     assert.match(inputTag(page, "imap_pass"), /value="imap-secret"/);
     assert.match(inputTag(page, "smtp_pass"), /value="smtp-secret"/);
     assert.match(page, /Save anyway/, "the way past the gate has to be on the page");
+    // The note and the panel's footer are read together, not in competition:
+    // the advice says what to change, and nothing above it says press Save.
+    assert.doesNotMatch(page, /Press Save to store them/);
   } finally {
     await close();
     await imap.close();
   }
 });
 
-test("Test connection carries them back too", async () => {
+test("a connectivity failure on the same domain says nothing about app passwords", async () => {
+  // Nothing is listening on either port, so both services are unreachable and
+  // no server has said anything about any password. The note must not appear.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(
+        accountsPath,
+        formAgainst(1, { "mail.defaultFrom": "anna@gmail.com" })
+      )
+    );
+
+    assert.equal(res.status, 400);
+    const page = await res.text();
+    assert.match(page, /did not answer/);
+    assert.equal(GMAIL_NOTE.test(page), false, "a note was shown for a host that never answered");
+    assert.equal(GENERIC_NOTE.test(page), false, "nor the generic one, for the same reason");
+  } finally {
+    await close();
+  }
+});
+
+test("a rejection on a domain with no entry keeps the sentence it always had", async () => {
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(
+        accountsPath,
+        formAgainst(imap.port, { "mail.defaultFrom": "anna@example.invalid" })
+      )
+    );
+
+    // No entry, no note, and no crash: the fallback is the wire contract's own
+    // sentence, which is what this page said before #148 existed.
+    assert.equal(res.status, 400);
+    const page = await res.text();
+    assert.match(page, GENERIC_NOTE);
+    assert.equal(GMAIL_NOTE.test(page), false);
+    assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("Test connection carries the passwords back, and reports the same note", async () => {
   // The same dead end by a different door: probe, then a form whose mandatory
   // password boxes the answer had emptied. This route stores nothing whatever
-  // it finds, so the only thing the operator can do next is press Save.
+  // it finds, so the only thing the operator can do next is press Save — and
+  // this is where the note has no refusal sentence to replace, so it is the
+  // whole notice on its own.
   const imap = await startRejectingImapServer();
   const { url, accountsPath, close } = await startConnector();
   try {
     const res = await post(
       url,
       "/settings/mailboxes/test",
-      await withStampProbed(accountsPath, formAgainst(imap.port))
+      await withStampProbed(
+        accountsPath,
+        formAgainst(imap.port, { "mail.defaultFrom": "anna@icloud.com" })
+      )
     );
+
     assert.equal(res.status, 200);
-    assert.match(inputTag(await res.text(), "imap_pass"), /value="imap-secret"/);
+    const page = await res.text();
+    assert.match(inputTag(page, "imap_pass"), /value="imap-secret"/);
+    assert.match(page, /never your Apple Account password/);
+    assert.deepEqual(
+      JSON.parse(await readFile(accountsPath, "utf8")).accounts,
+      [],
+      "the probe route still stores nothing"
+    );
   } finally {
     await close();
     await imap.close();
@@ -1992,6 +2082,57 @@ test("the 303 after a state-changing POST carries the header set, through the wh
       assert.equal(res.headers.get(name), value, `expected ${name} on the 303`);
     }
     assert.equal(res.headers.get("content-type"), null, "a redirect carries no body to describe");
+  } finally {
+    await close();
+  }
+});
+
+// ---- #151: unsupported, named at lookup ------------------------------------
+
+test("an address at a provider that cannot be served is warned about at lookup", async () => {
+  // The one case in this file that lets the lookup run for real, and it does
+  // not depend on the answer: the warning is on the screen that follows
+  // whether the domain published settings or not, so this asserts the same
+  // thing online and offline. Nothing here reaches a mail server.
+  const { url, close } = await startConnector();
+  try {
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "lookup",
+      "mail.defaultFrom": "anna@outlook.com",
+      password: "hunter2",
+    });
+
+    assert.equal(res.status, 200, "a warning is not a refusal");
+    const html = await res.text();
+    assert.match(html, /no password will connect/);
+    // Told before a password is asked for. The screen that carries the warning
+    // asks for none: the one the operator already typed travels as a hidden
+    // field, and there is no password box on it to fill in again.
+    assert.equal(/type="password"/.test(html), false, html);
+    assert.equal(/class="error"/.test(html), false, "a warning is not an error box");
+  } finally {
+    await close();
+  }
+});
+
+test("a warned provider is still savable, because Proton's Bridge is real", async () => {
+  // The warning does not gate the write. Microsoft's "no" is absolute but
+  // Proton's is not — a mailbox pointed at a local Proton Mail Bridge works —
+  // and a gate here would lock out the one Proton setup that does.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(accountsPath, {
+        ...validForm({ "mail.defaultFrom": "anna@proton.me" }),
+        [SAVE_ANYWAY_FIELD]: CHECKBOX_ON,
+      })
+    );
+
+    assert.equal(res.status, 303);
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")).accounts as Account[];
+    assert.equal(stored.length, 1, "the unsupported entry must not refuse the write");
   } finally {
     await close();
   }

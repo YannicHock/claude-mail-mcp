@@ -106,7 +106,7 @@ import {
 } from "./accounts.js";
 import { StaleStampError } from "./accounts-writer.js";
 import { probeAccount, type ProbeReport } from "./probe.js";
-import { providerPresets } from "./providers.js";
+import { credentialNoteFor, providerPresets, unsupportedNoticeFor } from "./providers.js";
 import {
   ADDRESS_FIELD,
   caldavFailureNotice,
@@ -399,6 +399,72 @@ function toWireReport(report: ProbeReport): MailboxProbeReport {
 }
 
 /**
+ * The tail `saveRefusedNotice` puts on a refusal that included a credential
+ * rejection, copied here so it can be **replaced** rather than added to (#148).
+ *
+ * That sentence already gives the untargeted version of this issue's advice —
+ * "some providers want an app password rather than the account one" — and a
+ * `credentialNote` printed beside it would say the same thing twice on one
+ * screen, the second time specifically. The point of the note is that it is
+ * targeted, so it takes the generic sentence's place.
+ *
+ * The clean shape is a second parameter on `saveRefusedNotice` itself, in
+ * `shared/settings-api.ts`. That file belongs to another change in flight, so
+ * the substitution happens here for now, and the copy is held honest by a unit
+ * test that asserts a rejected report's notice really does end with this text.
+ * If that ever stops being true the test fails loudly, and this function's
+ * fallback is to leave the sentence exactly as the wire contract wrote it —
+ * losing the targeting rather than printing two remedies.
+ */
+export const GENERIC_CREDENTIAL_REMEDY =
+  "Check the password this mailbox needs — some providers want an app password " +
+  "rather than the account one — then try again, or press Save anyway to store it " +
+  "without testing it.";
+
+/** How the sentence ends once this provider's own note has taken that place. */
+const SAVE_ANYWAY_TAIL = "Or press Save anyway to store it without testing it.";
+
+/**
+ * True when any probed service was refused *by the server* rather than
+ * unreachable — the distinction `shared/credential-failure.ts` draws and the
+ * only thing that makes a `credentialNote` relevant. A host that never answered
+ * says nothing about which password it wanted.
+ */
+function credentialRejected(wire: MailboxProbeReport): boolean {
+  return [wire.imap, wire.smtp, wire.caldav].some(
+    (outcome) =>
+      outcome !== null && outcome.ok === false && outcome.credentialRejection === true
+  );
+}
+
+/**
+ * The sentence above a refused save, targeted at the provider when the address
+ * has one this table knows and the failure was a rejection.
+ *
+ * Three ways to get the untouched wire sentence, all of them deliberate: the
+ * failure was connectivity rather than credentials, the domain is not in the
+ * advice table, or its entry carries no note.
+ */
+function refusalNotice(report: MailboxProbeReport, email: string): string {
+  const notice = saveRefusedNotice(report) ?? "";
+  if (!credentialRejected(report)) return notice;
+  const note = credentialNoteFor(email);
+  if (note === null || !notice.endsWith(GENERIC_CREDENTIAL_REMEDY)) return notice;
+  return `${notice.slice(0, -GENERIC_CREDENTIAL_REMEDY.length)}${note} ${SAVE_ANYWAY_TAIL}`;
+}
+
+/**
+ * The same note on the routes that only test, which store nothing and so have
+ * no refusal sentence for it to replace. Nothing when the failure was not a
+ * rejection, which is the whole of #148's rule.
+ */
+function credentialAdvice(report: ProbeReport, email: string): { notice?: string } {
+  if (!credentialRejected(toWireReport(report))) return {};
+  const note = credentialNoteFor(email);
+  return note === null ? {} : { notice: note };
+}
+
+/**
  * The gate #147 put in front of both write routes: test the credentials before
  * anything is written, and hand the caller the report.
  *
@@ -487,7 +553,11 @@ async function gateOnProbe(opts: {
     ...draft,
     status: 400,
     probe: report,
-    notice: saveRefusedNotice(wire) ?? "",
+    // #148: on a credential rejection this carries what *this provider* wants
+    // in place of the wire contract's generic app-password sentence — a
+    // replacement, never a second sentence beside it. The address comes off the
+    // candidate rather than the body because that is the one already parsed.
+    notice: refusalNotice(wire, candidate.mail.defaultFrom),
   });
   return { proceed: false };
 }
@@ -832,6 +902,9 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
             sourceLabel: step.sourceLabel,
             values: step.values,
             password: step.password,
+            // #151 arrives here: a domain whose autoconfig answers — Microsoft's
+            // does — but whose server will refuse every password anyway.
+            ...(notice === undefined ? {} : { notice }),
           })
         );
         return;
@@ -848,6 +921,10 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
             selected: step.selected,
             password: step.password,
             errors: step.errors,
+            // #151's other landing: Proton publishes no autoconfig, so an
+            // address there falls to the provider list, and this is where the
+            // Bridge sentence has to be.
+            ...(notice === undefined ? {} : { notice }),
           })
         );
         return;
@@ -1017,10 +1094,19 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         const found = await lookupMailboxSettings(email);
         // A boolean and nothing else. Not the address, and not the hosts.
         log("info", "settings: add mailbox looked up an address", { found: found !== null });
+        // #151. The domain is known for the first time here, which is the
+        // earliest this connector can say that no password will work at this
+        // provider — and it is said now rather than after the save, because
+        // telling somebody that once they have typed a password is worse than
+        // not telling them at all. It warns and nothing else: the save is not
+        // blocked, because an operator running a Proton Mail Bridge has a
+        // configuration that works and must be able to carry on.
+        const unsupported = unsupportedNoticeFor(email);
         await sendStep(
           res,
           assertion.csrf,
-          stepFromLookup({ email, password, found, defaults: newMailboxDefaults(email) })
+          stepFromLookup({ email, password, found, defaults: newMailboxDefaults(email) }),
+          unsupported ?? undefined
         );
         return;
       }
@@ -1241,6 +1327,10 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
           // operator to press Save next. See `withCarriedPasswords`.
           values: withCarriedPasswords(body, fields),
           probe: toProbeView(report),
+          // #148. Nothing was stored and nothing was refused, so there is no
+          // sentence for the note to replace — it is the whole notice here, and
+          // only when the server actually rejected the credentials.
+          ...credentialAdvice(report, raw(body, ADDRESS_FIELD)),
         })
       );
     }
@@ -1397,6 +1487,8 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         account: existing,
         values: sanitize(body),
         probe: toProbeView(report),
+        // #148, on the edit form's own Test connection.
+        ...credentialAdvice(report, raw(body, ADDRESS_FIELD)),
       })
     );
   });
