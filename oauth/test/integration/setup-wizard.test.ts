@@ -1874,3 +1874,83 @@ test("the new actions are same-origin only, on the headers Chrome really sends",
     await harness.close();
   }
 });
+
+/**
+ * The `_action` a browser sends when Enter is pressed in one of a screen's boxes.
+ *
+ * Implicit submission is defined as activating the form's *first* submit
+ * button, and a `<button name value>` contributes its pair only when it is the
+ * button that was activated — so what reaches the server is that one button's
+ * pair and nothing else. Read out of the served HTML rather than assumed,
+ * because #140 was a page that named the right action on a button no browser
+ * was ever going to press.
+ */
+function implicitAction(html: string): string {
+  const form = /<form\b[^>]*>([\s\S]*?)<\/form>/.exec(html)?.[1] ?? "";
+  for (const match of form.matchAll(/<button\b([^>]*)>/g)) {
+    const attributes = match[1] ?? "";
+    const type = /\btype="([^"]*)"/.exec(attributes)?.[1] ?? "submit";
+    if (type !== "submit") continue;
+    return /\bname="_action"[^>]*?\bvalue="([^"]*)"/.exec(attributes)?.[1] ?? "";
+  }
+  return "";
+}
+
+test("Enter on the address screen looks the domain up rather than skipping step 2", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { suggestion: suggestionFor() });
+
+    const screen = await getSetup(harness, "/mailbox");
+    assert.equal(screen.status, 200);
+    const action = implicitAction(await screen.text());
+    assert.equal(action, "lookup", `Enter on the address screen submits _action=${action}`);
+
+    // Exactly what the browser posts: the two boxes, and the first submit
+    // button's pair. The other buttons on the screen contribute nothing.
+    const res = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: action,
+    });
+
+    // #140 on the live instance was the reverse of each of these: a 303 to step
+    // 3, and a connector log empty for the whole window.
+    assert.equal(res.status, 200, "Enter advanced past step 2");
+    assert.equal(lookups(harness), 1, "the connector was never asked for the settings");
+    assert.match(await res.text(), /Found settings for example\.com/);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("every step 2 screen the wizard serves submits its own action on Enter", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { suggestion: suggestionFor() });
+
+    for (const [path, expected] of [
+      ["/mailbox", "lookup"],
+      ["/mailbox?view=providers", "provider"],
+      ["/mailbox?view=manual", "save"],
+    ] as const) {
+      const res = await getSetup(harness, path);
+      assert.equal(res.status, 200, path);
+      assert.equal(implicitAction(await res.text()), expected, path);
+    }
+
+    // The confirmation screen is not at a URL of its own: a lookup is the only
+    // way to it, so it is checked from the answer to one.
+    const suggested = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    assert.equal(suggested.status, 200);
+    assert.equal(implicitAction(await suggested.text()), "save", "the confirmation screen");
+  } finally {
+    await harness.close();
+  }
+});

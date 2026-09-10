@@ -90,6 +90,18 @@ button.secondary {
   border: 1px solid color-mix(in srgb, CanvasText 35%, transparent);
 }
 .buttons { display: flex; gap: .5rem; }
+/*
+ * #140. Every action row is written primary-button-first, because that is the
+ * button a browser presses when the operator hits Enter in a text box, and the
+ * one that used to be first was Skip. These three rules are what paints them
+ * back in the order they read best in — Skip, then the secondary action, then
+ * the primary one — without moving them in the DOM. Delete a rule and the
+ * buttons move; delete a rule and reorder the markup to match, and Enter
+ * silently throws away a mailbox again.
+ */
+.actions > .skip { order: -1; }
+.buttons > button { order: 2; }
+.buttons > button.secondary { order: 1; }
 .probe-row {
   display: flex; justify-content: space-between; gap: 1rem;
   padding: .4rem .6rem; margin-bottom: .35rem; border-radius: 4px;
@@ -454,6 +466,8 @@ function noticeHtml(notice: MailboxPageData["notice"]): string {
  * `required`, which is what catches an incomplete form in the browser rather
  * than a round trip later — and which would otherwise make "Skip for now"
  * impossible to press, because a browser will not submit an empty form at all.
+ * It is written last in the action row and painted first, which is the half of
+ * that arrangement {@link skipButton} argues.
  */
 export function renderMailboxStep(data: MailboxPageData): string {
   const { values, errors } = data;
@@ -592,13 +606,11 @@ export function renderMailboxStep(data: MailboxPageData): string {
     ${passwordNote(values)}
 
     <div class="actions">
-      <button type="submit" name="_action" value="skip" class="secondary" formnovalidate>
-        Skip for now
-      </button>
       <span class="buttons">
-        <button type="submit" name="_action" value="test" class="secondary">Test connection</button>
         <button type="submit" name="_action" value="save">Save and continue</button>
+        <button type="submit" name="_action" value="test" class="secondary">Test connection</button>
       </span>
+      ${skipButton()}
     </div>
   </form>
   ${
@@ -663,9 +675,25 @@ export interface StepTwoLinks {
   manualHref: string;
 }
 
-/** Skip is on every one of these screens, and never validates the form first. */
+/**
+ * Skip is on every one of these screens, and never validates the form first.
+ *
+ * It is written *last* in every action row it appears in, and painted first by
+ * `.actions > .skip`. That is #140: a `<button name value>` contributes its
+ * pair only when it is the button that was activated, and a form submitted
+ * implicitly — Enter in a text box — is submitted as if its *first* submit
+ * button had been pressed. With Skip first, Enter on the address screen sent
+ * `_action=skip`, and `formnovalidate` meant the `required` boxes did not even
+ * stop it: the wizard discarded the address and the password that had just been
+ * typed and moved on, reporting success, because it had succeeded — at the
+ * wrong thing.
+ *
+ * `formnovalidate` stays, because a Skip that is actually pressed still has to
+ * get past the empty `required` boxes around it. It is only ever reached by
+ * pressing this button now, never by pressing Enter somewhere else.
+ */
 function skipButton(): string {
-  return `<button type="submit" name="_action" value="skip" class="secondary" formnovalidate>
+  return `<button type="submit" name="_action" value="skip" class="secondary skip" formnovalidate>
         Skip for now
       </button>`;
 }
@@ -734,8 +762,8 @@ export function renderMailboxAddressStep(data: MailboxAddressPageData): string {
       here rather than the one you sign in to their website with.
     </p>
     <div class="actions">
-      ${skipButton()}
       <button type="submit" name="_action" value="lookup">Continue</button>
+      ${skipButton()}
     </div>
   </form>
   ${otherWaysIn(data, "address")}
@@ -886,13 +914,13 @@ ${caldavRow}
     ${hidden}
     ${suggestionPassword(data.password)}
     <div class="actions">
-      ${skipButton()}
       <span class="buttons">
+        <button type="submit" name="_action" value="save">Continue</button>
         <button type="submit" name="_action" value="edit" class="secondary" formnovalidate>
           Edit these
         </button>
-        <button type="submit" name="_action" value="save">Continue</button>
       </span>
+      ${skipButton()}
     </div>
   </form>
   ${otherWaysIn(data, "address")}
@@ -1007,8 +1035,8 @@ export function renderMailboxProviderStep(data: MailboxProviderPageData): string
     </fieldset>
     ${providerPassword(data.password)}
     <div class="actions">
-      ${skipButton()}
       <button type="submit" name="_action" value="provider">Continue</button>
+      ${skipButton()}
     </div>
   </form>
   ${otherWaysIn(data, "providers")}
