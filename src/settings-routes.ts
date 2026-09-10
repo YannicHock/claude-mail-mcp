@@ -48,13 +48,33 @@
  * The `/:id` edit routes are not negotiated. They have no second caller, and a
  * surface with no user is a surface with no tests.
  *
- * ## The one route that is JSON and nothing else
+ * ## The two routes that are JSON and nothing else
  *
  * `POST /settings/autoconfig` answers a document whatever it is asked for,
  * because there is no page behind it: it is the wizard's tier-1 lookup, run here
  * rather than there because `src/autoconfig.ts` and the §7 constraints that make
  * a user-derived fetch safe are in this package and cannot be imported out of
  * it. See the route itself for why it is a POST and why it always answers 200.
+ *
+ * `POST /settings/providers` is the second, and is the same shape for a related
+ * reason. The provider table lives in this package (`src/providers.ts`) because
+ * this package now has a reader for it — the *Add mailbox* cascade below, which
+ * calls `providerPresets` as a function — and mirroring it into the OAuth layer
+ * would have made a fourth byte-for-byte cross-package duplicate, which #126
+ * argues against at length. The wizard reads the list here instead.
+ *
+ * ## Add mailbox, address first
+ *
+ * `GET /settings/mailboxes/new` is the address screen, `?view=providers` is the
+ * provider list and `?view=manual` is the eighteen-field form that used to be
+ * the only thing behind that URL; `POST /settings/mailboxes/new` moves between
+ * them. Nothing there stores, probes or validates a mailbox — every path that
+ * ends in an account still ends at `POST /settings/mailboxes`, unchanged.
+ *
+ * The branching between the screens is not written here and is not written in
+ * the wizard either: `stepFromLookup`, `stepFromProvider` and `stepFromEdit` in
+ * settings-api.ts are the cascade, both entry points call them, and what each
+ * package writes for itself is the chrome around the result (#141).
  *
  * Route path collisions: "new" and "test" are reserved path segments — GET
  * /settings/mailboxes/new and POST /settings/mailboxes/test are registered ahead of
@@ -86,20 +106,34 @@ import {
 } from "./accounts.js";
 import { StaleStampError } from "./accounts-writer.js";
 import { probeAccount, type ProbeReport } from "./probe.js";
+import { providerPresets } from "./providers.js";
 import {
+  ADDRESS_FIELD,
+  CHECKBOX_ON,
   flattenDraft,
   MAILBOX_FIELDS,
   MAILBOX_SECRET_FIELDS,
   parseMailboxDraft,
+  PROVIDER_FIELD,
+  SHARED_PASSWORD_FIELD,
+  stepFromEdit,
+  stepFromLookup,
+  stepFromProvider,
+  withSharedPassword,
   type AutoconfigAnswer,
   type MailboxCreatedAnswer,
   type MailboxErrorAnswer,
   type MailboxProbeAnswer,
+  type MailboxSetupStep,
   type MailboxStampAnswer,
+  type ProvidersAnswer,
 } from "./settings-api.js";
 import {
+  renderMailboxAddress,
   renderMailboxForm,
   renderMailboxList,
+  renderMailboxProviders,
+  renderMailboxSuggestion,
   SETTINGS_HEADERS,
   type ProbeReportView,
 } from "./settings-pages.js";
@@ -112,7 +146,11 @@ export interface SettingsRouterDeps {
   log: Logger;
 }
 
-const PASSWORD_FIELDS = new Set<string>(MAILBOX_SECRET_FIELDS);
+// The three per-service passwords a draft has, plus the cascade's own single
+// box — which is not one of `MAILBOX_FIELDS` and would otherwise survive
+// `sanitize()` into a re-rendered page's values as the one secret the strip
+// missed.
+const PASSWORD_FIELDS = new Set<string>([...MAILBOX_SECRET_FIELDS, SHARED_PASSWORD_FIELD]);
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
 /** Thrown by an individual field parser; caught and folded into the errors record. */
@@ -306,6 +344,50 @@ function idParam(req: { params: Record<string, string | string[]> }): string {
   return Array.isArray(value) ? (value[0] ?? "") : value;
 }
 
+/**
+ * Which screen of the *Add mailbox* cascade a GET is asking for.
+ *
+ * Anything unrecognised is tier 1, because a mistyped query is not a reason to
+ * show someone eighteen empty boxes.
+ */
+function viewOf(req: Request): "address" | "providers" | "manual" {
+  const view = req.query?.view;
+  if (view === "providers" || view === "manual") return view;
+  return "address";
+}
+
+/**
+ * An id and a label for a mailbox that is not the first one.
+ *
+ * The setup wizard has no need of this: its mailbox is `main`, there is nothing
+ * on disk to collide with, and it says so on the screen. Every mailbox added
+ * afterwards needs an id of its own, and one derived from the address is the
+ * obvious guess — so it is offered as a *filled-in box* on the confirmation
+ * screen rather than applied, which is the same rule the derived server settings
+ * beside it follow. Deriving it here rather than letting the operator meet
+ * "Mailbox 'anna' already exists." after pressing Save is the whole point.
+ *
+ * It has to satisfy {@link ID_PATTERN}, so it is built to: lowercased, anything
+ * outside the allowed set folded to `-`, a leading non-alphanumeric trimmed, and
+ * short enough that the collision suffix still fits.
+ */
+function suggestedIdentity(email: string, taken: readonly string[]): { id: string; label: string } {
+  const at = email.lastIndexOf("@");
+  const localPart = at <= 0 ? email : email.slice(0, at);
+  const stem =
+    localPart
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^[^a-z0-9]+/, "")
+      .slice(0, 32) || "mailbox";
+
+  let id = stem;
+  for (let n = 2; taken.includes(id) || RESERVED_IDS.has(id); n += 1) {
+    id = `${stem.slice(0, 28)}-${n}`;
+  }
+  return { id, label: email };
+}
+
 function assertionOf(res: Response): VerifiedAssertion {
   // Safe: every route below runs `requireSettingsAssertion` first, which is the
   // only place that ever sets `res.locals.assertion`.
@@ -338,6 +420,7 @@ function sendJson(
     | MailboxCreatedAnswer
     | MailboxErrorAnswer
     | AutoconfigAnswer
+    | ProvidersAnswer
 ): void {
   res.status(status).type("application/json").set(SETTINGS_HEADERS).json(payload);
 }
@@ -371,7 +454,11 @@ const MALFORMED_DRAFT =
  * not a draft at all.
  */
 function submittedFields(body: FormBody, json: boolean): FormBody | null {
-  if (!json) return body;
+  // The one password the cascade's screens ask for, spread across the services
+  // the submission names. Inert for every other caller: the full form sends no
+  // field under that name, and a JSON draft has its three password fields inside
+  // `mailbox` where a top-level one cannot reach them.
+  if (!json) return withSharedPassword(body);
   const draft = parseMailboxDraft(body.mailbox);
   return draft === null ? null : flattenDraft(draft);
 }
@@ -417,6 +504,113 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   const guardAssertion = requireSettingsAssertion({ key: settingsKey, issuer, log });
   const guardCsrf = requireFormCsrf();
 
+  /**
+   * What a new mailbox starts out as, before a lookup or a preset fills it in.
+   *
+   * The wizard's equivalent is a four-entry constant; this one has to look at
+   * the store, because a *second* mailbox needs an id nothing else has taken and
+   * because whether it should be the default depends on whether there is
+   * anything else. Everything in here is shown to the operator in a box they can
+   * change before anything is written.
+   */
+  function newMailboxDefaults(email: string): Record<string, string> {
+    const existing = store.list();
+    const identity = suggestedIdentity(
+      email,
+      existing.map((account) => account.id)
+    );
+    return {
+      [MAILBOX_FIELDS.id]: identity.id,
+      [MAILBOX_FIELDS.label]: identity.label,
+      // The first mailbox on a fresh instance is the one the mail tools reach
+      // for when none is named; a further one is not, unless the operator says
+      // so on the full form.
+      [MAILBOX_FIELDS.isDefault]: existing.length === 0 ? CHECKBOX_ON : "",
+      [MAILBOX_FIELDS.imapPort]: "993",
+      [MAILBOX_FIELDS.smtpPort]: "465",
+      [MAILBOX_FIELDS.mailDraftsFolder]: "Drafts",
+      [MAILBOX_FIELDS.mailSentFolder]: "Sent",
+    };
+  }
+
+  /**
+   * One step of the cascade, rendered in this UI's chrome.
+   *
+   * The switch is total over {@link MailboxSetupStep}, so a screen added to the
+   * cascade stops this file compiling rather than falling through to a blank
+   * page. Which step it is was decided in settings-api.ts, by the same functions
+   * the wizard calls; what is decided here is only how it looks and what status
+   * it goes out under.
+   */
+  async function sendStep(
+    res: Response,
+    csrf: string,
+    step: MailboxSetupStep,
+    notice?: string
+  ): Promise<void> {
+    switch (step.view) {
+      case "address":
+        // The only way back to tier 1 is an address that could not be read, so
+        // this is a rejected submission rather than a fresh screen.
+        sendHtml(
+          res,
+          400,
+          renderMailboxAddress({ csrf, email: step.email, errors: step.errors })
+        );
+        return;
+
+      case "suggestion":
+        sendHtml(
+          res,
+          200,
+          renderMailboxSuggestion({
+            csrf,
+            stamp: await store.stamp(),
+            domain: step.domain,
+            sourceLabel: step.sourceLabel,
+            values: step.values,
+            password: step.password,
+          })
+        );
+        return;
+
+      case "providers":
+        sendHtml(
+          res,
+          Object.keys(step.errors).length === 0 ? 200 : 400,
+          renderMailboxProviders({
+            csrf,
+            providers: providerPresets(step.email),
+            domain: step.domain,
+            email: step.email,
+            selected: step.selected,
+            password: step.password,
+            errors: step.errors,
+          })
+        );
+        return;
+
+      case "manual":
+        sendHtml(
+          res,
+          200,
+          renderMailboxForm({
+            csrf,
+            stamp: await store.stamp(),
+            account: null,
+            values: step.values,
+            notice:
+              notice ??
+              (step.preset === null
+                ? "Nothing has been saved. Fill in the rest and press Save."
+                : `${step.preset.label} settings have been filled in. Check them, ` +
+                  "and test the connection before saving."),
+          })
+        );
+        return;
+    }
+  }
+
   router.get("/settings/mailboxes", guardAssertion, async (_req, res) => {
     const assertion = assertionOf(res);
     const stamp = await store.stamp();
@@ -439,6 +633,19 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     );
   });
 
+  /**
+   * Add mailbox — the address screen by default, the other two on `?view=`.
+   *
+   * A bare URL is tier 1, which is what makes the address screen the one an
+   * operator meets from the *Add mailbox* link and the full form the fallback
+   * rather than the front door (#141). Anything unrecognised in `?view=` is
+   * tier 1 too: a mistyped query is not a reason to show someone eighteen boxes.
+   *
+   * The JSON branch is unchanged and is still the stamp. It is what the setup
+   * wizard reads here, and it does not go through the cascade at all — the
+   * wizard runs its own copy of these screens in its own chrome and posts
+   * finished drafts to `/settings/mailboxes`.
+   */
   router.get("/settings/mailboxes/new", guardAssertion, async (req, res) => {
     const assertion = assertionOf(res);
     const stamp = await store.stamp();
@@ -449,8 +656,141 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       sendJson(res, 200, { stamp });
       return;
     }
-    sendHtml(res, 200, renderMailboxForm({ csrf: assertion.csrf, stamp, account: null }));
+
+    const view = viewOf(req);
+    if (view === "manual") {
+      sendHtml(res, 200, renderMailboxForm({ csrf: assertion.csrf, stamp, account: null }));
+      return;
+    }
+    if (view === "providers") {
+      sendHtml(
+        res,
+        200,
+        renderMailboxProviders({
+          csrf: assertion.csrf,
+          providers: providerPresets(""),
+          domain: "",
+          email: "",
+          selected: "",
+          password: "",
+        })
+      );
+      return;
+    }
+    sendHtml(res, 200, renderMailboxAddress({ csrf: assertion.csrf, email: "" }));
   });
+
+  /**
+   * Add mailbox — the cascade's three steps, told apart by `_action`.
+   *
+   *   `lookup`    tier 1 — ask this connector's own autoconfig what the
+   *               address's domain says, and show it for confirmation, or fall
+   *               through to tier 2
+   *   `provider`  tier 2 — a chosen preset, filled into the full form
+   *   `edit`      the confirmation screen's `Edit these`, likewise
+   *
+   * None of them stores anything, probes anything or decides anything about a
+   * mailbox: each one produces the next screen, and every path that ends in an
+   * account ends at `POST /settings/mailboxes`, which is unchanged. The
+   * branching itself is `stepFrom*` in settings-api.ts — the same three
+   * functions the wizard's step 2 calls, so the cascade exists once (#141).
+   *
+   * Registered ahead of `POST /settings/mailboxes/:id`, which it would otherwise
+   * be ambiguous with; `new` is already a reserved account id for exactly that
+   * reason (see RESERVED_IDS in accounts.ts).
+   */
+  router.post(
+    "/settings/mailboxes/new",
+    guardAssertion,
+    formBody,
+    guardCsrf,
+    async (req, res) => {
+      const body = req.body as FormBody;
+      const assertion = assertionOf(res);
+      const action = raw(body, "_action");
+      const email = raw(body, ADDRESS_FIELD);
+      const password = raw(body, SHARED_PASSWORD_FIELD);
+
+      if (action === "lookup") {
+        // Reached as a function call, not over a hop: `src/autoconfig.ts` is in
+        // this package, which is the half of #141 that was already easy. The §7
+        // rules that make a user-derived fetch safe are in there and are not
+        // restated here.
+        const found = await lookupMailboxSettings(email);
+        // A boolean and nothing else. Not the address, and not the hosts.
+        log("info", "settings: add mailbox looked up an address", { found: found !== null });
+        await sendStep(
+          res,
+          assertion.csrf,
+          stepFromLookup({ email, password, found, defaults: newMailboxDefaults(email) })
+        );
+        return;
+      }
+
+      if (action === "provider") {
+        const chosen = raw(body, PROVIDER_FIELD);
+        await sendStep(
+          res,
+          assertion.csrf,
+          stepFromProvider({
+            email,
+            password,
+            chosen,
+            presets: providerPresets(email),
+            defaults: newMailboxDefaults(email),
+          })
+        );
+        return;
+      }
+
+      if (action === "edit") {
+        await sendStep(
+          res,
+          assertion.csrf,
+          stepFromEdit({ fields: body, password, defaults: newMailboxDefaults(email) }),
+          "Nothing has been saved. Change whatever is wrong and test the connection."
+        );
+        return;
+      }
+
+      // Anything else is a submission this build does not have a screen for.
+      // Tier 1 rather than a 400 page: there is nothing an operator could do
+      // with the difference, and the address screen is where they were going.
+      sendHtml(res, 400, renderMailboxAddress({ csrf: assertion.csrf, email: "" }));
+    }
+  );
+
+  /**
+   * The provider table, for the setup wizard.
+   *
+   * The table is `src/providers.ts`, in this package, because the settings UI
+   * reads it as a local function call and because mirroring it into the OAuth
+   * layer would have been the fourth byte-for-byte cross-package duplicate #126
+   * is about. The wizard reads it here instead, over the same JSON surface it
+   * already uses for the probe, the write, the accounts stamp and the autoconfig
+   * lookup.
+   *
+   * Not negotiated, like `/settings/autoconfig` and for the same reason: there
+   * is no page behind it. The connector's own screens call `providerPresets`
+   * directly, so an HTML branch here would be a surface with no caller.
+   *
+   * `POST` rather than `GET` for the same two reasons the lookup is one: the
+   * address stays out of the request line and out of everything that records
+   * one, and the CSRF guard applies unchanged. The answer is always 200 — the
+   * table is in code, so there is no failure for it to report.
+   */
+  router.post(
+    "/settings/providers",
+    guardAssertion,
+    jsonBody,
+    formBody,
+    guardCsrf,
+    (req, res) => {
+      const email = raw(req.body as FormBody, "email");
+      const answer: ProvidersAnswer = { providers: providerPresets(email) };
+      sendJson(res, 200, answer);
+    }
+  );
 
   router.get("/settings/mailboxes/:id", guardAssertion, async (req, res) => {
     const account = findAccount(store, idParam(req));

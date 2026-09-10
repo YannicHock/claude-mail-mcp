@@ -1,24 +1,35 @@
 /**
- * Tier 2 of the wizard's step 2: a short list of providers whose settings are
- * known, so that a domain with no autoconfig document still does not send the
- * operator straight to eighteen empty boxes.
+ * Tier 2 of the address-first cascade: a short list of providers whose settings
+ * are known, so that a domain with no autoconfig document still does not send
+ * the operator straight to eighteen empty boxes.
  *
- * ## Why this table is here and not in settings-api.ts
+ * ## Why this table is in the connector
  *
- * The values look like connector concerns — hosts, ports, TLS modes — and the
- * obvious home for anything both packages might care about is the mirrored
- * `settings-api.ts`, which a drift test already holds in step. It is the wrong
- * home for this, for one reason: the connector would never read it. What the
- * connector receives is a `MailboxDraft` with concrete values in it, and it has
- * no opinion at all about which of them came from a table. Mirroring a hundred
- * lines into a package with no reader would double the edit surface and hand the
- * drift test something to compare that says nothing about whether the two sides
- * still speak the same protocol — which is the only thing that test is for.
+ * It was in the OAuth layer until #141, next to the setup wizard that was its
+ * only reader, and the argument for that was that the connector would never read
+ * it: what the connector receives is a `MailboxDraft` with concrete values in
+ * it, and it has no opinion about which of them came from a table.
  *
- * So this is presentation data, and it lives with the presentation. What it does
- * *not* get to do is invent a second vocabulary: every entry is turned into the
- * `MAILBOX_FIELDS` names by {@link prefillFor} before it reaches a form, so a
- * field renamed in the shared contract still breaks this file at compile time.
+ * That premise is what #141 removed. The connector's own *Add mailbox* page now
+ * offers the same cascade — it is where every mailbox after the first is added,
+ * which is the mailbox an operator is *least* likely to know the settings for —
+ * so there are two readers, in two packages that cannot import from one another.
+ *
+ * The reflex answer was to mirror the file and add a fourth drift test. #126 is
+ * the argument against it: six cross-package duplicates protected four different
+ * ways, applied when a wave notices a shared rule and absent when it does not.
+ * So the table moved to the reader that can hold it *locally* — this one, where
+ * the settings UI calls {@link prefillFor} as a function — and the wizard reads
+ * the list over the same JSON surface it already uses for the probe, the write,
+ * the accounts stamp and the autoconfig lookup. `POST /settings/providers` in
+ * settings-routes.ts is that answer; `ProviderPreset` in settings-api.ts is its
+ * shape, and settings-api.ts is the module that was already mirrored for exactly
+ * this kind of cross-package agreement.
+ *
+ * What this table does *not* get to do is invent a second vocabulary: every
+ * entry is turned into the `MAILBOX_FIELDS` names by {@link prefillFor} before
+ * it reaches a form or the wire, so a field renamed in the shared contract still
+ * breaks this file at compile time.
  *
  * ## Every entry is verified, or absent
  *
@@ -34,7 +45,12 @@
  * it cannot fail halfway through somebody's setup.
  */
 
-import { CHECKBOX_ON, MAILBOX_FIELDS } from "./settings-api.js";
+import {
+  CHECKBOX_ON,
+  domainOf,
+  MAILBOX_FIELDS,
+  type ProviderPreset,
+} from "./settings-api.js";
 
 /**
  * The placeholders an entry may carry in a host or a URL, filled in from the
@@ -229,13 +245,6 @@ export function findProvider(id: string): MailProvider | null {
   return MAIL_PROVIDERS.find((provider) => provider.id === id) ?? null;
 }
 
-/** The domain half of an address, lowercased, or "" if there is not one. */
-export function domainOf(email: string): string {
-  const at = email.lastIndexOf("@");
-  if (at <= 0 || at === email.length - 1) return "";
-  return email.slice(at + 1).toLowerCase();
-}
-
 function localPartOf(email: string): string {
   const at = email.lastIndexOf("@");
   return at <= 0 ? email : email.slice(0, at);
@@ -300,4 +309,26 @@ export function prefillFor(provider: MailProvider, email: string): Record<string
     values[MAILBOX_FIELDS.caldavUser] = loginFor(provider.caldav.user, email);
   }
   return values;
+}
+
+/**
+ * The whole table, as the answer both readers work from.
+ *
+ * The values are resolved here rather than by whoever renders them, so no caller
+ * ever meets {@link DOMAIN_PLACEHOLDER} or has to know that iCloud's IMAP login
+ * is not its SMTP one. That is what makes the wire answer and the settings UI's
+ * local call the same thing: one is `JSON.stringify` of the other, and there is
+ * no second code path for the wizard to be subtly wrong on.
+ *
+ * `source` is deliberately absent from it. That is the documentation URL each
+ * entry was verified against — for whoever checks the table next, not for the
+ * operator — and nothing renders it, so nothing sends it.
+ */
+export function providerPresets(email: string): ProviderPreset[] {
+  return MAIL_PROVIDERS.map((provider) => ({
+    id: provider.id,
+    label: provider.label,
+    note: provider.note,
+    values: prefillFor(provider, email),
+  }));
 }

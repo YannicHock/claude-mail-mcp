@@ -54,19 +54,18 @@ import { ASSERTION_HEADER } from "../../src/assertion.js";
 import { verifyPassword } from "../../src/passwords.js";
 import { SESSION_COOKIE } from "../../src/session.js";
 import {
+  ADDRESS_FIELD,
   flattenDraft,
   MAILBOX_FIELDS,
   MAILBOX_FIELD_NAMES,
-  type MailboxProbeReport,
-  type MailboxRequestBody,
-  type MailboxSuggestion,
-} from "../../src/settings-api.js";
-import {
-  ADDRESS_FIELD,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
   SHARED_PASSWORD_FIELD,
-} from "../../src/setup-pages.js";
+  type MailboxProbeReport,
+  type MailboxRequestBody,
+  type MailboxSuggestion,
+  type ProviderPreset,
+} from "../../src/settings-api.js";
 import {
   getSetup,
   postSetupForm,
@@ -434,6 +433,72 @@ interface ConnectorBehaviour {
   autoconfigBody?: unknown;
   /** Drop the lookup's connection: the connector is there, then it is not. */
   autoconfigAnswer?: "reset";
+  /** Status for `POST /settings/providers`. 200 unless a test says otherwise. */
+  providersStatus?: number;
+  providersBody?: unknown;
+  /** Drop the provider list's connection, the way `autoconfigAnswer` does. */
+  providersAnswer?: "reset";
+}
+
+/**
+ * The provider table, as this stub answers for it.
+ *
+ * The real table is the connector's (`src/providers.ts`) since #141, and its
+ * entries are pinned literal by literal in the connector's own
+ * test/unit/providers.test.ts. What is being tested on this side of the hop is
+ * that whatever the connector sends reaches the screens — the list, the caveats,
+ * and the values on the form a chosen preset leads to — so this stub sends
+ * Posteo's real documented values, including the CalDAV URL that carries the
+ * local part and the port that is not 443.
+ */
+function stubPresets(email: string): ProviderPreset[] {
+  const localPart = (email.split("@")[0] ?? "").toLowerCase();
+  return [
+    {
+      id: "mailbox-org",
+      label: "mailbox.org",
+      note: "Log in with your main address, not an alias.",
+      values: {
+        [MAILBOX_FIELDS.mailDefaultFrom]: email,
+        [MAILBOX_FIELDS.imapHost]: "imap.mailbox.org",
+        [MAILBOX_FIELDS.imapPort]: "993",
+        [MAILBOX_FIELDS.imapUser]: email,
+        [MAILBOX_FIELDS.imapTls]: "1",
+        [MAILBOX_FIELDS.smtpHost]: "smtp.mailbox.org",
+        [MAILBOX_FIELDS.smtpPort]: "465",
+        [MAILBOX_FIELDS.smtpUser]: email,
+        [MAILBOX_FIELDS.smtpTls]: "1",
+      },
+    },
+    {
+      id: "posteo",
+      label: "Posteo",
+      note: "The server is posteo.de whatever your address ends in.",
+      values: {
+        [MAILBOX_FIELDS.mailDefaultFrom]: email,
+        [MAILBOX_FIELDS.imapHost]: "posteo.de",
+        [MAILBOX_FIELDS.imapPort]: "993",
+        [MAILBOX_FIELDS.imapUser]: email,
+        [MAILBOX_FIELDS.imapTls]: "1",
+        [MAILBOX_FIELDS.smtpHost]: "posteo.de",
+        [MAILBOX_FIELDS.smtpPort]: "465",
+        [MAILBOX_FIELDS.smtpUser]: email,
+        [MAILBOX_FIELDS.smtpTls]: "1",
+        [MAILBOX_FIELDS.caldavUrl]: `https://posteo.de:8443/calendars/${localPart}/default`,
+        [MAILBOX_FIELDS.caldavUser]: email,
+      },
+    },
+  ];
+}
+
+/** The `email` out of a `{ _csrf, email }` request document, or "". */
+function readEmail(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { email?: unknown };
+    return typeof parsed.email === "string" ? parsed.email : "";
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -452,8 +517,21 @@ function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): vo
     res.end(JSON.stringify(body));
   };
 
-  harness.upstream.respondWith((req, res) => {
+  harness.upstream.respondWith((req, res, requestBody) => {
     const url = req.url ?? "";
+    if (req.method === "POST" && url === "/settings/providers") {
+      if (behaviour.providersAnswer === "reset") {
+        res.destroy();
+        return;
+      }
+      const email = readEmail(requestBody);
+      json(
+        res,
+        behaviour.providersStatus ?? 200,
+        behaviour.providersBody ?? { providers: stubPresets(email) }
+      );
+      return;
+    }
     if (req.method === "POST" && url === "/settings/autoconfig") {
       if (behaviour.autoconfigAnswer === "reset") {
         res.destroy();
@@ -1339,6 +1417,79 @@ test("step 2 opens on the address, not on eighteen boxes", async () => {
   }
 });
 
+test("the wizard reads the provider table off the connector, not out of itself", async () => {
+  // #141 moved the table into the connector, where the settings UI can read it
+  // as a function call — so tier 2 is one more question over the hop the probe,
+  // the write, the stamp and the lookup already go over. What this pins is that
+  // the wizard renders *what it was sent*, rather than a copy of its own.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      providersBody: {
+        providers: [
+          { id: "invented", label: "A provider from the connector", note: "Says so.", values: {} },
+        ],
+      },
+    });
+
+    const res = await getSetup(harness, "/mailbox?view=providers");
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /value="invented"/);
+    assert.match(html, /A provider from the connector/);
+    assert.deepEqual(
+      harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
+      ["POST /settings/providers"]
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a provider list the connector will not give falls to the form, never to a dead end", async () => {
+  // The same shape of degradation the lookup has: a tier that cannot be shown
+  // hands over to the tier below rather than rendering an empty fieldset. It is
+  // not reported as a failure either — the operator can finish from the form,
+  // which is what they would have reached from the link anyway.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { providersAnswer: "reset" });
+
+    const res = await getSetup(harness, "/mailbox?view=providers");
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, new RegExp(`name="${MAILBOX_FIELDS.imapHost}"`));
+    assert.equal(/class="error"/.test(html), false, html);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a lookup that found nothing still reaches a usable screen with no table to show", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { providersStatus: 503, providersBody: { message: "nope" } });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: "hunter2",
+      _action: "lookup",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, new RegExp(`name="${MAILBOX_FIELDS.imapHost}"`));
+    // #120 survives the fallback: the password is still in the boxes that will
+    // send it, rather than being asked for a second time.
+    assert.match(html, /value="hunter2"/);
+  } finally {
+    await harness.close();
+  }
+});
+
 test("the other two tiers are reachable at any time, by URL", async () => {
   const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
   try {
@@ -1767,7 +1918,13 @@ test("choosing a provider fills the full form in rather than saving behind the o
     assert.match(html, /value="465"/);
     assert.match(html, /https:\/\/posteo\.de:8443\/calendars\/anna\/default/);
     assert.match(html, /Posteo settings have been filled in/);
-    assert.equal(harness.upstream.requests.length, 0, "nothing was contacted, let alone stored");
+    // Reading the table is the one thing this step now asks the connector for
+    // (#141) — the values live there, not here. Nothing was probed and nothing
+    // was stored, which is the property that matters.
+    assert.deepEqual(
+      harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
+      ["POST /settings/providers"]
+    );
   } finally {
     await harness.close();
   }
@@ -1793,7 +1950,10 @@ test("Other leads to an empty form with TLS still on and the address kept", asyn
     // — a default nobody chose, on the one setting worth defaulting.
     assert.match(html, new RegExp(`name="${MAILBOX_FIELDS.imapTls}"[^>]*checked`));
     assert.match(html, new RegExp(`name="${MAILBOX_FIELDS.smtpTls}"[^>]*checked`));
-    assert.equal(harness.upstream.requests.length, 0);
+    assert.deepEqual(
+      harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
+      ["POST /settings/providers"]
+    );
   } finally {
     await harness.close();
   }

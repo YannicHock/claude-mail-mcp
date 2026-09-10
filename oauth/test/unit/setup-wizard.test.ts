@@ -24,8 +24,8 @@ import {
 } from "../../src/operator.js";
 import { verifyPassword } from "../../src/passwords.js";
 import { escapeHtml } from "../../src/login.js";
-import { MAIL_PROVIDERS } from "../../src/providers.js";
 import {
+  ADDRESS_FIELD,
   CHECKBOX_ON,
   draftFromFields,
   flattenDraft,
@@ -34,11 +34,12 @@ import {
   parseErrorAnswer,
   parseProbeAnswer,
   parseStampAnswer,
-} from "../../src/settings-api.js";
-import {
-  ADDRESS_FIELD,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
+  SHARED_PASSWORD_FIELD,
+  type ProviderPreset,
+} from "../../src/settings-api.js";
+import {
   renderConnectStep,
   renderCredentialsStep,
   renderMailboxAddressStep,
@@ -46,7 +47,6 @@ import {
   renderMailboxStep,
   renderMailboxSuggestionStep,
   renderSetupComplete,
-  SHARED_PASSWORD_FIELD,
   type CompletePageData,
   type ConnectPageData,
   type MailboxAddressPageData,
@@ -58,6 +58,36 @@ import {
 import { SetupState } from "../../src/setup-state.js";
 
 const GOOD_PASSWORD = "correct horse battery staple";
+
+/**
+ * A stand-in for the connector's provider table.
+ *
+ * The wizard no longer owns those values (#141): the table is `src/providers.ts`
+ * in the connector, which is the package that can also read it locally, and the
+ * wizard renders whatever `POST /settings/providers` answered with. So the
+ * screens below are exercised against a fixture — three entries, including one
+ * with no caveat — and the real table's literals are pinned entry by entry in
+ * the connector's own test/unit/providers.test.ts.
+ */
+const PRESETS: ProviderPreset[] = [
+  {
+    id: "mailbox-org",
+    label: "mailbox.org",
+    note: "Log in with your main address, not an alias.",
+    values: {
+      [MAILBOX_FIELDS.imapHost]: "imap.mailbox.org",
+      [MAILBOX_FIELDS.imapPort]: "993",
+    },
+  },
+  {
+    id: "posteo",
+    label: "Posteo",
+    note: "The server is posteo.de whatever your address ends in.",
+    values: { [MAILBOX_FIELDS.imapHost]: "posteo.de", [MAILBOX_FIELDS.imapPort]: "993" },
+  },
+  { id: "iredmail", label: "iRedMail (self-hosted)", note: "", values: {} },
+];
+
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "oauth-wizard-"));
@@ -974,7 +1004,7 @@ describe("tier 2 — the provider list", () => {
   const render = (data: Partial<MailboxProviderPageData> = {}): string =>
     renderMailboxProviderStep({
       ...STEP_TWO_LINKS,
-      providers: MAIL_PROVIDERS.map((p) => ({ id: p.id, label: p.label, note: p.note })),
+      providers: PRESETS,
       domain: "",
       email: "",
       selected: "",
@@ -985,7 +1015,7 @@ describe("tier 2 — the provider list", () => {
 
   it("lists every provider in the table, plus a way out of it", () => {
     const html = render();
-    for (const provider of MAIL_PROVIDERS) {
+    for (const provider of PRESETS) {
       assert.match(html, new RegExp(`value="${provider.id}"`), provider.id);
       assert.ok(html.includes(escapeHtml(provider.label)), provider.label);
     }
@@ -997,7 +1027,7 @@ describe("tier 2 — the provider list", () => {
     // refusal of the account password as a bare "authentication failed" will
     // conclude they typed their password wrong.
     const html = render();
-    for (const provider of MAIL_PROVIDERS) {
+    for (const provider of PRESETS) {
       if (provider.note === "") continue;
       assert.ok(
         html.includes(escapeHtml(provider.note)),
@@ -1140,7 +1170,7 @@ const WIZARD_SCREENS: Array<{
     screen: "step 2 — the provider list",
     html: renderMailboxProviderStep({
       ...STEP_TWO_LINKS,
-      providers: MAIL_PROVIDERS.map((p) => ({ id: p.id, label: p.label, note: p.note })),
+      providers: PRESETS,
       domain: "",
       email: "",
       selected: "",
