@@ -263,6 +263,39 @@ describe("parseAutoconfigAnswer", () => {
     assert.deepEqual(parseAutoconfigAnswer({}), { suggestion: null });
   });
 
+  it("carries the connector's unsupported warning, which is about the address", () => {
+    // #180. The route used to answer only "what does this domain publish";
+    // this field widens it to "what does this connector know about this
+    // address", which is what the wizard was asking. The two are independent:
+    // outlook.com publishes autoconfig *and* refuses every password, and
+    // proton.me publishes nothing and refuses every password, so a warning has
+    // to be readable beside a suggestion and beside a miss alike.
+    assert.equal(
+      parseAutoconfigAnswer({ suggestion: null, unsupported: "no password will connect" })
+        ?.unsupported,
+      "no password will connect"
+    );
+    assert.equal(
+      parseAutoconfigAnswer({ suggestion: suggestion(), unsupported: "no password will connect" })
+        ?.unsupported,
+      "no password will connect"
+    );
+  });
+
+  it("parses an answer from a connector that predates the field unchanged", () => {
+    // The compatibility half of #180's acceptance. Absent, null and empty all
+    // mean the same thing — nothing to say about this address — and none of
+    // them may turn a readable answer into an unreadable one.
+    for (const value of [
+      { suggestion: null },
+      { suggestion: null, unsupported: null },
+      { suggestion: null, unsupported: "" },
+    ]) {
+      const answer = parseAutoconfigAnswer(value);
+      assert.deepEqual(answer, { suggestion: null }, JSON.stringify(value));
+    }
+  });
+
   it("reads an absent CalDAV block as no CalDAV, the way most providers answer", () => {
     const { caldav: _caldav, ...withoutCaldav } = suggestion();
     assert.equal(parseAutoconfigAnswer({ suggestion: withoutCaldav })?.suggestion?.caldav, null);
@@ -294,6 +327,9 @@ describe("parseAutoconfigAnswer", () => {
       { suggestion: { ...suggestion(), imap: { ...suggestion().imap, socketType: "PLAIN" } } },
       { suggestion: { ...suggestion(), caldav: { url: "https://dav.example.invalid/" } } },
       { suggestion: { ...suggestion(), caldav: { ...suggestion().caldav, source: "a-guess" } } },
+      // A warning is prose, and prose this build cannot read is not guessed at
+      // any more than a host is.
+      { suggestion: null, unsupported: 7 },
     ]) {
       assert.equal(parseAutoconfigAnswer(value), null, JSON.stringify(value) ?? "undefined");
     }
@@ -447,6 +483,7 @@ describe("stepFromLookup — tier 1's Continue", () => {
       selected: "",
       password: "hunter2",
       errors: {},
+      unsupported: null,
     });
   });
 
@@ -567,6 +604,85 @@ describe("stepFromEdit — the confirmation screen's Edit these", () => {
     if (step.view !== "manual") return;
     for (const secret of MAILBOX_SECRET_FIELDS) {
       assert.equal(secret in step.values, false, secret);
+    }
+  });
+});
+
+// ---- #186: the warning is a field of the step, not an argument of the render
+
+describe("the standing warning the cascade carries", () => {
+  // What #186 is: the warning used to be a fourth argument to each UI's
+  // `sendStep`, sharing one slot with the screen's own notice, and *Edit these*
+  // chose the notice. It is decided here now, in the same three functions that
+  // decide which screen comes next, so every screen the address survives on can
+  // show it beside whatever that screen has to say about itself.
+  const WARNING = "Microsoft has removed password authentication for IMAP.";
+
+  it("puts the warning on the confirmation screen the lookup led to", () => {
+    const step = stepFromLookup({
+      email: "anna@outlook.com",
+      password: "hunter2",
+      found: SUGGESTION,
+      unsupported: WARNING,
+    });
+    assert.equal(step.view, "suggestion");
+    assert.equal(step.unsupported, WARNING);
+  });
+
+  it("puts it on the provider list a lookup that found nothing led to", () => {
+    // Proton's own case: it publishes no autoconfig, so a proton.me address
+    // falls to tier 2 and the Bridge sentence has to be there.
+    const step = stepFromLookup({
+      email: "anna@proton.me",
+      password: "hunter2",
+      found: null,
+      unsupported: WARNING,
+    });
+    assert.equal(step.view, "providers");
+    assert.equal(step.unsupported, WARNING);
+  });
+
+  it("survives a chosen preset, and survives Edit these", () => {
+    // The two screens #186 names by hand: both end on the full form, and both
+    // used to arrive there with the warning gone.
+    const chosen = stepFromProvider({
+      email: "anna@outlook.com",
+      password: "hunter2",
+      chosen: PROVIDER_OTHER,
+      presets: PRESETS,
+      unsupported: WARNING,
+    });
+    assert.equal(chosen.view, "manual");
+    assert.equal(chosen.unsupported, WARNING);
+
+    const edited = stepFromEdit({
+      fields: submittedForm(),
+      password: "hunter2",
+      unsupported: WARNING,
+    });
+    assert.equal(edited.view, "manual");
+    assert.equal(edited.unsupported, WARNING);
+  });
+
+  it("is null when there is nothing to say, on every screen the cascade has", () => {
+    // Including the address screen, which can never carry one — an address with
+    // no domain in it matches no entry in the table — but which has the field
+    // so that no render site has to narrow before reading it.
+    const steps = [
+      stepFromLookup({ email: "anna", password: "", found: null }),
+      stepFromLookup({ email: "anna@example.com", password: "", found: SUGGESTION }),
+      stepFromLookup({ email: "anna@example.com", password: "", found: null }),
+      stepFromProvider({
+        email: "anna@example.com",
+        password: "",
+        chosen: "posteo",
+        presets: PRESETS,
+      }),
+      stepFromProvider({ email: "anna", password: "", chosen: "posteo", presets: PRESETS }),
+      stepFromEdit({ fields: submittedForm(), password: "" }),
+    ];
+    for (const step of steps) {
+      assert.equal(step.unsupported, null, step.view);
     }
   });
 });

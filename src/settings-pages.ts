@@ -79,6 +79,18 @@ export interface MailboxFormData {
    */
   notice?: string;
   /**
+   * The standing warning about the **address** — "no password will connect" —
+   * as opposed to {@link MailboxFormData.notice}, which is about this
+   * submission (#186).
+   *
+   * Its own slot because the two are different kinds of sentence and used to
+   * share one, which meant the screen's own notice displaced the warning the
+   * moment an operator pressed *Edit these*. Both are shown; neither replaces
+   * the other. The value is decided by the cascade in settings-api.ts and
+   * spelled in `PROVIDER_ADVICE`, never here.
+   */
+  warning?: string;
+  /**
    * The save was refused, so the probe panel must not end with "Press Save to
    * store them" — pressing Save re-probes and refuses again.
    *
@@ -534,6 +546,7 @@ ${
 
   const body = `<h1>${isNew ? "Add mailbox" : `Edit mailbox — ${escapeHtml(account.label)}`}</h1>
 <p class="sub">${escapeHtml(sub)}</p>
+${noticeHtml(opts.warning)}
 ${opts.notice === undefined ? "" : `<div class="notice">${escapeHtml(opts.notice)}</div>`}
 ${reservedNotice}
 ${probeSectionHtml(opts.probe, panelState)}
@@ -823,6 +836,8 @@ export interface MailboxSuggestionData {
   password: string;
   errors?: Record<string, string>;
   notice?: string;
+  /** The standing warning about the address (#186). See {@link MailboxFormData.warning}. */
+  warning?: string;
 }
 
 /** `imap.example.com:993`, or "" when there is no host to show. */
@@ -916,6 +931,7 @@ export function renderMailboxSuggestion(opts: MailboxSuggestionData): string {
   const body = `<h1>Add mailbox</h1>
 <p class="sub">Found settings for ${escapeHtml(opts.domain)}. Check them before they are used —
 nothing has been stored, and nothing has been contacted with your password yet.</p>
+${noticeHtml(opts.warning)}
 ${noticeHtml(opts.notice)}
 <div class="notice">
 ${suggestionRow(
@@ -982,6 +998,8 @@ export interface MailboxProvidersData {
   password: string;
   errors?: Record<string, string>;
   notice?: string;
+  /** The standing warning about the address (#186). See {@link MailboxFormData.warning}. */
+  warning?: string;
 }
 
 /**
@@ -1039,6 +1057,7 @@ export function renderMailboxProviders(opts: MailboxProvidersData): string {
 
   const body = `<h1>Add mailbox</h1>
 <p class="sub">${escapeHtml(lead)}</p>
+${noticeHtml(opts.warning)}
 ${noticeHtml(opts.notice)}
 <form method="post" action="${escapeHtml(ADD_MAILBOX)}" autocomplete="off">
   <input type="hidden" name="_csrf" value="${escapeHtml(opts.csrf)}">

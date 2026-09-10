@@ -30,6 +30,7 @@ import {
   PROVIDER_FIELD,
   PROVIDER_OTHER,
   SHARED_PASSWORD_FIELD,
+  UNSUPPORTED_FIELD,
   type ProviderPreset,
 } from "../../shared/settings-api.js";
 import { stepNumber, SETUP_STEPS, type SetupStep } from "./setup-state.js";
@@ -308,6 +309,19 @@ export interface MailboxPageData {
   errors: Record<string, string>;
   /** A message across the top of the screen: what happened, and to what. */
   notice?: { kind: "error" | "info"; message: string };
+  /**
+   * The connector's standing warning about the **address** — "no password will
+   * connect" — as opposed to {@link MailboxPageData.notice}, which is about
+   * this submission (#186).
+   *
+   * Its own slot because the two are different kinds of sentence and used to
+   * share one, so the screen's own notice displaced the warning the moment an
+   * operator pressed *Edit these*. Both are shown; neither replaces the other.
+   * The words are the connector's, out of `PROVIDER_ADVICE` in
+   * `src/providers.ts`, and reach this package over the autoconfig answer
+   * (#180) — nothing here decides which addresses are warned.
+   */
+  warning?: string;
   /** The connection report, when one has been run. */
   probe?: MailboxProbeView;
   /**
@@ -474,6 +488,36 @@ function noticeHtml(notice: MailboxPageData["notice"]): string {
 }
 
 /**
+ * The standing warning, above whatever the screen has to say about itself.
+ *
+ * Painted as a notice rather than an error: it is not a refusal and does not
+ * become one — a Proton mailbox pointed at a local Bridge is a real working
+ * configuration and must still be savable, which is why nothing here is a gate.
+ * No new class and no new rule in the stylesheet, so the four `order:` rules
+ * that keep Enter off *Save anyway* are untouched.
+ */
+function warningHtml(warning: string | undefined): string {
+  if (warning === undefined || warning === "") return "";
+  return `<div class="notice" role="alert">${escapeHtml(warning)}</div>`;
+}
+
+/**
+ * The warning, carried to the next screen the way the password is.
+ *
+ * The sentence is the connector's and this package must never work out which
+ * addresses get one — the domain set is `PROVIDER_ADVICE` in the connector's
+ * `src/providers.ts` and stays there (#180). So a screen that was told one
+ * hands it on rather than asking again, which costs no round trip and keeps the
+ * two UIs from disagreeing about which addresses are warned.
+ */
+function carriedWarning(warning: string | undefined): string {
+  if (warning === undefined || warning === "") return "";
+  return `<input type="hidden" name="${escapeHtml(UNSUPPORTED_FIELD)}" value="${escapeHtml(
+    warning
+  )}">`;
+}
+
+/**
  * Step 2 — the first mailbox, verified before it is stored.
  *
  * The field names come from `MAILBOX_FIELDS` in settings-api.ts, which the
@@ -518,9 +562,11 @@ export function renderMailboxStep(data: MailboxPageData): string {
     <em>Save anyway</em> to store them untested — for a server you know is in
     a maintenance window, say.
   </p>
+  ${warningHtml(data.warning)}
   ${noticeHtml(data.notice)}
   ${probeSection(data.probe)}
   <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
+    ${carriedWarning(data.warning)}
     <input type="hidden" name="${MAILBOX_FIELDS.isDefault}" value="${CHECKBOX_ON}">
     ${textInput({
       id: "label",
@@ -855,6 +901,8 @@ export interface MailboxSuggestionPageData extends StepTwoLinks {
   password: string;
   errors: Record<string, string>;
   notice?: { kind: "error" | "info"; message: string };
+  /** The standing warning about the address (#186). See {@link MailboxPageData.warning}. */
+  warning?: string;
 }
 
 /**
@@ -954,6 +1002,7 @@ export function renderMailboxSuggestionStep(data: MailboxSuggestionPageData): st
     Check these before they are used. Nothing has been stored, and nothing has
     been contacted with your password yet.
   </p>
+  ${warningHtml(data.warning)}
   ${noticeHtml(data.notice)}
   <div class="notice">
 ${suggestionRow(
@@ -971,6 +1020,7 @@ ${caldavRow}
   <p class="muted">${escapeHtml(data.sourceLabel)}</p>
   <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
     ${hidden}
+    ${carriedWarning(data.warning)}
     ${suggestionPassword(data.password)}
     <div class="actions">
       <span class="buttons">
@@ -1009,6 +1059,8 @@ export interface MailboxProviderPageData extends StepTwoLinks {
   password: string;
   errors: Record<string, string>;
   notice?: { kind: "error" | "info"; message: string };
+  /** The standing warning about the address (#186). See {@link MailboxPageData.warning}. */
+  warning?: string;
 }
 
 /**
@@ -1077,8 +1129,10 @@ export function renderMailboxProviderStep(data: MailboxProviderPageData): string
 
   const body = `
   <p class="lead">${escapeHtml(lead)}</p>
+  ${warningHtml(data.warning)}
   ${noticeHtml(data.notice)}
   <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
+    ${carriedWarning(data.warning)}
     <label for="mail_from">Email address</label>
     <input id="mail_from" name="${escapeHtml(ADDRESS_FIELD)}" type="email"
            value="${escapeHtml(data.email)}" required

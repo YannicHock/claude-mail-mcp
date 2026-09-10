@@ -140,14 +140,15 @@ import {
   stepFromLookup,
   stepFromProvider,
   stringField,
+  UNSUPPORTED_FIELD,
   withSharedPassword,
+  type AutoconfigAnswer,
   type AutoconfigRequestBody,
   type MailboxDraft,
   type MailboxProbeOutcome,
   type MailboxProbeReport,
   type MailboxRequestBody,
   type MailboxSetupStep,
-  type MailboxSuggestion,
   type ProviderPreset,
   type ProvidersRequestBody,
 } from "../../shared/settings-api.js";
@@ -365,6 +366,24 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
 
     const links = stepTwoLinks(base);
 
+    /**
+     * The connector's warning about this address, as this submission carried it.
+     *
+     * Assigned once the body is parsed, and consulted by {@link page} so the
+     * full form keeps saying it across a *Test connection* or a refused save —
+     * every screen the address survives on, which is #186's whole point.
+     *
+     * A hidden field rather than a second lookup because the domain match is
+     * the connector's (#180) and this package must not grow a copy of it, and
+     * because the lookup that produced the sentence costs a DNS cascade. The
+     * cost of carrying it is that it travels with the *form*, not with the
+     * address: an operator who edits the address box on a later screen carries
+     * the previous address's warning as far as the next lookup. It warns and
+     * never blocks, so the price of that is one sentence too many rather than a
+     * mailbox that cannot be saved.
+     */
+    let carried: string | null = null;
+
     const page = (status: number, data: Partial<MailboxPageData>): void => {
       sendPage(
         res,
@@ -376,6 +395,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
           providersHref: links.providersHref,
           values: {},
           errors: {},
+          ...(carried === null ? {} : { warning: carried }),
           ...(mailboxes === null ? { unavailable: true } : {}),
           ...data,
         })
@@ -397,6 +417,9 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     const action = stringField(body._action);
+    // The connector's own words, come back to us. Never recomputed here — see
+    // `carried` above and #180's option B.
+    carried = stringField(body[UNSUPPORTED_FIELD]) || null;
 
     if (action === "skip") {
       // Someone evaluating the thing should not need mail credentials to hand,
@@ -437,6 +460,12 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         notice?: MailboxPageData["notice"];
       } = {}
     ): Promise<void> => {
+      // #186's two slots, on this side of the hop. `notice` is what this screen
+      // has to say about this submission; the warning is what the connector
+      // said about the address, and it is on the step because it stays true for
+      // every screen the address survives on. Neither displaces the other.
+      const warning = decided.unsupported === null ? {} : { warning: decided.unsupported };
+
       switch (decided.view) {
         case "address":
           // The only way back to tier 1 is an address that could not be read.
@@ -457,6 +486,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
               values: decided.values,
               password: decided.password,
               errors: {},
+              ...warning,
             })
           );
           return;
@@ -469,7 +499,15 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
             // empty one — the same shape of degradation a lookup that answers
             // nothing gets, and for the same reason: a screen offering nothing
             // is worse than the form the operator can always fill in.
-            page(200, { values: carrying(emptyMailboxValues(decided.email), decided.password) });
+            //
+            // The warning comes with it. This is the one path where a
+            // miss-that-still-warns could quietly become "found nothing, here
+            // is the manual form" and lose the sentence on the way, which is
+            // the shape #180 says to watch for.
+            page(200, {
+              values: carrying(emptyMailboxValues(decided.email), decided.password),
+              ...warning,
+            });
             return;
           }
           providerPage(Object.keys(decided.errors).length === 0 ? 200 : 400, {
@@ -479,6 +517,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
             selected: decided.selected,
             password: decided.password,
             errors: decided.errors,
+            ...warning,
           });
           return;
         }
@@ -486,6 +525,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         case "manual":
           page(200, {
             values: decided.values,
+            ...warning,
             ...(opts.notice === undefined ? {} : { notice: opts.notice }),
           });
           return;
@@ -508,13 +548,29 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       // nothing to look up, and this is the one call in step 2 that reaches out
       // to the internet on the strength of what somebody typed.
       const askable = domainOf(email) !== "";
-      const found = askable ? await client.lookup(email) : null;
+      const answer: AutoconfigAnswer = askable ? await client.lookup(email) : { suggestion: null };
+      const found = answer.suggestion;
       if (askable) {
         // A boolean and nothing else. Not the address, and not the hosts.
         log("info", "setup step 2 looked up an address", { found: found !== null });
       }
 
-      await sendStep(stepFromLookup({ email, password, found, defaults: stepDefaults() }));
+      // #180. The same call, the same address, the same moment — the lookup was
+      // always here, and this is the field that was missing from its answer. A
+      // brand-new operator adding their first mailbox now hears "no password
+      // will connect" on the screen this leads to, instead of finding out three
+      // screens later.
+      carried = answer.unsupported ?? null;
+
+      await sendStep(
+        stepFromLookup({
+          email,
+          password,
+          found,
+          defaults: stepDefaults(),
+          unsupported: carried,
+        })
+      );
       return;
     }
 
@@ -529,7 +585,8 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       if (presets === null) {
         // Same fallback the provider screen itself has: with no table there is
         // nothing to resolve the chosen id against, and the form is where the
-        // operator was heading anyway.
+        // operator was heading anyway. `page` puts the carried warning back on
+        // it, so this path drops nothing either.
         page(200, { values: carrying(emptyMailboxValues(email), password) });
         return;
       }
@@ -540,6 +597,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         chosen,
         presets,
         defaults: stepDefaults(),
+        unsupported: carried,
       });
       if (decided.view === "manual" && decided.preset !== null) {
         log("info", "setup step 2: a provider preset was chosen", { provider: decided.preset.id });
@@ -561,12 +619,18 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       // operator typed, which came in on this submission rather than out of
       // anything the wizard stored.
       const password = stringField(body[SHARED_PASSWORD_FIELD]);
-      await sendStep(stepFromEdit({ fields: body, password, defaults: stepDefaults() }), {
-        notice: {
-          kind: "info",
-          message: "Nothing has been saved. Change whatever is wrong and test the connection.",
-        },
-      });
+      await sendStep(
+        stepFromEdit({ fields: body, password, defaults: stepDefaults(), unsupported: carried }),
+        {
+          // The press #186 is about. This sentence is about this submission and
+          // the warning is about the address; they have a slot each now, and
+          // the full form shows both.
+          notice: {
+            kind: "info",
+            message: "Nothing has been saved. Change whatever is wrong and test the connection.",
+          },
+        }
+      );
       return;
     }
 
@@ -1318,10 +1382,15 @@ interface MailboxClient {
   /** Probe without saving: the connector's own "Test connection" action. */
   test(draft: MailboxDraft): Promise<ConnectorAnswer<MailboxProbeReport>>;
   /**
-   * What the address's domain says its own settings are, or null — which covers
-   * "nothing published" and every failure alike, by design. Never throws.
+   * What the connector knows about the address: what its domain publishes, if
+   * anything, and whether no password will ever be accepted there (#180).
+   *
+   * The whole answer rather than just its `suggestion`, because the two halves
+   * are independent and both are needed at the same moment. `suggestion: null`
+   * still covers "nothing published" and every failure alike, by design, and a
+   * failure answers `{ suggestion: null }` with no warning on it. Never throws.
    */
-  lookup(email: string): Promise<MailboxSuggestion | null>;
+  lookup(email: string): Promise<AutoconfigAnswer>;
   /**
    * Tier 2's table, with every entry already filled in for `email`, or null when
    * the connector could not be asked or answered in a shape this build cannot
@@ -1490,12 +1559,16 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
         okStatus: 200,
         read: parseAutoconfigAnswer,
       });
-      if (answer.kind === "ok") return answer.value.suggestion;
+      if (answer.kind === "ok") return answer.value;
       log("warn", "setup step 2: the autoconfig lookup did not answer usefully", {
         kind: answer.kind,
         status: answer.kind === "rejected" || answer.kind === "refused" ? answer.status : 0,
       });
-      return null;
+      // A connector that could not be asked has said nothing about this
+      // address either — including that it cannot be served. Silence is the
+      // one honest answer here; inventing a warning out of an unreachable
+      // connector would be this package doing the domain match itself.
+      return { suggestion: null };
     },
 
     /**
