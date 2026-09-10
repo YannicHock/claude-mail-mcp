@@ -11,23 +11,33 @@
  * submission quickly, not hold a request open until the proxy gives up on it.
  */
 
-import { ImapFlow, AuthenticationFailure } from "imapflow";
+import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import { createDAVClient } from "tsdav";
 
 import type { ImapCreds, SmtpCreds, CalDavCreds } from "./accounts.js";
 import { withTimeout } from "./timeout.js";
+import {
+  classifyFailure,
+  describeFailure,
+  CREDENTIAL_REJECTION_MESSAGE,
+} from "../shared/credential-failure.js";
 
 export const PER_PROBE_TIMEOUT_MS = 10_000;
 export const TOTAL_TIMEOUT_MS = 25_000;
-export const MAX_MESSAGE_LENGTH = 200;
 
 /**
- * The one message a probe reports when the server was reached and answered,
- * and what it answered was "not with those credentials". Exported so the
- * tests assert the classification rather than a copy of the wording.
+ * Both re-exported, not re-declared. The classification and the bound moved to
+ * `shared/credential-failure.ts` in #146 so the MCP tools could reach them too:
+ * they were private to this file, and `src/tools-mail.ts` reported imapflow's
+ * generic `Command failed` for a rejected password as a result. Every existing
+ * `import { … } from "./probe.js"` keeps working, and there is still exactly
+ * one declaration — which `test/unit/shared-modules.test.ts` enforces.
  */
-export const CREDENTIAL_REJECTION_MESSAGE = "the server rejected these credentials";
+export {
+  MAX_MESSAGE_LENGTH,
+  CREDENTIAL_REJECTION_MESSAGE,
+} from "../shared/credential-failure.js";
 
 export interface ProbeInput {
   imap: ImapCreds;
@@ -43,81 +53,8 @@ export interface ProbeReport {
   caldav: ProbeResult | null;
 }
 
-/**
- * Turn an error into a message safe to hand back to the settings UI: no
- * credentials, bounded length. Never interpolates the password or the raw
- * error object — only `err.message`, whitespace-collapsed and truncated.
- */
-function describe(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err);
-  const collapsed = raw.replace(/\s+/g, " ").trim();
-  return collapsed.length > MAX_MESSAGE_LENGTH
-    ? `${collapsed.slice(0, MAX_MESSAGE_LENGTH)}…`
-    : collapsed;
-}
-
 function toFailure(err: unknown): ProbeResult {
-  return { ok: false, message: describe(err) };
-}
-
-/**
- * The fields imapflow decorates an IMAP command failure with. None of them
- * are on `Error`, and imapflow's published types describe them only on the
- * `AuthenticationFailure` subclass, so they are declared here and read
- * defensively — every one of them is checked before it is trusted.
- */
-interface ImapCommandError {
-  /** Set by imapflow's LOGIN/AUTHENTICATE handlers on any error escaping the
-   * authentication step (`dist/esm/commands/login.js`, `authenticate.js`). */
-  authenticationFailed?: unknown;
-  /** `"NO"` or `"BAD"` — present only when the server actually answered with a
-   * tagged rejection (`settleRequest()` in `dist/esm/imap-flow.js`). */
-  responseStatus?: unknown;
-  /** The RFC 5530 response code, e.g. `AUTHENTICATIONFAILED`, for servers that
-   * send one. GreenMail does not; Dovecot does. */
-  serverResponseCode?: unknown;
-}
-
-/**
- * True when the IMAP server was reached, answered, and refused the login.
- *
- * imapflow throws its `AuthenticationFailure` class only in narrow cases it
- * decides on its own (login disabled, no password configured, Exchange's
- * authenticate-then-fail-NAMESPACE quirk). The ordinary wrong-password case —
- * a server answering `LOGIN` with a tagged `NO` — is not one of them: imapflow
- * raises a plain `Error("Command failed")` and hangs the interesting detail off
- * it as properties. Reporting `err.message` there tells the operator "Command
- * failed", which reads like a connectivity problem and is exactly the confusion
- * this classification exists to prevent. Verified against GreenMail, which
- * yields `authenticationFailed: true`, `responseStatus: "NO"`, `responseText:
- * "LOGIN failed. Invalid login/password for user id alice"` and no
- * `serverResponseCode` at all.
- *
- * Both halves of the final check matter, and neither is redundant:
- *
- *   - `authenticationFailed` alone is too broad. imapflow's LOGIN handler tags
- *     it onto *anything* thrown out of the authentication step, including a
- *     socket that dies mid-command — a connectivity failure that must keep
- *     reading as one.
- *   - `responseStatus` alone is too broad in the other direction: a tagged
- *     `NO`/`BAD` says the server refused a command, not that it refused these
- *     credentials.
- *
- * Together they are precisely "the server rejected the login", which is the
- * claim the message makes. `serverResponseCode` is checked as well for the
- * servers that do send RFC 5530's `AUTHENTICATIONFAILED`, so the classification
- * does not rest solely on internal imapflow bookkeeping.
- */
-function isCredentialRejection(err: unknown): boolean {
-  if (err instanceof AuthenticationFailure) return true;
-  if (!(err instanceof Error)) return false;
-
-  const fields = err as Error & ImapCommandError;
-  if (fields.serverResponseCode === "AUTHENTICATIONFAILED") return true;
-
-  const status =
-    typeof fields.responseStatus === "string" ? fields.responseStatus.toUpperCase() : "";
-  return fields.authenticationFailed === true && (status === "NO" || status === "BAD");
+  return { ok: false, message: describeFailure(err) };
 }
 
 /**
@@ -168,14 +105,14 @@ async function probeImap(creds: ImapCreds, perProbeMs: number): Promise<ProbeRes
     await withTimeout(client.connect(), perProbeMs, "IMAP", () => client.close());
     return { ok: true };
   } catch (err) {
-    if (isCredentialRejection(err)) {
-      // Deliberately a fixed string rather than the server's own text: the
-      // operator needs to know which of the two things went wrong, and the
-      // server's wording is neither dependable nor guaranteed free of the
-      // credentials it is complaining about.
-      return { ok: false, message: CREDENTIAL_REJECTION_MESSAGE };
-    }
-    return toFailure(err);
+    // `classifyFailure` is the fork this catch used to spell out by hand: the
+    // fixed CREDENTIAL_REJECTION_MESSAGE when the server answered and refused
+    // the login, the bounded description of the error for everything else. Its
+    // `credentialRejection` flag is not part of a ProbeResult and is dropped
+    // here — the settings UI reads the message. The MCP tools, which log the
+    // flag, are the reason it exists.
+    const { reason } = classifyFailure(err);
+    return { ok: false, message: reason };
   } finally {
     try {
       await client.logout();
@@ -247,7 +184,8 @@ export const CALDAV_DISCOVERY_FAILURE_PREFIX =
  * and stays a connectivity failure.
  *
  * Why a pre-flight at all. imapflow decorates its errors with what the server
- * said (see isCredentialRejection above), so probeImap() can classify after
+ * said (see `isCredentialRejection` in shared/credential-failure.ts), so
+ * probeImap() can classify after
  * the fact. tsdav cannot be classified after the fact: `createAccount()`
  * (node_modules/tsdav/dist/tsdav.cjs.js, ~line 1372) walks a list of candidate
  * root URLs — the discovered one, the configured `serverUrl`, and the origin's
@@ -381,11 +319,11 @@ async function probeCalDav(creds: CalDavCreds, perProbeMs: number): Promise<Prob
           // says so. Rethrowing keeps that the answer rather than dressing an
           // abort up as "the server answered".
           if (controller.signal.aborted) throw err;
-          // Reached and not refused, but no calendar came back. `describe()`
+          // Reached and not refused, but no calendar came back. `describeFailure()`
           // runs over the composed string, not just the library's half, so the
           // whole message stays inside MAX_MESSAGE_LENGTH.
-          const detail = `${CALDAV_DISCOVERY_FAILURE_PREFIX}${describe(err)}`;
-          return { ok: false, message: describe(detail) };
+          const detail = `${CALDAV_DISCOVERY_FAILURE_PREFIX}${describeFailure(err)}`;
+          return { ok: false, message: describeFailure(detail) };
         }
         return { ok: true };
       })(),

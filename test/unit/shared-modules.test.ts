@@ -134,6 +134,24 @@ describe("shared/", () => {
     }
   });
 
+  it("exports the credential classifier #146 moved out of src/probe.ts", () => {
+    // Named for the same reason as the list above: the generic guard below
+    // only fires on a *second* copy, so a module that quietly lost its
+    // classifier would leave it asserting over nothing at all. `src/probe.ts`
+    // re-exports MAX_MESSAGE_LENGTH and CREDENTIAL_REJECTION_MESSAGE, which is
+    // why every existing `import … from "./probe.js"` still resolves; the two
+    // tool registries import the classifier from here directly.
+    for (const name of [
+      "isCredentialRejection",
+      "classifyFailure",
+      "describeFailure",
+      "CREDENTIAL_REJECTION_MESSAGE",
+      "MAX_MESSAGE_LENGTH",
+    ]) {
+      assert.ok(sharedExports.has(name), `shared/ no longer exports ${name}`);
+    }
+  });
+
   /**
    * The one deliberate exception, written down rather than tolerated silently.
    *
