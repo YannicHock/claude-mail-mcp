@@ -11,8 +11,17 @@ import { ImapClient } from "./imap-client.js";
 import { SmtpClient } from "./smtp-client.js";
 import { CalDavClient } from "./caldav-client.js";
 import { Account, AccountsStore } from "./accounts.js";
+import type { Logger } from "../shared/log.js";
 
-interface AccountClients {
+export interface AccountClients {
+  /**
+   * The id of the account these clients belong to — *resolved*, so a call that
+   * omitted `account` and got the default still knows which mailbox it got.
+   * Every tool failure is reported and logged against this (#146): a
+   * multi-account instance has to say which mailbox refused, and "(default)"
+   * does not say it.
+   */
+  id: string;
   imap: ImapClient;
   smtp: SmtpClient;
   caldav: CalDavClient | null;
@@ -24,8 +33,21 @@ export class ClientPool {
   private readonly store: AccountsStore;
   private pool: Map<string, AccountClients> = new Map();
 
-  constructor(store: AccountsStore) {
+  /**
+   * Where a tool failure against one of these clients is reported (#146).
+   *
+   * The pool carries it because the pool is the one deployment-wide object
+   * both tool registries already hold, and because it is what resolves an
+   * account id in the first place — the two halves of the line a failure has
+   * to write. `src/index.ts` passes the process logger; everything else
+   * defaults to the same no-op `createApp()` uses, so a test harness stays
+   * quiet unless it asks not to be.
+   */
+  readonly log: Logger;
+
+  constructor(store: AccountsStore, log: Logger = () => {}) {
     this.store = store;
+    this.log = log;
   }
 
   /**
@@ -85,6 +107,7 @@ export class ClientPool {
         })
       : null;
     return {
+      id: account.id,
       imap,
       smtp,
       caldav,

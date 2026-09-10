@@ -86,7 +86,11 @@ async function main(): Promise<void> {
   }
 
   const store = new AccountsStore(config.accountsFile);
-  const pool = new ClientPool(store);
+  // The pool carries the logger so a tool failure against one of its clients
+  // can be written down (#146). Before that, `src/tools-mail.ts` swallowed
+  // every failure into a bare `catch {}` and the only line this process ever
+  // logged about a broken mailbox was the "accounts.json changed" above it.
+  const pool = new ClientPool(store, log);
   await store.start((next, prev) => {
     log("info", "accounts.json changed", {
       previous: prev.map((a) => a.id),

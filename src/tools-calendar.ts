@@ -7,11 +7,28 @@
  * surfaces a clear error rather than silently failing.
  *
  * All times are ISO 8601 with timezone offset (e.g. 2026-05-22T09:00:00+02:00).
+ *
+ * v0.7.1 (#146): a CalDAV failure names the account and leaves exactly one
+ * `warn` line, the same as the mail tools, through `reportingFailures()`.
+ *
+ * One asymmetry is worth stating rather than leaving to be rediscovered. The
+ * *probe* can report a CalDAV credential rejection as one, because #44 gave it
+ * a plain-HTTP pre-flight that reads the `401` before tsdav's discovery
+ * overwrites it. `CalDavClient` has no such pre-flight, and tsdav keeps only
+ * the last error from the candidate root URLs it walks, so what arrives here
+ * for a refused password is tsdav's own prose. That prose does currently say
+ * `Invalid credentials: … returned 401 Unauthorized`, which is a usable
+ * sentence — but it is the library's wording, not a classification, and
+ * nothing here pattern-matches it into one. What #146 guarantees for the
+ * calendar tools is the rest: the account named, the reason bounded by
+ * `describeFailure()`, and one line in the log.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ClientPool } from "./client-pool.js";
+import { CalDavClient } from "./caldav-client.js";
+import { reportingFailures } from "./tool-errors.js";
 
 function asJson(value: unknown): { content: { type: "text"; text: string }[] } {
   return {
@@ -37,14 +54,29 @@ const accountSchema = z
     "Account ID (from list_accounts) to act on. Omit to use the default account."
   );
 
-function requireCaldav(pool: ClientPool, accountId?: string) {
+/**
+ * Resolve the account and hand back its CalDAV client together with the id
+ * every failure below is reported and logged against (#146).
+ *
+ * The two errors thrown from here — an unknown account id out of
+ * `pool.for()`, and "no CalDAV configured" — deliberately do not go through
+ * `reportingFailures()`: both already say something true and specific, and
+ * neither is a server that failed. Logging them as mailbox failures would
+ * blame a host nothing ever contacted. The second message names the *resolved*
+ * id rather than the argument, so a caller who omitted `account` is told which
+ * mailbox it landed on instead of the unhelpful `(default)`.
+ */
+function requireCaldav(
+  pool: ClientPool,
+  accountId?: string
+): { caldav: CalDavClient; id: string } {
   const clients = pool.for(accountId);
   if (!clients.caldav) {
     throw new Error(
-      `Account "${accountId ?? "(default)"}" has no CalDAV configured. Add a CalDAV URL under /settings/mailboxes on this deployment's public URL.`
+      `Account "${clients.id}" has no CalDAV configured. Add a CalDAV URL under /settings/mailboxes on this deployment's public URL.`
     );
   }
-  return clients.caldav;
+  return { caldav: clients.caldav, id: clients.id };
 }
 
 export function registerCalendarTools(
@@ -61,8 +93,10 @@ export function registerCalendarTools(
       },
     },
     async ({ account }) => {
-      const caldav = requireCaldav(pool, account);
-      return asJson(await caldav.listCalendars());
+      const { caldav, id } = requireCaldav(pool, account);
+      return asJson(
+        await reportingFailures(pool, "list_calendars", id, () => caldav.listCalendars())
+      );
     }
   );
 
@@ -82,8 +116,10 @@ export function registerCalendarTools(
       },
     },
     async ({ calendar_url, start, end, account }) => {
-      const caldav = requireCaldav(pool, account);
-      const events = await caldav.listEvents(calendar_url, start, end);
+      const { caldav, id } = requireCaldav(pool, account);
+      const events = await reportingFailures(pool, "list_events", id, () =>
+        caldav.listEvents(calendar_url, start, end)
+      );
       return asJson({ count: events.length, events });
     }
   );
@@ -114,17 +150,19 @@ export function registerCalendarTools(
       },
     },
     async (args) => {
-      const caldav = requireCaldav(pool, args.account);
-      const result = await caldav.createEvent({
-        calendarUrl: args.calendar_url,
-        summary: args.summary,
-        description: args.description,
-        location: args.location,
-        start: args.start,
-        end: args.end,
-        allDay: args.all_day,
-        attendees: args.attendees,
-      });
+      const { caldav, id } = requireCaldav(pool, args.account);
+      const result = await reportingFailures(pool, "create_event", id, () =>
+        caldav.createEvent({
+          calendarUrl: args.calendar_url,
+          summary: args.summary,
+          description: args.description,
+          location: args.location,
+          start: args.start,
+          end: args.end,
+          allDay: args.all_day,
+          attendees: args.attendees,
+        })
+      );
       return asJson({ success: true, ...result });
     }
   );
@@ -160,18 +198,20 @@ export function registerCalendarTools(
       },
     },
     async (args) => {
-      const caldav = requireCaldav(pool, args.account);
-      const slots = await caldav.findFreeSlots(
-        args.calendar_urls,
-        args.range_start,
-        args.range_end,
-        args.duration_minutes,
-        args.working_hours
-          ? {
-              startHour: args.working_hours.start_hour,
-              endHour: args.working_hours.end_hour,
-            }
-          : undefined
+      const { caldav, id } = requireCaldav(pool, args.account);
+      const slots = await reportingFailures(pool, "find_free_slot", id, () =>
+        caldav.findFreeSlots(
+          args.calendar_urls,
+          args.range_start,
+          args.range_end,
+          args.duration_minutes,
+          args.working_hours
+            ? {
+                startHour: args.working_hours.start_hour,
+                endHour: args.working_hours.end_hour,
+              }
+            : undefined
+        )
       );
       return asJson({ count: slots.length, slots });
     }
