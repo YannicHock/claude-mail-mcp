@@ -12,6 +12,20 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
   `DEPLOYMENT.md` stops carrying three providers' worth of app-password knowledge in passing inside a section about revoking them, and points here.
 
+### Changed
+
+- **Both images now build from the repository root, and compile one `shared/` directory instead of six hand-mirrored modules.** `secrets.ts`, `settings-api.ts`, `canonical-url.ts`, the settings pages' `pageHeaders`/`SETTINGS_CSP` header set, `trustProxyHops` and `escapeHtml` existed twice, once per package, because the connector built from `.` and the OAuth layer from `oauth/` and neither could import from the other. They exist once now. Nothing either image does at run time changes; what changes is that a rule can no longer be corrected in one service and left wrong in the other. (#126, closes #132)
+
+  The change every operator building by hand has to know about: **the OAuth image's build context is the repository root**, not `oauth/`. `docker build -f oauth/Dockerfile oauth` no longer works; use `docker build -f oauth/Dockerfile .`. What keeps each image free of the other package is a per-Dockerfile ignore file — the root `.dockerignore` still excludes `oauth`, and the new `oauth/Dockerfile.dockerignore` excludes the connector's tree; BuildKit resolves the latter in preference to the former. The published `docker-compose.yml` pulls images and does not build, so an operator upgrading is unaffected.
+
+  Compiling `shared/` moved `rootDir` to the package root in both packages, so **the entrypoints moved with it**: `dist/src/index.js` in the connector image and `dist/oauth/src/index.js` in the OAuth layer's, matched by `main`, `start`, `bin` and `ecosystem.config.cjs`. The documented `hash-password` invocation is now `--entrypoint node mail-oauth dist/oauth/src/hash-password.js`.
+
+  `trustProxyHops` is the reason this outranked its line count: a security-relevant rule about how many `X-Forwarded-For` hops to trust, character-identical in both packages down to the error string, with no comment, no mirrored module and no drift test — while three larger duplicates beside it had one. The pattern was applied when a wave noticed a shared rule and absent when it did not.
+
+### Removed
+
+- **The four drift tests, and the duplicated `oauth/test/unit/secrets.test.ts`.** They were four readings of one intent — three whole-file comparators that stripped a header comment (one of them also rewriting an import), and one that pulled two declarations out with a regex — guarding an invariant that no longer exists, because there are no copies left to compare. About 1,650 lines of mirrored source and 530 lines of mirrored test go with them. Every test that asserts the modules' *behaviour* stays, and now runs once instead of twice. One new test replaces all four: nothing under `src/` or `oauth/src/` may declare a symbol `shared/` already exports — not "the copies match" but "a second copy did not appear". (#126, closes #132)
+
 ### Fixed
 
 - **The `/authorize` redirects carry the security headers, and no longer echo the authorization code.** The two redirects on the authorization path — the success hand-off back to the client, and the OAuth error response — went out through `res.redirect()`, which sets none of this service's headers and renders a body when the client accepts HTML. That body repeated the target URL: for the success redirect, the one-time authorization code; for the error redirect, the `error_description`. Both now go out through the same `sendRedirect()` helper every other redirect in the service uses, so they carry `Cache-Control: no-store`, the CSP, `X-Frame-Options` and `Referrer-Policy`, and end with no body at all. `page-headers.test.ts` gained a case per redirect, which is what the file was missing: every case in it reached a *rendered page*, so the one credential-carrying response in the service was outside the invariant the file exists to assert.

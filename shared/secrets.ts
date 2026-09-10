@@ -30,11 +30,17 @@
  * meaning outside the deployment, and the setup wizard sets it through
  * `OperatorRecord`.
  *
- * This module is duplicated verbatim as `src/secrets.ts` in the connector
- * package — the two services are separate npm packages with no shared workspace,
- * the same way `trackedSecret()` here and its namesake there already mirror each
- * other. Change one, change the other: the two must derive byte-identical values
- * from the same file or the settings assertion stops verifying.
+ * This module is compiled into both images from this one copy. It used to be
+ * mirrored by hand as `src/secrets.ts` and `oauth/src/secrets.ts`, pinned by a
+ * whole-file drift test, because the two packages had separate Docker build
+ * contexts and could not import from one another (#126). They build from one
+ * context now, so the two services derive byte-identical values from the same
+ * file by construction rather than by comparison — which is what the settings
+ * assertion needs in order to keep verifying.
+ *
+ * It imports nothing from either package. The logger arrives as a parameter and
+ * its type comes from shared/log.ts, which both packages re-export; that is the
+ * one coupling this file has, and it is a type.
  */
 
 import { randomBytes } from "node:crypto";
@@ -48,7 +54,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
-import type { Logger } from "./logger.js";
+import type { Logger } from "./log.js";
 
 /**
  * Mode for a generated secret file: readable by its owner and by the shared

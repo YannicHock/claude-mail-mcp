@@ -59,7 +59,7 @@ import {
   logSecretReport,
   SecretError,
   type SecretSource,
-} from "./secrets.js";
+} from "../../shared/secrets.js";
 
 /**
  * 32 random bytes, base64url.

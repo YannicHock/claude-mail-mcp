@@ -5,10 +5,10 @@
   "description": "OAuth 2.1 authorization layer in front of the claude-mail-mcp connector — lets Claude's hosted surfaces (claude.ai web, Cowork) connect to a server that only speaks static Bearer auth.",
   "license": "MIT",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/oauth/src/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "node dist/oauth/src/index.js",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "typecheck:test": "tsc -p tsconfig.test.json",

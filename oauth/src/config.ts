@@ -30,6 +30,7 @@
 // forward-slashed even when a contributor runs the test suite on Windows.
 import { dirname, join } from "node:path/posix";
 
+import { trustProxyHops } from "../../shared/trust-proxy.js";
 import type { LogLevel } from "./logger.js";
 import { isValidHashFormat } from "./passwords.js";
 import {
@@ -38,7 +39,7 @@ import {
   type ResolveOptions,
   type ResolvedSecret,
   type SecretReportEntry,
-} from "./secrets.js";
+} from "../../shared/secrets.js";
 import {
   HOSTED_CLAUDE_REDIRECT_URIS,
   LOOPBACK_REDIRECT_URIS,
@@ -388,7 +389,12 @@ export function loadConfig(env: Env = process.env): OAuthConfig {
     operatorFile,
     claimTokenFile,
     wizardStateFile,
-    trustProxy: trustProxyHops(env),
+    // The rule lives in shared/trust-proxy.ts; the connector had a
+    // character-identical copy of it, error string included, with nothing
+    // comparing the two (#126). Only the error *class* is this package's:
+    // bootstrap catches ConfigError and turns it into a readable startup
+    // message, so a plain Error here would reach the operator as a stack.
+    trustProxy: trustProxyHops(env, (message) => new ConfigError(message)),
     accessTokenTtl: integer(env, "ACCESS_TOKEN_TTL", 3600),
     refreshTokenTtl: integer(env, "REFRESH_TOKEN_TTL", 30 * 24 * 3600),
     redirectAllowlist: buildRedirectAllowlist(env),
@@ -427,31 +433,6 @@ function buildRedirectAllowlist(env: Env): string[] {
   }
 
   return allowlist;
-}
-
-/**
- * How many proxy hops to trust.
- *
- * Never a boolean. `trust proxy: true` trusts the entire X-Forwarded-For chain
- * and takes its leftmost entry, which the client writes — so a client could pick
- * its own `req.ip` and sidestep the login throttle one forged address at a time.
- * A hop count makes Express skip exactly the proxies that are really there.
- *
- * The default, 1, matches a single reverse proxy terminating TLS. Raise it only
- * if there is genuinely another trusted hop in front, such as a CDN: setting it
- * higher than the real chain reintroduces the same forgery.
- */
-function trustProxyHops(env: Env): number {
-  const raw = env.TRUST_PROXY;
-  if (raw === undefined || raw.trim() === "") return 1;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new ConfigError(
-      `TRUST_PROXY must be a non-negative integer — the number of reverse-proxy ` +
-        `hops in front of this service — got ${raw}. Use 0 when nothing proxies it.`
-    );
-  }
-  return parsed;
 }
 
 function normaliseMcpPath(value: string): string {

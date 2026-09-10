@@ -23,7 +23,7 @@ import { config } from "./config.js";
 import { AccountsStore } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
 import { createApp, VERSION } from "./app.js";
-import { canCreateFilesIn, dataDirectoryAdvice, logSecretReport } from "./secrets.js";
+import { canCreateFilesIn, dataDirectoryAdvice, logSecretReport } from "../shared/secrets.js";
 
 export { createApp, SERVER_NAME, VERSION } from "./app.js";
 export type { CreateAppOptions, Logger, LogLevel } from "./app.js";

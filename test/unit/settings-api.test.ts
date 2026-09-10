@@ -1,32 +1,29 @@
 /**
- * The contract between the connector and the setup wizard, pinned from this
- * side of it.
+ * The contract between the connector and the setup wizard, pinned.
  *
  * Two packages, one vocabulary. Before #69 the wizard read the connector's
  * answers back out of its rendered HTML with three regular expressions, and a
  * helper in the other package kept a verbatim copy of this package's markup so
  * those regular expressions had something real to run against — a "change one,
- * change both" rule that nothing enforced. `src/settings-api.ts` replaced it,
- * and `oauth/src/settings-api.ts` is its twin.
+ * change both" rule that nothing enforced. `settings-api.ts` replaced it. It was
+ * then itself mirrored in both packages and pinned by a drift test, until #126
+ * moved it to `shared/settings-api.ts` and both images began compiling the one
+ * copy; the drift test went with the twin.
  *
  * What is asserted here:
  *
- *  1. **The two copies have not drifted.** Same shape as the secrets.ts drift
- *     test: everything below the header comment is compared byte for byte, so
- *     "identical" is a fact rather than a comment.
- *  2. **The flat form and the nested draft are inverses.** The connector's own
+ *  1. **The flat form and the nested draft are inverses.** The connector's own
  *     `parseAccountForm` reads the flat names, the wire carries the document,
  *     and `flattenDraft`/`draftFromFields` are the only translation between
  *     them. A round trip that loses a field is exactly the failure #69 is
  *     about, told loudly instead of showing up as "Required." against a box the
  *     operator has filled in.
- *  3. **The rendered mailbox form names every field the vocabulary has.** The
+ *  2. **The rendered mailbox form names every field the vocabulary has.** The
  *     wizard's own form is pinned the same way in the OAuth package.
- *  4. **The readers fail closed.** Anything unrecognised reads as no result.
+ *  3. **The readers fail closed.** Anything unrecognised reads as no result.
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
@@ -53,7 +50,7 @@ import {
   type MailboxDraft,
   type MailboxSuggestion,
   type ProviderPreset,
-} from "../../src/settings-api.js";
+} from "../../shared/settings-api.js";
 import { renderMailboxForm } from "../../src/settings-pages.js";
 
 function submittedForm(overrides: Record<string, string> = {}): Record<string, string> {
@@ -81,30 +78,6 @@ function submittedForm(overrides: Record<string, string> = {}): Record<string, s
     ...overrides,
   };
 }
-
-describe("the two copies of settings-api.ts", () => {
-  // The same drift check secrets.test.ts keeps over the two copies of
-  // secrets.ts, for the same reason: the packages have separate Docker build
-  // contexts and cannot import from one another, so a mirrored module is the
-  // closest thing to a shared one — and a mirror nothing compares is a copy
-  // waiting to rot. The header comment names the *other* package, so it differs
-  // on purpose and is stripped before the comparison.
-  it("stay identical below the header comment", () => {
-    const body = (url: URL): string =>
-      readFileSync(url, "utf8")
-        // Line endings first: on a CRLF checkout the header ends `*/\r\n`, the
-        // regex below does not match it, and the comparison then fails on the
-        // one paragraph that is supposed to differ.
-        .replace(/\r\n/g, "\n")
-        .replace(/^\/\*\*[\s\S]*?\*\/\n/, "");
-
-    assert.equal(
-      body(new URL("../../src/settings-api.ts", import.meta.url)),
-      body(new URL("../../oauth/src/settings-api.ts", import.meta.url)),
-      "src/settings-api.ts and oauth/src/settings-api.ts have drifted — change one, change the other"
-    );
-  });
-});
 
 describe("the field vocabulary", () => {
   it("names every field the mailbox form renders a box for", () => {

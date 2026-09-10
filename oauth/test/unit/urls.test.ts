@@ -10,20 +10,21 @@ import {
   redirectUriAllowed,
   sameResource,
 } from "../../src/urls.js";
-import * as canonicalUrl from "../../src/canonical-url.js";
+import * as canonicalUrl from "../../../shared/canonical-url.js";
 
 describe("the canonicalisation urls.ts re-exports", () => {
   // #110 moved the RFC 8707 canonicalisation out of urls.ts into canonical-url.ts,
-  // which is mirrored byte-for-byte as the connector's src/canonical-url.ts and
-  // held there by a drift test — that mirrored pair is what stops the two services
-  // normalising `PUBLIC_URL` differently and 401ing every settings request.
+  // which was mirrored byte-for-byte in the connector and held there by a drift
+  // test; #126 made it one shared/canonical-url.ts compiled into both images.
+  // Either way it is what stops the two services normalising `PUBLIC_URL`
+  // differently and 401ing every settings request.
   //
-  // The drift test can only compare the two copies of canonical-url.ts. It cannot
-  // see a change here that quietly gave this package a second, private copy of the
-  // rule again, and the cases below would keep passing if one appeared. Identity
-  // is what rules that out: these must be the very functions the mirrored module
+  // What neither the old drift test nor the shared build can see is a change
+  // *here* that quietly gave this package a second, private copy of the rule
+  // again, and the cases below would keep passing if one appeared. Identity is
+  // what rules that out: these must be the very functions the shared module
   // exports, not equivalent ones.
-  it("is the mirrored module's, not a second copy", () => {
+  it("is the shared module's, not a second copy", () => {
     assert.equal(canonicalResource, canonicalUrl.canonicalResource);
     assert.equal(sameResource, canonicalUrl.sameResource);
     assert.equal(normalisePublicUrl, canonicalUrl.normalisePublicUrl);

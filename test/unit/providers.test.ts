@@ -30,7 +30,7 @@ import {
   prefillFor,
   providerPresets,
 } from "../../src/providers.js";
-import { CHECKBOX_ON, domainOf, MAILBOX_FIELDS } from "../../src/settings-api.js";
+import { CHECKBOX_ON, domainOf, MAILBOX_FIELDS } from "../../shared/settings-api.js";
 
 const EMAIL = "Anna.Example@Example.Com";
 

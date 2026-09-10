@@ -22,6 +22,11 @@
 
 import type { Response } from "express";
 
+import {
+  pageHeaders,
+  SETTINGS_CSP,
+  SETTINGS_HEADERS,
+} from "../../shared/page-headers.js";
 import { escapeHtml } from "./login.js";
 import {
   MIN_PASSWORD_LENGTH,
@@ -31,49 +36,15 @@ import {
 import { CSRF_FIELD } from "./session.js";
 
 /**
- * The response headers every operator-facing HTML page in this service sets.
- *
- * One function rather than one literal per page, because these pages differ in
- * exactly one header and agree on the other three. The settings pages, the setup
- * wizard and the /authorize consent screen all carry a CSRF token or a request
- * token, all take a password, must none of them be cached anywhere, and have
- * none of them any reason to be framed. Only the CSP differs — the consent
- * screen has to widen `form-action` to the redirect allowlist, because
- * submitting it hands off to the client — so the CSP is the parameter and the
- * rest is fixed.
- *
- * Before this was a function the set was written out three times: here, in the
- * connector's own src/settings-pages.ts, and inline in `sendLoginPage()` in
- * app.ts. The consent screen's copy was outside every test, which is how it
- * came to be the page 0.6.1 and 0.6.2 were both about.
+ * The header set is declared in shared/page-headers.ts and re-exported here,
+ * where every page in this service already imports it from. Until #126 it was
+ * one of two copies — the connector's src/settings-pages.ts held the other —
+ * pinned by a drift test that pulled both declarations out with a regex and
+ * compared the extracted text. Inside this service the settings pages, the
+ * setup wizard and the /authorize consent screen all go through `pageHeaders`
+ * already, so that was the last pair left.
  */
-export function pageHeaders(csp: string): Record<string, string> {
-  return {
-    "Cache-Control": "no-store",
-    "X-Frame-Options": "DENY",
-    "Content-Security-Policy": csp,
-    // same-origin, not no-referrer. These pages submit forms back to this origin,
-    // and the POST handlers verify the request came from here with isSameOrigin(),
-    // which reads Origin and falls back to Referer. Chrome does not send Origin on
-    // a same-origin form POST, so no-referrer left the check with neither header
-    // and refused every browser sign-in. same-origin still withholds the referrer
-    // from any cross-origin destination, which is the property that matters.
-    "Referrer-Policy": "same-origin",
-  };
-}
-
-/**
- * The CSP for a page whose forms only ever post back here.
- *
- * Allows inline styles and nothing else — in particular no script, which is why
- * every interaction on these pages is a form submission. The consent screen
- * builds its own instead; see `loginCsp` in app.ts.
- */
-export const SETTINGS_CSP =
-  "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
-
-/** The header set the settings pages, and by extension the wizard, are served with. */
-export const SETTINGS_HEADERS: Record<string, string> = pageHeaders(SETTINGS_CSP);
+export { pageHeaders, SETTINGS_CSP, SETTINGS_HEADERS } from "../../shared/page-headers.js";
 
 /**
  * Send an HTML page with this service's headers. The only way to send one.

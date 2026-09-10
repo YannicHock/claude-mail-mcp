@@ -35,7 +35,7 @@ import {
   parseProvidersAnswer,
   type MailboxDraft,
   type MailboxProbeReport,
-} from "../../src/settings-api.js";
+} from "../../shared/settings-api.js";
 import { readStamp } from "../../src/accounts-writer.js";
 import { makeAccount, makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
 

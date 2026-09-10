@@ -17,6 +17,10 @@ RUN npm ci
 
 COPY tsconfig.json ./
 COPY src ./src
+# Compiled into this image and into the OAuth layer's, from one copy (#126).
+# tsconfig.json's rootDir is `.` rather than `src` so both trees can be emitted,
+# which is why the entrypoint below is dist/src/index.js and not dist/index.js.
+COPY shared ./shared
 RUN npm run build
 
 # ---- Runtime --------------------------------------------------------------
@@ -112,4 +116,4 @@ EXPOSE 3220
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "require('http').get({host:'127.0.0.1',port:process.env.PORT||3220,path:'/health',timeout:4000},(r)=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
-ENTRYPOINT ["node", "dist/index.js"]
+ENTRYPOINT ["node", "dist/src/index.js"]

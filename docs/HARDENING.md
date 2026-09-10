@@ -110,7 +110,7 @@ environment named neither file; the mount handed it both.
 **The residual, stated exactly.** `secrets/shared` is writable from both sides,
 because whichever service boots first generates the two shared secrets on a first
 boot, and replacing a file somebody truncated to nothing means unlinking it first
-(`src/secrets.ts`, `resolveSecret` and `removeBlankFile`). So a compromised
+(`shared/secrets.ts`, `resolveSecret` and `removeBlankFile`). So a compromised
 connector can **replace** the shared pair. It cannot use them to gain privilege —
 it already had them — but replacing them is a denial of service: the OAuth layer
 keeps presenting the old token upstream until it is restarted, and on restart both
@@ -119,7 +119,7 @@ forced credential rotation, not escalation.
 
 You can close even that by pre-creating all four files by hand and marking the
 connector's mount `:ro`. Nothing is ever generated over a file that already
-exists — the rule is stated once in `src/secrets.ts` and pinned by
+exists — the rule is stated once in `shared/secrets.ts` and pinned by
 *"reads the file and writes nothing"*, *"wins over an inline value, and over
 generating one"* and *"reads back the same value on the next boot, rather than
 rotating"* in `test/unit/secrets.test.ts`. The OAuth layer's mount cannot be made
@@ -168,7 +168,7 @@ The two images run as **different** non-root users — uid 100/gid 101 and uid
 file is the only one that can read it; the other crash-loops on `EACCES` with
 nothing in `docker compose logs` but a permission error. That is not a
 hypothetical: it is the documented failure that made the secrets self-generating
-in the first place (`src/secrets.ts`, the module docstring and the
+in the first place (`shared/secrets.ts`, the module docstring and the
 `GENERATED_SECRET_MODE` docstring).
 
 So the file has to be group-readable, and both processes have to be in that group.
@@ -188,7 +188,7 @@ start it without one.
 the two service accounts, and writable by nobody outside the group.
 
 **The setgid bit is the mechanism, and it is the only one.** Nothing in
-`src/secrets.ts` chowns anything. It cannot: the gid is not knowable at image
+`shared/secrets.ts` chowns anything. It cannot: the gid is not knowable at image
 build time, and the two services do not both receive it at run time either. Mode
 `2770` on `secrets/shared` and `secrets/oauth` is what puts a file created by
 either service into the shared group instead of into the creator's own. Without
@@ -211,7 +211,7 @@ What pins all of this:
 | That mode actually reaches the disk, umask and all | *"writes that mode to disk"* (POSIX only) |
 | Neither image bakes a gid, publishes a `secrets-gid` label, or puts its user in a shared group | *"`Dockerfile` pins no gid for the shared secrets group"* and siblings, run over both Dockerfiles |
 | Both services are put in `${SECRETS_GID}`, and the stack refuses to start without it | *"docker-compose.yml puts both services in ${SECRETS_GID}"*, *"docker-compose.yml refuses to start without SECRETS_GID"* |
-| The two copies of the module have not drifted apart | *"stay identical below the header comment"* |
+| No second copy of the module has appeared in either package | `test/unit/shared-modules.test.ts` — *"is not copied back into src/"* / *"…into oauth/src/"* |
 
 `auth_password_hash.txt` is the one secret that is **never** generated: it is the
 only value with a meaning outside this deployment. It is either written by the
@@ -441,10 +441,13 @@ Two deliberate variations:
 HSTS, `X-Content-Type-Options: nosniff` and `X-Robots-Tag: noindex` are the
 proxy's, not the application's — see [DEPLOYMENT.md](DEPLOYMENT.md).
 
-`pageHeaders` exists **twice**, once per package, because the two have separate
-Docker build contexts and cannot share a module. That duplication is caught rather
-than trusted: `test/unit/settings-headers.test.ts` compares the two source texts in
-*"the two surviving copies of the header set are identical"*. The values themselves
+`pageHeaders` exists **once**, in `shared/page-headers.ts`, compiled into both
+images and re-exported by both packages' `settings-pages.ts`. It used to exist
+twice, because the two packages had separate Docker build contexts and could not
+share a module, and the two copies were compared as source text by a drift test;
+#126 gave both builds one context and deleted the copy along with the test.
+`test/unit/shared-modules.test.ts` now fails if a second declaration reappears in
+either package. The values themselves
 are asserted **on served responses**, against literals written out independently of
 the constant, in `oauth/test/integration/page-headers.test.ts` — every operator
 page, the consent screen, the consent screen re-served after a wrong password, and

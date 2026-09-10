@@ -1,7 +1,24 @@
 # syntax=docker/dockerfile:1
 
-# OAuth 2.1 layer for claude-mail-mcp. Built from the oauth/ directory:
-#   docker build -f oauth/Dockerfile oauth
+# OAuth 2.1 layer for claude-mail-mcp. Built from the *repository root*:
+#   docker build -f oauth/Dockerfile .
+#
+# The context is the root, not oauth/, because this image compiles shared/ as
+# well as oauth/src — and a context rooted at oauth/ cannot reach a sibling
+# directory (#126). Two consequences are worth stating where they will be read:
+#
+#   1. Every COPY below names its path from the repository root. `COPY
+#      package.json` would pick up the *connector's* manifest — same filename,
+#      wrong package, and a build that succeeds while producing the wrong image.
+#   2. What reaches the build is filtered by oauth/Dockerfile.dockerignore, not
+#      by the root .dockerignore. BuildKit resolves `<dockerfile>.dockerignore`
+#      in preference to the context's, which is what lets the root file keep
+#      excluding oauth/ for the connector image while this build keeps it.
+#
+# WORKDIR is /app/oauth with shared/ at /app/shared, so the layout inside the
+# image is the repository's layout. That is deliberate: it means
+# `../../shared/x.js` resolves the same way in a checkout and in the container,
+# and the compiler emits the same paths in both.
 #
 # Deliberately mirrors the connector's Dockerfile — same base image, same
 # non-root pattern, same "no build tools in the runtime stage" split — so there
@@ -13,18 +30,27 @@
 
 # ---- Builder ------------------------------------------------------------
 FROM node:24-alpine AS builder
-WORKDIR /app
+WORKDIR /app/oauth
 
-COPY package.json package-lock.json ./
+COPY oauth/package.json oauth/package-lock.json ./
 RUN npm ci
 
-COPY tsconfig.json ./
-COPY src ./src
+COPY oauth/tsconfig.json ./
+COPY oauth/src ./src
+# Sibling of the package directory, exactly as in the repository. tsconfig.json's
+# rootDir is `..`, so this emits dist/oauth/src/… beside dist/shared/… .
+#
+# shared/package.json comes with it and is not optional. /app has no manifest in
+# this image, and under NodeNext TypeScript reads a file's module format from the
+# nearest package.json — without that marker these files would emit as CommonJS
+# here and as ESM in the connector's build, and this container would die at
+# startup on a named import that typechecked cleanly.
+COPY shared /app/shared
 RUN npm run build
 
 # ---- Runtime ------------------------------------------------------------
 FROM node:24-alpine AS runtime
-WORKDIR /app
+WORKDIR /app/oauth
 
 ENV NODE_ENV=production
 # Binds all interfaces inside the container; Docker's port publishing forwards to
@@ -38,10 +64,10 @@ ENV HOST=0.0.0.0
 ENV PORT=8080
 ENV STATE_FILE=/data/oauth-state.json
 
-COPY package.json package-lock.json ./
+COPY oauth/package.json oauth/package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
-COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/oauth/dist ./dist
 
 # Dedicated non-root user. dist/ and node_modules/ stay owned by root so the
 # runtime user cannot write to its own application code.
@@ -83,4 +109,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "require('http').get({host:'127.0.0.1',port:process.env.PORT||8080,path:'/health',timeout:4000},(r)=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
-ENTRYPOINT ["node", "dist/index.js"]
+ENTRYPOINT ["node", "dist/oauth/src/index.js"]

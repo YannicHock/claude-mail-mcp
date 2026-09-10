@@ -1,10 +1,12 @@
 /**
  * Minting side of the settings assertion.
  *
- * See src/settings-assertion.ts in the connector for the verifying side and for why
- * this is an HMAC rather than a JWT. The two packages have separate Docker build
- * contexts and cannot share a module; if you change the format here, change it
- * there in the same commit.
+ * See src/settings-assertion.ts in the connector for the verifying side and for
+ * why this is an HMAC rather than a JWT. The two halves stay separate on purpose
+ * — minting and verifying are not the same code, and two independent
+ * implementations of a security format are a cross-check — so this is not a
+ * candidate for shared/ (#126). If you change the format here, change it there
+ * in the same commit.
  */
 
 import { createHmac } from "node:crypto";

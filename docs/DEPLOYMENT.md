@@ -329,15 +329,15 @@ request:
 
 ```bash
 read -rs PW && printf '%s\n' "$PW" | docker compose run --rm -T \
-  --entrypoint node mail-oauth dist/hash-password.js \
+  --entrypoint node mail-oauth dist/oauth/src/hash-password.js \
   > secrets/oauth/auth_password_hash.txt; unset PW
 sudo chgrp mailsecrets secrets/oauth/auth_password_hash.txt
 chmod 640 secrets/oauth/auth_password_hash.txt
 ```
 
 The `--entrypoint` override is required: the image's `ENTRYPOINT` is
-`node dist/index.js`, so a trailing command is appended to it as arguments and
-starts the server instead of the hashing tool. `read -rs` keeps the password off
+`node dist/oauth/src/index.js`, so a trailing command is appended to it as
+arguments and starts the server instead of the hashing tool. `read -rs` keeps the password off
 the terminal and out of shell history.
 
 `AUTH_PASSWORD_HASH` only **seeds** the operator record, once, on that record's

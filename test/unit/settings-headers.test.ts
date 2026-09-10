@@ -1,14 +1,12 @@
 /**
  * The security headers the connector's own settings pages serve, pinned.
  *
- * The set lives twice — once here in src/settings-pages.ts and once in
- * oauth/src/settings-pages.ts — because the two packages have separate Docker
- * build contexts and cannot share a module. Twice is the floor, not a tolerance:
- * every copy that could be removed by an import has been (#61), so within the
- * OAuth layer the settings pages, the setup wizard and the /authorize consent
- * screen now all read one `pageHeaders`. The OAuth layer's copy has been pinned
- * by a header matrix since #14; this copy was pinned by nothing but a comment
- * saying "change one, change both".
+ * The set lives once, in shared/page-headers.ts, compiled into both images and
+ * re-exported by both packages' settings-pages.ts. It used to live twice, and
+ * this file used to carry a second test that pulled the two declarations out of
+ * the two files with a regex and compared the extracted text; #126 deleted that
+ * along with the second copy. Every copy that could be removed by an import had
+ * already been removed (#61), so that pair was the last one.
  *
  * `Referrer-Policy` is the entry that matters most and the one with a history.
  * `no-referrer` here is not a lint-level nit: these pages are served through the
@@ -18,17 +16,12 @@
  * header — which is exactly what made every browser sign-in impossible in 0.6.0
  * (fixed in 0.6.1, and this copy corrected in 0.6.3).
  *
- * Two guarantees, therefore:
- *
- *  1. The values are asserted on a *served response* — a real request through a
- *     real Express server — and against literal strings, not against
- *     `SETTINGS_HEADERS` itself. A test that loops over the constant passes just
- *     as happily when the constant is wrong; the integration suite's existing
- *     header check does exactly that, on purpose, since its subject is the
- *     wiring rather than the values.
- *  2. The two copies of the constant are compared directly, so "byte-for-byte
- *     identical" stops being a claim in a comment. Same shape as the drift test
- *     over the two copies of secrets.ts in secrets.test.ts.
+ * The guarantee, therefore: the values are asserted on a *served response* — a
+ * real request through a real Express server — and against literal strings, not
+ * against `SETTINGS_HEADERS` itself. A test that loops over the constant passes
+ * just as happily when the constant is wrong; the integration suite's existing
+ * header check does exactly that, on purpose, since its subject is the wiring
+ * rather than the values.
  *
  * Offline like every other unit test: the server binds 127.0.0.1:0 and the
  * accounts store lives in a temp directory.
@@ -36,7 +29,6 @@
 
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { readFileSync } from "node:fs";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
@@ -156,48 +148,4 @@ test("a plain-text settings response carries them too", async () => {
   for (const [name, value] of Object.entries(EXPECTED_HEADERS)) {
     assert.equal(res.headers.get(name), value, `expected ${name} on a plain-text response`);
   }
-});
-
-/**
- * The two declarations that together define the header set, pulled out of a
- * file as source text.
- *
- * Source text rather than an import: `src/` and `oauth/src/` are separate npm
- * packages with separate `node_modules`, and nothing under `test/` may import
- * across that line. Reading the file is the only way to compare them.
- */
-function headerSource(url: URL): string {
-  const source = readFileSync(url, "utf8")
-    // Line endings first — on a CRLF checkout every regex below would
-    // otherwise be matching against `\r\n` and the comparison fails on
-    // whitespace rather than on drift.
-    .replace(/\r\n/g, "\n");
-
-  const declarations = [
-    /export function pageHeaders\(csp: string\): Record<string, string> \{[\s\S]*?\n\}/,
-    /export const SETTINGS_CSP =[\s\S]*?;\n/,
-  ].map((pattern) => {
-    const match = pattern.exec(source);
-    assert.ok(match, `${pattern} found nothing in ${url.pathname}`);
-    // The comments inside differ on purpose: each one explains the rule in the
-    // terms of its own package. The header values are what must match.
-    return match[0].replace(/^[ \t]*\/\/.*\n/gm, "");
-  });
-
-  return declarations.join("\n");
-}
-
-test("the two surviving copies of the header set are identical", () => {
-  // Two copies are left, and only two: this one and the OAuth layer's. Within
-  // the OAuth layer the settings pages, the setup wizard and the /authorize
-  // consent screen all go through its `pageHeaders`, so a real import covers
-  // them. Across the package boundary nothing in the build stops these two from
-  // drifting, and both are served on pages of the same browser session: a header
-  // the two disagree about is a header whose effect depends on which service
-  // answered.
-  assert.equal(
-    headerSource(new URL("../../src/settings-pages.ts", import.meta.url)),
-    headerSource(new URL("../../oauth/src/settings-pages.ts", import.meta.url)),
-    "the header set in src/settings-pages.ts and oauth/src/settings-pages.ts has drifted — change one, change the other"
-  );
 });

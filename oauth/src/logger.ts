@@ -12,13 +12,16 @@
  *    is a deployment change, not a cosmetic one — see {@link LOGIN_FAILURE_EVENT}.
  */
 
-export type LogLevel = "debug" | "info" | "warn" | "error";
+/**
+ * Re-exported, not declared: shared/secrets.ts takes a logger as a parameter and
+ * both packages have to hand it the same type (#126). Every existing
+ * `import type { Logger } from "./logger.js"` keeps working. What is *not*
+ * shared is anything below — the service name, the level threshold and
+ * {@link LOGIN_FAILURE_EVENT} are this service's own.
+ */
+import type { LogLevel, Logger } from "../../shared/log.js";
 
-export type Logger = (
-  level: LogLevel,
-  message: string,
-  extra?: Record<string, unknown>
-) => void;
+export type { LogLevel, Logger } from "../../shared/log.js";
 
 const LEVELS: Record<LogLevel, number> = {
   debug: 10,

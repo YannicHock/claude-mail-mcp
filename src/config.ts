@@ -7,15 +7,16 @@
  *
  * Every secret can be supplied inline (`NAME`) or as a path to a file holding it
  * (`NAME_FILE`). A present file always wins; an absent one is created. That rule
- * and its consequences live in src/secrets.ts.
+ * and its consequences live in shared/secrets.ts.
  */
 
-import { normalisePublicUrl } from "./canonical-url.js";
+import { normalisePublicUrl } from "../shared/canonical-url.js";
+import { trustProxyHops } from "../shared/trust-proxy.js";
 import {
   resolveSecret,
   type ResolveOptions,
   type SecretReportEntry,
-} from "./secrets.js";
+} from "../shared/secrets.js";
 
 /**
  * Where each configured secret came from — read from its file, taken from the
@@ -30,7 +31,7 @@ const secretReport: SecretReportEntry[] = [];
  *
  * `NAME_FILE` wins when both are set, an absent one is an instruction to create
  * the file, and a `NAME_FILE` that is there but unreadable stays fatal — see
- * src/secrets.ts for the whole rule. Values are trimmed on both paths, because
+ * shared/secrets.ts for the whole rule. Values are trimmed on both paths, because
  * SETTINGS_SIGNING_KEY has to come out byte-identical here and in the OAuth
  * layer for the assertion's HMAC to verify, and a trailing newline pasted from
  * `openssl rand -base64 48` must not survive on one side but not the other.
@@ -79,48 +80,18 @@ function int(name: string, fallback: number): number {
  * takes as `trust proxy`, and therefore what decides which `X-Forwarded-For`
  * entry becomes `req.ip`.
  *
- * **Never a boolean.** `trust proxy: true` trusts the entire X-Forwarded-For
- * chain and takes its leftmost entry, and a reverse proxy only *appends* the
- * address it saw — so the leftmost entry is whatever the client wrote. This
- * connector has no login throttle for a forged address to sidestep, but `req.ip`
- * is what its two rejection log lines carry (`rejected unauthenticated MCP
- * request` in src/app.ts, `rejected settings request` in
- * src/settings-assertion.ts), and the obvious use for those is a fail2ban jail.
- * A jail reading a client-chosen field bans whatever the attacker names. A hop
- * count makes Express skip exactly the proxies that are really there.
+ * The rule itself lives in shared/trust-proxy.ts, because the OAuth layer had a
+ * character-identical copy of it — error string included — with nothing
+ * comparing the two (#126). Read the argument for never making this a boolean
+ * there.
  *
- * The default, 1, matches a single reverse proxy terminating TLS — the shape
- * every documented deployment has, including the one where the OAuth layer sits
- * in between, since its proxy forwards `X-Forwarded-For` unchanged rather than
- * appending to it (see `HOP_BY_HOP` in oauth/src/proxy.ts). Raise it only if
- * there is genuinely another trusted hop in front, such as a CDN: setting it
- * higher than the real chain reintroduces the same forgery. Use 0 when nothing
- * proxies this process, which makes `req.ip` the socket address.
- *
- * Its own variable rather than one shared with the OAuth layer's `TRUST_PROXY`
- * constant: the name is the same because the meaning is the same, and the two
- * processes never read one environment — docker-compose.yml gives them `.env`
- * and `.env.oauth`, and the pm2/systemd recipes give each its own env file — so
- * a deployment that puts a different number of proxies in front of each can say
- * so.
- *
- * Exported for the test suite. `config` below is evaluated once at import time,
- * so every rejection case would otherwise need a process of its own — see the
- * header of test/unit/config.defaults.test.ts for why the env constellations
- * are split across files. The parser is pure and can be exercised directly.
+ * Re-exported for the test suite. `config` below is evaluated once at import
+ * time, so every rejection case would otherwise need a process of its own — see
+ * the header of test/unit/config.defaults.test.ts for why the env
+ * constellations are split across files. The parser is pure and can be
+ * exercised directly.
  */
-export function trustProxyHops(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.TRUST_PROXY;
-  if (raw === undefined || raw.trim() === "") return 1;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(
-      `TRUST_PROXY must be a non-negative integer — the number of reverse-proxy ` +
-        `hops in front of this service — got ${raw}. Use 0 when nothing proxies it.`
-    );
-  }
-  return parsed;
-}
+export { trustProxyHops };
 
 /**
  * Read `PUBLIC_URL` and canonicalise it the way the OAuth layer canonicalises its
@@ -205,9 +176,9 @@ export const config = {
    * This service's own public URL — the assertion's `iss`, compared on every
    * settings request against the value the OAuth layer holds in `.env.oauth`.
    *
-   * Canonicalised by the rule *both* packages now share: src/canonical-url.ts
-   * here, oauth/src/canonical-url.ts there, byte-identical below their headers
-   * and pinned that way by test/unit/canonical-url.test.ts. Before #110 this
+   * Canonicalised by the rule *both* packages share: one shared/canonical-url.ts
+   * compiled into both images since #126, mirrored by hand and pinned by a drift
+   * test before that. Before #110 this
    * side only trimmed and stripped trailing slashes while the other side ran the
    * value through `new URL`, so `https://Mail.example.com` against
    * `https://mail.example.com`, or an explicit `:443` against none, 401'd every

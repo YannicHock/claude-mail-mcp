@@ -12,14 +12,13 @@
  *    `aud` rather than doing a strict byte-for-byte comparison against what the
  *    user typed", so both sides are canonicalised before comparison.
  *
- *    That canonicalisation no longer lives here. It moved to `./canonical-url.js`
- *    for #110, because the connector needs the identical rule for its own
- *    `PUBLIC_URL` and the two packages have separate Docker build contexts: it is
- *    now a mirrored module, `oauth/src/canonical-url.ts` and `src/canonical-url.ts`,
- *    held byte-identical by a drift test the way `secrets.ts` and `settings-api.ts`
- *    already are. The three functions are re-exported below so this file stays
- *    the one place in this package that URL comparison is imported from, and so
- *    the rule exists exactly once per package rather than twice.
+ *    That canonicalisation no longer lives here. It moved out for #110, because
+ *    the connector needs the identical rule for its own `PUBLIC_URL`; it was a
+ *    module mirrored in both packages and held byte-identical by a drift test
+ *    until #126 gave the two builds one context, and it is now the single
+ *    `shared/canonical-url.ts` both images compile. The three functions are
+ *    re-exported below so this file stays the one place in this package that URL
+ *    comparison is imported from, and so the rule exists exactly once.
  *
  * 2. Loopback redirect URIs. RFC 8252 section 7.3 requires the port to be ignored
  *    when matching `127.0.0.1`, because a native client binds an ephemeral port at
@@ -33,7 +32,7 @@ export {
   canonicalResource,
   normalisePublicUrl,
   sameResource,
-} from "./canonical-url.js";
+} from "../../shared/canonical-url.js";
 
 /** Redirect URIs Claude's hosted surfaces use: claude.ai web, Desktop, mobile, Cowork. */
 export const HOSTED_CLAUDE_REDIRECT_URIS = [

@@ -134,7 +134,7 @@ import {
   type MailboxSuggestion,
   type ProviderPreset,
   type ProvidersRequestBody,
-} from "./settings-api.js";
+} from "../../shared/settings-api.js";
 import {
   MAILBOX_DEFAULTS,
   renderConnectStep,

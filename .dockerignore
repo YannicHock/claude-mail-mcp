@@ -1,9 +1,13 @@
 node_modules
 dist
 .git
-# The OAuth layer is a separate package with its own Dockerfile and its own
-# build context (oauth/). Nothing from it belongs in the connector image, and
-# leaving it in the context would ship its node_modules across on every build.
+# The OAuth layer is a separate package with its own Dockerfile. Since #126 it
+# builds from *this* context too — it has to, because it compiles shared/ and a
+# context rooted at oauth/ cannot reach a sibling directory — but it is filtered
+# by its own oauth/Dockerfile.dockerignore, which BuildKit resolves in
+# preference to this file. So this line still means what it always meant:
+# nothing from the OAuth layer belongs in the connector image, and leaving it in
+# the context would ship its node_modules across on every build.
 oauth
 secrets
 oauth-data
@@ -27,3 +31,7 @@ SECURITY.md
 README.md
 LICENSE
 ecosystem.config.cjs
+
+# `shared` is deliberately absent from this list. It is the one directory both
+# images compile (#126); excluding it here would remove half of the connector's
+# own source.

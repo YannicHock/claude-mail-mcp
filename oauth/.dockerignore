@@ -1,7 +1,0 @@
-node_modules
-dist
-test
-tsconfig.test.json
-.env
-.env.*
-!.env.example

@@ -30,7 +30,7 @@ import {
   PROVIDER_OTHER,
   SHARED_PASSWORD_FIELD,
   type ProviderPreset,
-} from "./settings-api.js";
+} from "../../shared/settings-api.js";
 import { stepNumber, SETUP_STEPS, type SetupStep } from "./setup-state.js";
 
 /** The title of each screen, used in the header line and the document title. */

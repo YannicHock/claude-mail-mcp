@@ -28,6 +28,7 @@ import express, { NextFunction, Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
+import type { Logger } from "../shared/log.js";
 import { AccountsStore, reservedIdAccounts, reservedIdNotice } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
 import { registerMailTools } from "./tools-mail.js";
@@ -40,13 +41,12 @@ export const SERVER_NAME = "claude-mail-mcp";
 /** MCP `serverInfo.version` reported to clients, and the `version` field of `/health`. */
 export const VERSION = "0.7.0";
 
-export type LogLevel = "debug" | "info" | "warn" | "error";
-
-export type Logger = (
-  level: LogLevel,
-  message: string,
-  extra?: Record<string, unknown>
-) => void;
+/**
+ * Re-exported, not declared: shared/secrets.ts takes a logger as a parameter and
+ * both packages have to hand it the same type (#126). Every existing
+ * `import type { Logger } from "./app.js"` keeps working.
+ */
+export type { LogLevel, Logger } from "../shared/log.js";
 
 export interface CreateAppOptions {
   /** Account store backing `/health` and every tool's account resolution. */
