@@ -26,6 +26,7 @@ import {
   ADDRESS_FIELD,
   CHECKBOX_ON,
   MAILBOX_FIELDS,
+  MAILBOX_SECRET_FIELDS,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
   SHARED_PASSWORD_FIELD,
@@ -400,7 +401,7 @@ function passwordInput(opts: {
   const carried = opts.values[opts.name] ?? "";
   return `<label for="${escapeHtml(opts.id)}">${escapeHtml(opts.label)}</label>
 <input id="${escapeHtml(opts.id)}" name="${escapeHtml(opts.name)}" type="password" value="${escapeHtml(carried)}"
-       autocomplete="off"${opts.required === true ? " required" : ""}${invalid(message)}>
+       autocomplete="new-password"${opts.required === true ? " required" : ""}${invalid(message)}>
 ${fieldError(message)}`;
 }
 
@@ -415,9 +416,11 @@ ${fieldError(message)}`;
  * are looking at two that are not.
  */
 function passwordNote(values: Record<string, string>): string {
-  const carried =
-    (values[MAILBOX_FIELDS.imapPass] ?? "") !== "" ||
-    (values[MAILBOX_FIELDS.smtpPass] ?? "") !== "";
+  // Over every secret field, not the two that were obvious — see the same
+  // correction in the connector's renderMailboxForm. This function's own
+  // comment argues that saying the boxes are empty while an operator looks at
+  // two that are not would be the worst outcome; it forgot the third box.
+  const carried = MAILBOX_SECRET_FIELDS.some((name) => (values[name] ?? "") !== "");
   const about = carried
     ? "The password you entered has been carried over rather than asked for again. " +
       "Change it here if this mailbox takes a different one for IMAP and SMTP."
@@ -812,7 +815,7 @@ export function renderMailboxAddressStep(data: MailboxAddressPageData): string {
     ${fieldError(emailError)}
     <label for="mailbox_password">Password</label>
     <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
-           value="" autocomplete="off" required>
+           value="" autocomplete="new-password" required>
     <p class="muted">
       The password for the mailbox itself. Some providers want an app password
       here rather than the one you sign in to their website with.
@@ -882,7 +885,7 @@ function suggestionPassword(password: string): string {
   if (password === "") {
     return `<label for="mailbox_password">Password</label>
     <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
-           value="" autocomplete="off" required autofocus>
+           value="" autocomplete="new-password" required autofocus>
     <p class="muted">
       Passwords are never written back into this page, so it has to be typed
       here. It is used to log in to the servers above, and stored only once they
