@@ -399,36 +399,10 @@ function toWireReport(report: ProbeReport): MailboxProbeReport {
 }
 
 /**
- * The tail `saveRefusedNotice` puts on a refusal that included a credential
- * rejection, copied here so it can be **replaced** rather than added to (#148).
- *
- * That sentence already gives the untargeted version of this issue's advice —
- * "some providers want an app password rather than the account one" — and a
- * `credentialNote` printed beside it would say the same thing twice on one
- * screen, the second time specifically. The point of the note is that it is
- * targeted, so it takes the generic sentence's place.
- *
- * The clean shape is a second parameter on `saveRefusedNotice` itself, in
- * `shared/settings-api.ts`. That file belongs to another change in flight, so
- * the substitution happens here for now, and the copy is held honest by a unit
- * test that asserts a rejected report's notice really does end with this text.
- * If that ever stops being true the test fails loudly, and this function's
- * fallback is to leave the sentence exactly as the wire contract wrote it —
- * losing the targeting rather than printing two remedies.
- */
-export const GENERIC_CREDENTIAL_REMEDY =
-  "Check the password this mailbox needs — some providers want an app password " +
-  "rather than the account one — then try again, or press Save anyway to store it " +
-  "without testing it.";
-
-/** How the sentence ends once this provider's own note has taken that place. */
-const SAVE_ANYWAY_TAIL = "Or press Save anyway to store it without testing it.";
-
-/**
  * True when any probed service was refused *by the server* rather than
  * unreachable — the distinction `shared/credential-failure.ts` draws and the
- * only thing that makes a `credentialNote` relevant. A host that never answered
- * says nothing about which password it wanted.
+ * only thing that makes a `credentialNote` relevant (#148). A host that never
+ * answered has said nothing about which password it wanted.
  */
 function credentialRejected(wire: MailboxProbeReport): boolean {
   return [wire.imap, wire.smtp, wire.caldav].some(
@@ -438,19 +412,18 @@ function credentialRejected(wire: MailboxProbeReport): boolean {
 }
 
 /**
- * The sentence above a refused save, targeted at the provider when the address
- * has one this table knows and the failure was a rejection.
+ * The sentence above a refused save, carrying this provider's own requirement
+ * when the failure was a rejection and the address's domain has one.
  *
- * Three ways to get the untouched wire sentence, all of them deliberate: the
- * failure was connectivity rather than credentials, the domain is not in the
- * advice table, or its entry carries no note.
+ * `saveRefusedNotice` substitutes it for the generic app-password sentence
+ * rather than printing both — see its own comment. Three ways to get the
+ * untargeted sentence back, all of them deliberate: the failure was
+ * connectivity rather than credentials, the domain is not in the advice table,
+ * or its entry carries no note.
  */
-function refusalNotice(report: MailboxProbeReport, email: string): string {
-  const notice = saveRefusedNotice(report) ?? "";
-  if (!credentialRejected(report)) return notice;
-  const note = credentialNoteFor(email);
-  if (note === null || !notice.endsWith(GENERIC_CREDENTIAL_REMEDY)) return notice;
-  return `${notice.slice(0, -GENERIC_CREDENTIAL_REMEDY.length)}${note} ${SAVE_ANYWAY_TAIL}`;
+function refusalNotice(wire: MailboxProbeReport, email: string): string {
+  const note = credentialRejected(wire) ? credentialNoteFor(email) : null;
+  return saveRefusedNotice(wire, note ?? undefined) ?? "";
 }
 
 /**

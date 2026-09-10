@@ -24,8 +24,11 @@ import {
   PROVIDER_ADVICE,
   unsupportedNoticeFor,
 } from "../../src/providers.js";
-import { GENERIC_CREDENTIAL_REMEDY } from "../../src/settings-routes.js";
-import { saveRefusedNotice, type MailboxProbeReport } from "../../shared/settings-api.js";
+import {
+  saveRefusedNotice,
+  type MailboxProbeOutcome,
+  type MailboxProbeReport,
+} from "../../shared/settings-api.js";
 
 describe("the advice table's own shape", () => {
   it("gives every entry a reason to exist and a source to check it against", () => {
@@ -216,32 +219,44 @@ describe("Gmail as a preset (#150)", () => {
   });
 });
 
-describe("the generic remedy #148's note replaces", () => {
+describe("saveRefusedNotice takes the note in place of its generic sentence", () => {
   const REJECTED = { ok: false as const, message: "no", credentialRejection: true };
+  const UNREACHABLE = { ok: false as const, message: "connect ECONNREFUSED" };
+  const GENERIC = /some providers want an app password rather than the account one/;
+  const NOTE = "Gmail wants an app password.";
 
-  it("is still exactly how a credential rejection's notice ends", () => {
-    // `src/settings-routes.ts` replaces this sentence with the provider's own
-    // note rather than printing both, and it can only do that by recognising
-    // it. If `saveRefusedNotice` is reworded in shared/settings-api.ts, this
-    // fails here — loudly — instead of the note silently never appearing.
-    //
-    // The clean fix is a second parameter on `saveRefusedNotice` itself; that
-    // file belonged to another change in flight when this landed.
-    const report: MailboxProbeReport = { imap: REJECTED, smtp: { ok: true }, caldav: null };
-    const notice = saveRefusedNotice(report) ?? "";
-    assert.ok(
-      notice.endsWith(GENERIC_CREDENTIAL_REMEDY),
-      `saveRefusedNotice no longer ends with the sentence #148 replaces:\n${notice}`
-    );
+  const report = (imap: MailboxProbeOutcome): MailboxProbeReport => ({
+    imap,
+    smtp: { ok: true },
+    caldav: null,
   });
 
-  it("is not what a connectivity failure gets, so nothing is replaced there", () => {
-    const report: MailboxProbeReport = {
-      imap: { ok: false, message: "connect ECONNREFUSED" },
-      smtp: { ok: true },
-      caldav: null,
-    };
-    const notice = saveRefusedNotice(report) ?? "";
-    assert.equal(notice.endsWith(GENERIC_CREDENTIAL_REMEDY), false, notice);
+  it("says the generic sentence when no note was passed", () => {
+    assert.match(saveRefusedNotice(report(REJECTED)) ?? "", GENERIC);
+  });
+
+  it("says the note instead of it, never as well as it", () => {
+    // Both on one screen would say the same thing twice, the second time
+    // specifically, and the argument for the note is that it is targeted.
+    const notice = saveRefusedNotice(report(REJECTED), NOTE) ?? "";
+    assert.ok(notice.includes(NOTE), notice);
+    assert.equal(GENERIC.test(notice), false, notice);
+    assert.match(notice, /IMAP rejected these credentials, so nothing was saved\./);
+    assert.match(notice, /Save anyway/, "the way past the gate must survive it");
+  });
+
+  it("ignores a note on a connectivity failure, which has no such sentence", () => {
+    const notice = saveRefusedNotice(report(UNREACHABLE), NOTE) ?? "";
+    assert.equal(notice.includes(NOTE), false, notice);
+    assert.match(notice, /did not answer/);
+    assert.match(notice, /Check what failed above/);
+  });
+
+  it("reads an empty note as no note, the way ProviderPreset.note already does", () => {
+    assert.match(saveRefusedNotice(report(REJECTED), "") ?? "", GENERIC);
+  });
+
+  it("is still null when the report is not a refusal at all", () => {
+    assert.equal(saveRefusedNotice(report({ ok: true }), NOTE), null);
   });
 });
