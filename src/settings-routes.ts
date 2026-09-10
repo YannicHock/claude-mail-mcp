@@ -123,6 +123,7 @@ import {
   SHARED_PASSWORD_FIELD,
   stepFromEdit,
   stepFromLookup,
+  stringField,
   stepFromProvider,
   withSharedPassword,
   type AutoconfigAnswer,
@@ -172,13 +173,24 @@ class FormError extends Error {
 
 type FormBody = Record<string, unknown>;
 
+/**
+ * A form field, or "" for one that is missing or repeated.
+ *
+ * This is {@link stringField} applied to a body and a key, and it is written as
+ * a call to it rather than as a fourth copy of the rule. There were three: one
+ * in `shared/settings-api.ts`, one in `oauth/src/setup-routes.ts`, and a `text`
+ * closure in `draftFromFields` — #134 collapsed those and its CHANGELOG entry
+ * said "there is one now, exported", which was untrue while this one stood.
+ * The duplicate guard could not see it: it collides on the *body*, not on the
+ * name, which is the same fail-open class that guard has now been widened for
+ * twice.
+ */
 function raw(body: FormBody, key: string): string {
-  const v = body[key];
-  return typeof v === "string" ? v : "";
+  return stringField(body[key]);
 }
 
 function checkbox(body: FormBody, key: string): boolean {
-  return raw(body, key) === "1";
+  return raw(body, key) === CHECKBOX_ON;
 }
 
 /**

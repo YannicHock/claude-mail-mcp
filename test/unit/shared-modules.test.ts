@@ -178,6 +178,18 @@ describe("shared/", () => {
       sharedExports.set(name, file);
     }
     for (const name of declaredNames(source)) {
+      // Last-writer-wins would hide a duplicate *inside* shared/ — two modules
+      // declaring the same private helper would collapse to one entry and this
+      // file, whose whole subject is duplicates, would report nothing. The index
+      // tripled in size when it started carrying private names; that is exactly
+      // when a silent overwrite stops being harmless.
+      const earlier = sharedDeclarations.get(name);
+      assert.equal(
+        earlier,
+        undefined,
+        `shared/ declares ${name} twice: ${earlier} and ${file}. ` +
+          `One of them is the copy this file exists to refuse.`
+      );
       sharedDeclarations.set(name, file);
     }
   }
@@ -268,6 +280,30 @@ describe("shared/", () => {
     ["oauth/src/config.ts", new Set(["Env"])],
     ["oauth/src/bootstrap.ts", new Set(["readIfPresent"])],
   ]);
+
+  it("keeps no exception it no longer needs", () => {
+    // An exception silences a collision. If the collision goes away — the shared
+    // module renames the name, or exports it so the copy can import it — the
+    // entry stops protecting anything and starts hiding the next one. The
+    // readIfPresent entry is the live case: the intent is to collapse it the way
+    // trustProxyHops was collapsed, and on the day shared/secrets.ts exports it,
+    // the oauth copy becomes an ordinary offence that this list would swallow.
+    const stale: string[] = [];
+    for (const [file, names] of deliberateMirrors) {
+      for (const name of names) {
+        if (!sharedDeclarations.has(name)) {
+          stale.push(`${file}: ${name} is no longer declared in shared/`);
+        } else if (sharedExports.has(name) && !exportedNames(read(file)).has(name)) {
+          stale.push(`${file}: shared/ exports ${name} now — import it instead of mirroring it`);
+        }
+      }
+    }
+    assert.deepEqual(
+      stale,
+      [],
+      `the exception list has entries that protect nothing: ${stale.join("; ")}`
+    );
+  });
 
   for (const dir of ["src/", "oauth/src/"]) {
     it(`is not copied back into ${dir}`, () => {
