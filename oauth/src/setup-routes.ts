@@ -1162,6 +1162,12 @@ const SETUP_SUBJECT = "setup-wizard";
  * over there raises this one with it. What is left to get wrong is the slack
  * itself, and `oauth/test/unit/setup-wizard.test.ts` pins that it is positive.
  *
+ * The derivation holds for the connector's *default* budget, which is what the
+ * routes this wizard calls actually run under. `probeAccount` and
+ * `lookupMailboxSettings` both accept a `totalMs` override, and nothing but a
+ * test passes one today; a future caller that does owns this invariant itself,
+ * because no arithmetic here can see its argument.
+ *
  * Both are exported for that test and for nothing else.
  */
 export const PROBE_SLACK_MS = 5_000;
