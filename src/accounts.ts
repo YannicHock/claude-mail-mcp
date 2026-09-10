@@ -290,6 +290,31 @@ export class AccountsStore {
     return readStamp(this.filePath);
   }
 
+  /**
+   * The single-default invariant, applied to a list a mutation has just
+   * produced. `writtenId` names the account that mutation wrote; if it asked
+   * to be the default, every other account loses the flag, so the flag moves
+   * rather than accumulating a second holder.
+   *
+   * This lives in the store because the store is the one place that knows
+   * the whole list. Both writers need it: the settings form's "default"
+   * checkbox and the setup wizard's mailbox step, whose `default` field is
+   * hidden and always on — so a second mailbox added through the wizard used
+   * to be stored as a second default, leaving `resolve()` picking whichever
+   * came first and the "Make default" button on the first one apparently
+   * doing nothing.
+   *
+   * A write that does *not* claim the default promotes nobody: an
+   * accounts.json that already holds two (hand-edited, or written before
+   * this rule existed) keeps them until the next default-bearing write, and
+   * `resolve()` behaves as it always has in the meantime.
+   */
+  private static withSingleDefault(accounts: Account[], writtenId: string): Account[] {
+    const written = accounts.find((a) => a.id === writtenId);
+    if (written?.default !== true) return accounts;
+    return accounts.map((a) => (a.id === writtenId ? a : { ...a, default: undefined }));
+  }
+
   /** Add a new account. Rejects if `account.id` is already taken or reserved
    * (see {@link RESERVED_IDS}) — the one entry point every new account, whether
    * created through the settings form or programmatically, has to pass through. */
@@ -303,7 +328,7 @@ export class AccountsStore {
       if (accounts.some((a) => a.id === account.id)) {
         throw new AccountsStoreError(`An account with id "${account.id}" already exists.`);
       }
-      return [...accounts, account];
+      return AccountsStore.withSingleDefault([...accounts, account], account.id);
     });
   }
 
@@ -319,7 +344,7 @@ export class AccountsStore {
       }
       const next = [...accounts];
       next[index] = account;
-      return next;
+      return AccountsStore.withSingleDefault(next, account.id);
     });
   }
 
