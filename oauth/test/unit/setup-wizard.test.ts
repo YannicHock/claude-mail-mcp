@@ -27,6 +27,8 @@ import { escapeHtml } from "../../src/login.js";
 import {
   ADDRESS_FIELD,
   CHECKBOX_ON,
+  CONNECTOR_AUTOCONFIG_BUDGET_MS,
+  CONNECTOR_PROBE_BUDGET_MS,
   draftFromFields,
   flattenDraft,
   MAILBOX_FIELDS,
@@ -55,6 +57,14 @@ import {
   type MailboxProviderPageData,
   type MailboxSuggestionPageData,
 } from "../../src/setup-pages.js";
+import {
+  LOOKUP_SLACK_MS,
+  LOOKUP_TIMEOUT_MS,
+  PROBE_SLACK_MS,
+  PROBE_TIMEOUT_MS,
+  QUICK_TIMEOUT_MS,
+  saveTimeoutMs,
+} from "../../src/setup-routes.js";
 import { SetupState } from "../../src/setup-state.js";
 
 const GOOD_PASSWORD = "correct horse battery staple";
@@ -1302,5 +1312,78 @@ describe("what pressing Enter in a wizard field does", () => {
       assert.match(html, /class="secondary skip"/, `${screen} has no ordering class on Skip`);
       assert.match(html, /\.actions > \.skip \{ order: -1; \}/, `${screen} has no ordering rule`);
     }
+  });
+});
+
+/**
+ * The cross-package timeout invariant (#134).
+ *
+ * Two of the wizard's budgets must stay above the connector's own. When they do
+ * not, the wizard abandons a call that is still running and shows the operator
+ * *"the connector did not answer"* for work that was going to succeed — the
+ * exact class of failure #82 was filed about, reached from the other end.
+ *
+ * The two numbers used to live in different npm packages, so no compiler and no
+ * single suite saw both, and three comments in `setup-routes.ts` were the whole
+ * enforcement. The connector's budgets are exports of `shared/settings-api.ts`
+ * now and the wizard's two are `budget + slack`, so raising a connector budget
+ * raises the wizard's with it and the invariant cannot be broken from that
+ * direction at all. What is left to pin is this side: that the derivation is
+ * still a derivation, and that the slack is still positive.
+ */
+describe("the wizard waits longer than the connector it is waiting on", () => {
+  it("derives the probe timeout from the connector's probe budget", () => {
+    assert.equal(PROBE_TIMEOUT_MS, CONNECTOR_PROBE_BUDGET_MS + PROBE_SLACK_MS);
+  });
+
+  it("derives the lookup timeout from the connector's autoconfig budget", () => {
+    assert.equal(LOOKUP_TIMEOUT_MS, CONNECTOR_AUTOCONFIG_BUDGET_MS + LOOKUP_SLACK_MS);
+  });
+
+  it("gives each of them strictly positive slack", () => {
+    // Zero slack is the same bug arrived at politely: a connector that runs to
+    // the end of its budget and then answers is abandoned mid-sentence.
+    assert.ok(PROBE_SLACK_MS > 0, `probe slack is ${PROBE_SLACK_MS}ms`);
+    assert.ok(LOOKUP_SLACK_MS > 0, `lookup slack is ${LOOKUP_SLACK_MS}ms`);
+  });
+
+  it("is strictly above the connector on both, which is the invariant itself", () => {
+    assert.ok(
+      PROBE_TIMEOUT_MS > CONNECTOR_PROBE_BUDGET_MS,
+      `${PROBE_TIMEOUT_MS}ms is not above the connector's ${CONNECTOR_PROBE_BUDGET_MS}ms`
+    );
+    assert.ok(
+      LOOKUP_TIMEOUT_MS > CONNECTOR_AUTOCONFIG_BUDGET_MS,
+      `${LOOKUP_TIMEOUT_MS}ms is not above the connector's ${CONNECTOR_AUTOCONFIG_BUDGET_MS}ms`
+    );
+  });
+
+  it("still waits the two lengths it has always waited", () => {
+    // The move changed how these are written, not how long an operator waits.
+    assert.equal(PROBE_TIMEOUT_MS, 30_000);
+    assert.equal(LOOKUP_TIMEOUT_MS, 13_000);
+  });
+
+  /**
+   * The third decision site, which #147 added after the issue was written.
+   *
+   * `POST /settings/mailboxes` is two different calls behind one route now: a
+   * probe-then-write, or the write *Save anyway* asks for, which probes nothing.
+   * Picking the budget inline made that a place where a probe budget is chosen
+   * and coupled to the connector's by a comment — the very shape #134 exists to
+   * remove, in a line younger than the issue. The reasoning survives as a
+   * function, so the invariant can be asserted over the branch that probes.
+   */
+  it("gives the branch that probes a budget above the connector's", () => {
+    assert.equal(saveTimeoutMs(false), PROBE_TIMEOUT_MS);
+    assert.ok(saveTimeoutMs(false) > CONNECTOR_PROBE_BUDGET_MS);
+  });
+
+  it("gives the branch that probes nothing the quick budget, and only that one", () => {
+    // Not derived, and deliberately so: there is no connector-side deadline on
+    // the other end of a write to be above. What must stay true is that this
+    // shorter budget is only ever chosen for the call that does no probing.
+    assert.equal(saveTimeoutMs(true), QUICK_TIMEOUT_MS);
+    assert.ok(QUICK_TIMEOUT_MS < CONNECTOR_PROBE_BUDGET_MS, "or it would be the probe budget");
   });
 });

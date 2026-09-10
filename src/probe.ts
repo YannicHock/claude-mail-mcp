@@ -22,9 +22,18 @@ import {
   describeFailure,
   CREDENTIAL_REJECTION_MESSAGE,
 } from "../shared/credential-failure.js";
+import { CONNECTOR_PROBE_BUDGET_MS } from "../shared/settings-api.js";
 
 export const PER_PROBE_TIMEOUT_MS = 10_000;
-export const TOTAL_TIMEOUT_MS = 25_000;
+
+/**
+ * The budget for a whole probe, under the name every caller here has always
+ * imported — but the number itself is {@link CONNECTOR_PROBE_BUDGET_MS}, and it
+ * lives in the wire contract because the setup wizard waits on this call and
+ * has to wait longer than it (#134). A literal here would be the wizard's slack
+ * measured against a deadline that is no longer the real one.
+ */
+export const TOTAL_TIMEOUT_MS = CONNECTOR_PROBE_BUDGET_MS;
 
 /**
  * Both re-exported, not re-declared. The classification and the bound moved to

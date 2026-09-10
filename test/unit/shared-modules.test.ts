@@ -155,9 +155,30 @@ describe("shared/", () => {
   });
 
   const sharedExports = new Map<string, string>();
+  /**
+   * Every name `shared/` declares, private ones included.
+   *
+   * The second fail-open, found the same day as the non-recursive walk. The
+   * guard used to index only what `shared/` *exports*, so a module-private
+   * helper copied into a package was structurally invisible to it: `stringField`
+   * sat declared byte-for-byte in `shared/settings-api.ts` and
+   * `oauth/src/setup-routes.ts` through the whole of #126 — 1,650 lines spent
+   * de-mirroring those two packages — and this file, whose entire subject is
+   * refusing a second copy, stayed green.
+   *
+   * Whether a helper happens to be exported says nothing about whether writing
+   * it twice is a defect. It is the same rule in two places either way, and a
+   * private one is if anything worse: no import site anywhere points at the
+   * original, so nothing but this test will ever notice.
+   */
+  const sharedDeclarations = new Map<string, string>();
   for (const file of sharedFiles) {
-    for (const name of exportedNames(read(file))) {
+    const source = read(file);
+    for (const name of exportedNames(source)) {
       sharedExports.set(name, file);
+    }
+    for (const name of declaredNames(source)) {
+      sharedDeclarations.set(name, file);
     }
   }
 
@@ -196,8 +217,21 @@ describe("shared/", () => {
     }
   });
 
+  it("indexes what a shared module keeps to itself, not only what it exports", () => {
+    // The mutation this guard was verified by: `stringField` is private to
+    // shared/settings-api.ts, and until #134 nothing here could see it. Pinning
+    // the index rather than the offence list, because the offence list is empty
+    // when the guard works — which is also what it is when the guard is blind.
+    assert.equal(sharedDeclarations.get("spreadSharedPassword"), "shared/settings-api.ts");
+    assert.equal(sharedExports.get("spreadSharedPassword"), undefined, "it stays private");
+    // And the index still contains everything the narrower one did.
+    for (const [name, file] of sharedExports) {
+      assert.equal(sharedDeclarations.get(name), file, name);
+    }
+  });
+
   /**
-   * The one deliberate exception, written down rather than tolerated silently.
+   * The deliberate exceptions, written down rather than tolerated silently.
    *
    * src/autoconfig.ts declares its own structurally-identical `SuggestedServer`,
    * `SuggestedCalDav`, `SuggestionSource` and `MailboxSuggestion`. That is not a
@@ -208,6 +242,22 @@ describe("shared/", () => {
    * delete that check, which is a design question (#6's neighbourhood) and not
    * part of the move.
    *
+   * The other two arrived with the private-name index above, and both are in
+   * `oauth/src/`:
+   *
+   *  - `Env`, `type Env = Record<string, string | undefined>` in both
+   *    shared/secrets.ts and oauth/src/config.ts. Structurally identical, and a
+   *    two-word alias for `process.env` rather than a rule anything could get
+   *    wrong: there is no second copy of a decision here to drift. Exporting it
+   *    from shared/ to satisfy this guard would put a name on the shared surface
+   *    whose only purpose is this guard.
+   *  - `readIfPresent`, in shared/secrets.ts and oauth/src/bootstrap.ts. This one
+   *    is a real duplicate of a real rule — read a file, absent on ENOENT, blank
+   *    counts as absent — and shared/secrets.ts says so in its own comment. What
+   *    stops it collapsing here is that the two throw different error types with
+   *    different sentences, so the merge needs an injected failure and belongs to
+   *    an issue about the secret readers, not to this one.
+   *
    * Anything else lands here only by being argued for in a review.
    */
   const deliberateMirrors = new Map<string, ReadonlySet<string>>([
@@ -215,6 +265,8 @@ describe("shared/", () => {
       "src/autoconfig.ts",
       new Set(["SuggestedServer", "SuggestedCalDav", "SuggestionSource", "MailboxSuggestion"]),
     ],
+    ["oauth/src/config.ts", new Set(["Env"])],
+    ["oauth/src/bootstrap.ts", new Set(["readIfPresent"])],
   ]);
 
   for (const dir of ["src/", "oauth/src/"]) {
@@ -222,9 +274,10 @@ describe("shared/", () => {
       const offences: string[] = [];
       for (const file of tsFilesIn(dir)) {
         for (const name of declaredNames(read(file))) {
-          const home = sharedExports.get(name);
+          const home = sharedDeclarations.get(name);
           if (home !== undefined && !deliberateMirrors.get(file)?.has(name)) {
-            offences.push(`${file} declares ${name}, which ${home} already exports`);
+            const how = sharedExports.has(name) ? "already exports" : "already declares";
+            offences.push(`${file} declares ${name}, which ${home} ${how}`);
           }
         }
       }
@@ -233,7 +286,9 @@ describe("shared/", () => {
         [],
         `a second copy of a shared declaration has appeared:\n  ${offences.join("\n  ")}\n` +
           `Import it from shared/ — or re-export it, which is what the packages do ` +
-          `for the names their own modules have always been imported under.`
+          `for the names their own modules have always been imported under. ` +
+          `A name shared/ keeps private has to be exported there first; that it ` +
+          `was private is not a reason to write it a second time.`
       );
     });
   }

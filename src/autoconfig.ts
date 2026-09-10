@@ -69,9 +69,16 @@ import type { LookupFunction } from "node:net";
 import type { Readable } from "node:stream";
 
 import { withTimeout } from "./timeout.js";
+import { CONNECTOR_AUTOCONFIG_BUDGET_MS } from "../shared/settings-api.js";
 
 export const AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS = 3_000;
-export const AUTOCONFIG_TOTAL_TIMEOUT_MS = 10_000;
+
+/**
+ * The whole cascade's budget, under the name this module has always used — the
+ * number is {@link CONNECTOR_AUTOCONFIG_BUDGET_MS}, shared with the setup
+ * wizard, which waits on this lookup and has to wait longer than it (#134).
+ */
+export const AUTOCONFIG_TOTAL_TIMEOUT_MS = CONNECTOR_AUTOCONFIG_BUDGET_MS;
 export const MAX_RESPONSE_BYTES = 128 * 1024;
 export const MAX_REDIRECTS = 1;
 
