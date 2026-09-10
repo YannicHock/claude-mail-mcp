@@ -145,3 +145,73 @@ test("a plain-text settings response carries them too", async () => {
     assert.equal(res.headers.get(name), value, `expected ${name} on a plain-text response`);
   }
 });
+
+/**
+ * POST `path` off the same router, and do not follow what comes back.
+ *
+ * `redirect: "manual"` is the whole point. The default `follow` would fetch the
+ * mailbox list and hand back *its* headers, which satisfy every assertion in
+ * this file no matter what the 303 itself carried — which is exactly why the
+ * gap #127 records survived a suite that already had four tests asserting
+ * `status === 303`.
+ *
+ * `fields` is a function of the current stamp rather than a plain object: every
+ * state-changing route rejects a submission whose `_stamp` is not the one
+ * accounts.json is on, and the store is only in scope inside the callback.
+ */
+async function postSettings(
+  path: string,
+  fields: (stamp: string) => Record<string, string>
+): Promise<Response> {
+  return withAccountsStore([makeAccount({ id: "work", label: "Work", default: true })], async (store) => {
+    const app = express();
+    app.use(
+      createSettingsRouter({
+        store,
+        issuer: ISSUER,
+        settingsKey: SETTINGS_KEY,
+        log: () => {},
+      })
+    );
+    return withServer(app, async (baseUrl) => {
+      const body = new URLSearchParams({ _csrf: "csrf-1", ...fields(await store.stamp()) });
+      const res = await fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          [ASSERTION_HEADER]: mint("POST", path),
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: body.toString(),
+      });
+      // Drain the body so the socket does not keep the server from closing.
+      await res.text();
+      return res;
+    });
+  });
+}
+
+test("the 303 a state-changing POST answers with carries the same set", async () => {
+  // The gap #127 was filed for. Every other send site in settings-routes.ts
+  // chains `.set(SETTINGS_HEADERS)`; four bare `res.redirect(303, …)` chained
+  // nothing, so the response an operator's browser actually receives after
+  // pressing *Make default* went out with no `Cache-Control: no-store`, no CSP,
+  // no `X-Frame-Options` and no `Referrer-Policy`.
+  const res = await postSettings("/settings/mailboxes/work/default", (stamp) => ({ _stamp: stamp }));
+  assert.equal(res.status, 303);
+  assert.equal(res.headers.get("location"), "/settings/mailboxes");
+  for (const [name, value] of Object.entries(EXPECTED_HEADERS)) {
+    assert.equal(res.headers.get(name), value, `expected ${name} on a 303 from a settings POST`);
+  }
+});
+
+test("that 303 carries no body at all", async () => {
+  // `res.redirect()` renders a courtesy `<p>See Other. Redirecting to …</p>`
+  // into a response whose status says there is nothing to read, and a
+  // `Content-Type` describing it. `sendRedirect` ends it empty instead — the
+  // half of #136 that mattered, now true in this package too.
+  const res = await postSettings("/settings/mailboxes/work/delete", (stamp) => ({ _stamp: stamp }));
+  assert.equal(res.status, 303);
+  assert.equal(res.headers.get("content-type"), null);
+  assert.equal(res.headers.get("content-length"), "0");
+});

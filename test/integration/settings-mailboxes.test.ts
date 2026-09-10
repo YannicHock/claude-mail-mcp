@@ -1884,3 +1884,115 @@ test("an edit is gated the same way, and leaves the stored mailbox alone", async
     await imap.close();
   }
 });
+
+/** The `<input>` tag with this `id`, from a rendered page. */
+function inputTag(page: string, id: string): string {
+  const match = new RegExp(`<input id="${escapeRe(id)}"[^>]*>`).exec(page);
+  assert.ok(match, `expected an input with id="${id}" on the page`);
+  return match[0];
+}
+
+test("the refusal page carries the passwords back, so Save anyway can be pressed", async () => {
+  // The milestone's headline scenario, walked to its end. The operator types an
+  // account password Google will not take over IMAP, presses Save, waits out
+  // the probe, and lands on a 400 whose notice ends "…or press Save anyway to
+  // store it without testing it."
+  //
+  // `sanitize()` strips every password, and this form's boxes are `required`
+  // because there is no account behind it — so that button used to do nothing
+  // but pop the browser's "Please fill out this field" bubble, on a box the
+  // server had just cleared. The advertised escape hatch was a dead end on the
+  // exact screen the deployment failure happened on.
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(accountsPath, formAgainst(imap.port))
+    );
+    assert.equal(res.status, 400);
+    const page = await res.text();
+
+    assert.match(inputTag(page, "imap_pass"), /value="imap-secret"/);
+    assert.match(inputTag(page, "smtp_pass"), /value="smtp-secret"/);
+    assert.match(page, /Save anyway/, "the way past the gate has to be on the page");
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("Test connection carries them back too", async () => {
+  // The same dead end by a different door: probe, then a form whose mandatory
+  // password boxes the answer had emptied. This route stores nothing whatever
+  // it finds, so the only thing the operator can do next is press Save.
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes/test",
+      await withStampProbed(accountsPath, formAgainst(imap.port))
+    );
+    assert.equal(res.status, 200);
+    assert.match(inputTag(await res.text(), "imap_pass"), /value="imap-secret"/);
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("the refusal page does not tell the operator to press Save", async () => {
+  // The probe panel's footer was written for the *Test connection* answer,
+  // where "These values were not saved. Press Save to store them." is true. On
+  // a page that has just refused a Save it is advice that cannot work — Save
+  // re-probes and refuses again — and it contradicts the notice a few lines
+  // above it. Both pages are asserted here, because the fix has to leave the
+  // sentence standing where it is still true.
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const refused = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(accountsPath, formAgainst(imap.port))
+    );
+    assert.equal(refused.status, 400);
+    const refusedPage = await refused.text();
+    assert.match(refusedPage, /IMAP rejected these credentials/, "the panel is on the page");
+    assert.doesNotMatch(refusedPage, /Press Save to store them/);
+
+    const tested = await post(
+      url,
+      "/settings/mailboxes/test",
+      await withStampProbed(accountsPath, formAgainst(imap.port))
+    );
+    assert.equal(tested.status, 200);
+    assert.match(await tested.text(), /Press Save to store them/);
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("the 303 after a state-changing POST carries the header set, through the whole app", async () => {
+  // The unit suite pins this on the settings router alone. Here the response
+  // comes back through the connector's full middleware chain, so a header
+  // something upstream drops or overwrites shows up as a failure rather than
+  // as a passing test of a router nobody mounts on its own (#127).
+  const { url, accountsPath, close } = await startConnector([
+    makeAccount({ id: "work", label: "Work" }),
+    makeAccount({ id: "spare", label: "Spare" }),
+  ]);
+  try {
+    const res = await post(url, "/settings/mailboxes/spare/default", await withStamp(accountsPath, {}));
+    assert.equal(res.status, 303);
+    for (const [name, value] of Object.entries(EXPECTED_HEADERS)) {
+      assert.equal(res.headers.get(name), value, `expected ${name} on the 303`);
+    }
+    assert.equal(res.headers.get("content-type"), null, "a redirect carries no body to describe");
+  } finally {
+    await close();
+  }
+});

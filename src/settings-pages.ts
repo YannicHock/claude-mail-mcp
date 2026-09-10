@@ -101,6 +101,20 @@ export interface MailboxListData {
  * The connector's pages are served through the OAuth proxy and post to their
  * own origin, so nothing here needs a second CSP and nothing here should grow
  * one.
+ *
+ * The *senders* are deliberately not mirrored, and this is the note that says
+ * so (#127). `oauth/src/settings-pages.ts` keeps `sendPage` and `sendRedirect`
+ * beside its own `pageHeaders`; this package keeps `sendHtml`, `sendPlain`,
+ * `sendJson` and `sendRedirect` together in settings-routes.ts. Splitting one
+ * of the four out to sit next to a re-export would put the connector's senders
+ * in two files to make them look like the OAuth layer's, and would give this
+ * module — pure functions, plain data in, an HTML string out, no Express — its
+ * first `Response` parameter. What actually has to hold across the packages is
+ * the header set, and that already holds by import rather than by convention:
+ * both sides get it from shared/page-headers.ts. That a redirect carries it is
+ * pinned per package on a served response instead —
+ * `test/unit/settings-headers.test.ts` here,
+ * `oauth/test/integration/page-headers.test.ts` there.
  */
 export { escapeHtml } from "../shared/escape-html.js";
 export { pageHeaders, SETTINGS_CSP, SETTINGS_HEADERS } from "../shared/page-headers.js";
@@ -291,11 +305,17 @@ function probeRowHtml(name: string, result: ProbeResultView): string {
  * was activated. So the field arrives exactly when the operator pressed this
  * and never otherwise, in the same body shape a JSON caller sends.
  *
- * Always rendered, not only after a refusal. The probe budget is 25 seconds,
- * and an operator who already knows their server is in a maintenance window
- * should not have to sit through it to be shown the way past it.
+ * Rendered whether or not there has been a refusal — the probe budget is 25
+ * seconds, and an operator who already knows their server is in a maintenance
+ * window should not have to sit through it to be shown the way past it — but
+ * *not* on a form whose Save cannot store anything. `savable` is the same flag
+ * {@link probeSectionHtml} is given, and for the same reason: on the edit form
+ * of an account whose id is reserved, the submission goes to a route that is not
+ * its own, so a button reading "Save anyway" promises the one thing that
+ * definitely will not happen. It was rendered there unconditionally until #130.
  */
-function saveAnywayButton(): string {
+function saveAnywayButton(savable: boolean): string {
+  if (!savable) return "";
   return `<button type="submit" name="${escapeHtml(SAVE_ANYWAY_FIELD)}" value="${escapeHtml(
     CHECKBOX_ON
   )}" title="Store this mailbox without testing the connection first">
@@ -304,13 +324,26 @@ function saveAnywayButton(): string {
 }
 
 /**
- * The probe panel. `savable` is false for an account whose id is reserved: the
- * form's Save posts to a route that is not its own (see RESERVED_IDS in
- * accounts.ts), so the usual "Press Save to store them" would be a lie, and one
- * the operator has already been told the opposite of on the list row. The
- * remedy is not repeated here — the notice above the panel carries it.
+ * The probe panel, in one of three states.
+ *
+ * - `"savable"` — the ordinary case, after *Test connection*: nothing was
+ *   stored, and Save is what stores it.
+ * - `"unsavable"` — an account whose id is reserved. The form's Save posts to a
+ *   route that is not its own (see RESERVED_IDS in accounts.ts), so "Press Save
+ *   to store them" would be a lie, and one the operator has already been told
+ *   the opposite of on the list row. The remedy is not repeated here — the
+ *   notice above the panel carries it.
+ * - `"refused"` — the panel is on a page that has *just refused a Save*. The
+ *   third state exists because the first one was being used for it: under a
+ *   failing IMAP row, on a 400, the panel said "Press Save to store them" — a
+ *   step that cannot work, since pressing Save re-probes and refuses again, and
+ *   one that contradicts the `saveRefusedNotice` a few lines above it. What is
+ *   true on that page is the other button, so the footer says nothing and lets
+ *   the notice do the talking.
  */
-function probeSectionHtml(probe: ProbeReportView | undefined, savable: boolean): string {
+type ProbePanelState = "savable" | "unsavable" | "refused";
+
+function probeSectionHtml(probe: ProbeReportView | undefined, state: ProbePanelState): string {
   if (!probe) return "";
   const rows = [
     probeRowHtml("IMAP", probe.imap),
@@ -319,12 +352,14 @@ function probeSectionHtml(probe: ProbeReportView | undefined, savable: boolean):
   ]
     .filter(Boolean)
     .join("\n");
-  const footer = savable
-    ? "These values were not saved. Press Save to store them."
-    : "These values were not saved, and Save will not store them either.";
+  const footer = {
+    savable: "These values were not saved. Press Save to store them.",
+    unsavable: "These values were not saved, and Save will not store them either.",
+    refused: "",
+  }[state];
   return `<div class="notice">
 ${rows}
-<p>${escapeHtml(footer)}</p>
+${footer === "" ? "" : `<p>${escapeHtml(footer)}</p>`}
 </div>`;
 }
 
@@ -458,11 +493,21 @@ ${
       "Change it here if this mailbox takes a different one for IMAP and SMTP."
     : "Password fields are always blank here. Leave one blank to keep the stored value.";
 
+  // A panel *and* a notice is the one combination that means "the save was
+  // refused": the /test routes send a report with nothing to say above it, and
+  // the cascade's manual step sends a notice with no report. See
+  // `probeSectionHtml` for what the third state is for.
+  const panelState: ProbePanelState = reserved
+    ? "unsavable"
+    : opts.notice === undefined
+      ? "savable"
+      : "refused";
+
   const body = `<h1>${isNew ? "Add mailbox" : `Edit mailbox — ${escapeHtml(account.label)}`}</h1>
 <p class="sub">${escapeHtml(sub)}</p>
 ${opts.notice === undefined ? "" : `<div class="notice">${escapeHtml(opts.notice)}</div>`}
 ${reservedNotice}
-${probeSectionHtml(opts.probe, !reserved)}
+${probeSectionHtml(opts.probe, panelState)}
 <form method="post" action="${escapeHtml(actionPath)}" autocomplete="off">
   <input type="hidden" name="_csrf" value="${escapeHtml(opts.csrf)}">
   <input type="hidden" name="_stamp" value="${escapeHtml(opts.stamp)}">
@@ -608,7 +653,7 @@ ${probeSectionHtml(opts.probe, !reserved)}
   <button type="submit" formaction="${escapeHtml(testPath)}" name="_action" value="test">
     Test connection
   </button>
-  ${saveAnywayButton()}
+  ${saveAnywayButton(!reserved)}
 </form>
 ${isNew ? otherWaysIn("manual") : ""}
 <p><a href="/settings">Back to settings</a></p>`;
