@@ -39,22 +39,38 @@ Four categories:
 
 ## Summary
 
+`src/providers.ts` holds two tables, and the column below says which of them an
+entry is in. **Preset** is `MAIL_PROVIDERS`: hosts, ports and TLS, offered as a
+choice on the provider screen. **Advice** is `PROVIDER_ADVICE`: what to say about
+a password, matched against the domain the operator's address ends in, and shown
+only at the moment it is relevant — a `credentialNote` when a server has just
+rejected the password (#148), an `unsupported` warning as soon as the address is
+looked up (#151).
+
+The two sets do not coincide, and neither one is a subset of the other. A
+provider whose customers use their own domain (mailcow, iRedMail, Migadu,
+Hetzner) cannot be recognised by an address, so its advice has to live on its
+preset's `note` instead. A provider whose settings are not presettable — Zoho's
+IMAP host depends on the account type, Microsoft and Proton have nothing to dial
+— gets advice and no preset, because a possibly-wrong host in a required box is
+the failure mode `src/providers.ts` exists to avoid.
+
 | Provider | In `src/providers.ts` | What the password must be |
 | --- | --- | --- |
-| [Gmail](#gmail) | no — see #148 | App password when 2FA is on |
-| [mailbox.org](#mailboxorg) | yes | App password when 2FA is on |
-| [Zoho Mail](#zoho-mail) | no | App password when 2FA is on |
-| [mailcow](#mailcow-self-hosted) | yes | App password when 2FA is on |
-| [Fastmail](#fastmail) | yes | **App password always** |
-| [iCloud Mail](#icloud-mail) | yes | **App password always** |
-| [Yahoo Mail](#yahoo-mail) | no | **App password always** |
-| [AOL Mail](#aol-mail) | no | **App password always** |
-| [Posteo](#posteo) | yes | App password (see the entry — Posteo documents it as *the* credential) |
-| [Migadu](#migadu) | yes | Password |
-| [Hetzner Web Hosting](#hetzner-web-hosting--managed-server) | yes | Password |
-| [iRedMail](#iredmail-self-hosted) | yes | Password |
-| [Outlook.com / Microsoft 365](#outlookcom-and-microsoft-365) | no | **Cannot be served** |
-| [Proton Mail](#proton-mail) | no | **Cannot be served without the Bridge** |
+| [Gmail](#gmail) | preset + advice | App password when 2FA is on |
+| [mailbox.org](#mailboxorg) | preset + advice | App password when 2FA is on |
+| [Zoho Mail](#zoho-mail) | advice only | App password when 2FA is on |
+| [mailcow](#mailcow-self-hosted) | preset (`note`) | App password when 2FA is on |
+| [Fastmail](#fastmail) | preset + advice | **App password always** |
+| [iCloud Mail](#icloud-mail) | preset + advice | **App password always** |
+| [Yahoo Mail](#yahoo-mail) | advice only | **App password always** |
+| [AOL Mail](#aol-mail) | advice only | **App password always** |
+| [Posteo](#posteo) | preset + advice | App password (see the entry — Posteo documents it as *the* credential) |
+| [Migadu](#migadu) | preset | Password |
+| [Hetzner Web Hosting](#hetzner-web-hosting--managed-server) | preset | Password |
+| [iRedMail](#iredmail-self-hosted) | preset | Password |
+| [Outlook.com / Microsoft 365](#outlookcom-and-microsoft-365) | advice (`unsupported`) | **Cannot be served** |
+| [Proton Mail](#proton-mail) | advice (`unsupported`) | **Cannot be served without the Bridge** |
 
 ---
 
@@ -408,3 +424,12 @@ Same standard as the hosts and ports it sits next to. Read the provider's **own
 current** documentation, put the URL in the entry, and if the documentation does not
 answer the question, leave the note out. A provider with no verifiable note simply
 has none — the field is optional, and an entry without one is valid.
+
+Decide which table it belongs in, and it may be both. A `MAIL_PROVIDERS` preset
+needs documented hosts and ports that are the same for every customer of that
+provider; anything less than that is a wrong preset, which is worse than none. A
+`PROVIDER_ADVICE` entry needs domains its customers' addresses actually end in —
+keep that list short, because a domain missing from it costs an operator a
+sentence, while a domain wrongly in it tells them something untrue. `credentialNote`
+and `unsupported` are mutually exclusive in practice: a provider that cannot be
+served has no app password to recommend.

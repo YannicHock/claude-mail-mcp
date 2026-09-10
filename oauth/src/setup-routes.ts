@@ -766,10 +766,16 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
               ? "The connector refused to store these details, so this attempt added " +
                 "nothing. What it objected to is marked below; fix that, retype the " +
                 "passwords and try again."
-              : // The connector's own sentence, from the shared wire contract, so
-                // this screen and the connector's settings form say the same
-                // thing about the same refusal.
-                (saveRefusedNotice(refusedByProbe) ??
+              : // The connector's own sentence, so this screen and the
+                // connector's settings form say the same thing about the same
+                // refusal. Taken from the answer when it carried one — that is
+                // the sentence the connector actually wrote, and on a credential
+                // rejection it names what the operator's own provider requires
+                // (#148), which this package has no table to work out. Falling
+                // back to computing it from the report keeps a connector that
+                // sent no message saying what it said before.
+                (created.message ??
+                saveRefusedNotice(refusedByProbe) ??
                 "Nothing was saved. Fix what failed above, retype the passwords and try again."),
         },
       });
@@ -1247,6 +1253,16 @@ type ConnectorAnswer<T> =
       status: number;
       errors: Record<string, string>;
       probe?: MailboxProbeReport;
+      /**
+       * The connector's own sentence about this refusal, when it sent one.
+       *
+       * Carried rather than recomputed because the connector can say more than
+       * this package can work out: it holds the provider table, so on a
+       * credential rejection its sentence names what *that provider* wants
+       * instead of the generic app-password advice (#148). Absent from a
+       * connector that predates it, which is what the fallback below is for.
+       */
+      message?: string;
     }
   /** Any other status: not about the mailbox, about the request. */
   | { kind: "refused"; status: number }
@@ -1361,6 +1377,11 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
           status: res.status,
           errors: answer.errors,
           ...(answer.probe === undefined ? {} : { probe: answer.probe }),
+          // An empty string is not a sentence, and reading one as though it
+          // were would replace the fallback below with a blank notice.
+          ...(answer.message === undefined || answer.message === ""
+            ? {}
+            : { message: answer.message }),
         };
       }
       return { kind: "refused", status: res.status };

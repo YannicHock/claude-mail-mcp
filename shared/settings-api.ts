@@ -487,6 +487,15 @@ export function probeRefusesSave(report: MailboxProbeReport): boolean {
  * `shared/credential-failure.ts` exists to draw — because the two have
  * completely different remedies: one is the password, the other is the host,
  * the port, or a server that is simply down.
+ *
+ * `credentialNote` (#148) is the one thing a caller may say better than this
+ * function can: what *this provider* wants, when the caller recognised the
+ * address's domain. It **replaces** the generic app-password sentence rather
+ * than being printed beside it — both on one screen would say the same thing
+ * twice, the second time specifically, and the whole argument for the note is
+ * that it is targeted. Passing one for a refusal that was not a credential
+ * rejection changes nothing: there is no generic sentence there to replace,
+ * because no server said anything about any password.
  */
 /**
  * What the operator is told about a CalDAV failure that did *not* stop the save,
@@ -507,7 +516,10 @@ export function caldavFailureNotice(report: MailboxProbeReport): string | null {
   );
 }
 
-export function saveRefusedNotice(report: MailboxProbeReport): string | null {
+export function saveRefusedNotice(
+  report: MailboxProbeReport,
+  credentialNote?: string
+): string | null {
   const blocked = blockedServices(report);
   if (blocked.length === 0) return null;
   const clauses = blocked.map((service) =>
@@ -515,12 +527,24 @@ export function saveRefusedNotice(report: MailboxProbeReport): string | null {
       ? `${service.name} rejected these credentials`
       : `${service.name} did not answer`
   );
-  const remedy = blocked.some((service) => service.credentialRejection)
-    ? "Check the password this mailbox needs — some providers want an app password " +
-      "rather than the account one — then try again"
-    : "Check what failed above, then try again";
-  return `${clauses.join(", and ")}, so nothing was saved. ${remedy}, or press ` +
-    "Save anyway to store it without testing it.";
+  const rejected = blocked.some((service) => service.credentialRejection);
+  // The note is the targeted form of the generic sentence below it, so it takes
+  // that sentence's place — never both. An empty string is read as no note, the
+  // way `ProviderPreset.note` already spells "nothing to say".
+  const targeted = rejected && credentialNote !== undefined && credentialNote !== "";
+  const remedy = targeted
+    ? credentialNote
+    : rejected
+      ? "Check the password this mailbox needs — some providers want an app password " +
+        "rather than the account one — then try again"
+      : "Check what failed above, then try again";
+  // A note is prose of its own and ends in a full stop; the generic remedies are
+  // clauses written to be continued. Joining both with ", or press" would run a
+  // paragraph into a subordinate clause.
+  const tail = targeted
+    ? " Or press Save anyway to store it without testing it."
+    : ", or press Save anyway to store it without testing it.";
+  return `${clauses.join(", and ")}, so nothing was saved. ${remedy}${tail}`;
 }
 
 export function parseStampAnswer(value: unknown): string | null {

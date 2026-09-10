@@ -61,6 +61,7 @@ import {
   PROVIDER_FIELD,
   PROVIDER_OTHER,
   SAVE_ANYWAY_FIELD,
+  saveRefusedNotice,
   SHARED_PASSWORD_FIELD,
   type MailboxProbeReport,
   type MailboxRequestBody,
@@ -592,10 +593,15 @@ function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): vo
  * which service and why. The wizard no longer probes before it writes, so this
  * — not the probe route's answer — is where a bad password is turned back.
  */
-function refusedByProbe(probe: MailboxProbeReport): ConnectorBehaviour {
+function refusedByProbe(probe: MailboxProbeReport, message?: string): ConnectorBehaviour {
   return {
     createStatus: 400,
-    createBody: { message: "refused", errors: {}, probe },
+    // What a real connector sends: `message` is the notice it wrote, not a
+    // placeholder. The wizard prefers it over recomputing one (#148), because
+    // the connector holds the provider table and can name what the operator's
+    // own provider requires; `message` here defaults to exactly what the
+    // connector would have said with no provider recognised.
+    createBody: { message: message ?? saveRefusedNotice(probe) ?? "", errors: {}, probe },
   };
 }
 
@@ -653,6 +659,53 @@ test("credentials that fail the probe are not saved", async () => {
     // And the wizard has not moved on.
     const entry = await getSetup(harness);
     assert.equal(entry.headers.get("location"), `/setup/${harness.claimToken}/mailbox`);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("the connector's own sentence about a rejection is what this screen shows", async () => {
+  // #148. The provider table is in the connector, so the connector is the only
+  // side that can turn "the server rejected these credentials" into "Gmail
+  // wants an app password once 2-Step Verification is on". The wizard shows
+  // what it was told rather than working out a weaker sentence of its own.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    const targeted =
+      "IMAP rejected these credentials, so nothing was saved. Gmail takes an app " +
+      "password once 2-Step Verification is on. Or press Save anyway to store it " +
+      "without testing it.";
+    stubConnector(
+      harness,
+      refusedByProbe(
+        {
+          imap: {
+            ok: false,
+            message: "the server rejected these credentials",
+            credentialRejection: true,
+          },
+          smtp: { ok: true },
+          caldav: null,
+        },
+        targeted
+      )
+    );
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+
+    assert.equal(res.status, 400);
+    const html = await res.text();
+    assert.match(html, /Gmail takes an app password once 2-Step Verification is on/);
+    // Once, and in place of the generic advice — not beside it.
+    assert.equal(
+      /some providers want an app password rather than the account one/.test(html),
+      false,
+      html
+    );
   } finally {
     await harness.close();
   }
