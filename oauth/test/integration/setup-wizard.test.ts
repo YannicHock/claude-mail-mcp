@@ -392,6 +392,20 @@ function mailboxFields(overrides: Record<string, string> = {}): Record<string, s
   };
 }
 
+/**
+ * The `<input>` tag with this `id`, from a rendered page.
+ *
+ * A box that is `required` and empty is a box the browser will not let the form
+ * be submitted with, so what an escape hatch needs is not a sentence on the page
+ * but a value in the tag beneath it — which is what this reads. Named and shaped
+ * like the connector's own helper, because it pins the same fix (#183/#130).
+ */
+function inputTag(page: string, id: string): string {
+  const match = new RegExp(`<input id="${id}"[^>]*>`).exec(page);
+  assert.ok(match, `expected an input with id="${id}" on the page`);
+  return match[0];
+}
+
 /** What `GET /settings/mailboxes/new` reports before anything has been written. */
 const STAMP_BEFORE = "412-1757000000000";
 /** What an acknowledged write reports back. Nothing on this side reads it. */
@@ -1049,7 +1063,16 @@ test("a save the connector refuses does not blame the passwords for it", async (
   }
 });
 
-test("a mailbox password is never written back into the page", async () => {
+test("the refusal page keeps the password boxes filled, so Save anyway can be pressed", async () => {
+  // #183, the wizard's half of the connector's #130. The notice on this page
+  // ends "…or press Save anyway to store it without testing it", and both
+  // password boxes on this form are `required` — so a re-render that strips
+  // them makes that sentence a lie the browser enforces: the click pops "Please
+  // fill out this field" on a box the answer had just cleared, and the operator
+  // meets it on the first screen the wizard has.
+  //
+  // Asserted as the value attributes rather than as the advice, because the
+  // advice was there all along and the button still could not be pressed.
   const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
   try {
     await reachStep2(harness);
@@ -1070,10 +1093,43 @@ test("a mailbox password is never written back into the page", async () => {
 
     // What was typed comes back, so a retry is not a retype of everything …
     assert.match(html, /value="imap\.example\.com"/);
-    // … but the password does not, and the page says so rather than leaving the
-    // operator to wonder why the box is empty.
-    assert.equal(html.includes(MAILBOX_PASSWORD), false);
-    assert.match(html, /Passwords are never written back/);
+    // … the passwords included. Not read back out of anything: this is the
+    // operator's own submission, on its way back to the form that will send it
+    // again. Nothing on this path writes it to a file or a log.
+    assert.match(inputTag(html, "imap_pass"), new RegExp(`value="${MAILBOX_PASSWORD}"`));
+    assert.match(inputTag(html, "smtp_pass"), new RegExp(`value="${MAILBOX_PASSWORD}"`));
+    assert.match(html, /Save anyway/, "the way past the gate has to be on the page");
+    // And the page no longer claims the boxes are empty.
+    assert.match(html, /carried over/i);
+    assert.equal(/Passwords are never written back/.test(html), false, html);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a CalDAV password nobody typed is not invented on the way back", async () => {
+  // The carry is "keep what was submitted", not "fill every password box":
+  // a mail-only mailbox comes back mail-only, and the empty optional box stays
+  // empty rather than being described as carrying something.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(
+      harness,
+      refusedByProbe({
+        imap: { ok: false, message: "no route to host" },
+        smtp: { ok: true },
+        caldav: null,
+      })
+    );
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      ...mailboxFields(),
+      _action: "save",
+    });
+    const html = await res.text();
+
+    assert.match(inputTag(html, "caldav_pass"), /value=""/);
   } finally {
     await harness.close();
   }

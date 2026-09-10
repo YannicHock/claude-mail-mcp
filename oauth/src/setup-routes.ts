@@ -123,8 +123,10 @@ import {
   domainOf,
   draftFromFields,
   emptyMailboxValues,
+  flattenDraft,
   formValues,
   MAILBOX_FIELDS,
+  MAILBOX_SECRET_FIELDS,
   parseAutoconfigAnswer,
   parseErrorAnswer,
   parseProbeAnswer,
@@ -576,7 +578,10 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     }
 
     const draft = draftFromFields(withSharedPassword(body));
-    const values = formValues(draft);
+    // Not `formValues(draft)`: this form's password boxes are `required`, and a
+    // re-render that strips them is a page whose buttons cannot be pressed.
+    // See {@link withCarriedPasswords}.
+    const values = withCarriedPasswords(draft);
 
     // `Test connection`: probe, report, store nothing. Still the wizard's own
     // call, because that is all this button is — a question with no write
@@ -764,8 +769,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
           message:
             refusedByProbe === undefined
               ? "The connector refused to store these details, so this attempt added " +
-                "nothing. What it objected to is marked below; fix that, retype the " +
-                "passwords and try again."
+                "nothing. What it objected to is marked below; fix that and try again."
               : // The connector's own sentence, so this screen and the
                 // connector's settings form say the same thing about the same
                 // refusal. Taken from the answer when it carried one — that is
@@ -776,7 +780,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
                 // sent no message saying what it said before.
                 (created.message ??
                 saveRefusedNotice(refusedByProbe) ??
-                "Nothing was saved. Fix what failed above, retype the passwords and try again."),
+                "Nothing was saved. Fix what failed above and try again."),
         },
       });
       return;
@@ -1012,6 +1016,43 @@ async function fetchConfiguredMailboxes(
     });
     return { reachable: false, mailboxes: [] };
   }
+}
+
+/**
+ * The submitted mailbox as the form's own values, with the passwords kept.
+ *
+ * The wizard's mirror of `withCarriedPasswords` in the connector's
+ * settings-routes.ts, and for the same reason (#183, the sibling of #130).
+ * {@link formValues} strips every {@link MAILBOX_SECRET_FIELDS} name out of a
+ * draft, and `renderMailboxStep` marks the IMAP and SMTP boxes `required` —
+ * rightly, because step 2's form only ever creates a mailbox and a blank
+ * password on create is an error rather than "keep the stored one". Together
+ * they handed the operator two empty, mandatory password boxes on the refusal
+ * page, under a sentence ending "…or press Save anyway to store it without
+ * testing it": that button, and Save and continue beside it, did nothing but
+ * pop the browser's "Please fill out this field" bubble on a box the answer had
+ * just cleared. The advertised escape hatch was a dead end on the first screen
+ * a new operator meets.
+ *
+ * The stripping rule is about a password read back out of *storage* — that one
+ * is never written into a page, on either side of the hop, and nothing here
+ * changes it. What is carried is the operator's own submission, still in
+ * flight, on its way back to the form that is about to send it again: it came
+ * in on this request, it is already in memory, it reaches no file and no log,
+ * and the page says on its face that the boxes are filled rather than empty
+ * (see `passwordNote`). It is the rule the cascade has followed since #120.
+ *
+ * Blank stays blank, so a service the operator gave no password for is not
+ * described as carrying one.
+ */
+function withCarriedPasswords(draft: MailboxDraft): Record<string, string> {
+  const values = formValues(draft);
+  const submitted = flattenDraft(draft);
+  for (const name of MAILBOX_SECRET_FIELDS) {
+    const typed = submitted[name] ?? "";
+    if (typed !== "") values[name] = typed;
+  }
+  return values;
 }
 
 function refusedNotice(status: number): { kind: "error"; message: string } {

@@ -376,18 +376,17 @@ ${fieldError(message)}${opts.hint === undefined ? "" : `<p class="muted">${escap
  * A password box, empty unless the caller has a password to carry into it.
  *
  * The rule this used to state — always empty, no exceptions — was aimed at one
- * thing: a mailbox password read back out of somewhere and written into a page.
- * The connector's own form never does it, and neither does the re-render after
- * a failed probe, where the password is the thing most likely to have been
- * wrong and the retype is the point. `formValues` is what enforces that: it
- * strips every secret out of a draft before the draft becomes a page.
+ * thing: a mailbox password read back out of *storage* and written into a page.
+ * Nothing does that, on either side of the hop, and nothing here weakens it.
  *
- * A password carried forward from the screen the operator typed it on is not
- * that. It is their own submission, still in flight, on its way to the form
- * that is about to send it — and #120 is what happens without it: the wizard
- * asks for the same mailbox password twice, with a screen in between that never
- * mentions the first one. So the value comes from `values`, which is empty on
- * every path that is not a carry.
+ * A password the operator typed a moment ago is not that. It is their own
+ * submission, still in flight, on its way back to the form that is about to
+ * send it again — and dropping it is what #120 and #183 are: the wizard asking
+ * for the same mailbox password twice with a screen in between that never
+ * mentioned the first (the cascade), and a refusal page whose `required`
+ * password boxes the answer had emptied, so that neither *Save and continue*
+ * nor the *Save anyway* the notice points at could be pressed at all. So the
+ * value comes from `values`, which is empty on every path that is not a carry.
  */
 function passwordInput(opts: {
   id: string;
