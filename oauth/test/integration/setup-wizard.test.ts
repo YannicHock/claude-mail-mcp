@@ -64,6 +64,7 @@ import {
   saveRefusedNotice,
   SHARED_PASSWORD_FIELD,
   UNSUPPORTED_FIELD,
+  UNSUPPORTED_FOR_FIELD,
   type MailboxProbeReport,
   type MailboxRequestBody,
   type MailboxSuggestion,
@@ -2521,6 +2522,10 @@ test("a warned mailbox still saves in the wizard, because Bridge is a real setup
     const res = await postSetupForm(harness, "/mailbox", {
       ...mailboxFields({ [ADDRESS_FIELD]: "anna@proton.me" }),
       [UNSUPPORTED_FIELD]: PROTON_WARNING,
+      // The address the sentence is about, which is what keeps it alive across
+      // this hop (#191) — without it the form is carrying a warning about
+      // nothing and the wizard drops it.
+      [UNSUPPORTED_FOR_FIELD]: "anna@proton.me",
       _action: "save",
     });
 
@@ -2550,6 +2555,172 @@ test("a connector that predates the field warns about nothing at all", async () 
     const html = await res.text();
     assert.match(html, /Found settings for example\.com/);
     assert.equal(/no password will connect/.test(html), false, html);
+  } finally {
+    await harness.close();
+  }
+});
+
+// ---- #191: one warning, about the address on the screen ---------------------
+
+/**
+ * How many times a sentence is *shown* on the page. One box, or two, or none.
+ *
+ * Hidden inputs are stripped first: this wizard carries the warning onward in
+ * one, so the sentence is always on the page a second time as form state, and
+ * counting that as a second box would make every screen look duplicated.
+ */
+function occurrences(html: string, needle: RegExp): number {
+  const shown = html.replace(/<input type="hidden"[^>]*>/g, "");
+  return shown.match(new RegExp(needle.source, "g"))?.length ?? 0;
+}
+
+test("a refused save says the warning once, not once in each box", async () => {
+  // #191's first finding, on the screen the operator lands on. The full form
+  // gained a warning box in #186 and the connector's refusal sentence had the
+  // same paragraph inside it — `rejectionNoteFor` returned the `unsupported`
+  // entry as if it were a credential note, and `saveRefusedNotice` substituted
+  // it for the generic remedy — so a refused save painted the paragraph in a
+  // grey box and then again in the red one directly beneath.
+  //
+  // Fixed at the root rather than suppressed here: the connector no longer puts
+  // it in the sentence, and this stub sends what the connector now sends. The
+  // wizard prints whatever message it is given, which is the contract (#148),
+  // so a 0.7.0 connector behind a newer wizard would still say it twice — a
+  // cosmetic mismatch in a mixed-version deployment, and the reason the fix is
+  // where the sentence is written rather than where it is rendered.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    const probe: MailboxProbeReport = {
+      imap: { ok: false, message: "did not answer", credentialRejection: false },
+      smtp: { ok: false, message: "did not answer", credentialRejection: false },
+      caldav: null,
+    };
+    // Exactly what the connector sends for a warned address: the same shared
+    // builder, called with the same third argument its `refusalNotice` passes.
+    // Asserted rather than assumed, so that putting the paragraph back inside
+    // the sentence fails here as well as on the connector's own suite — that is
+    // the change that reintroduces the duplication, and it is made two packages
+    // away from this screen.
+    const sentence = saveRefusedNotice(probe, undefined, true) ?? "";
+    assert.equal(/Bridge/.test(sentence), false, "the refusal sentence swallowed the warning");
+    stubConnector(harness, {
+      unsupported: PROTON_WARNING,
+      ...refusedByProbe(probe, sentence),
+    });
+
+    const listed = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@proton.me",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    const list = await listed.text();
+    assert.match(list, /Bridge/, "the screen the lookup led to");
+
+    const refused = await postSetupForm(harness, "/mailbox", {
+      ...hiddenFields(list),
+      ...mailboxFields({ [ADDRESS_FIELD]: "anna@proton.me" }),
+      _action: "save",
+    });
+
+    assert.equal(refused.status, 400);
+    const html = await refused.text();
+    assert.equal(occurrences(html, /Proton Mail Bridge/), 1, "the paragraph is in two boxes");
+    assert.match(html, /did not answer/, "the report is still the report");
+    assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 1);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("an address corrected on the provider screen drops the warning about the old one", async () => {
+  // #191's other half. The provider screen's address box is editable, and the
+  // warning travels with the *form*: an operator who lands there with
+  // `anna@proton.me`, corrects it to `anna@fastmail.com` and picks a preset used
+  // to read Proton's Bridge paragraph over a Fastmail mailbox — and went on
+  // reading it through Test connection and a refused save, because the full
+  // form emits no lookup and nothing else ever re-asked.
+  //
+  // The sentence now carries the address it was derived for, and this hop drops
+  // it because the domains differ. No round trip and no table on this side.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { unsupported: PROTON_WARNING });
+
+    const listed = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@proton.me",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    const list = await listed.text();
+    assert.match(list, /Bridge/, "the provider list warned about the address typed at tier 1");
+
+    const corrected = await postSetupForm(harness, "/mailbox", {
+      ...hiddenFields(list),
+      [ADDRESS_FIELD]: "anna@fastmail.com",
+      [PROVIDER_FIELD]: "posteo",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "provider",
+    });
+
+    assert.equal(corrected.status, 200);
+    const html = await corrected.text();
+    assert.match(html, new RegExp(`name="${MAILBOX_FIELDS.imapHost}"`), "this is the full form");
+    assert.equal(/Bridge/.test(html), false, "a paragraph about the provider they left");
+    // And it is gone for good, not until the next press: nothing on the full
+    // form carries it any more, so Test connection cannot bring it back.
+    assert.equal(/_unsupported/.test(html), false, "the form is still carrying it onward");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("an address corrected the other way is not warned until the next lookup", async () => {
+  // The direction that stays open, pinned so that it is a decision rather than
+  // a surprise. Recognising `anna@proton.me` here would need the connector's
+  // domain table, and this package must not hold one (#180) — the wizard is
+  // *told* the sentence, at the lookup, and the provider screen's Continue is
+  // not a lookup. So an operator who lands on tier 2 with an unknown address
+  // and corrects it to a warned one reads no warning on the form; they are
+  // warned the moment the new address is looked up, which is the way back tier
+  // 2 carries a link to.
+  //
+  // Warning too little is what this direction can afford. Warning about the
+  // wrong provider is not: that paragraph is read as a fact about the mailbox
+  // on the screen, and it would be false.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { unsupported: PROTON_WARNING });
+
+    const listed = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    const list = await listed.text();
+
+    const corrected = await postSetupForm(harness, "/mailbox", {
+      ...hiddenFields(list),
+      [ADDRESS_FIELD]: "anna@proton.me",
+      [PROVIDER_FIELD]: "posteo",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "provider",
+    });
+
+    assert.equal(corrected.status, 200);
+    const html = await corrected.text();
+    assert.match(html, new RegExp(`name="${MAILBOX_FIELDS.imapHost}"`), "this is the full form");
+    assert.equal(/Bridge/.test(html), false, "the wizard grew a copy of the domain table");
+
+    // The lookup is what answers for the new address, and it does.
+    const relooked = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@proton.me",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    assert.match(await relooked.text(), /Bridge/, "the next lookup is where it is picked up");
   } finally {
     await harness.close();
   }

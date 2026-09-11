@@ -664,6 +664,37 @@ describe("the standing warning the cascade carries", () => {
     assert.equal(edited.unsupported, WARNING);
   });
 
+  it("drops a warning whose address lost its domain, in all three functions", () => {
+    // One rule, written three times because there are three doors: with no
+    // domain on the screen there is nothing the table could have recognised, so
+    // a sentence handed in about the previous address is not about what the
+    // operator is looking at. `stepFromLookup` and `stepFromProvider` said so
+    // from the start; `stepFromEdit` took the caller's value unconditionally
+    // and is the one this line was added for (#191).
+    const edited = stepFromEdit({
+      fields: submittedForm({ [MAILBOX_FIELDS.mailDefaultFrom]: "anna" }),
+      password: "hunter2",
+      unsupported: WARNING,
+    });
+    assert.equal(edited.unsupported, null);
+
+    assert.equal(
+      stepFromLookup({ email: "anna", password: "", found: null, unsupported: WARNING })
+        .unsupported,
+      null
+    );
+    assert.equal(
+      stepFromProvider({
+        email: "anna",
+        password: "",
+        chosen: "posteo",
+        presets: PRESETS,
+        unsupported: WARNING,
+      }).unsupported,
+      null
+    );
+  });
+
   it("is null when there is nothing to say, on every screen the cascade has", () => {
     // Including the address screen, which can never carry one — an address with
     // no domain in it matches no entry in the table — but which has the field

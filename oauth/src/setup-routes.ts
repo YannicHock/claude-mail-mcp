@@ -141,6 +141,7 @@ import {
   stepFromProvider,
   stringField,
   UNSUPPORTED_FIELD,
+  UNSUPPORTED_FOR_FIELD,
   withSharedPassword,
   type AutoconfigAnswer,
   type AutoconfigRequestBody,
@@ -375,15 +376,40 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
      *
      * A hidden field rather than a second lookup because the domain match is
      * the connector's (#180) and this package must not grow a copy of it, and
-     * because the lookup that produced the sentence costs a DNS cascade. The
-     * cost of carrying it is that it travels with the *form*, not with the
-     * address: an operator who edits the address box on a later screen carries
-     * the previous address's warning as far as the next lookup. It warns and
-     * never blocks, so the price of that is one sentence too many rather than a
-     * mailbox that cannot be saved.
+     * because the lookup that produced the sentence costs a DNS cascade.
+     *
+     * The cost of carrying is that the sentence travels with the *form* rather
+     * than with the address, and two of these screens have an address box the
+     * operator can edit. #191 is what that cost actually was: the comment here
+     * claimed it ran "as far as the next lookup", but tier 1 is the only screen
+     * that emits `_action=lookup`, so a Proton address corrected to a Fastmail
+     * one on the provider list carried the Bridge paragraph onto the full form
+     * and kept it through *Test connection* and a refused save. So the address
+     * the sentence was derived for is carried beside it and checked below.
+     *
+     * That closes one direction only, and the open one is deliberate: an
+     * address corrected the other way — `anna@example.com` to `anna@outlook.com`
+     * on the provider screen — is **not** warned, because recognising that
+     * would need the connector's table and this package must not hold one. It
+     * is warned at the next lookup, which is tier 1's Continue. Warning too
+     * little is the failure this direction can afford; a paragraph about the
+     * wrong provider is not, because it is read as a fact about the mailbox on
+     * the screen.
      */
     let carried: string | null = null;
 
+    /**
+     * The full form's warning, and the only place it is decided (#191).
+     *
+     * Not a spread at each render site as well. `sendStep` used to derive the
+     * same value a second time from `decided.unsupported` and spread it into
+     * the two `page` calls below, four lines from this default and with a
+     * comment contradicting it about which one was load-bearing. The two agreed
+     * on every reachable path, so one of them was dead; this is the one that
+     * survives, because it also covers the renders that happen before any step
+     * exists — an unreadable form, a connector with no signing key, and every
+     * `test`/`save` answer, none of which go through the cascade at all.
+     */
     const page = (status: number, data: Partial<MailboxPageData>): void => {
       sendPage(
         res,
@@ -420,6 +446,17 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     // The connector's own words, come back to us. Never recomputed here — see
     // `carried` above and #180's option B.
     carried = stringField(body[UNSUPPORTED_FIELD]) || null;
+    // …but only while it is still about the address on the screen. The domain
+    // comparison is the whole check: `domainOf` is string handling, not a table
+    // read, so this stays free of any knowledge of which providers are warned.
+    // An empty box on either side compares unequal and drops the sentence,
+    // which is the right way round — a form with no address on it has nothing
+    // for the paragraph to be about.
+    if (carried !== null) {
+      const warnedFor = domainOf(stringField(body[UNSUPPORTED_FOR_FIELD]).trim());
+      const submitted = domainOf(stringField(body[ADDRESS_FIELD]).trim());
+      if (warnedFor === "" || warnedFor !== submitted) carried = null;
+    }
 
     if (action === "skip") {
       // Someone evaluating the thing should not need mail credentials to hand,
@@ -464,6 +501,11 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       // has to say about this submission; the warning is what the connector
       // said about the address, and it is on the step because it stays true for
       // every screen the address survives on. Neither displaces the other.
+      //
+      // For the two cascade screens only. The full form's warning is `page`'s
+      // default and nothing else's (#191) — spreading this over it as well was
+      // a second mechanism for one slot, agreeing with the first on every
+      // reachable path and disagreeing with it in the comments.
       const warning = decided.unsupported === null ? {} : { warning: decided.unsupported };
 
       switch (decided.view) {
@@ -500,13 +542,12 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
             // nothing gets, and for the same reason: a screen offering nothing
             // is worse than the form the operator can always fill in.
             //
-            // The warning comes with it. This is the one path where a
-            // miss-that-still-warns could quietly become "found nothing, here
-            // is the manual form" and lose the sentence on the way, which is
-            // the shape #180 says to watch for.
+            // The warning comes with it, off `page`'s own default — this is the
+            // one path where a miss-that-still-warns could quietly become
+            // "found nothing, here is the manual form" and lose the sentence on
+            // the way, which is the shape #180 says to watch for.
             page(200, {
               values: carrying(emptyMailboxValues(decided.email), decided.password),
-              ...warning,
             });
             return;
           }
@@ -523,9 +564,12 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         }
 
         case "manual":
+          // The warning is `page`'s, from `carried`, which every path into this
+          // branch has just set — the lookup from the connector's answer, the
+          // other two from the submission, all of them the same value
+          // `decided.unsupported` holds.
           page(200, {
             values: decided.values,
-            ...warning,
             ...(opts.notice === undefined ? {} : { notice: opts.notice }),
           });
           return;

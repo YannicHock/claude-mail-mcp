@@ -290,3 +290,31 @@ test("Save anyway stores credentials the server would have refused", SKIP, async
     await close();
   }
 });
+
+test("a probe that works does not take the warning off the screen with it", SKIP, async () => {
+  // #191, and the half of it that needs servers which answer. The warning is a
+  // fact about the **address**, so *Test connection* keeps it whichever way the
+  // probe went — and a clean probe is the case that matters most, because that
+  // is the operator running Proton Mail Bridge, which is exactly who the Bridge
+  // sentence is written for: their servers answer, their mailbox works, and
+  // they are the one audience the sentence must reach.
+  //
+  // GreenMail stands in for Bridge's local IMAP and SMTP here, which is what
+  // Bridge is from this connector's side: a server on the machine that answers
+  // an ordinary password.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(url, "/settings/mailboxes/test", {
+      ...form({ "mail.defaultFrom": "anna@proton.me" }),
+      _stamp: await stampOf(accountsPath),
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /Bridge/, "a probe that worked carried the warning away with it");
+    assert.equal(/probe-row fail/.test(html), false, "both services answered");
+    assert.deepEqual(await storedAccounts(accountsPath), [], "Test connection stores nothing");
+  } finally {
+    await close();
+  }
+});

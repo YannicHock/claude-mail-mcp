@@ -43,9 +43,10 @@ Four categories:
 entry is in. **Preset** is `MAIL_PROVIDERS`: hosts, ports and TLS, offered as a
 choice on the provider screen. **Advice** is `PROVIDER_ADVICE`: what to say about
 a password, matched against the domain the operator's address ends in, and shown
-only at the moment it is relevant — a `credentialNote` when a server has just
-rejected the password (#148), an `unsupported` warning as soon as the address is
-looked up (#151).
+when it is relevant — a `credentialNote` when a server has just rejected the
+password (#148), and an `unsupported` warning from the moment the address is
+looked up onward, in its own box on every screen that address survives on, in
+the settings UI and in the setup wizard alike (#151, #186, #180).
 
 The two sets do not coincide, and neither one is a subset of the other. A
 provider whose customers use their own domain (mailcow, iRedMail, Migadu,
