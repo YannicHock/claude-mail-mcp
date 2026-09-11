@@ -2725,3 +2725,57 @@ test("an address corrected the other way is not warned until the next lookup", a
     await harness.close();
   }
 });
+
+test("a refusal at an address the wizard was never warned about still explains itself", async () => {
+  // The hole the open direction above used to leave on the one screen where it
+  // costs something. `saveRefusedNotice`'s third argument suppresses its own
+  // remedy on the assumption that the screen already carries the standing
+  // warning — true of the connector's HTML, and asserted to JSON callers too
+  // while shipping nothing they could show. So a save from this exact state
+  // produced a refusal whose only suggested action was to store credentials
+  // known not to work: no Bridge paragraph, no "check what failed above", not
+  // even the generic app-password clause. Strictly less than 0.7.0 said.
+  //
+  // The fix is not to teach this package the domain table. The connector sends
+  // the warning with the refusal now, and the wizard prefers it over whatever
+  // it was carrying.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    const probe: MailboxProbeReport = {
+      imap: { ok: false, message: "did not answer", credentialRejection: false },
+      smtp: { ok: false, message: "did not answer", credentialRejection: false },
+      caldav: null,
+    };
+    // Exactly what the connector sends for a warned address, built from the
+    // same shared function with the same third argument its `refusalNotice`
+    // passes — including the `unsupported` field, which is the half that was
+    // missing.
+    stubConnector(harness, {
+      createStatus: 400,
+      createBody: {
+        message: saveRefusedNotice(probe, undefined, true) ?? "",
+        errors: {},
+        probe,
+        unsupported: PROTON_WARNING,
+      },
+    });
+
+    const refused = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@proton.me",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "save",
+    });
+
+    assert.equal(refused.status, 400);
+    const html = await refused.text();
+    assert.match(html, /Bridge/, "the refusal has to explain itself, carried or not");
+    assert.equal(
+      occurrences(html, /Proton Mail Bridge/),
+      1,
+      "and say it once — the connector's message already assumes the box is there"
+    );
+  } finally {
+    await harness.close();
+  }
+});

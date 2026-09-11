@@ -803,10 +803,19 @@ function sendDraftRefusal(res: Response, json: boolean, refusal: DraftRefusal): 
     // is the same class of answer as a field the parser would not take, which
     // the wizard's `ConnectorAnswer` already reads as `rejected`. What makes it
     // actionable is the report, so it travels with the refusal.
+    // The warning goes with it. `notice` was written assuming the screen
+    // already carries the standing warning about this address, so it prints no
+    // remedy of its own — true of the HTML branch below, which re-derives it on
+    // the very next line, and a lie to a JSON caller unless we send the thing
+    // the assumption is about. Without this a wizard refusal at an address the
+    // wizard had not been told about could end with nothing but "Press Save
+    // anyway to store it without testing it".
+    const warning = unsupportedNoticeFor(raw(body, ADDRESS_FIELD));
     sendJson(res, status, {
       ...(notice === undefined ? {} : { message: notice }),
       errors,
       ...(probe === undefined ? {} : { probe: toWireReport(probe) }),
+      ...(warning === null ? {} : { unsupported: warning }),
     });
     return;
   }

@@ -376,6 +376,18 @@ export interface MailboxErrorAnswer {
    * was stored", never as "the probe passed".
    */
   probe?: MailboxProbeReport;
+  /**
+   * The standing warning about this *address*, when the table has one (#151).
+   *
+   * It travels with the refusal because `message` is written on the assumption
+   * that the screen already carries it — `saveRefusedNotice`'s third argument
+   * suppresses its own remedy so the paragraph is not printed twice. That
+   * assumption is the connector's to make about its own HTML, and it was
+   * asserted to JSON callers too while shipping nothing they could show. A
+   * caller that has this field renders it beside the message; one that does not
+   * gets a message which no longer claims a warning is present.
+   */
+  unsupported?: string;
 }
 
 // ---- Reading them ----------------------------------------------------------
@@ -675,7 +687,12 @@ export function parseErrorAnswer(value: unknown): MailboxErrorAnswer {
   // Unreadable is absent, not a failure: the refusal stands whatever shape the
   // report arrived in, and a caller with no report says so rather than guessing.
   const probe = parseProbeReport(body.probe);
-  return probe === null ? answer : { ...answer, probe };
+  const withProbe = probe === null ? answer : { ...answer, probe };
+  // An empty string is no warning, the way it is everywhere else on this wire.
+  const unsupported = asString(body.unsupported);
+  return unsupported === null || unsupported === ""
+    ? withProbe
+    : { ...withProbe, unsupported };
 }
 
 /**

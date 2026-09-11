@@ -863,6 +863,13 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       // objecting to a *field* — an id already taken, a port that is not a
       // port — with nothing wrong with the servers at all.
       const refusedByProbe = created.probe;
+      // The connector's own answer wins over what this screen was carrying. It
+      // holds the table; we hold a string somebody handed us one screen ago,
+      // and on the path #191 leaves open — an address corrected on a later
+      // screen — that string is null while the address is warned about. Taking
+      // the connector's value closes that on the screen where it matters,
+      // without this package learning a single domain.
+      const warned = created.unsupported ?? carried;
       log("error", "setup step 2: the connector refused to save the mailbox", {
         status: created.status,
         fields: Object.keys(created.errors).length,
@@ -871,6 +878,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       page(400, {
         values,
         errors: created.errors,
+        warning: warned ?? undefined,
         probe: refusedByProbe === undefined ? undefined : probeView(refusedByProbe),
         notice: {
           kind: "error",
@@ -887,7 +895,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
                 // back to computing it from the report keeps a connector that
                 // sent no message saying what it said before.
                 (created.message ??
-                saveRefusedNotice(refusedByProbe) ??
+                saveRefusedNotice(refusedByProbe, undefined, warned !== null) ??
                 "Nothing was saved. Fix what failed above and try again."),
         },
       });
@@ -1412,6 +1420,18 @@ type ConnectorAnswer<T> =
        * connector that predates it, which is what the fallback below is for.
        */
       message?: string;
+      /**
+       * The standing warning about the *address*, when the connector sent one.
+       *
+       * Preferred over the carried `_unsupported` field, because the connector
+       * holds the table and this package must not. It matters on the one path
+       * where the carried value is null but the address is warned about — an
+       * address corrected on a later screen, which #191 leaves open in that
+       * direction: `message` is written assuming the warning is on the screen,
+       * so without this the refusal would end with nothing but "Press Save
+       * anyway to store it without testing it".
+       */
+      unsupported?: string;
     }
   /** Any other status: not about the mailbox, about the request. */
   | { kind: "refused"; status: number }
@@ -1536,6 +1556,7 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
           ...(answer.message === undefined || answer.message === ""
             ? {}
             : { message: answer.message }),
+          ...(answer.unsupported === undefined ? {} : { unsupported: answer.unsupported }),
         };
       }
       return { kind: "refused", status: res.status };
