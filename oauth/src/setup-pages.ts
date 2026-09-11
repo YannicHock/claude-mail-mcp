@@ -31,6 +31,7 @@ import {
   PROVIDER_OTHER,
   SHARED_PASSWORD_FIELD,
   UNSUPPORTED_FIELD,
+  UNSUPPORTED_FOR_FIELD,
   type ProviderPreset,
 } from "../../shared/settings-api.js";
 import { stepNumber, SETUP_STEPS, type SetupStep } from "./setup-state.js";
@@ -509,12 +510,21 @@ function warningHtml(warning: string | undefined): string {
  * `src/providers.ts` and stays there (#180). So a screen that was told one
  * hands it on rather than asking again, which costs no round trip and keeps the
  * two UIs from disagreeing about which addresses are warned.
+ *
+ * The address travels with it (#191). A sentence about a provider is only true
+ * of an address at that provider, and two of these screens have an address box
+ * the operator can edit — so the reader in `setup-routes.ts` drops the sentence
+ * when the submitted address is at a different domain, and it can only do that
+ * if it is told which domain the sentence was about. The address handed in here
+ * is the one this screen is displaying, which is the address the warning was
+ * just decided for.
  */
-function carriedWarning(warning: string | undefined): string {
+function carriedWarning(warning: string | undefined, email: string): string {
   if (warning === undefined || warning === "") return "";
-  return `<input type="hidden" name="${escapeHtml(UNSUPPORTED_FIELD)}" value="${escapeHtml(
-    warning
-  )}">`;
+  return (
+    `<input type="hidden" name="${escapeHtml(UNSUPPORTED_FIELD)}" value="${escapeHtml(warning)}">` +
+    `<input type="hidden" name="${escapeHtml(UNSUPPORTED_FOR_FIELD)}" value="${escapeHtml(email)}">`
+  );
 }
 
 /**
@@ -566,7 +576,7 @@ export function renderMailboxStep(data: MailboxPageData): string {
   ${noticeHtml(data.notice)}
   ${probeSection(data.probe)}
   <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
-    ${carriedWarning(data.warning)}
+    ${carriedWarning(data.warning, values[MAILBOX_FIELDS.mailDefaultFrom] ?? "")}
     <input type="hidden" name="${MAILBOX_FIELDS.isDefault}" value="${CHECKBOX_ON}">
     ${textInput({
       id: "label",
@@ -1020,7 +1030,7 @@ ${caldavRow}
   <p class="muted">${escapeHtml(data.sourceLabel)}</p>
   <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
     ${hidden}
-    ${carriedWarning(data.warning)}
+    ${carriedWarning(data.warning, values[MAILBOX_FIELDS.mailDefaultFrom] ?? "")}
     ${suggestionPassword(data.password)}
     <div class="actions">
       <span class="buttons">
@@ -1132,7 +1142,7 @@ export function renderMailboxProviderStep(data: MailboxProviderPageData): string
   ${warningHtml(data.warning)}
   ${noticeHtml(data.notice)}
   <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
-    ${carriedWarning(data.warning)}
+    ${carriedWarning(data.warning, data.email)}
     <label for="mail_from">Email address</label>
     <input id="mail_from" name="${escapeHtml(ADDRESS_FIELD)}" type="email"
            value="${escapeHtml(data.email)}" required

@@ -569,7 +569,25 @@ export function caldavFailureNotice(report: MailboxProbeReport): string | null {
 
 export function saveRefusedNotice(
   report: MailboxProbeReport,
-  credentialNote?: string
+  credentialNote?: string,
+  /**
+   * The screen already carries the standing warning about this address in its
+   * own box, so this sentence prints no remedy of its own (#191).
+   *
+   * The third state of the same rule the note is the second of: the generic
+   * "some providers want an app password" clause is the weakest thing that can
+   * be said, and both the others displace it rather than sitting beside it.
+   * Until #191 the connector passed the `unsupported` sentence in as the note,
+   * which put a 60-word paragraph inside the refusal sentence — and once the
+   * warning has a box of its own on every screen, that is the same paragraph
+   * twice, one above the other. Dropping it without this flag would hand an
+   * `@outlook.com` refusal back the generic app-password clause and send its
+   * operator hunting for a passcode Microsoft does not issue, which is #184.
+   *
+   * Deliberately not derived from the report: no report says anything about an
+   * address, and this function has no table to ask.
+   */
+  addressWarned?: boolean
 ): string | null {
   const blocked = blockedServices(report);
   if (blocked.length === 0) return null;
@@ -592,6 +610,11 @@ export function saveRefusedNotice(
   // at all, so its refusal is connectivity, and gating here swallowed the one
   // entry that explains it.
   const targeted = credentialNote !== undefined && credentialNote !== "";
+  // The warning box says what to do and says it in stronger terms, so this
+  // sentence stops at the report and the escape hatch. A note still wins over
+  // it: a caller that has both has recognised the domain twice over and the
+  // note is the more specific of the two.
+  const deferred = !targeted && addressWarned === true;
   const remedy = targeted
     ? credentialNote
     : rejected
@@ -604,6 +627,10 @@ export function saveRefusedNotice(
   const tail = targeted
     ? " Or press Save anyway to store it without testing it."
     : ", or press Save anyway to store it without testing it.";
+  if (deferred) {
+    return `${clauses.join(", and ")}, so nothing was saved. Press Save anyway to store it ` +
+      "without testing it.";
+  }
   return `${clauses.join(", and ")}, so nothing was saved. ${remedy}${tail}`;
 }
 
@@ -1067,6 +1094,28 @@ export const PROVIDER_FIELD = "provider";
  */
 export const UNSUPPORTED_FIELD = "_unsupported";
 
+/**
+ * The address {@link UNSUPPORTED_FIELD} was derived for, carried beside it.
+ *
+ * A carried sentence travels with the *form*, not with the address, and two of
+ * the wizard's screens have an address box the operator can edit — so without
+ * this field an operator who lands on the provider list with `anna@proton.me`,
+ * corrects the box to `anna@fastmail.com` and picks a preset reads Proton's
+ * Bridge paragraph over a Fastmail mailbox, and goes on reading it through
+ * *Test connection* and a refused save, because the full form emits no lookup.
+ *
+ * So the sentence carries the address it is about, and the reader of the
+ * submission drops it when the submitted address is at a different domain. That
+ * needs no round trip and no copy of the domain set (#180). It closes the false
+ * positive only: an address corrected the *other* way — unwarned to warned — is
+ * not warned until the next lookup, because nothing on this side can recognise
+ * a domain. See the reader in `oauth/src/setup-routes.ts`.
+ *
+ * Not one of {@link MAILBOX_FIELDS}, for the same reason as the sentence: it is
+ * bookkeeping between two screens and never reaches a draft.
+ */
+export const UNSUPPORTED_FOR_FIELD = "_unsupported_for";
+
 /** What `Other` submits: no preset, straight to the full form. */
 export const PROVIDER_OTHER = "other";
 
@@ -1477,11 +1526,16 @@ export function stepFromEdit(input: {
   unsupported?: string | null;
 }): MailboxSetupStep {
   const values = formValues(draftFromFields(input.fields));
+  const email = values[MAILBOX_FIELDS.mailDefaultFrom] ?? "";
   return {
     view: "manual",
-    email: values[MAILBOX_FIELDS.mailDefaultFrom] ?? "",
+    email,
     values: carrying({ ...(input.defaults ?? {}), ...values }, input.password),
     preset: null,
-    unsupported: input.unsupported ?? null,
+    // The same rule the other two state: with no domain on the screen there is
+    // nothing the table could have recognised, so whatever was handed in is not
+    // about what the operator is looking at. Written here as well because one
+    // rule omitted from one of three functions is the shape a drift takes.
+    unsupported: domainOf(email) === "" ? null : (input.unsupported ?? null),
   };
 }

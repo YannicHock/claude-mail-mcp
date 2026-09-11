@@ -266,4 +266,30 @@ describe("saveRefusedNotice takes the note in place of its generic sentence", ()
   it("is still null when the report is not a refusal at all", () => {
     assert.equal(saveRefusedNotice(report({ ok: true }), NOTE), null);
   });
+
+  it("stands aside for a warning the screen is already showing", () => {
+    // #191. The `unsupported` sentence used to be passed in here as if it were
+    // a note, which put a 60-word paragraph inside this sentence — and once the
+    // form has a warning box of its own, that is the same paragraph twice, one
+    // above the other. So the caller says the screen is already showing it and
+    // this sentence prints no remedy: what failed, and the way past the gate.
+    const notice = saveRefusedNotice(report(REJECTED), undefined, true) ?? "";
+    assert.match(notice, /IMAP rejected these credentials, so nothing was saved\./);
+    assert.match(notice, /Save anyway/, "the way past the gate must survive it");
+    // Not the generic clause either, and that is the whole point of the flag
+    // rather than simply dropping the paragraph: the address it is about is one
+    // no password can reach, so "find an app password" is a wrong instruction
+    // and the reason #184 put the paragraph here in the first place.
+    assert.equal(GENERIC.test(notice), false, notice);
+    assert.doesNotMatch(notice, /Check what failed above/, notice);
+  });
+
+  it("still prefers a note over standing aside, when the caller has both", () => {
+    const notice = saveRefusedNotice(report(REJECTED), NOTE, true) ?? "";
+    assert.ok(notice.includes(NOTE), notice);
+  });
+
+  it("says the generic sentence when nothing is warned, flag or no flag", () => {
+    assert.match(saveRefusedNotice(report(REJECTED), undefined, false) ?? "", GENERIC);
+  });
 });

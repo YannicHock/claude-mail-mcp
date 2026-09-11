@@ -547,7 +547,7 @@ ${
   const body = `<h1>${isNew ? "Add mailbox" : `Edit mailbox — ${escapeHtml(account.label)}`}</h1>
 <p class="sub">${escapeHtml(sub)}</p>
 ${noticeHtml(opts.warning)}
-${opts.notice === undefined ? "" : `<div class="notice">${escapeHtml(opts.notice)}</div>`}
+${noticeHtml(opts.notice)}
 ${reservedNotice}
 ${probeSectionHtml(opts.probe, panelState)}
 <form method="post" action="${escapeHtml(actionPath)}" autocomplete="off">
@@ -757,8 +757,20 @@ function otherWaysIn(current: AddMailboxView): string {
   return `<p class="ways">${links}</p>`;
 }
 
+/**
+ * A notice box, or nothing at all.
+ *
+ * Empty is nothing, not an empty box. `undefined` was the only absent value
+ * worth guarding while this rendered only `notice`, which every caller either
+ * sets or omits. The standing warning (#186) goes through it too now, and that
+ * one is a sentence out of a table — `PROVIDER_ADVICE` spells "nothing to say"
+ * as an absent field and `ProviderPreset.note` spells it as `""`, so both have
+ * to mean it here. The wizard's twin in `oauth/src/setup-pages.ts` has guarded
+ * both since it was written.
+ */
 function noticeHtml(notice: string | undefined): string {
-  return notice === undefined ? "" : `<div class="notice">${escapeHtml(notice)}</div>`;
+  if (notice === undefined || notice === "") return "";
+  return `<div class="notice">${escapeHtml(notice)}</div>`;
 }
 
 export interface MailboxAddressData {

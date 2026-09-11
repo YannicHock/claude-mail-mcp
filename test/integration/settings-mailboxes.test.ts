@@ -2356,54 +2356,181 @@ function hiddenFields(html: string): Record<string, string> {
   return fields;
 }
 
-test("a warned address still carries its warning on the screen after the lookup", async () => {
-  // The journey #186 is about, walked one press at a time. Which screen the
-  // lookup leads to is the one thing here that is not this suite's to decide —
-  // outlook.com publishes autoconfig, so a connector with a working DNS
-  // resolver reaches the suggestion screen and one without reaches the provider
-  // list — so this follows whichever came back and presses the button that is
-  // on it. Both continuations end on the full form, and the warning has to be
-  // on it either way.
+test("a warned address that reaches the suggestion screen keeps the warning through Edit these", async () => {
+  // #186's first named journey. Driven from the `edit` hop rather than through
+  // the lookup, which is the correction #191 makes to this case: it used to
+  // branch on `firstHtml.includes('name="provider"')` — on what DNS answered —
+  // so a resolver that reached the suggestion screen exercised this journey and
+  // one that did not exercised the other, and whichever environment CI ran in,
+  // one of the two was never tested at all. `Edit these` is a form action, not
+  // a lookup: it is reachable on its own terms and it is the press #186 names.
+  //
+  // The body is what the suggestion screen submits: the settings it is showing,
+  // plus the address, minus every password. Nothing here is carried — this UI
+  // re-derives the warning from its own table on every screen, which is the
+  // difference between it and the wizard.
   const { url, accountsPath, close } = await startConnector();
   const before = await stamp(accountsPath);
   try {
-    const first = await post(url, "/settings/mailboxes/new", {
-      _action: "lookup",
-      "mail.defaultFrom": "anna@outlook.com",
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "edit",
+      ...validForm({ "mail.defaultFrom": "anna@outlook.com" }),
+      "imap.pass": "",
+      "smtp.pass": "",
       password: "hunter2",
     });
-    assert.equal(first.status, 200);
-    const firstHtml = await first.text();
-    assert.match(firstHtml, /no password will connect/, "the screen the lookup led to");
 
-    const carried = hiddenFields(firstHtml);
-    const onProviderList = firstHtml.includes('name="provider"');
-    const second = await post(
-      url,
-      "/settings/mailboxes/new",
-      onProviderList
-        ? {
-            _action: "provider",
-            "mail.defaultFrom": "anna@outlook.com",
-            provider: "gmail",
-            password: "hunter2",
-          }
-        : { ...carried, _action: "edit" }
-    );
-
-    assert.equal(second.status, 200);
-    const secondHtml = await second.text();
-    // The full form, one press further on, still saying what it said.
-    assert.match(secondHtml, /name="imap\.host"/, "this is the full form");
-    assert.match(secondHtml, /no password will connect/, "the warning did not survive Edit these");
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /name="imap\.host"/, "this is the full form");
+    assert.match(html, /no password will connect/, "the warning did not survive Edit these");
     // And the screen's own sentence is still there beside it: the two do not
     // share a slot any more, so neither displaces the other.
-    assert.match(
-      secondHtml,
-      onProviderList ? /settings have been filled in/ : /Nothing has been saved/,
-      "the screen's own notice was displaced by the warning"
-    );
+    assert.match(html, /Nothing has been saved/, "the screen's own notice was displaced");
     assert.equal(await stamp(accountsPath), before, "nothing was written on the way");
+  } finally {
+    await close();
+  }
+});
+
+test("a warned address that reaches the provider list keeps the warning through a preset", async () => {
+  // #186's other named journey, on the same terms: the `provider` hop, driven
+  // by pressing Continue on the provider list. outlook.com rather than Proton,
+  // so that the two cases here are the two addresses the milestone names and
+  // neither depends on a resolver.
+  const { url, close } = await startConnector();
+  try {
+    const res = await post(url, "/settings/mailboxes/new", {
+      _action: "provider",
+      "mail.defaultFrom": "anna@outlook.com",
+      provider: "gmail",
+      password: "hunter2",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /name="imap\.host"/, "this is the full form");
+    assert.match(html, /no password will connect/, "the warning did not survive the provider list");
+    assert.match(html, /settings have been filled in/, "the screen's own notice was displaced");
+  } finally {
+    await close();
+  }
+});
+
+// ---- #191: the slot is filled on every screen, not only in the cascade ------
+//
+// The cascade's four screens were the journey #186 tested. These are the press
+// after it: *Test connection* and a refused save re-render the same form for
+// the same address through routes the cascade never touches, and those passed
+// no warning at all — the sentence reached them, when it reached them, through
+// the notice slot #186 exists to stop it using.
+
+/** How many times a sentence is on the page. One box, or two, or none. */
+function occurrences(html: string, needle: RegExp): number {
+  return html.match(new RegExp(needle.source, "g"))?.length ?? 0;
+}
+
+test("Test connection on a warned address keeps the warning, whatever the probe found", async () => {
+  // The press one past #186's journey. The probe fails here, which is the case
+  // that used to move the sentence out of the warning box and into the screen's
+  // own notice — the displacement #186 was filed about, alive on a route #186
+  // did not name. The success half of this needs servers that answer and is in
+  // settings-save-probe.test.ts, against GreenMail.
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes/test",
+      await withStampProbed(
+        accountsPath,
+        formAgainst(imap.port, { "mail.defaultFrom": "anna@outlook.com" })
+      )
+    );
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /no password will connect/, "the warning did not survive Test connection");
+    assert.equal(occurrences(html, /no password will connect/), 1, "said once, in one box");
+    // The report is still the report: the warning did not take its place either.
+    assert.match(html, /IMAP/, "the probe panel is still on the screen");
+    assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("Test connection warns about an unservable provider that never answered", async () => {
+  // #189, on this route. `unsupported` holds however the probe failed: Proton
+  // answers no IMAP from the internet at all, so nothing here is a credential
+  // rejection, and a warning gated behind one would say nothing on the single
+  // journey the Bridge sentence is written for. The slot is filled from the
+  // address and from nothing else — not from the report, and not from whether
+  // any server complained about a password.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes/test",
+      await withStampProbed(accountsPath, formAgainst(1, { "mail.defaultFrom": "anna@proton.me" }))
+    );
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /probe-row fail/, "the report is still the report");
+    assert.equal(/rejected/.test(html), false, "nothing here complained about a password");
+    assert.match(html, /Bridge/, "a warning gated behind a credential rejection is #189 again");
+  } finally {
+    await close();
+  }
+});
+
+test("a refused save says the warning once, in its own box, beside the report", async () => {
+  // Both halves of #191's first finding, on the refusal screen. The sentence
+  // used to arrive as the refusal's own notice, *substituted* for the remedy —
+  // so giving the form a warning slot without changing that printed the same
+  // 60-word paragraph twice, one box above the other, which is what the wizard
+  // was doing. It is said once; the report still names what failed; and the
+  // generic app-password clause stays gone, because the paragraph above it says
+  // no password will work at all (#184).
+  const imap = await startRejectingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await post(
+      url,
+      "/settings/mailboxes",
+      await withStampProbed(
+        accountsPath,
+        formAgainst(imap.port, { "mail.defaultFrom": "anna@outlook.com" })
+      )
+    );
+
+    assert.equal(res.status, 400);
+    const html = await res.text();
+    assert.equal(occurrences(html, /no password will connect/), 1, "the paragraph is not doubled");
+    assert.match(html, /IMAP rejected these credentials/, "the report is still the report");
+    assert.match(html, /Save anyway/, "the escape hatch is still offered");
+    assert.equal(GENERIC_NOTE.test(html), false, "a passcode Microsoft does not issue");
+    assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("the edit form warns about the address it already stores", async () => {
+  // The last screen with no slot filled: an operator who comes back to change
+  // something about a Proton mailbox reads the Bridge sentence on the screen
+  // they are changing it on. No submission behind this one — the address is the
+  // stored one, which is what the form is showing.
+  const account = makeAccount({ id: "work" });
+  account.mail.defaultFrom = "anna@proton.me";
+  const { url, close } = await startConnector([account]);
+  try {
+    const res = await get(url, "/settings/mailboxes/work", mint("GET", "/settings/mailboxes/work"));
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /Bridge/);
   } finally {
     await close();
   }

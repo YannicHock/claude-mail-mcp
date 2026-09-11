@@ -128,6 +128,8 @@ import {
   stepFromLookup,
   stringField,
   stepFromProvider,
+  UNSUPPORTED_FIELD,
+  UNSUPPORTED_FOR_FIELD,
   withSharedPassword,
   type AutoconfigAnswer,
   type MailboxCreatedAnswer,
@@ -218,6 +220,13 @@ function sanitize(body: FormBody): Record<string, string> {
     // Echoing it back into a re-rendered form would make the next submission
     // an override the operator did not press anything for.
     if (key === SAVE_ANYWAY_FIELD) continue;
+    // The wizard's carried warning and the address it is about (#180, #191).
+    // This connector's own screens emit neither — it re-derives the sentence
+    // from the table on every render — so nothing reaches here carrying them
+    // today. Stripped anyway, beside the other bookkeeping names: the cost is
+    // one line, and the alternative is a form that quietly echoes a sentence
+    // back to itself the day this UI grows a carry of its own.
+    if (key === UNSUPPORTED_FIELD || key === UNSUPPORTED_FOR_FIELD) continue;
     if (PASSWORD_FIELDS.has(key)) continue;
     if (typeof value === "string") values[key] = value;
   }
@@ -424,24 +433,25 @@ function toWireReport(report: ProbeReport): MailboxProbeReport {
  * never answered has said nothing about which password it wanted, which is the
  * distinction `shared/credential-failure.ts` exists to draw (#148, #146).
  *
- * `unsupported` comes first, and that ordering is the whole of #184's second
- * half. An entry that carries one says no password this connector can send will
- * ever be accepted; an entry that carries a `credentialNote` says which password
- * to go and find. Where the table has both kinds of knowledge about an address
- * it only ever has the stronger one — `microsoft` and `proton` carry
- * `unsupported` and deliberately carry no note — so without this line an
- * `@outlook.com` refusal fell through to the generic app-password sentence and
- * sent its operator hunting for a passcode Microsoft does not issue.
+ * This used to answer for `unsupported` as well, and #191 is why it no longer
+ * does. The two are different kinds of sentence and they now have a slot each
+ * on every screen: the warning is a fact about the **address** and goes to
+ * {@link addressWarning}, which asks the table unconditionally, on every render
+ * of the full form. Returning it from here as if it were a note put it in the
+ * screen's own `notice` instead — so *Test connection* on an `@outlook.com`
+ * mailbox displaced whatever that screen had to say when the probe failed, and
+ * dropped the sentence altogether when it succeeded.
+ *
+ * Note the gate it left behind: this function's one remaining half is gated on
+ * `rejected`, and that gate is right for a note about a password. It must never
+ * grow back over `unsupported`, which holds however the probe failed — Proton
+ * answers no IMAP from the internet at all, so its failure is connectivity, and
+ * a rejection-only gate hid the one entry that explains it (#189).
  */
 function rejectionNoteFor(email: string, rejected: boolean): string | null {
-  // The two halves are gated differently, and that is the correction #184's
-  // first attempt got wrong. An `unsupported` entry is a fact about the
-  // *address* — it holds however the probe failed, and Proton is the reason it
-  // has to: Proton answers no IMAP from the internet, so its failure is
-  // connectivity and a rejection-only gate hid the one note that explains it.
   // A `credentialNote` is about a password, so it needs a server to have
   // actually complained about one.
-  return unsupportedNoticeFor(email) ?? (rejected ? credentialNoteFor(email) : null);
+  return rejected ? credentialNoteFor(email) : null;
 }
 
 /**
@@ -452,18 +462,48 @@ function rejectionNoteFor(email: string, rejected: boolean): string | null {
  * rather than printing both — see its own comment. Three ways to get the
  * untargeted sentence back, all of them deliberate: the failure was
  * connectivity rather than credentials, the domain is not in the advice table,
- * or its entry carries neither an `unsupported` warning nor a note.
+ * or its entry carries no note.
+ *
+ * The third argument is the other half of #191. The warning about the address
+ * is in its own box on this screen now, so putting it in here too would print
+ * the same paragraph twice — and simply dropping it would hand an
+ * `@outlook.com` refusal back the generic app-password clause that #184
+ * removed. So the warning displaces that clause without being repeated: the
+ * report and the *Save anyway* escape stand alone, and the remedy is the
+ * paragraph above them.
  */
 function refusalNotice(wire: MailboxProbeReport, email: string): string {
   const note = probeRefusesSave(wire)
     ? rejectionNoteFor(email, credentialRejectionRefusesSave(wire))
     : null;
-  return saveRefusedNotice(wire, note ?? undefined) ?? "";
+  return saveRefusedNotice(wire, note ?? undefined, unsupportedNoticeFor(email) !== null) ?? "";
+}
+
+/**
+ * The standing warning about an address, in the slot the form keeps for it.
+ *
+ * Asked of the table on every render of the full form, and asked of nothing
+ * else: not of the probe, not of whether anything was refused. That is the
+ * whole of #186 — the sentence is true of the address, so it is true on the
+ * screen after *Test connection* whichever way the probe went, and on the
+ * screen after a refused save. Absent rather than empty, so a page never paints
+ * a box with nothing in it.
+ *
+ * The connector re-derives rather than carrying, because `PROVIDER_ADVICE` is
+ * in this package and the lookup is a table read. The wizard cannot and carries
+ * the sentence instead (#180); that difference is stated in both places.
+ */
+function addressWarning(email: string): { warning?: string } {
+  const warning = unsupportedNoticeFor(email);
+  return warning === null ? {} : { warning };
 }
 
 /**
  * The same note on the routes that only test, which store nothing and so have
  * no refusal sentence for it to replace.
+ *
+ * The note only — the standing warning is {@link addressWarning}'s and comes in
+ * through the form's other slot, beside whatever this returns (#191).
  *
  * The scope is wider here than on a save, deliberately. A save is refused by
  * IMAP or SMTP alone, so that path asks {@link credentialRejectionRefusesSave};
@@ -781,6 +821,11 @@ function sendDraftRefusal(res: Response, json: boolean, refusal: DraftRefusal): 
       errors,
       ...(probe === undefined ? {} : { probe: toProbeView(probe) }),
       ...(notice === undefined ? {} : { notice }),
+      // The warning about the address, in the other slot (#191). Read off the
+      // submission, which is where the address on the screen this re-renders
+      // came from — and read here rather than at the five callers, because
+      // every one of them re-renders the same form for the same address.
+      ...addressWarning(raw(body, ADDRESS_FIELD)),
       // This is the one function that refuses a draft, so it is the one place
       // that says so. The form used to work it out from `notice` being set,
       // which stopped being true the moment the /test routes gained a notice
@@ -921,8 +966,11 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       case "address":
         // The only way back to tier 1 is an address that could not be read, so
         // this is a rejected submission rather than a fresh screen. Nothing is
-        // known about an address with no domain in it, which is why this screen
-        // is the one variant with no warning slot on it.
+        // known about an address with no domain in it, so `step.unsupported` is
+        // null here by construction — the step still carries the field, the way
+        // every variant does, so that no render site has to narrow the union.
+        // What has no slot is this screen's *renderer*, which asks for an
+        // address and nothing else and has nothing to say about one yet.
         sendHtml(
           res,
           400,
@@ -1076,6 +1124,10 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
 
     const view = viewOf(req);
     if (view === "manual") {
+      // No warning slot filled here and nothing missing: this is a GET with an
+      // empty form behind it, so there is no address yet to know anything
+      // about. The first submission from it goes through a route that asks
+      // {@link addressWarning}.
       sendHtml(res, 200, renderMailboxForm({ csrf: assertion.csrf, stamp, account: null }));
       return;
     }
@@ -1246,7 +1298,21 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     }
     const assertion = assertionOf(res);
     const stamp = await store.stamp();
-    sendHtml(res, 200, renderMailboxForm({ csrf: assertion.csrf, stamp, account }));
+    sendHtml(
+      res,
+      200,
+      renderMailboxForm({
+        csrf: assertion.csrf,
+        stamp,
+        account,
+        // The stored address rather than a submitted one — there is no
+        // submission here — and the same sentence the add cascade showed about
+        // it. An operator who comes back to a Proton mailbox to change
+        // something should read the Bridge paragraph on the screen they are
+        // changing it on (#191).
+        ...addressWarning(account.mail.defaultFrom),
+      })
+    );
   });
 
   router.post(
@@ -1389,6 +1455,13 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
           // operator to press Save next. See `withCarriedPasswords`.
           values: withCarriedPasswords(body, fields),
           probe: toProbeView(report),
+          // #191. The address is the one on this screen, so the sentence about
+          // it is too — whichever way the probe went. This is the press #186's
+          // fix stopped one short of: a probe that failed used to move the
+          // warning into the notice below and displace it, and a probe that
+          // succeeded dropped it, which is exactly the Proton-with-Bridge
+          // operator the sentence is written for.
+          ...addressWarning(raw(body, ADDRESS_FIELD)),
           // #148. Nothing was stored and nothing was refused, so there is no
           // sentence for the note to replace — it is the whole notice here, and
           // only when the server actually rejected the credentials.
@@ -1596,6 +1669,10 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         // blank and still means "unchanged".
         values: withCarriedPasswords(body, body),
         probe: toProbeView(report),
+        // #191, on the edit form's own Test connection: the submitted address,
+        // not the stored one, because the box above is editable and the
+        // sentence is about what is in it.
+        ...addressWarning(raw(body, ADDRESS_FIELD)),
         // #148, on the edit form's own Test connection.
         ...credentialAdvice(report, raw(body, ADDRESS_FIELD)),
       })
