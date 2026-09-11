@@ -2,7 +2,27 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.1] — 2026-09-11
+
+**A wrong password says so.** The release that opened this milestone failed on a Gmail
+mailbox: the account was stored despite a password the server would never accept, every
+later tool call answered `Command failed`, and the log said nothing at all. All three are
+fixed. A mailbox is tested before it is written, a rejection is told apart from a host
+that never answered, and the answer names which mailbox and what that provider actually
+wants — an app password for Gmail and iCloud, or, for Outlook.com and Proton, that no
+password this connector can send will ever work.
+
+**One behaviour change to know about before upgrading:** `POST /settings/mailboxes` and
+`POST /settings/mailboxes/:id` now probe before they write, so **a save that used to
+succeed can now be refused**. IMAP or SMTP rejecting the credentials refuses the write;
+CalDAV failing does not, because it fails for benign reasons far too often and is optional
+by design. A second button, *Save anyway*, stores without testing — never the default, and
+never reachable by pressing Enter.
+
+Underneath, the six modules that were mirrored by hand across the two packages now live
+once in `shared/`, compiled into both images. That is why both `Dockerfile`s now build
+from the repository root; an operator pulling images is unaffected.
+
 
 ### Added
 

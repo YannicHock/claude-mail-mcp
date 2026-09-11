@@ -39,7 +39,7 @@ import { createSettingsRouter } from "./settings-routes.js";
 export const SERVER_NAME = "claude-mail-mcp";
 
 /** MCP `serverInfo.version` reported to clients, and the `version` field of `/health`. */
-export const VERSION = "0.7.0";
+export const VERSION = "0.7.1";
 
 /**
  * Re-exported, not declared: shared/secrets.ts takes a logger as a parameter and
