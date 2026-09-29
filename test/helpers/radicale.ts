@@ -261,6 +261,32 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
   };
 }
 
+/**
+ * The file names of the objects Radicale's own `time-range` filter puts in
+ * `[start, end)` (UTC ISO instants): how the server itself — and so any
+ * client that asks it — places what the connector wrote. Radicale converts a
+ * TZID time to an instant with its own zone data, so a window an hour either
+ * side of where the event should be tells a right zone from a wrong one.
+ */
+export async function serverFindsIn(cal: RadicaleCalendar, start: string, end: string): Promise<string[]> {
+  const stamp = (iso: string): string => iso.replace(/[-:]/g, "").replace(/\.\d+/, "");
+  const body = `<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/></D:prop>
+  <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
+    <C:time-range start="${stamp(start)}" end="${stamp(end)}"/>
+  </C:comp-filter></C:comp-filter></C:filter>
+</C:calendar-query>`;
+  const res = await fetch(cal.calendarUrl, {
+    method: "REPORT",
+    headers: { authorization: cal.authHeader, depth: "1", "content-type": "application/xml; charset=utf-8" },
+    body,
+  });
+  if (res.status !== 207) throw new Error(`REPORT with a time-range answered ${res.status}`);
+  const text = await res.text();
+  return [...text.matchAll(/<(?:\w+:)?href>[^<]*\/([^/<]+)<\/(?:\w+:)?href>/g)].map((m) => decodeURIComponent(m[1])).sort();
+}
+
 /** Delete an object behind the connector's back, as a phone would. */
 export async function deleteBehindTheBack(cal: RadicaleCalendar, filename: string): Promise<void> {
   const res = await fetch(`${cal.calendarUrl}${filename}`, { method: "DELETE", headers: { authorization: cal.authHeader } });

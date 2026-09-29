@@ -30,6 +30,7 @@ import {
   getRawEvent,
   makeRadicaleCalendar,
   putRawEvent,
+  serverFindsIn,
   waitForRadicaleReady,
   type CalDavProxy,
   type RadicaleCalendar,
@@ -485,6 +486,117 @@ describe("update_event", SKIP, () => {
       })
     );
     assert.match(message, /single occurrence.*not supported yet/);
+  });
+});
+
+/** A single Berlin event on 2026-10-22, 09:00–10:00 CEST, with or without its VTIMEZONE. */
+function berlinEvent(uid: string, withVtimezone: boolean): string {
+  return ics(
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Other Client//EN",
+    ...(withVtimezone ? BERLIN_VTIMEZONE : []),
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    "DTSTAMP:20260901T080000Z",
+    "DTSTART;TZID=Europe/Berlin:20261022T090000",
+    "DTEND;TZID=Europe/Berlin:20261022T100000",
+    "SUMMARY:Planning",
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    "TRIGGER:-PT15M",
+    "DESCRIPTION:Reminder",
+    "END:VALARM",
+    "END:VEVENT",
+    "END:VCALENDAR"
+  );
+}
+
+describe("zones on write (#208, #209)", SKIP, () => {
+  for (const withVtimezone of [true, false]) {
+    it(`a Berlin event ${withVtimezone ? "with" : "without"} a VTIMEZONE, moved by update_event across the DST change, stays Berlin and expands on Radicale to the right instants`, async () => {
+      const { cal: own, client: mine } = await freshCalendar();
+      const uid = `berlin-move-${String(withVtimezone)}@example.com`;
+      const etag = await putRawEvent(own, "berlin.ics", berlinEvent(uid, withVtimezone));
+      // 09:00 on the 29th, after the clocks went back: 08:00Z, not 07:00Z.
+      await mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, start: "2026-10-29T09:00:00+01:00" });
+
+      const stored = (await getRawEvent(own, "berlin.ics")) ?? "";
+      assert.match(stored, /DTSTART;TZID=Europe\/Berlin:20261029T090000/);
+      assert.match(stored, /DTEND;TZID=Europe\/Berlin:20261029T100000/);
+      // Radicale normalises what it stores (R16) and gives an object with an
+      // IANA TZID a VTIMEZONE of its own, so on this server both cases are
+      // stored with one; that the connector adds none is the unit test's.
+      assert.match(stored, /BEGIN:VTIMEZONE/);
+      assert.match(stored, /BEGIN:VALARM/);
+
+      // Radicale places it at 08:00Z itself; at CEST it would be 07:00Z.
+      assert.deepEqual(await serverFindsIn(own, "2026-10-29T08:00:00Z", "2026-10-29T08:30:00Z"), ["berlin.ics"]);
+      assert.deepEqual(await serverFindsIn(own, "2026-10-29T06:30:00Z", "2026-10-29T08:00:00Z"), []);
+      const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+      assert.deepEqual(
+        events.map((e) => [e.start, e.end, e.timezone]),
+        [["2026-10-29T08:00:00.000Z", "2026-10-29T09:00:00.000Z", "Europe/Berlin"]]
+      );
+    });
+  }
+
+  it("a floating event moved by update_event stays floating", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "floating-move@example.com";
+    const etag = await putRawEvent(
+      own,
+      "floating.ics",
+      berlinEvent(uid, false).replaceAll(";TZID=Europe/Berlin", "")
+    );
+    await mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, start: "2026-10-29T15:00:00" });
+    const stored = (await getRawEvent(own, "floating.ics")) ?? "";
+    assert.match(stored, /DTSTART:20261029T150000\r?\n/);
+    assert.match(stored, /DTEND:20261029T160000\r?\n/);
+    const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(
+      events.map((e) => [e.start, e.timezone]),
+      [["2026-10-29T15:00:00", "floating"]]
+    );
+  });
+
+  it("create_event on a calendar with no zone of its own writes UTC, as before, and says so", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    // What tsdav hands back for Radicale, which sets no calendar-timezone (R13).
+    assert.deepEqual(
+      (await mine.listCalendars()).map((c) => c.timezone),
+      [""]
+    );
+    const created = await mine.createEvent({
+      calendarUrl: own.calendarUrl,
+      summary: "No zone",
+      start: "2026-10-01T09:00:00+02:00",
+      end: "2026-10-01T10:00:00+02:00",
+    });
+    assert.equal(created.timezone, "UTC");
+    const stored = (await getRawEvent(own, `${created.uid}.ics`)) ?? "";
+    assert.match(stored, /DTSTART:20261001T070000Z/);
+    assert.doesNotMatch(stored, /VTIMEZONE/);
+  });
+
+  it("create_event with a timezone writes it with a VTIMEZONE Radicale reads to the right instant", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const created = await mine.createEvent({
+      calendarUrl: own.calendarUrl,
+      summary: "In Jerusalem",
+      // Jerusalem is at +03:00 from Friday 2026-03-27: 10:00 on the 28th is 07:00Z.
+      start: "2026-03-28T10:00:00",
+      end: "2026-03-28T11:00:00",
+      timezone: "Asia/Jerusalem",
+    });
+    assert.equal(created.timezone, "Asia/Jerusalem");
+    const stored = (await getRawEvent(own, `${created.uid}.ics`)) ?? "";
+    assert.match(stored, /DTSTART;TZID=Asia\/Jerusalem:20260328T100000/);
+    assert.match(stored, /BEGIN:VTIMEZONE/);
+    const file = `${created.uid}.ics`;
+    assert.deepEqual(await serverFindsIn(own, "2026-03-28T07:00:00Z", "2026-03-28T07:30:00Z"), [file]);
+    // At the winter +02:00 it would be 08:00–09:00Z.
+    assert.deepEqual(await serverFindsIn(own, "2026-03-28T08:00:00Z", "2026-03-28T09:00:00Z"), []);
   });
 });
 

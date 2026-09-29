@@ -33,9 +33,15 @@
  * whose registry is process-wide (R6), and no VTIMEZONE is added: an object
  * that had none goes back the way the other client wrote it.
  *
- * The writing half — a VTIMEZONE generated from `Intl` for `create_event`'s
- * `timezone` (spec §2.5 A) — is added by the zones-on-write change (plan
- * Task 4a) beside this one.
+ * **The writing half** (plan Task 4a, #208, #209) keeps a time in the zone it
+ * was stored in: {@link writeZoneOf} says which zone a stored time is written
+ * back in, {@link readDateTime} reads a caller's time for it, and
+ * {@link timeIn} makes the value to write. A Berlin event moved stays
+ * `TZID=Europe/Berlin` local time, a UTC one stays UTC, a floating one stays
+ * floating. The one VTIMEZONE the connector ever authors is
+ * {@link vtimezoneFromIntl}'s, for `create_event`'s `timezone` (spec §2.5 A):
+ * generated from `Intl` transition by transition, so it is exact where the
+ * rejected package was not.
  */
 
 import ICAL from "ical.js";
@@ -161,6 +167,15 @@ export function zonedWallToInstant(
 
 /** Names `Intl` refused, so a TZID repeated on every instance costs one RangeError, not one each. */
 const notZones = new Set<string>();
+
+/**
+ * {@link zonedWallToInstant} with seconds: it works in whole minutes, because
+ * that is what a transition is aligned to, and a caller's `09:00:30` should
+ * still come back as `09:00:30`.
+ */
+function zonedWallToInstantWithSeconds(w: ZonedWall, tz: string): number {
+  return zonedWallToInstant(w.year, w.month, w.day, w.hour, w.minute, tz) + w.second * 1000;
+}
 
 /** True when `Intl` knows `name` as a zone. Offsets like `+01:00` are not zones here. */
 function isIanaZone(name: string): boolean {
@@ -316,4 +331,278 @@ export function zoneOf(prop: ICAL.Property): ZoneKind {
   if (tzid === undefined) return { kind: "floating" };
   if (zone?.component) return { kind: "vtimezone", tzid: String(tzid) };
   return { kind: "unresolved", tzid: String(tzid) };
+}
+
+// ---------------------------------------------------------------------------
+// The writing half (plan Task 4a): a time goes back in the zone it came from.
+// ---------------------------------------------------------------------------
+
+/**
+ * The zone a new DTSTART or DTEND is written in.
+ *
+ *   - `utc`: `…Z`, as every time this connector wrote before v0.7.4.
+ *   - `floating`: clock time with no zone (#209). Arithmetic on it is on the
+ *     clock: its "instant" is the clock time read as if it were UTC, the same
+ *     rule `list_events` sorts it by.
+ *   - `zoned`: local time with `TZID=tzid`, where `tzid` is written exactly as
+ *     the object stored it (`/mozilla.org/…/Europe/Berlin` stays that) and
+ *     `zone` is what does the arithmetic — the object's own VTIMEZONE, or an
+ *     {@link IntlTimezone} when it had none.
+ */
+export type WriteZone =
+  | { kind: "utc" }
+  | { kind: "floating" }
+  | { kind: "zoned"; tzid: string; zone: ICAL.Timezone };
+
+export const UTC_ZONE: WriteZone = { kind: "utc" };
+
+/**
+ * The zone a stored DTSTART or DTEND is written back in (spec §2.5, #208):
+ * its own. An `unresolved` TZID has no zone this connector can do arithmetic
+ * in; the caller decides whether it needs one. Meant for an object that has
+ * been through `parseCalendar` (src/ical-parse.ts).
+ */
+export function writeZoneOf(prop: ICAL.Property): WriteZone | { kind: "unresolved"; tzid: string } {
+  const kind = zoneOf(prop);
+  switch (kind.kind) {
+    case "utc":
+      return UTC_ZONE;
+    case "floating":
+      return { kind: "floating" };
+    case "unresolved":
+      return kind;
+    default: {
+      const time = prop.getFirstValue() as ICAL.Time;
+      return { kind: "zoned", tzid: String(prop.getParameter("tzid")), zone: time.zone as ICAL.Timezone };
+    }
+  }
+}
+
+/** True for an ISO date-time that says its offset: `Z`, `+02:00`, `-0500`. A date alone has none. */
+export function hasOffset(value: string): boolean {
+  return /T.*(?:Z|[+-]\d{2}(?::?\d{2})?)$/i.test(value.trim());
+}
+
+/** The clock time of an ISO date-time with no offset, or null for anything else. */
+function wallOfIso(value: string): ZonedWall | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?$/.exec(value.trim());
+  if (m === null) return null;
+  const [year, month, day, hour, minute, second] = m.slice(1).map((part) => Number(part ?? 0));
+  // The round trip catches a clock time that does not exist on any calendar:
+  // `2026-13-45T25:00` would otherwise roll over into a later one.
+  const back = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  if (
+    back.getUTCFullYear() !== year ||
+    back.getUTCMonth() !== month - 1 ||
+    back.getUTCDate() !== day ||
+    back.getUTCHours() !== hour ||
+    back.getUTCMinutes() !== minute
+  ) {
+    return null;
+  }
+  return { year, month, day, hour, minute, second };
+}
+
+/** The UTC fields of `ms`, as a wall time: what a floating time's "instant" reads back as. */
+function utcWall(ms: number): ZonedWall {
+  const d = new Date(ms);
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+    second: d.getUTCSeconds(),
+  };
+}
+
+/** The instant a wall time names in `zone`, by the zone's own arithmetic. */
+function wallToInstantIn(w: ZonedWall, zone: ICAL.Timezone): number {
+  if (zone instanceof IntlTimezone) return zonedWallToInstantWithSeconds(w, zone.iana);
+  return ICAL.Time.fromData({ ...w, isDate: false }, zone).toUnixTime() * 1000;
+}
+
+/**
+ * The wall time `ms` shows in `zone`.
+ *
+ * For an {@link IntlTimezone} that is `Intl`'s answer. A VTIMEZONE answers only
+ * the other question — the offset of a wall time — so the wall time is found
+ * the way {@link zonedWallToInstant} finds an instant: take the offsets in
+ * effect a day and a half either side, and keep the wall time that maps back
+ * to `ms`. ical.js's own conversion does it in two naive steps and lands on
+ * the wrong side of a transition near one.
+ */
+function wallIn(ms: number, zone: ICAL.Timezone): ZonedWall {
+  if (zone instanceof IntlTimezone) return instantToZonedWall(ms, zone.iana);
+  const offsets = [ms, ms - OFFSET_SEARCH_MS, ms + OFFSET_SEARCH_MS].map(
+    (probe) => zone.utcOffset(ICAL.Time.fromData({ ...utcWall(probe), isDate: false }, zone)) * 1000
+  );
+  for (const offset of offsets) {
+    const wall = utcWall(ms + offset);
+    if (wallToInstantIn(wall, zone) === ms) return wall;
+  }
+  // The second pass through an autumn overlap: no local time names it
+  // (RFC 5545 §3.3.5 reads the wall time as the first pass), so the nearest
+  // one does.
+  return utcWall(ms + offsets[0]);
+}
+
+/**
+ * The instant a caller's start or end names when it is written in `zone`, in
+ * epoch ms — for a floating zone, the clock time read as UTC. NaN when it is
+ * no ISO 8601 date-time.
+ *
+ * A time with an offset names its instant whatever the zone. One without is
+ * clock time in `zone` — so `2026-10-29T15:00:00` for a Berlin event is 15:00
+ * in Berlin, not in whatever zone this process runs in, which is how
+ * `Date.parse` would read it. The caller refuses an offset for a floating
+ * zone before it gets here: dropping it would move the event by it.
+ */
+export function readDateTime(value: string, zone: WriteZone): number {
+  if (hasOffset(value)) return Date.parse(value);
+  const wall = wallOfIso(value);
+  if (wall === null) return NaN;
+  if (zone.kind === "zoned") return wallToInstantIn(wall, zone.zone);
+  return Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
+}
+
+/**
+ * A stored time as {@link readDateTime} would have read it: the instant, or
+ * for a floating time its clock time read as UTC. `toJSDate` would read a
+ * floating time in the process's own zone.
+ */
+export function msOf(time: ICAL.Time): number {
+  if (isFloating(time)) {
+    return Date.UTC(time.year, time.month - 1, time.day, time.hour, time.minute, time.second);
+  }
+  return time.toUnixTime() * 1000;
+}
+
+/** The DATE-TIME to write for `ms` (as {@link readDateTime} returns it) in `zone`. */
+export function timeIn(ms: number, zone: WriteZone): ICAL.Time {
+  const whole = Math.floor(ms / 1000) * 1000;
+  if (zone.kind === "utc") return ICAL.Time.fromJSDate(new Date(whole), true);
+  if (zone.kind === "floating") return ICAL.Time.fromData({ ...utcWall(whole), isDate: false });
+  return ICAL.Time.fromData({ ...wallIn(whole, zone.zone), isDate: false }, zone.zone);
+}
+
+/**
+ * An IANA name in `Intl`'s canonical spelling (`europe/berlin` is
+ * `Europe/Berlin`), or null for anything that is not one. What
+ * `create_event`'s `timezone` accepts.
+ */
+export function canonicalZone(name: string): string | null {
+  if (!isIanaZone(name)) return null;
+  return formatterFor(name).resolvedOptions().timeZone;
+}
+
+/** True for the names that mean UTC itself, which is written as `…Z`, not as a TZID. */
+export function isUtcName(zone: string): boolean {
+  return /^(?:Etc\/)?(?:UTC|UCT|GMT|Universal|Zulu)$/i.test(zone);
+}
+
+/**
+ * The IANA zone a calendar's `calendar-timezone` names, or null, for
+ * `create_event`'s default (spec §2.5). RFC 4791 §5.2.2 makes the property a
+ * VCALENDAR holding one VTIMEZONE; tsdav hands it over as whatever text the
+ * server sent, and a server may send a bare id instead. Which one Nextcloud
+ * sends is acceptance point A7, so both are read here. Radicale sets none
+ * (R13), and tsdav then reports `""`.
+ *
+ * A zone that is no IANA name — a Windows name, with its VTIMEZONE — is null:
+ * the event is written in UTC, as every event was before v0.7.4.
+ */
+export function calendarZone(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (text === "") return null;
+  if (!/^BEGIN:/i.test(text)) {
+    const iana = resolveUnknownTzid(text);
+    return iana === null ? null : canonicalZone(iana);
+  }
+  try {
+    const vcal = new ICAL.Component(ICAL.parse(text));
+    const tzid = vcal.getFirstSubcomponent("vtimezone")?.getFirstPropertyValue("tzid");
+    if (typeof tzid !== "string") return null;
+    const iana = resolveUnknownTzid(tzid);
+    return iana === null ? null : canonicalZone(iana);
+  } catch {
+    return null;
+  }
+}
+
+/** `+0200`, `-0500`, `+0530`, with seconds only when a zone has them. */
+function formatOffset(ms: number): string {
+  const sign = ms < 0 ? "-" : "+";
+  const total = Math.abs(Math.round(ms / 1000));
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  const seconds = total % 60;
+  return `${sign}${pad(Math.floor(total / 3600))}${pad(Math.floor(total / 60) % 60)}${seconds === 0 ? "" : pad(seconds)}`;
+}
+
+/** `20261025T030000`: a local DATE-TIME, for an observance's DTSTART. */
+function formatLocal(w: ZonedWall): string {
+  const pad = (n: number, width = 2): string => String(n).padStart(width, "0");
+  return `${pad(w.year, 4)}${pad(w.month)}${pad(w.day)}T${pad(w.hour)}${pad(w.minute)}${pad(w.second)}`;
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * A VTIMEZONE for the IANA zone `tz` that is exact from `fromMs` to `toMs`,
+ * as iCalendar text (spec §2.5 A). `create_event` writes it for its `timezone`
+ * with the event's span plus a year either side; it makes no recurring
+ * events, so the span is short.
+ *
+ * One observance per transition, and none of them a rule: the offsets are
+ * `Intl`'s, found by a daily scan and a bisection to the second, so the block
+ * says exactly what the zone database says — Jerusalem's Friday before the
+ * last Sunday of March, Casablanca's Ramadan — where a published RRULE-based
+ * block was measured wrong (§0.1). The first observance is the offset in
+ * effect at `fromMs`. An observance is DAYLIGHT when its offset is above the
+ * lowest one in the span, STANDARD otherwise.
+ */
+export function vtimezoneFromIntl(tz: string, fromMs: number, toMs: number): string {
+  const start = Math.floor(fromMs / 1000) * 1000;
+  const changes: Array<{ at: number; from: number; to: number }> = [];
+  let before = utcOffsetMs(start, tz);
+  for (let lo = start; lo < toMs; lo += DAY_MS) {
+    const hi = Math.min(lo + DAY_MS, toMs);
+    const after = utcOffsetMs(hi, tz);
+    if (after === before) continue;
+    // The first second showing the new offset: lo still shows the old one.
+    let a = lo;
+    let b = hi;
+    while (b - a > 1000) {
+      const mid = a + Math.floor((b - a) / 2000) * 1000;
+      if (utcOffsetMs(mid, tz) === before) a = mid;
+      else b = mid;
+    }
+    changes.push({ at: b, from: before, to: utcOffsetMs(b, tz) });
+    before = utcOffsetMs(b, tz);
+    // Resume the scan from the transition, in case the day holds a second one.
+    lo = b - DAY_MS;
+  }
+
+  const first = utcOffsetMs(start, tz);
+  const lowest = Math.min(first, ...changes.map((c) => c.to));
+  const observance = (at: number, from: number, to: number): string[] => {
+    const kind = to > lowest ? "DAYLIGHT" : "STANDARD";
+    return [
+      `BEGIN:${kind}`,
+      // RFC 5545 §3.6.5: the onset as local time in the offset it replaces.
+      `DTSTART:${formatLocal(utcWall(at + from))}`,
+      `TZOFFSETFROM:${formatOffset(from)}`,
+      `TZOFFSETTO:${formatOffset(to)}`,
+      `END:${kind}`,
+    ];
+  };
+  const lines = [
+    "BEGIN:VTIMEZONE",
+    `TZID:${tz}`,
+    ...observance(start, first, first),
+    ...changes.flatMap((c) => observance(c.at, c.from, c.to)),
+    "END:VTIMEZONE",
+  ];
+  return `${lines.join("\r\n")}\r\n`;
 }

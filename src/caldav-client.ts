@@ -25,14 +25,25 @@ import ICAL from "ical.js";
 import { randomUUID } from "node:crypto";
 import {
   applyEventPatch,
+  calendarDate,
   changesSomething,
   describeStoredEvent,
-  icalTimeFor,
   mainSequence,
+  timedBound,
   touchesTime,
   type EventPatch,
 } from "./ical-edit.js";
 import { expandObject, instantOfReported, type CalendarEvent } from "./ical-expand.js";
+import {
+  calendarZone,
+  canonicalZone,
+  IntlTimezone,
+  isUtcName,
+  timeIn,
+  UTC_ZONE,
+  vtimezoneFromIntl,
+  type WriteZone,
+} from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 // createDAVClient returns a logged-in client whose type omits the login
@@ -71,10 +82,24 @@ export interface NewEventInput {
   summary: string;
   description?: string;
   location?: string;
-  start: string; // ISO 8601, with timezone offset
+  /** ISO 8601; with no offset, clock time in the zone the event is written in. */
+  start: string;
   end: string;
   allDay?: boolean;
   attendees?: string[];
+  /**
+   * The IANA zone to write the event in (spec 2026-09-29 §2.5). Omitted, it is
+   * the calendar's own zone when the server reports one, and UTC otherwise.
+   */
+  timezone?: string;
+}
+
+/** What `create_event` answers: where the event went, and the zone it was written in. */
+export interface CreatedEvent {
+  url: string;
+  uid: string;
+  /** The IANA zone, `"UTC"`, or `"floating"` for an all-day event — as `list_events` reports it. */
+  timezone: string;
 }
 
 /** Which event a write is aimed at, and the guards spec §4 puts on it. */
@@ -179,11 +204,28 @@ export class CalDavClient {
     return { events, skipped };
   }
 
-  async createEvent(input: NewEventInput): Promise<{ url: string; uid: string }> {
+  /**
+   * Write a new event. Its zone (spec 2026-09-29 §2.5) is `input.timezone`
+   * when given — refused, before the server is contacted, unless it is an
+   * IANA name — else the calendar's own `calendar-timezone`, so an event
+   * Claude creates behaves like one made in the server's web UI, else UTC as
+   * before v0.7.4. The answer says which zone it was.
+   */
+  async createEvent(input: NewEventInput): Promise<CreatedEvent> {
+    let zone: string | null = null;
+    if (input.timezone !== undefined) {
+      zone = canonicalZone(input.timezone);
+      if (zone === null) {
+        throw new ToolRefusal(
+          `"${input.timezone}" is not an IANA time zone. Pass a name like Europe/Berlin or America/New_York, or omit timezone to use the calendar's own. Nothing was created.`
+        );
+      }
+    }
     const calendar = await this.findCalendar(input.calendarUrl);
+    zone ??= calendarZone(calendar.timezone) ?? "UTC";
     const client = await this.ensureClient();
     const uid = `${randomUUID()}@claude-mail-mcp`;
-    const ics = buildIcs({ ...input, uid });
+    const ics = buildIcs({ ...input, uid }, zone);
     const filename = `${uid}.ics`;
     const res = await client.createCalendarObject({
       calendar,
@@ -192,7 +234,8 @@ export class CalDavClient {
     });
     assertWritten(res, "PUT");
     const base = calendar.url.endsWith("/") ? calendar.url : `${calendar.url}/`;
-    return { url: `${base}${filename}`, uid };
+    const timezone = input.allDay === true ? "floating" : isUtcName(zone) ? "UTC" : zone;
+    return { url: `${base}${filename}`, uid, timezone };
   }
 
   /**
@@ -519,19 +562,49 @@ export function assertWritten(res: Response, method: string): void {
   }
 }
 
-function buildIcs(input: NewEventInput & { uid: string }): string {
+/** How far either side of a new event its generated VTIMEZONE reaches (spec §2.5 A). */
+const VTIMEZONE_MARGIN_MS = 366 * 86_400_000;
+
+/**
+ * The object `create_event` writes, in the IANA zone `zone` (spec 2026-09-29
+ * §2.5): UTC (`…Z`, and no VTIMEZONE, as before v0.7.4) when `zone` is UTC,
+ * and otherwise `TZID=zone` local time with a VTIMEZONE {@link
+ * vtimezoneFromIntl} generates for the event's span and a year either side. A
+ * time given without an offset is clock time in `zone`. An all-day event is
+ * dates whatever the zone.
+ *
+ * Throws {@link ToolRefusal} for a start or end it cannot read.
+ */
+export function buildIcs(input: NewEventInput & { uid: string }, zone: string, now: Date = new Date()): string {
+  const nothingDone = "Nothing was created.";
   const cal = new ICAL.Component(["vcalendar", [], []]);
   cal.updatePropertyWithValue("prodid", "-//claude-mail-mcp//EN");
   cal.updatePropertyWithValue("version", "2.0");
 
   const vevent = new ICAL.Component("vevent");
   vevent.updatePropertyWithValue("uid", input.uid);
-  vevent.updatePropertyWithValue(
-    "dtstamp",
-    ICAL.Time.fromJSDate(new Date(), true)
-  );
-  vevent.updatePropertyWithValue("dtstart", icalTimeFor(input.start, input.allDay === true));
-  vevent.updatePropertyWithValue("dtend", icalTimeFor(input.end, input.allDay === true));
+  vevent.updatePropertyWithValue("dtstamp", ICAL.Time.fromJSDate(now, true));
+  if (input.allDay === true) {
+    vevent.updatePropertyWithValue("dtstart", ICAL.Time.fromDateString(calendarDate("start", input.start, nothingDone)));
+    vevent.updatePropertyWithValue("dtend", ICAL.Time.fromDateString(calendarDate("end", input.end, nothingDone)));
+  } else {
+    const target: WriteZone = isUtcName(zone)
+      ? UTC_ZONE
+      : { kind: "zoned", tzid: zone, zone: new IntlTimezone(zone, zone) };
+    const startMs = timedBound("start", input.start, target, nothingDone);
+    const endMs = timedBound("end", input.end, target, nothingDone);
+    for (const [name, ms] of [["dtstart", startMs], ["dtend", endMs]] as const) {
+      const prop = new ICAL.Property(name);
+      prop.setValue(timeIn(ms, target));
+      if (target.kind === "zoned") prop.setParameter("tzid", target.tzid);
+      vevent.addProperty(prop);
+    }
+    if (target.kind === "zoned") {
+      const from = Math.min(startMs, endMs) - VTIMEZONE_MARGIN_MS;
+      const to = Math.max(startMs, endMs) + VTIMEZONE_MARGIN_MS;
+      cal.addSubcomponent(new ICAL.Component(ICAL.parse(vtimezoneFromIntl(zone, from, to))));
+    }
+  }
   vevent.updatePropertyWithValue("summary", input.summary);
   if (input.description) {
     vevent.updatePropertyWithValue("description", input.description);

@@ -12,6 +12,13 @@
  * and clock time with no offset for a floating one, beside the event's
  * `timezone` (v0.7.4, spec 2026-09-29 §2.5).
  *
+ * A time written keeps a zone (v0.7.4, #208, #209): `update_event` writes a
+ * new time in the event's own zone — Berlin local time with its TZID, UTC,
+ * a date, or clock time for a floating event, which is refused a time with an
+ * offset — and `create_event` writes in its `timezone`, else the calendar's
+ * own zone, else UTC. A time given without an offset is clock time in that
+ * zone.
+ *
  * v0.7.4 (spec 2026-09-29 §2.2): `list_events` expands recurrence in the
  * connector, so an all-day series, a floating series or an invitation to one
  * instance no longer fails the whole calendar (R1–R3), and an object that
@@ -82,6 +89,14 @@ const DATE_OR_DATE_TIME =
   "an ISO 8601 date-time with offset, e.g. 2026-05-22T09:00:00+02:00, or YYYY-MM-DD when all_day";
 
 const dateOrDateTime = z.string().describe(`Start: ${DATE_OR_DATE_TIME}`);
+
+/**
+ * What a changed time needs besides {@link DATE_OR_DATE_TIME} (#209): a
+ * floating event is refused a time with an offset, so the model has to be
+ * told before it tries one.
+ */
+const IN_THE_EVENTS_ZONE =
+  "Written in the event's own time zone. For a floating event (timezone \"floating\" in list_events) give it without an offset, e.g. 2026-05-22T09:00:00";
 
 const accountSchema = z
   .string()
@@ -188,7 +203,7 @@ export function registerCalendarTools(
     "create_event",
     {
       description:
-        "Create a new calendar event. WRITE OPERATION. Use all_day=true for date-only events (start/end should then be YYYY-MM-DD; end is exclusive — for a one-day event set end to the day after).",
+        "Create a new calendar event. WRITE OPERATION. Use all_day=true for date-only events (start/end should then be YYYY-MM-DD; end is exclusive — for a one-day event set end to the day after). The event is written in `timezone`, or the calendar's own zone, or UTC; the answer's `timezone` says which.",
       inputSchema: {
         calendar_url: calendarUrlSchema,
         summary: z.string().min(1).describe("Event title"),
@@ -202,6 +217,13 @@ export function registerCalendarTools(
           .optional()
           .describe(
             "Email addresses of attendees. Attendees may or may not receive an invitation, depending on the calendar server. CalDAV itself does not mail invitations, and this connector does not send them."
+          ),
+        timezone: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "IANA time zone to write the event in, e.g. Europe/Berlin. Omit to use the calendar's own zone when the server reports one, and UTC otherwise. A start or end with no offset is clock time in this zone."
           ),
         account: accountSchema,
       },
@@ -218,6 +240,7 @@ export function registerCalendarTools(
           end: args.end,
           allDay: args.all_day,
           attendees: args.attendees,
+          timezone: args.timezone,
         })
       );
       return asJson({ success: true, ...result });
@@ -238,8 +261,10 @@ export function registerCalendarTools(
         location: z.string().optional().describe("New location; an empty string removes it"),
         start: dateOrDateTime
           .optional()
-          .describe(`New start: ${DATE_OR_DATE_TIME}. Alone, it moves the event and keeps its length.`),
-        end: dateOrDateTime.optional().describe(`New end: ${DATE_OR_DATE_TIME}; exclusive for an all-day event`),
+          .describe(`New start: ${DATE_OR_DATE_TIME}. Alone, it moves the event and keeps its length. ${IN_THE_EVENTS_ZONE}.`),
+        end: dateOrDateTime
+          .optional()
+          .describe(`New end: ${DATE_OR_DATE_TIME}; exclusive for an all-day event. ${IN_THE_EVENTS_ZONE}.`),
         all_day: z
           .boolean()
           .optional()
