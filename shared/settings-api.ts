@@ -348,7 +348,9 @@ export interface MailboxCreatedAnswer {
    * A 201 carrying a report means the mailbox was stored *and* something the
    * save does not gate on — CalDAV — has something to say about itself. Absent
    * when the operator asked for *Save anyway*, since then nothing was probed
-   * and there is nothing to state.
+   * and there is nothing to state. The setup wizard reads it and shows
+   * `caldavFailureNotice` on step 3, the sentence the connector's own form
+   * shows for the same save (#172).
    */
   probe?: MailboxProbeReport;
 }

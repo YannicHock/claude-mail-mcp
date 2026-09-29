@@ -53,6 +53,7 @@ import test from "node:test";
 import { ASSERTION_HEADER } from "../../src/assertion.js";
 import { verifyPassword } from "../../src/passwords.js";
 import { SESSION_COOKIE } from "../../src/session.js";
+import { SAVE_ANYWAY_ACTION } from "../../src/setup-pages.js";
 import {
   ADDRESS_FIELD,
   flattenDraft,
@@ -877,9 +878,40 @@ test("CalDAV alone failing does not stop a working mailbox being saved", async (
     assert.equal(res.status, 303);
     assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
     assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 1);
+
+    // ...and step 3 says so, once (#172). The settings form has always shown
+    // this sentence for the same outcome; the wizard received it on the 201
+    // and dropped it, so the same save told two UIs two different amounts.
+    const first = await (await getSetup(harness, "/connect")).text();
+    assert.ok(first.includes("The mailbox was saved. Its CalDAV server did not work: 404 Not Found."), first);
+    const again = await (await getSetup(harness, "/connect")).text();
+    assert.equal(again.includes("CalDAV server did not work"), false, "shown once, not on every visit");
   } finally {
     await harness.close();
   }
+});
+
+test("a 201 with no report, or one this build cannot read, still advances and says nothing", async () => {
+  // The status is the fact (#82): an unreadable body is still a stored account.
+  for (const createBody of [{ id: "main", stamp: STAMP_AFTER }, "not json at all"]) {
+    const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+    try {
+      await reachStep2(harness);
+      stubConnector(harness, { createBody });
+      const res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
+      assert.equal(res.status, 303);
+      const page = await (await getSetup(harness, "/connect")).text();
+      assert.equal(page.includes("CalDAV server did not work"), false);
+    } finally {
+      await harness.close();
+    }
+  }
+});
+
+test("the wizard's Save anyway button posts the wire contract's own field name", () => {
+  // Equal by derivation, not by coincidence: rename the wire field and the
+  // button must follow, or the wizard's escape hatch silently stops working.
+  assert.equal(SAVE_ANYWAY_ACTION, SAVE_ANYWAY_FIELD);
 });
 
 test("a saved mailbox reaches the connector with the credentials it expects", async () => {

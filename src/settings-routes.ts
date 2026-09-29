@@ -1403,10 +1403,10 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         // 201 and not the browser's 303: there is nowhere to send a caller that
         // is not a browser, and the two facts it wants are the id it now has
         // and where accounts.json got to. The status is what says "stored" —
-        // the setup wizard reads nothing else out of this body, and an answer
+        // the setup wizard reads only the report out of this body, and an answer
         // that never arrives is settled by asking for the stamp again. The
-        // report rides along so a caller that wants to say something about a
-        // CalDAV block that did not work can, without probing a second time.
+        // report rides along so the wizard can say what a CalDAV block that
+        // did not work means for this mailbox without probing a second time.
         sendJson(res, 201, {
           id: parsed.account.id,
           stamp: await store.stamp(),

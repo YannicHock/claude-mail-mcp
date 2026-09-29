@@ -29,6 +29,7 @@ import {
   MAILBOX_SECRET_FIELDS,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
+  SAVE_ANYWAY_FIELD,
   SHARED_PASSWORD_FIELD,
   UNSUPPORTED_FIELD,
   UNSUPPORTED_FOR_FIELD,
@@ -759,18 +760,20 @@ export interface StepTwoLinks {
  * way it does on the connector's form — one button submits one name/value pair.
  * `handleMailbox` translates this into `SAVE_ANYWAY_FIELD` on the request it
  * makes, which is where the two paths meet.
+ *
+ * The *value* is that field's name, by derivation rather than by coincidence
+ * (#172): the two were equal literals, so renaming the wire field would have
+ * left this one behind with nothing to say so.
  */
-export const SAVE_ANYWAY_ACTION = "save_anyway";
+export const SAVE_ANYWAY_ACTION: string = SAVE_ANYWAY_FIELD;
 
 /**
  * *Save anyway* — store the mailbox without probing it first (#147).
  *
  * Written after *Save and continue* and after *Test connection*, and painted
- * after both by `.buttons > button.save-anyway`. Only the *first* submit
- * button in the DOM is what a form submitted implicitly (Enter in a text box)
- * acts as, so Enter on this screen presses Save, which probes. This one takes
- * a deliberate click, which is the whole of #140's lesson applied before the
- * fact rather than after it.
+ * after both by `.buttons > button.save-anyway`. The DOM-order constraint and
+ * why it is the whole of #140's lesson are argued once, on the connector's
+ * `saveAnywayButton` in `src/settings-pages.ts`; this one obeys the same rule.
  *
  * The class is `secondary save-anyway`, not `secondary` alone. `.secondary`
  * carries the looks and `order: 1` together, and taking both put this button
@@ -778,10 +781,7 @@ export const SAVE_ANYWAY_ACTION = "save_anyway";
  * #173. An override should be the last thing the eye reaches, not the
  * next-to-last.
  *
- * It is on the screen from the start rather than appearing after a refusal: the
- * connector's probe budget is 25 seconds, and an operator who already knows
- * their server is in a maintenance window should not have to sit through it to
- * be shown the way past it.
+ * On the screen from the start, for the reason the connector's gives.
  */
 function saveAnywayButton(): string {
   return `<button type="submit" name="_action" value="${escapeHtml(SAVE_ANYWAY_ACTION)}"
