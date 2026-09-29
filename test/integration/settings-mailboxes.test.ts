@@ -16,14 +16,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
-import type { Server } from "node:http";
-import type { AddressInfo } from "node:net";
 
-import { AccountsStore, type Account } from "../../src/accounts.js";
-import { ClientPool } from "../../src/client-pool.js";
-import { createApp } from "../../src/app.js";
+import type { Account } from "../../src/accounts.js";
 import { ASSERTION_HEADER } from "../../src/settings-assertion.js";
 import { MAIL_PROVIDERS } from "../../src/providers.js";
 import {
@@ -40,136 +35,22 @@ import {
   type MailboxProbeReport,
 } from "../../shared/settings-api.js";
 import { startRejectingImapServer } from "../helpers/fake-imap.js";
-import { readStamp } from "../../src/accounts-writer.js";
-import { makeAccount, makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
+import {
+  AUTH_TOKEN,
+  CSRF,
+  get,
+  mint,
+  post,
+  SETTINGS_KEY,
+  startConnector,
+  stampOf,
+} from "../helpers/settings-connector.js";
+import { makeAccount } from "../helpers/fixtures.js";
 
-const AUTH_TOKEN = "settings-routes-test-token-please-do-not-reuse";
-const SETTINGS_KEY = "s".repeat(32);
 const OTHER_KEY = "z".repeat(32);
-const CSRF = "test-csrf-value";
-const SUB = "operator";
-const SID = "session-1";
-
-/**
- * The canonical spelling of this connector's `PUBLIC_URL` — what the OAuth layer
- * puts in every assertion's `iss`, because its own config canonicalises before
- * minting. The connector is configured with this by default; the two cases below
- * hand `startConnector` a different *spelling* of the same URL, which is the
- * whole of #110.
- */
-const PUBLIC_URL = "https://mail-mcp.example.invalid";
-
-interface Connector {
-  url: string;
-  accountsPath: string;
-  close(): Promise<void>;
-}
-
-async function startConnector(
-  accounts: Account[] = [],
-  publicUrlAsConfigured: string = PUBLIC_URL
-): Promise<Connector> {
-  const dir = await makeTmpDir();
-  const accountsPath = `${dir}/accounts.json`;
-  // Pre-seed accounts.json — empty by default: a fresh deployment that has been
-  // initialised but has no mailboxes yet, and (unlike an absent file) one a
-  // probe-only "test connection" submission can read back afterwards to prove it
-  // wrote nothing. A caller that needs mailboxes already on disk passes them in.
-  await writeFile(accountsPath, JSON.stringify({ version: 1, accounts }), "utf8");
-  const store = new AccountsStore(accountsPath);
-  await store.start();
-  const pool = new ClientPool(store);
-  const app = createApp({
-    store,
-    pool,
-    authToken: AUTH_TOKEN,
-    accountsFile: accountsPath,
-    settingsSigningKey: SETTINGS_KEY,
-    publicUrl: publicUrlAsConfigured,
-  });
-
-  const server = await new Promise<Server>((resolve, reject) => {
-    const s: Server = app.listen(0, "127.0.0.1", () => resolve(s));
-    s.on("error", reject);
-  });
-  const { port } = server.address() as AddressInfo;
-
-  return {
-    url: `http://127.0.0.1:${port}`,
-    accountsPath,
-    close: async () => {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      store.stop();
-      await pool.closeAll().catch(() => {});
-      await cleanupTmpDir(dir);
-    },
-  };
-}
-
-/** Mint an assertion the way the OAuth layer would, for `method`/`path`. */
-function mint(
-  method: string,
-  path: string,
-  key: string = SETTINGS_KEY,
-  overrides: Record<string, unknown> = {}
-): string {
-  const payload = {
-    v: 1,
-    iss: PUBLIC_URL,
-    aud: "mail-mcp-settings",
-    sub: SUB,
-    sid: SID,
-    csrf: CSRF,
-    htm: method.toUpperCase(),
-    htu: path,
-    exp: Math.floor(Date.now() / 1000) + 30,
-    ...overrides,
-  };
-  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  const mac = createHmac("sha256", Buffer.from(key, "utf8")).update(encoded).digest("base64url");
-  return `${encoded}.${mac}`;
-}
 
 function mintExpired(method: string, path: string): string {
   return mint(method, path, SETTINGS_KEY, { exp: Math.floor(Date.now() / 1000) - 30 });
-}
-
-async function get(url: string, path: string, assertion: string): Promise<Response> {
-  return fetch(`${url}${path}`, {
-    headers: {
-      authorization: `Bearer ${AUTH_TOKEN}`,
-      [ASSERTION_HEADER]: assertion,
-    },
-  });
-}
-
-async function post(
-  url: string,
-  path: string,
-  fields: Record<string, string>,
-  opts: { csrf?: string; assertion?: string } = {}
-): Promise<Response> {
-  const body = new URLSearchParams();
-  const csrf = opts.csrf ?? CSRF;
-  if (csrf !== "") body.set("_csrf", csrf);
-  for (const [key, value] of Object.entries(fields)) {
-    body.set(key, value);
-  }
-  const assertion = opts.assertion ?? mint("POST", path);
-  return fetch(`${url}${path}`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${AUTH_TOKEN}`,
-      [ASSERTION_HEADER]: assertion,
-      "content-type": "application/x-www-form-urlencoded",
-    },
-    body: body.toString(),
-    redirect: "manual",
-  });
-}
-
-async function stamp(accountsPath: string): Promise<string> {
-  return readStamp(accountsPath);
 }
 
 function validForm(overrides: Record<string, string> = {}): Record<string, string> {
@@ -244,7 +125,7 @@ async function withStamp(
   accountsPath: string,
   fields: Record<string, string>
 ): Promise<Record<string, string>> {
-  return { ...fields, _stamp: await stamp(accountsPath), [SAVE_ANYWAY_FIELD]: CHECKBOX_ON };
+  return { ...fields, _stamp: await stampOf(accountsPath), [SAVE_ANYWAY_FIELD]: CHECKBOX_ON };
 }
 
 /** The same, for a case that wants the probe to run. */
@@ -252,7 +133,7 @@ async function withStampProbed(
   accountsPath: string,
   fields: Record<string, string>
 ): Promise<Record<string, string>> {
-  return { ...fields, _stamp: await stamp(accountsPath) };
+  return { ...fields, _stamp: await stampOf(accountsPath) };
 }
 
 test("a settings request without an assertion is refused", async () => {
@@ -337,7 +218,7 @@ test("a notice token the connector never issued is no notice, and no error (#173
 });
 
 test("a PUBLIC_URL whose host is spelled with capitals still verifies", async () => {
-  const { url, close } = await startConnector([], "https://Mail-MCP.Example.invalid");
+  const { url, close } = await startConnector([], { publicUrl: "https://Mail-MCP.Example.invalid" });
   try {
     const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
     assert.equal(res.status, 200);
@@ -347,7 +228,7 @@ test("a PUBLIC_URL whose host is spelled with capitals still verifies", async ()
 });
 
 test("a PUBLIC_URL carrying an explicit default port still verifies", async () => {
-  const { url, close } = await startConnector([], "https://mail-mcp.example.invalid:443/");
+  const { url, close } = await startConnector([], { publicUrl: "https://mail-mcp.example.invalid:443/" });
   try {
     const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
     assert.equal(res.status, 200);
@@ -359,7 +240,7 @@ test("a PUBLIC_URL carrying an explicit default port still verifies", async () =
 test("a PUBLIC_URL naming a different host is still refused", async () => {
   // The fix canonicalises; it does not make the comparison lenient. A wrong host
   // is a wrong issuer, exactly as before.
-  const { url, close } = await startConnector([], "https://other.example.invalid");
+  const { url, close } = await startConnector([], { publicUrl: "https://other.example.invalid" });
   try {
     const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
     assert.equal(res.status, 401);
@@ -599,7 +480,7 @@ test("ticking remove_caldav does remove the stored CalDAV block", async () => {
 test("a stale stamp is reported rather than clobbering", async () => {
   const { url, accountsPath, close } = await startConnector();
   try {
-    const stale = await stamp(accountsPath);
+    const stale = await stampOf(accountsPath);
     // Pretty-printed, unlike startConnector()'s seed write — guarantees a
     // different file size (and thus a different stamp) even if the two writes
     // land within the same filesystem mtime tick.
@@ -909,7 +790,7 @@ test("the new-mailbox route states the accounts stamp when asked for JSON", asyn
 
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type")?.split(";")[0].trim(), "application/json");
-    assert.deepEqual(await res.json(), { stamp: await stamp(accountsPath) });
+    assert.deepEqual(await res.json(), { stamp: await stampOf(accountsPath) });
     // The same headers a page carries: these bodies hold the same account
     // details, and no-store means as much to a fetch as to a browser.
     for (const [header, value] of Object.entries(EXPECTED_HEADERS)) {
@@ -950,7 +831,7 @@ test("a browser still gets a page from the very same route", async () => {
 test("a JSON probe reports one result per service and writes nothing", async () => {
   const { url, accountsPath, close } = await startConnector();
   try {
-    const before = await stamp(accountsPath);
+    const before = await stampOf(accountsPath);
     const res = await postJson(url, "/settings/mailboxes/test", {
       _csrf: CSRF,
       _stamp: before,
@@ -974,7 +855,7 @@ test("a JSON probe reports one result per service and writes nothing", async () 
     assert.deepEqual(parseProbeAnswer(body), body.probe);
 
     assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
-    assert.equal(await stamp(accountsPath), before, "a probe writes nothing");
+    assert.equal(await stampOf(accountsPath), before, "a probe writes nothing");
   } finally {
     await close();
   }
@@ -983,7 +864,7 @@ test("a JSON probe reports one result per service and writes nothing", async () 
 test("a JSON create stores the account and answers 201 with the id and the new stamp", async () => {
   const { url, accountsPath, close } = await startConnector();
   try {
-    const before = await stamp(accountsPath);
+    const before = await stampOf(accountsPath);
     const res = await postJson(url, "/settings/mailboxes", {
       _csrf: CSRF,
       _stamp: before,
@@ -996,7 +877,7 @@ test("a JSON create stores the account and answers 201 with the id and the new s
     assert.equal(res.status, 201);
     const body = await res.json();
     assert.equal(body.id, "work");
-    assert.equal(body.stamp, await stamp(accountsPath));
+    assert.equal(body.stamp, await stampOf(accountsPath));
     assert.notEqual(body.stamp, before, "the file moved");
     assert.equal(parseCreatedAnswer(body)?.id, "work");
 
@@ -1019,7 +900,7 @@ test("a JSON create carries a CalDAV block through when the draft has one", asyn
   try {
     const res = await postJson(url, "/settings/mailboxes", {
       _csrf: CSRF,
-      _stamp: await stamp(accountsPath),
+      _stamp: await stampOf(accountsPath),
       mailbox: validDraft({
         caldav: { url: "https://dav.example.invalid/", user: "dav-user", pass: "dav-secret" },
       }),
@@ -1046,7 +927,7 @@ test("a JSON submission the parser rejects comes back keyed by field name", asyn
   try {
     const res = await postJson(url, "/settings/mailboxes", {
       _csrf: CSRF,
-      _stamp: await stamp(accountsPath),
+      _stamp: await stampOf(accountsPath),
       mailbox: validDraft({
         imap: { host: "", port: "not-a-port", user: "u", pass: "", tls: true },
       }),
@@ -1090,7 +971,7 @@ test("a JSON body that is not a mailbox draft is refused without a field to blam
     for (const mailbox of [undefined, "a string", { id: "work" }, { ...validDraft(), imap: null }]) {
       const res = await postJson(url, "/settings/mailboxes", {
         _csrf: CSRF,
-        _stamp: await stamp(accountsPath),
+        _stamp: await stampOf(accountsPath),
         mailbox,
       });
       assert.equal(res.status, 400, JSON.stringify(mailbox));
@@ -1109,7 +990,7 @@ test("the JSON routes are behind exactly the credentials the pages are", async (
   // /settings/api/… ones: there is no second place for a guard to be forgotten.
   const { url, accountsPath, close } = await startConnector();
   try {
-    const body = { _csrf: CSRF, _stamp: await stamp(accountsPath), mailbox: validDraft() };
+    const body = { _csrf: CSRF, _stamp: await stampOf(accountsPath), mailbox: validDraft() };
 
     const noBearer = await fetch(`${url}/settings/mailboxes`, {
       method: "POST",
@@ -1360,7 +1241,7 @@ test("the JSON caller still gets the stamp from that URL, cascade or no cascade"
       },
     });
     assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), { stamp: await stamp(accountsPath) });
+    assert.deepEqual(await res.json(), { stamp: await stampOf(accountsPath) });
   } finally {
     await close();
   }
@@ -1409,7 +1290,7 @@ test("an address the screen cannot read is the one thing it does report", async 
 
 test("choosing a provider fills the form in and stores nothing", async () => {
   const { url, accountsPath, close } = await startConnector();
-  const before = await stamp(accountsPath);
+  const before = await stampOf(accountsPath);
   try {
     const res = await post(url, "/settings/mailboxes/new", {
       _action: "provider",
@@ -1430,7 +1311,7 @@ test("choosing a provider fills the form in and stores nothing", async () => {
     // And the password the operator typed a screen ago is in the boxes that
     // will send it, rather than being asked for a second time.
     assert.match(html, /type="password" value="hunter2"/);
-    assert.equal(await stamp(accountsPath), before, "nothing was written");
+    assert.equal(await stampOf(accountsPath), before, "nothing was written");
   } finally {
     await close();
   }
@@ -1827,7 +1708,7 @@ test("the same submission in JSON is refused with the report, not just a message
   try {
     const res = await postJson(url, "/settings/mailboxes", {
       _csrf: CSRF,
-      _stamp: await stamp(accountsPath),
+      _stamp: await stampOf(accountsPath),
       mailbox: draftFromFields(formAgainst(imap.port)),
     });
 
@@ -1922,7 +1803,7 @@ test("an edit is gated the same way, and Save anyway then stores what was typed"
       ...typed,
       "imap.pass": inputValue(page, "imap_pass"),
       "smtp.pass": inputValue(page, "smtp_pass"),
-      _stamp: await stamp(accountsPath),
+      _stamp: await stampOf(accountsPath),
       [SAVE_ANYWAY_FIELD]: CHECKBOX_ON,
     });
 
@@ -1964,7 +1845,7 @@ test("a password box the operator left alone on the edit form still means unchan
 
     const again = await post(url, "/settings/mailboxes/work", {
       ...blank,
-      _stamp: await stamp(accountsPath),
+      _stamp: await stampOf(accountsPath),
       [SAVE_ANYWAY_FIELD]: CHECKBOX_ON,
     });
     assert.equal(again.status, 303);
@@ -2390,7 +2271,7 @@ test("a warned address that reaches the suggestion screen keeps the warning thro
   // re-derives the warning from its own table on every screen, which is the
   // difference between it and the wizard.
   const { url, accountsPath, close } = await startConnector();
-  const before = await stamp(accountsPath);
+  const before = await stampOf(accountsPath);
   try {
     const res = await post(url, "/settings/mailboxes/new", {
       _action: "edit",
@@ -2407,7 +2288,7 @@ test("a warned address that reaches the suggestion screen keeps the warning thro
     // And the screen's own sentence is still there beside it: the two do not
     // share a slot any more, so neither displaces the other.
     assert.match(html, /Nothing has been saved/, "the screen's own notice was displaced");
-    assert.equal(await stamp(accountsPath), before, "nothing was written on the way");
+    assert.equal(await stampOf(accountsPath), before, "nothing was written on the way");
   } finally {
     await close();
   }

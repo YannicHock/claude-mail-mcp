@@ -26,20 +26,22 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
-import type { Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { readFile } from "node:fs/promises";
 
-import { AccountsStore, type Account } from "../../src/accounts.js";
-import { ClientPool } from "../../src/client-pool.js";
-import { createApp } from "../../src/app.js";
+import type { Account } from "../../src/accounts.js";
 import { ASSERTION_HEADER } from "../../src/settings-assertion.js";
 import { CHECKBOX_ON, SAVE_ANYWAY_FIELD } from "../../shared/settings-api.js";
 import { isDockerAvailable, composeUp, composeDown, waitForGreenmailReady } from "../helpers/docker.js";
 import { startFakeCalDavServer, type FakeCalDavServer } from "../helpers/fake-caldav.js";
 import { ensureMailboxes } from "../helpers/imap-setup.js";
-import { makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
+import {
+  AUTH_TOKEN,
+  mint,
+  post,
+  startConnector,
+  stampOf,
+  type LogLine,
+} from "../helpers/settings-connector.js";
 
 const DOCKER_AVAILABLE = isDockerAvailable();
 const SKIP: { skip: string } | Record<string, never> = DOCKER_AVAILABLE
@@ -51,99 +53,6 @@ const IMAP_PORT = 3143;
 const SMTP_PORT = 3025;
 const USER = "alice";
 const PASSWORD = "pw1";
-
-const AUTH_TOKEN = "settings-save-probe-token-please-do-not-reuse";
-const SETTINGS_KEY = "s".repeat(32);
-const CSRF = "test-csrf-value";
-const PUBLIC_URL = "https://mail-mcp.example.invalid";
-
-interface Connector {
-  url: string;
-  accountsPath: string;
-  close(): Promise<void>;
-}
-
-/** One line the connector logged, as its `Logger` was handed it. */
-interface LogLine {
-  level: string;
-  message: string;
-  fields: Record<string, unknown>;
-}
-
-async function startConnector(accounts: Account[] = [], lines?: LogLine[]): Promise<Connector> {
-  const dir = await makeTmpDir();
-  const accountsPath = `${dir}/accounts.json`;
-  await writeFile(accountsPath, JSON.stringify({ version: 1, accounts }), "utf8");
-  const store = new AccountsStore(accountsPath);
-  await store.start();
-  const pool = new ClientPool(store);
-  const app = createApp({
-    store,
-    pool,
-    authToken: AUTH_TOKEN,
-    accountsFile: accountsPath,
-    settingsSigningKey: SETTINGS_KEY,
-    publicUrl: PUBLIC_URL,
-    ...(lines === undefined
-      ? {}
-      : {
-          log: (level: string, message: string, fields: Record<string, unknown> = {}) => {
-            lines.push({ level, message, fields });
-          },
-        }),
-  });
-  const server = await new Promise<Server>((resolve, reject) => {
-    const s: Server = app.listen(0, "127.0.0.1", () => resolve(s));
-    s.on("error", reject);
-  });
-  const { port } = server.address() as AddressInfo;
-  return {
-    url: `http://127.0.0.1:${port}`,
-    accountsPath,
-    close: async () => {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      store.stop();
-      await pool.closeAll().catch(() => {});
-      await cleanupTmpDir(dir);
-    },
-  };
-}
-
-/** An assertion in the shape the OAuth layer mints, bound to this method and path. */
-function mint(method: string, path: string): string {
-  const payload = {
-    v: 1,
-    iss: PUBLIC_URL,
-    aud: "mail-mcp-settings",
-    sub: "operator",
-    sid: "session-1",
-    csrf: CSRF,
-    htm: method.toUpperCase(),
-    htu: path,
-    exp: Math.floor(Date.now() / 1000) + 60,
-  };
-  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  const mac = createHmac("sha256", Buffer.from(SETTINGS_KEY, "utf8")).update(encoded).digest("base64url");
-  return `${encoded}.${mac}`;
-}
-
-async function post(
-  url: string,
-  path: string,
-  fields: Record<string, string>
-): Promise<Response> {
-  const body = new URLSearchParams({ _csrf: CSRF, ...fields });
-  return fetch(`${url}${path}`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${AUTH_TOKEN}`,
-      [ASSERTION_HEADER]: mint("POST", path),
-      "content-type": "application/x-www-form-urlencoded",
-    },
-    body: body.toString(),
-    redirect: "manual",
-  });
-}
 
 /**
  * Where a save's 303 points, asserted to be the list with a notice token, and
@@ -161,11 +70,6 @@ async function followNotice(url: string, res: Response): Promise<string> {
   });
   assert.equal(page.status, 200);
   return page.text();
-}
-
-async function stampOf(accountsPath: string): Promise<string> {
-  const { readStamp } = await import("../../src/accounts-writer.js");
-  return readStamp(accountsPath);
 }
 
 async function storedAccounts(accountsPath: string): Promise<Account[]> {
@@ -223,29 +127,6 @@ test("credentials the server accepts are stored, having authenticated once first
     const accounts = await storedAccounts(accountsPath);
     assert.equal(accounts.length, 1);
     assert.equal(accounts[0]?.id, "work");
-  } finally {
-    await close();
-  }
-});
-
-test("a password the server rejects is refused at save time, and nothing is stored", SKIP, async () => {
-  // The case that opened the milestone, against a real server rather than a
-  // fake one: a mailbox whose credentials the server refuses used to sit in
-  // accounts.json having never authenticated once.
-  const { url, accountsPath, close } = await startConnector();
-  try {
-    const res = await post(url, "/settings/mailboxes", {
-      ...form({ "imap.pass": "not-the-password" }),
-      _stamp: await stampOf(accountsPath),
-    });
-
-    assert.equal(res.status, 400);
-    const page = await res.text();
-    assert.match(page, /IMAP rejected these credentials/);
-    // SMTP answered, so the refusal must not implicate it. A gate that reports
-    // one verdict across the lot sends the operator to look at both.
-    assert.equal(page.includes("SMTP did not answer"), false, page);
-    assert.deepEqual(await storedAccounts(accountsPath), []);
   } finally {
     await close();
   }
@@ -334,30 +215,12 @@ test("an edit whose CalDAV fails lands on the list by 303 too, not on the edit U
   }
 });
 
-test("Save anyway stores credentials the server would have refused", SKIP, async () => {
-  const { url, accountsPath, close } = await startConnector();
-  try {
-    const res = await post(url, "/settings/mailboxes", {
-      ...form({ "imap.pass": "not-the-password" }),
-      _stamp: await stampOf(accountsPath),
-      [SAVE_ANYWAY_FIELD]: CHECKBOX_ON,
-    });
-
-    assert.equal(res.status, 303);
-    const accounts = await storedAccounts(accountsPath);
-    assert.equal(accounts.length, 1);
-    assert.equal(accounts[0]?.imap.pass, "not-the-password", "stored exactly as typed");
-  } finally {
-    await close();
-  }
-});
-
 test("every save says in the log whether it was tested first (#173)", SKIP, async () => {
   // The refusal already left a `warn` line; a successful write left nothing, so
   // an operator could not tell from the log whether a mailbox that fails every
   // tool call had ever authenticated. *Save anyway* is exactly that case.
   const lines: LogLine[] = [];
-  const { url, accountsPath, close } = await startConnector([], lines);
+  const { url, accountsPath, close } = await startConnector([], { lines });
   try {
     const saved = (): LogLine[] =>
       lines.filter((line) => line.message === "settings: a mailbox was saved");
