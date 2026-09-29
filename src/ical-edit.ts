@@ -193,6 +193,22 @@ export function setTime(vevent: ICAL.Component, name: "dtstart" | "dtend", time:
   else prop.removeParameter("tzid");
 }
 
+/**
+ * After a write moved times in `zones`: the VTIMEZONE this connector
+ * generated for any of them (`create_event`'s, marked as ours) is regenerated
+ * to cover the object's times again (`coverGeneratedVtimezone` in
+ * src/ical-zones.ts), since outside its span it would read the zone wrong.
+ * Any other VTIMEZONE is left byte for byte (review of #224). `vcal` is the
+ * VCALENDAR the written VEVENT sits in; null for a VEVENT outside one, which
+ * has no block to cover.
+ */
+export function coverGenerated(vcal: ICAL.Component | null, zones: Iterable<WriteZone>): void {
+  if (vcal === null) return;
+  for (const zone of new Set(zones)) {
+    if (zone.kind === "zoned" && zone.generated === true) coverGeneratedVtimezone(vcal, zone.tzid);
+  }
+}
+
 /** How a timed bound is shown in a refusal: clock time for a floating one, an instant otherwise. */
 export function shown(ms: number, zone: WriteZone): string {
   const iso = new Date(ms).toISOString();
@@ -358,12 +374,7 @@ export function patchTimes(vevent: ICAL.Component, patch: EventPatch, nothingDon
       const end = writtenTime(endMs, endZone);
       setTime(vevent, "dtend", end.time, end.zone);
     }
-    // A VTIMEZONE this connector generated follows the new times; any
-    // other is left byte for byte (review of #224).
-    const vcal = vevent.parent;
-    for (const zone of new Set([startZone, endZone])) {
-      if (zone.kind === "zoned" && zone.generated === true && vcal) coverGeneratedVtimezone(vcal, zone.tzid);
-    }
+    coverGenerated(vevent.parent, [startZone, endZone]);
   }
   vevent.removeAllProperties("duration");
 }

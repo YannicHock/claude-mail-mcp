@@ -16,6 +16,7 @@
 
 import ICAL from "ical.js";
 import {
+  coverGenerated,
   patchText,
   setTime,
   shown,
@@ -30,7 +31,6 @@ import { keyOf } from "./ical-series.js";
 import {
   addToWall,
   clockSeconds,
-  coverGeneratedVtimezone,
   dayOf,
   instantAt,
   storedInstant,
@@ -86,7 +86,7 @@ const SUB_DAILY = new Set(["HOURLY", "MINUTELY", "SECONDLY"]);
  * Text fields in `patch` go to the master, as `apply_to_series` says. The
  * master and every override that moved get a new revision. A VTIMEZONE this
  * connector generated is regenerated to cover the series, to its UNTIL or ten
- * years on (`coverGeneratedVtimezone` in src/ical-zones.ts).
+ * years on (`coverGenerated` in src/ical-edit.ts).
  *
  * Refused, each ending in `nothingDone`: a start on another *date* than the
  * occurrence it describes (the day of a series is its rule's, not its time);
@@ -299,10 +299,7 @@ function shiftTimedSeries(
     if (changed) stampRevision(ve, now);
   }
 
-  const vcal = master.parent;
-  for (const z of new Set([zone, endZone])) {
-    if (z.kind === "zoned" && z.generated === true && vcal) coverGeneratedVtimezone(vcal, z.tzid);
-  }
+  coverGenerated(master.parent, [zone, endZone]);
 }
 
 /**
