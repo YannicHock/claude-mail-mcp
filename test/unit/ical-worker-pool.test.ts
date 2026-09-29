@@ -156,12 +156,15 @@ describe("ExpansionPool — one slow calendar does not stall the others (review 
   it("runOnEach is one request too: a second one is served between its objects, and its hanging object rejects alone (#213)", { timeout: 30_000 }, async () => {
     // find_free_slot reads every object of every calendar asked about; one
     // runOn per object would be one request each, and another account's
-    // single object would queue behind all of them.
-    const deadlineMs = 1000;
+    // single object would queue behind all of them. Five hanging objects on
+    // two workers are three deadlines in one line, more than the two B may
+    // wait; shorter deadlines than the test above keep two cores from
+    // spinning long enough to slow the suite's timed tests.
+    const deadlineMs = 600;
     const p = pool({ size: 2, deadlineMs });
     await p.expand([{ url: "warm-1", etag: null, data: GOOD }, { url: "warm-2", etag: null, data: GOOD }], OCTOBER);
     const objects = [
-      ...Array.from({ length: 6 }, (_, i) => ({ url: `https://a.example/cal/hangs-${i}.ics`, etag: `"h${i}"`, data: HANGS })),
+      ...Array.from({ length: 5 }, (_, i) => ({ url: `https://a.example/cal/hangs-${i}.ics`, etag: `"h${i}"`, data: HANGS })),
       { url: "https://a.example/cal/good.ics", etag: '"g"', data: GOOD },
     ];
     const slow = p.runOnEach(objects, "busyTimes", (o) => [o.data, OCTOBER, [], "UTC"]);
@@ -174,7 +177,7 @@ describe("ExpansionPool — one slow calendar does not stall the others (review 
     const results = await slow;
     assert.deepEqual(
       results.map((r) => r.status),
-      ["rejected", "rejected", "rejected", "rejected", "rejected", "rejected", "fulfilled"]
+      ["rejected", "rejected", "rejected", "rejected", "rejected", "fulfilled"]
     );
     const first = results[0];
     assert.match(first.status === "rejected" ? reasonOf(first.reason) : "", /did not finish reading its busy times/);
