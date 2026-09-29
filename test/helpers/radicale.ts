@@ -130,8 +130,8 @@ export interface ProxiedRequest {
  * was found somewhere specific; everything not named is passed through
  * untouched.
  *
- * The plan (v0.7.4) names five behaviours in all. Four are here; `refuseMove`
- * (#212, Task 7) joins them with the change that tests it.
+ * Each is one rewriter in {@link startCalDavProxy}: of the request, of
+ * Radicale's answer, or of both.
  */
 export interface CalDavProxyOptions {
   /**
@@ -196,6 +196,20 @@ export interface CalDavProxyOptions {
    */
   failAddressLookups?: number;
   /**
+   * Answer every MOVE with this status itself, never passing it on: a server
+   * that refuses a MOVE between two collections (spec 2026-09-29 §2.6 names
+   * 403, 405, 501 and 502), so `move_event` has to copy the event into the
+   * target and delete it from the source instead (#212).
+   */
+  refuseMove?: 403 | 405 | 501 | 502;
+  /**
+   * Answer `412 Precondition Failed` to every DELETE of an object under this
+   * path on Radicale — a collection's, e.g. `/u…/cal/`: the source's event
+   * changed after `move_event` copied it into the target, so the copy has to
+   * be removed again (plan v0.7.4, Review Focus 3).
+   */
+  failSourceDelete?: string;
+  /**
    * Run before a request is forwarded, e.g. to delete an event between the
    * connector's lookup and its write.
    */
@@ -217,6 +231,8 @@ export interface CalDavProxy {
   requests: () => ProxiedRequest[];
   /** PUTs refused for their `If-Match: *` under `starIfMatchBroken`. */
   starRefusals: () => number;
+  /** MOVEs the proxy answered itself under `refuseMove`: proof the fallback was needed. */
+  refusedMoves: () => number;
   close: () => Promise<void>;
 }
 
@@ -258,21 +274,163 @@ function rewriteGetetags(xml: string, change: ((etag: string) => string) | null)
 }
 
 /**
+ * One request on its way through the proxy: what a {@link RequestRewriter}
+ * may change before it is forwarded. `headers` are already the ones that
+ * will be sent upstream.
+ */
+interface Exchange {
+  seen: ProxiedRequest;
+  /** The request's URL on Radicale. */
+  upstreamUrl: URL;
+  headers: Headers;
+  body: ReturnType<typeof Buffer.concat> | undefined;
+}
+
+/** An answer the proxy gives itself, without asking Radicale. */
+interface ShortAnswer {
+  status: number;
+  statusText: string;
+  body?: string;
+}
+
+/** Radicale's answer on its way back: what a {@link ResponseRewriter} may change before it is passed on. */
+interface Answer {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  payload: Buffer;
+}
+
+/**
+ * One mode's change to a request: an answer of its own, which ends the
+ * exchange there, or null, and the request goes on (with whatever it
+ * changed in the exchange's headers).
+ */
+type RequestRewriter = (ex: Exchange) => Promise<ShortAnswer | null>;
+
+/** One mode's change to Radicale's answer, made in place. */
+type ResponseRewriter = (ex: Exchange, answer: Answer) => void;
+
+const PRECONDITION_FAILED: ShortAnswer = { status: 412, statusText: "Precondition Failed" };
+
+/**
  * A proxy in front of Radicale that behaves the way {@link CalDavProxyOptions}
  * says: what Radicale itself cannot be made to do, faked at the HTTP layer
  * (spec 2026-09-29 §6). Point a CalDavClient at `url` instead of
  * {@link RADICALE_URL}; the paths are the same.
+ *
+ * Each option is one rewriter of the request, of the answer, or of both
+ * (health review P3), and the handler at the bottom only runs them: a new
+ * mode is one more rewriter, not one more branch in a single function. The
+ * request rewriters run in the order they are pushed below, and the first
+ * one that answers itself ends the exchange there; the answer rewriters run
+ * on what Radicale said, after the `after` hook.
+ *
+ * One rewrite is not a mode: a MOVE's `Destination` names the proxy, and
+ * Radicale answers 502 to a destination on any host but its own (its
+ * `move.py`), so it is pointed at Radicale, as a reverse proxy in front of a
+ * real server leaves the host the server knows itself by.
  */
 export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promise<CalDavProxy> {
   let stripped = 0;
   let corrupted = 0;
   let starRefused = 0;
   let failedLookups = 0;
+  let movesRefused = 0;
   const log: ProxiedRequest[] = [];
   const { createServer } = await import("node:http");
   const upstream = new URL(RADICALE_URL);
   // Hop-by-hop, or no longer true once fetch has decoded the body.
   const dropped = new Set(["connection", "transfer-encoding", "content-length", "content-encoding", "keep-alive"]);
+
+  const requestRewriters: RequestRewriter[] = [];
+  const responseRewriters: ResponseRewriter[] = [];
+  const isStarWrite = (ex: Exchange): boolean =>
+    ex.seen.ifMatch?.trim() === "*" && (ex.seen.method === "PUT" || ex.seen.method === "DELETE");
+
+  if (options.failAddressLookups !== undefined) {
+    const limit = options.failAddressLookups;
+    requestRewriters.push(async (ex) => {
+      if (ex.seen.method !== "PROPFIND" || failedLookups >= limit) return null;
+      if (!ex.body?.toString("utf8").includes("calendar-user-address-set")) return null;
+      failedLookups += 1;
+      return { status: 503, statusText: "Service Unavailable", body: "unavailable" };
+    });
+  }
+  if (options.starIfMatchBroken) {
+    requestRewriters.push(async (ex) => {
+      if (!isStarWrite(ex) || ex.seen.method !== "PUT") return null;
+      starRefused += 1;
+      return PRECONDITION_FAILED;
+    });
+  }
+  if (options.noEtags) {
+    requestRewriters.push(async (ex) => {
+      if (!isStarWrite(ex)) return null;
+      const exists = await fetch(ex.upstreamUrl, {
+        method: "GET",
+        headers: { authorization: ex.headers.get("authorization") ?? "" },
+      });
+      await exists.arrayBuffer();
+      if (exists.status === 404) return PRECONDITION_FAILED;
+      ex.headers.delete("if-match");
+      return null;
+    });
+    responseRewriters.push((ex, answer) => {
+      delete answer.headers.etag;
+      if (ex.seen.method === "REPORT" || ex.seen.method === "PROPFIND") {
+        answer.payload = Buffer.from(rewriteGetetags(answer.payload.toString("utf8"), null), "utf8");
+      }
+    });
+  }
+  if (options.refuseMove !== undefined) {
+    const status = options.refuseMove;
+    requestRewriters.push(async (ex) => {
+      if (ex.seen.method !== "MOVE") return null;
+      movesRefused += 1;
+      return { status, statusText: "Refused by the proxy" };
+    });
+  }
+  if (options.failSourceDelete !== undefined) {
+    const collection = options.failSourceDelete;
+    requestRewriters.push(async (ex) => {
+      if (ex.seen.method !== "DELETE" || !ex.seen.path.startsWith(collection)) return null;
+      return PRECONDITION_FAILED;
+    });
+  }
+  if (options.etaglessPuts) {
+    responseRewriters.push((ex, answer) => {
+      if (ex.seen.method !== "PUT" || answer.headers.etag === undefined) return;
+      stripped += 1;
+      delete answer.headers.etag;
+    });
+  }
+  if (options.weakEtags) {
+    responseRewriters.push((ex, answer) => {
+      if (answer.headers.etag !== undefined) answer.headers.etag = weakened(answer.headers.etag);
+      if (ex.seen.method === "REPORT" || ex.seen.method === "PROPFIND") {
+        answer.payload = Buffer.from(rewriteGetetags(answer.payload.toString("utf8"), weakened), "utf8");
+      }
+    });
+  }
+  if (options.corruptObject !== undefined) {
+    const name = options.corruptObject;
+    responseRewriters.push((ex, answer) => {
+      if (ex.seen.method !== "REPORT") return;
+      const { xml, planted } = plantCorruptObject(answer.payload.toString("utf8"), name, options.corruptWith);
+      if (!planted) return;
+      corrupted += 1;
+      answer.payload = Buffer.from(xml, "utf8");
+    });
+  }
+  if (options.createdOnOverwrite) {
+    responseRewriters.push((ex, answer) => {
+      if (ex.seen.method !== "PUT" || answer.status < 200 || answer.status > 299) return;
+      answer.status = 201;
+      answer.statusText = "Created";
+    });
+  }
+
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
@@ -282,81 +440,51 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
         if (v === undefined || k === "host" || dropped.has(k)) continue;
         headers.set(k, Array.isArray(v) ? v.join(", ") : v);
       }
-      const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
-      const ifMatch = headers.get("if-match");
+      const destination = headers.get("destination");
+      if (destination !== null) {
+        const named = new URL(destination);
+        headers.set("destination", new URL(named.pathname + named.search, upstream).href);
+      }
+      const upstreamUrl = new URL(req.url ?? "/", upstream);
       const seen: ProxiedRequest = {
         method: req.method ?? "GET",
-        path: new URL(req.url ?? "/", upstream).pathname,
-        ifMatch,
+        path: upstreamUrl.pathname,
+        ifMatch: headers.get("if-match"),
       };
       log.push(seen);
-      const refuse = (): void => {
-        res.writeHead(412, "Precondition Failed", { "content-length": "0" });
-        res.end();
-      };
+      const ex: Exchange = { seen, upstreamUrl, headers, body: chunks.length > 0 ? Buffer.concat(chunks) : undefined };
       (async () => {
         await options.before?.(seen);
-        if (
-          req.method === "PROPFIND" &&
-          failedLookups < (options.failAddressLookups ?? 0) &&
-          body?.toString("utf8").includes("calendar-user-address-set")
-        ) {
-          failedLookups += 1;
-          res.writeHead(503, "Service Unavailable", { "content-type": "text/plain", "content-length": "11" });
-          res.end("unavailable");
+        for (const rewrite of requestRewriters) {
+          const short = await rewrite(ex);
+          if (short === null) continue;
+          const body = short.body ?? "";
+          res.writeHead(short.status, short.statusText, {
+            ...(body === "" ? {} : { "content-type": "text/plain" }),
+            "content-length": String(Buffer.byteLength(body)),
+          });
+          res.end(body);
           return;
         }
-        if (ifMatch?.trim() === "*" && (req.method === "PUT" || req.method === "DELETE")) {
-          if (options.starIfMatchBroken && req.method === "PUT") {
-            starRefused += 1;
-            return refuse();
-          }
-          if (options.noEtags) {
-            const exists = await fetch(new URL(req.url ?? "/", upstream), {
-              method: "GET",
-              headers: { authorization: headers.get("authorization") ?? "" },
-            });
-            await exists.arrayBuffer();
-            if (exists.status === 404) return refuse();
-            headers.delete("if-match");
-          }
-        }
-        const answer = await fetch(new URL(req.url ?? "/", upstream), {
-          method: req.method,
-          headers,
-          body,
+        const upstreamAnswer = await fetch(upstreamUrl, {
+          method: seen.method,
+          headers: ex.headers,
+          body: ex.body,
           redirect: "manual",
         });
-        const out: Record<string, string> = {};
-        answer.headers.forEach((v, k) => {
-          if (dropped.has(k)) return;
-          if (options.etaglessPuts && req.method === "PUT" && k === "etag") {
-            stripped += 1;
-            return;
-          }
-          if (k === "etag" && options.noEtags) return;
-          out[k] = k === "etag" && options.weakEtags ? weakened(v) : v;
+        const answer: Answer = {
+          status: upstreamAnswer.status,
+          statusText: upstreamAnswer.statusText,
+          headers: {},
+          payload: Buffer.from(await upstreamAnswer.arrayBuffer()),
+        };
+        upstreamAnswer.headers.forEach((v, k) => {
+          if (!dropped.has(k)) answer.headers[k] = v;
         });
-        let payload = Buffer.from(await answer.arrayBuffer());
-        if ((options.weakEtags || options.noEtags) && (req.method === "REPORT" || req.method === "PROPFIND")) {
-          const xml = rewriteGetetags(payload.toString("utf8"), options.noEtags ? null : weakened);
-          payload = Buffer.from(xml, "utf8");
-        }
-        if (options.corruptObject !== undefined && req.method === "REPORT") {
-          const { xml, planted } = plantCorruptObject(payload.toString("utf8"), options.corruptObject, options.corruptWith);
-          if (planted) {
-            corrupted += 1;
-            payload = Buffer.from(xml, "utf8");
-          }
-        }
         await options.after?.(seen, answer.status);
-        if (options.createdOnOverwrite && req.method === "PUT" && answer.ok) {
-          res.writeHead(201, "Created", { ...out, "content-length": String(payload.length) });
-          res.end(payload);
-          return;
-        }
-        res.writeHead(answer.status, answer.statusText, { ...out, "content-length": String(payload.length) });
-        res.end(payload);
+        for (const rewrite of responseRewriters) rewrite(ex, answer);
+        res.writeHead(answer.status, answer.statusText, { ...answer.headers, "content-length": String(answer.payload.length) });
+        res.end(answer.payload);
       })().catch((err: unknown) => {
         res.writeHead(502);
         res.end(String(err));
@@ -372,6 +500,7 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
     corruptedReports: () => corrupted,
     requests: () => [...log],
     starRefusals: () => starRefused,
+    refusedMoves: () => movesRefused,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
