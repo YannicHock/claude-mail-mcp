@@ -167,6 +167,100 @@ describe("zones on the calendar tools (spec 2026-09-29 §2.5)", () => {
   });
 });
 
+describe("find_free_slot's zone and what it could not check (#213, spec 2026-09-29 §2.7)", () => {
+  it("takes an optional IANA timezone for the working hours, says what it defaults to, and no longer says UTC is all it knows", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const shape = schemaOf(tools, "find_free_slot");
+      const timezone = shape.timezone;
+      assert.ok(timezone, "find_free_slot has no timezone");
+      assert.equal(timezone.safeParse(undefined).success, true, "timezone is required");
+      assert.match(timezone.description ?? "", /IANA/);
+      assert.match(timezone.description ?? "", /all name the same one.*UTC/);
+      const texts = [tools.get("find_free_slot")?.config.description ?? "", shape.working_hours?.description ?? ""];
+      for (const text of texts) assert.doesNotMatch(text, /in UTC|UTC window/, text);
+      assert.match(shape.working_hours?.description ?? "", /every day/);
+    });
+  });
+
+  it("says the answer names the zone used, and names in skipped what it could not check", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const description = tools.get("find_free_slot")?.config.description ?? "";
+      assert.match(description, /`timezone`/);
+      assert.match(description, /`skipped`/);
+      assert.match(description, /transparent|cancelled|declined/i);
+    });
+  });
+
+  it("refuses a timezone that is no IANA name before any request, and leaves no warn line", async () => {
+    await withCalendarTools(CLOSED, async (tools, warnings) => {
+      const find = tools.get("find_free_slot");
+      assert.ok(find);
+      await assert.rejects(
+        find.handler({
+          calendar_urls: [`${CLOSED}cal/`],
+          range_start: "2026-10-05T00:00:00Z",
+          range_end: "2026-10-08T00:00:00Z",
+          duration_minutes: 60,
+          timezone: "Mars/Olympus_Mons",
+        }),
+        (err: unknown) => err instanceof ToolRefusal && /not an IANA time zone/.test(err.message)
+      );
+      assert.equal(warnings(), 0);
+    });
+  });
+
+  it("refuses working hours that end before they start, before any request", async () => {
+    await withCalendarTools(CLOSED, async (tools, warnings) => {
+      const find = tools.get("find_free_slot");
+      assert.ok(find);
+      await assert.rejects(
+        find.handler({
+          calendar_urls: [`${CLOSED}cal/`],
+          range_start: "2026-10-05T00:00:00Z",
+          range_end: "2026-10-08T00:00:00Z",
+          duration_minutes: 60,
+          working_hours: { start_hour: 17, end_hour: 9 },
+        }),
+        (err: unknown) => err instanceof ToolRefusal && /end_hour/.test(err.message)
+      );
+      assert.equal(warnings(), 0);
+    });
+  });
+});
+
+describe("find_free_slot's bounds, refused before any request (review of PR #232)", () => {
+  async function refused(args: Record<string, unknown>, pattern: RegExp): Promise<void> {
+    await withCalendarTools(CLOSED, async (tools, warnings) => {
+      const find = tools.get("find_free_slot");
+      assert.ok(find);
+      await assert.rejects(
+        find.handler({ calendar_urls: [`${CLOSED}cal/`], duration_minutes: 60, ...args }),
+        (err: unknown) => err instanceof ToolRefusal && pattern.test(err.message) && err.message.endsWith("No calendar was read.")
+      );
+      assert.equal(warnings(), 0);
+    });
+  }
+
+  it("refuses a range longer than 366 days — the years 0001–9999 blocked the event loop for 72 s", async () => {
+    await refused({ range_start: "0001-01-01T00:00:00Z", range_end: "9999-01-01T00:00:00Z" }, /366 days/);
+    await refused({ range_start: "2026-01-01T00:00:00Z", range_end: "2027-01-02T00:00:01Z" }, /366 days/);
+  });
+
+  it("says the range cap and the slot cap in its description", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const description = tools.get("find_free_slot")?.config.description ?? "";
+      assert.match(description, /366 days/);
+      assert.match(description, /200/);
+      assert.match(description, /`truncated`/);
+    });
+  });
+
+  it("refuses a range_start or range_end with no offset, which the process's own zone would otherwise read", async () => {
+    await refused({ range_start: "2026-10-05T09:00", range_end: "2026-10-06T00:00:00Z" }, /offset/);
+    await refused({ range_start: "2026-10-05T09:00:00Z", range_end: "2026-10-06T17:00:00" }, /offset/);
+  });
+});
+
 describe("update_event with nothing to change", () => {
   it("is refused before any request, and leaves no warn line", async () => {
     // Had the call reached for the closed port, it would have failed as

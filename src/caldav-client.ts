@@ -30,7 +30,9 @@ import {
 import { randomUUID } from "node:crypto";
 import { buildIcs, builtZoneName, type NewEventFields } from "./ical-build.js";
 import {
+  addressKey,
   calendarUserAddresses,
+  mailtoOf,
   mayNotifyOnMove,
   notifyChoice,
   schedulable,
@@ -56,9 +58,20 @@ import {
   type OccurrenceLookup,
   type StoredObject,
 } from "./ical-expand.js";
+import {
+  freeSlots,
+  MAX_FREE_SLOT_RANGE_DAYS,
+  MAX_FREE_SLOT_RANGE_MS,
+  MAX_FREE_SLOTS,
+  workingZone,
+  type BusyInterval,
+  type FreeSlot,
+  type WorkingHours,
+} from "./free-slots.js";
 import { parseCalendar, seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { expansionPool, reasonOf } from "./ical-worker-pool.js";
-import { calendarZone, canonicalZone } from "./ical-zones.js";
+import type { WorkerOps } from "./ical-worker-ops.js";
+import { calendarZone, canonicalZone, DAY_MS, hasOffset } from "./ical-zones.js";
 import {
   assertWritten,
   changedSinceRead,
@@ -255,9 +268,34 @@ interface FoundObject extends StoredObject {
   parsed: ParsedCalendar;
 }
 
-export interface FreeSlot {
-  start: string;
-  end: string;
+/** What `find_free_slot` asks for (#213, spec 2026-09-29 §2.7). */
+export interface FreeSlotQuery {
+  calendarUrls: string[];
+  rangeStart: string;
+  rangeEnd: string;
+  durationMinutes: number;
+  /** Whole hours on the working zone's clock, applied to every day in the range. */
+  workingHours?: WorkingHours;
+  /** An IANA name; omitted, the calendars' own when they agree, else UTC. */
+  timezone?: string;
+}
+
+/** What `find_free_slot` answers: the zone it worked in, the slots in it, and what it could not check. */
+export interface FreeSlotAnswer {
+  /** The IANA zone, or `"UTC"`, the working hours were applied in and the slots are given in. */
+  timezone: string;
+  /** The earliest slots, at most {@link MAX_FREE_SLOTS} of them. */
+  slots: FreeSlot[];
+  /** True when there were more than {@link MAX_FREE_SLOTS} slots, and only the earliest are in `slots`. */
+  truncated: boolean;
+  /** Objects whose busy time could not be read, as `list_events` names them. Empty when every one was read. */
+  skipped: SkippedObject[];
+  /**
+   * False when the principal's addresses could not be looked up: only the
+   * mailbox's own address counted as the account's, so an invitation it
+   * declined under another address was counted as busy.
+   */
+  addressesKnown: boolean;
 }
 
 /** What a {@link CalDavClient} reports through, beside its answers (#210.4). */
@@ -348,22 +386,48 @@ export class CalDavClient {
    * The expansion runs in src/ical-worker-pool.ts's workers, each object
    * under a deadline: one recurrence rule ical.js never returns from is a
    * `skipped` entry, not a connector that no longer answers anyone (review of
-   * #223). `find_free_slot` reads through here, so it is covered too.
+   * #223). `find_free_slot` reads its objects through the same pool, with
+   * its own operation ({@link findFreeSlots}).
    */
   async listEvents(calendarUrl: string, rangeStart: string, rangeEnd: string): Promise<EventListing> {
     const calendar = await this.findCalendar(calendarUrl);
+    const window = { start: Date.parse(rangeStart), end: Date.parse(rangeEnd) };
+    const skipped: SkippedObject[] = [];
+    const expanded = await this.readEach(calendar, { start: rangeStart, end: rangeEnd }, skipped, "expand", (o) => [
+      o.data,
+      window,
+      { url: o.url, etag: o.etag },
+    ]);
+    const events: CalendarEvent[] = expanded.flatMap((result) => result.instances);
+    events.sort((a, b) => instantOfReported(a.start) - instantOfReported(b.start));
+    return { events, skipped };
+  }
+
+  /**
+   * Every stored object of `calendar` the server finds in `timeRange`, read
+   * through the worker operation `op` — off this thread, each object under
+   * its deadline, all of them one request (src/ical-worker-pool.ts) — with
+   * what could not be read pushed onto `skipped`: an object the server sent
+   * no data for, one whose worker timed out or failed, and the `skipped`
+   * sentence the operation itself gave. The one path `list_events` and
+   * `find_free_slot` read a calendar by (code-health review of PR #232), so
+   * the two cannot disagree about what could be read.
+   *
+   * Answers what each object that was read gave, in the server's order.
+   */
+  private async readEach<K extends "expand" | "busyTimes">(
+    calendar: DAVCalendar,
+    timeRange: { start: string; end: string },
+    skipped: SkippedObject[],
+    op: K,
+    argsOf: (object: StoredObject) => Parameters<WorkerOps[K]>
+  ): Promise<ReturnType<WorkerOps[K]>[]> {
     const client = await this.ensureClient();
     const objects: DAVCalendarObject[] = await client.fetchCalendarObjects({
       calendar,
-      timeRange: {
-        start: rangeStart,
-        end: rangeEnd,
-      },
+      timeRange,
       urlFilter: everyObjectIn(calendar),
     });
-    const window = { start: Date.parse(rangeStart), end: Date.parse(rangeEnd) };
-    const events: CalendarEvent[] = [];
-    const skipped: SkippedObject[] = [];
     const stored: StoredObject[] = [];
     for (const obj of objects) {
       if (typeof obj.data !== "string" || obj.data === "") {
@@ -372,14 +436,18 @@ export class CalDavClient {
       }
       stored.push({ url: obj.url, etag: obj.etag ?? null, data: obj.data });
     }
-    // Off this thread, each object under a deadline: see src/ical-worker-pool.ts.
-    const expanded = await expansionPool.expand(stored, window);
-    expanded.forEach((result, i) => {
-      events.push(...result.instances);
-      if (result.skipped !== undefined) skipped.push({ url: stored[i].url, reason: result.skipped });
+    const settled = await expansionPool.runOnEach(stored, op, argsOf);
+    const read: ReturnType<WorkerOps[K]>[] = [];
+    settled.forEach((result, i) => {
+      if (result.status === "rejected") {
+        skipped.push({ url: stored[i].url, reason: reasonOf(result.reason) });
+        return;
+      }
+      read.push(result.value);
+      const reason = (result.value as { skipped?: string }).skipped;
+      if (reason !== undefined) skipped.push({ url: stored[i].url, reason });
     });
-    events.sort((a, b) => instantOfReported(a.start) - instantOfReported(b.start));
-    return { events, skipped };
+    return read;
   }
 
   /**
@@ -1153,85 +1221,129 @@ export class CalDavClient {
     return null;
   }
 
-  async findFreeSlots(
-    calendarUrls: string[],
-    rangeStart: string,
-    rangeEnd: string,
-    durationMinutes: number,
-    workingHours?: { startHour: number; endHour: number }
-  ): Promise<FreeSlot[]> {
-    const busy: Array<{ start: number; end: number }> = [];
-    for (const url of calendarUrls) {
-      const { events } = await this.listEvents(url, rangeStart, rangeEnd);
-      for (const e of events) {
-        busy.push({
-          start: instantOfReported(e.start),
-          end: instantOfReported(e.end),
-        });
+  /**
+   * Free time across `calendarUrls` (#213, R14, spec 2026-09-29 §2.7): a thin
+   * wrapper — the busy filter is src/ical-busy.ts, run in the worker pool, and
+   * the slots are src/free-slots.ts.
+   *
+   * - **The zone:** `query.timezone`, else the calendars' own when they all
+   *   report the same one, else UTC ({@link workingZone}). The answer names it.
+   * - **The account's own addresses,** to know whose `PARTSTAT=DECLINED`
+   *   frees time, are spec §2.7's: every `mailto:` the principal lists
+   *   ({@link ownAddresses}) *and* the mailbox's `mail.defaultFrom` — {@link
+   *   freeBusyAddresses}. Wider than the ORGANIZER rule, on purpose: an
+   *   address too many here only frees an invitation the account declined.
+   * - **A lookup that fails** is no refusal: the mailbox's address alone
+   *   counts, an invitation declined under another one blocks time as anyone
+   *   else's does — the safe side for "is this free?" — one `info` line says
+   *   why, and `addressesKnown` is false, for the tool's warning.
+   * - **What could not be read is said,** in `skipped`, the way `list_events`
+   *   says it ({@link readEach}): an object with no data, one ical.js cannot
+   *   read, one cut short, one that timed out in its worker. Its time is
+   *   unknown, and never reported as free in silence.
+   * - **A calendar named twice** — with and without its trailing slash — is
+   *   read once ({@link sameCollection}), so its objects are not named twice.
+   * - **At most {@link MAX_FREE_SLOTS} slots,** the earliest, with
+   *   `truncated` when there were more.
+   *
+   * The objects are asked for, and walked, a day either side of the range: a
+   * floating or all-day time is placed on the working zone's clock, up to 14
+   * hours from where the server's UTC filter put it. Busy time outside the
+   * range is then ignored by `freeSlots`.
+   *
+   * Refused before any request, with `ToolRefusal`: a `timezone` that is no
+   * IANA name; working hours that end at or before they start; a range that
+   * is not two date-times with an offset, the first before the second (one
+   * without would be read in whatever zone this process runs in); and a
+   * range longer than {@link MAX_FREE_SLOT_RANGE_DAYS} days, whose per-day
+   * work runs on this thread (review of PR #232).
+   */
+  async findFreeSlots(query: FreeSlotQuery): Promise<FreeSlotAnswer> {
+    const nothingDone = "No calendar was read.";
+    let zone: string | null = null;
+    if (query.timezone !== undefined) {
+      zone = canonicalZone(query.timezone);
+      if (zone === null) {
+        throw new ToolRefusal(
+          `"${query.timezone}" is not an IANA time zone. Pass a name like Europe/Berlin or America/New_York, or omit timezone to use the calendars' own. ${nothingDone}`
+        );
       }
     }
-    busy.sort((a, b) => a.start - b.start);
-    const merged: Array<{ start: number; end: number }> = [];
-    for (const slot of busy) {
-      const last = merged[merged.length - 1];
-      if (last && slot.start <= last.end) {
-        last.end = Math.max(last.end, slot.end);
-      } else {
-        merged.push({ ...slot });
-      }
+    const hours = query.workingHours;
+    if (hours !== undefined && hours.endHour <= hours.startHour) {
+      throw new ToolRefusal(
+        `working_hours.end_hour (${hours.endHour}) must be after start_hour (${hours.startHour}): working hours are one span within each day. ${nothingDone}`
+      );
+    }
+    const range = { start: rangeBound(query.rangeStart), end: rangeBound(query.rangeEnd) };
+    if (!Number.isFinite(range.start) || !Number.isFinite(range.end) || range.end <= range.start) {
+      throw new ToolRefusal(
+        `range_start and range_end must be ISO 8601 date-times with an offset, like 2026-10-05T09:00:00+02:00 or 2026-10-05T07:00:00Z, range_start the earlier. ${nothingDone}`
+      );
+    }
+    if (range.end - range.start > MAX_FREE_SLOT_RANGE_MS) {
+      throw new ToolRefusal(
+        `The range from range_start to range_end is longer than ${MAX_FREE_SLOT_RANGE_DAYS} days, the most find_free_slot searches at once. Ask for a shorter range, or for one range after another. ${nothingDone}`
+      );
     }
 
-    const rangeStartMs = new Date(rangeStart).getTime();
-    const rangeEndMs = new Date(rangeEnd).getTime();
-    const durationMs = durationMinutes * 60 * 1000;
-    const free: FreeSlot[] = [];
-    let cursor = rangeStartMs;
+    const calendars: DAVCalendar[] = [];
+    for (const url of query.calendarUrls) {
+      if (calendars.some((c) => sameCollection(c.url, url))) continue;
+      const calendar = await this.findCalendar(url);
+      if (!calendars.some((c) => sameCollection(c.url, calendar.url))) calendars.push(calendar);
+    }
+    const timezone = zone ?? workingZone(calendars.map((c) => c.timezone));
+    const { own, addressesKnown } = await this.freeBusyAddresses();
 
-    const clampToWork = (start: number, end: number): { s: number; e: number } | null => {
-      if (!workingHours) return { s: start, e: end };
-      // Anchor to the day of `start` in UTC; users pass ISO with offset, so
-      // working hours are interpreted in UTC. v0.2 will accept a timezone.
-      const d = new Date(start);
-      const dayStart = Date.UTC(
-        d.getUTCFullYear(),
-        d.getUTCMonth(),
-        d.getUTCDate(),
-        workingHours.startHour
-      );
-      const dayEnd = Date.UTC(
-        d.getUTCFullYear(),
-        d.getUTCMonth(),
-        d.getUTCDate(),
-        workingHours.endHour
-      );
-      const s = Math.max(start, dayStart);
-      const e = Math.min(end, dayEnd);
-      if (e - s < durationMs) return null;
-      return { s, e };
+    const window = { start: range.start - DAY_MS, end: range.end + DAY_MS };
+    const timeRange = { start: new Date(window.start).toISOString(), end: new Date(window.end).toISOString() };
+    const busy: BusyInterval[] = [];
+    const skipped: SkippedObject[] = [];
+    for (const calendar of calendars) {
+      const read = await this.readEach(calendar, timeRange, skipped, "busyTimes", (o) => [o.data, window, own, timezone]);
+      for (const result of read) busy.push(...result.busy);
+    }
+    const found = freeSlots(busy, range, query.durationMinutes, { workingHours: hours, timezone, limit: MAX_FREE_SLOTS + 1 });
+    return {
+      timezone,
+      slots: found.slice(0, MAX_FREE_SLOTS),
+      truncated: found.length > MAX_FREE_SLOTS,
+      skipped,
+      addressesKnown,
     };
+  }
 
-    for (const slot of merged) {
-      if (cursor + durationMs <= slot.start) {
-        const clamped = clampToWork(cursor, slot.start);
-        if (clamped) {
-          free.push({
-            start: new Date(clamped.s).toISOString(),
-            end: new Date(clamped.e).toISOString(),
-          });
-        }
-      }
-      cursor = Math.max(cursor, slot.end);
+  /**
+   * The addresses `find_free_slot` counts as the account's own (spec
+   * 2026-09-29 §2.7): every one {@link ownAddresses} gives, and the mailbox's
+   * `mail.defaultFrom` besides, each once by `addressKey`. {@link
+   * ownAddresses} leaves the mailbox's out where the principal lists
+   * addresses of its own — the ORGANIZER rule of PR #230, unchanged — but an
+   * invitation sent to the mailbox and declined there is the account's own
+   * declined one all the same (review of PR #232).
+   *
+   * A lookup that fails is not passed on: the mailbox's address alone is
+   * used, `addressesKnown` is false, and one `info` line says why.
+   */
+  private async freeBusyAddresses(): Promise<{ own: string[]; addressesKnown: boolean }> {
+    let listed: readonly string[] = [];
+    let addressesKnown = true;
+    try {
+      listed = await this.ownAddresses();
+    } catch (err) {
+      addressesKnown = false;
+      this.log("info", "caldav: find_free_slot counts only the mailbox's address as the account's; the principal's addresses could not be looked up", {
+        account: this.accountId,
+        reason: classifyFailure(err).reason,
+      });
     }
-    if (cursor + durationMs <= rangeEndMs) {
-      const clamped = clampToWork(cursor, rangeEndMs);
-      if (clamped) {
-        free.push({
-          start: new Date(clamped.s).toISOString(),
-          end: new Date(clamped.e).toISOString(),
-        });
-      }
+    const own = [...listed];
+    const mailbox = this.address;
+    if (mailbox && addressKey(mailbox) !== "" && !own.some((a) => addressKey(a) === addressKey(mailbox))) {
+      own.push(mailtoOf(mailbox));
     }
-    return free;
+    return { own, addressesKnown };
   }
 
   /**
@@ -1255,7 +1367,8 @@ export class CalDavClient {
    * received, and mail people accordingly. See {@link lookUpAddresses}.
    *
    * `find_free_slot` (#213) reads it too, to know which ATTENDEE is the
-   * account's own declined one.
+   * account's own declined one — with the mailbox's address added whatever
+   * the principal lists ({@link freeBusyAddresses}).
    */
   async ownAddresses(): Promise<readonly string[]> {
     this.addresses ??= this.lookUpAddresses().catch((err: unknown) => {
@@ -1341,6 +1454,18 @@ export class CalDavClient {
     }
     return match;
   }
+}
+
+/**
+ * A `find_free_slot` range bound in epoch ms, or NaN for anything but an
+ * ISO 8601 date-time that says its offset ({@link hasOffset}). Without one,
+ * `Date.parse` reads `2026-10-05T09:00` in the zone this process runs in — a
+ * server's, not the user's — which the refusal already claimed was not
+ * accepted (review of PR #232). `timedBound` (src/ical-input.ts) reads a
+ * bare clock time in an event's zone instead; a search range has none.
+ */
+function rangeBound(value: string): number {
+  return hasOffset(value) ? Date.parse(value) : NaN;
 }
 
 /**

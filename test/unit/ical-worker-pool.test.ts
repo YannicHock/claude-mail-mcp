@@ -13,7 +13,7 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { ExpansionPool, startExpansionWorker, type ExpansionPoolOptions } from "../../src/ical-worker-pool.js";
+import { ExpansionPool, reasonOf, startExpansionWorker, type ExpansionPoolOptions } from "../../src/ical-worker-pool.js";
 
 function ics(...lines: string[]): string {
   return `${lines.join("\r\n")}\r\n`;
@@ -151,6 +151,36 @@ describe("ExpansionPool — one slow calendar does not stall the others (review 
     assert.ok(waited < 2 * deadlineMs, `B waited ${waited} ms behind A's hanging objects`);
     const results = await slow;
     assert.ok(results.every((r) => /did not finish expanding/.test(r.skipped ?? "")));
+  });
+
+  it("runOnEach is one request too: a second one is served between its objects, and its hanging object rejects alone (#213)", { timeout: 30_000 }, async () => {
+    // find_free_slot reads every object of every calendar asked about; one
+    // runOn per object would be one request each, and another account's
+    // single object would queue behind all of them. Five hanging objects on
+    // two workers are three deadlines in one line, more than the two B may
+    // wait; shorter deadlines than the test above keep two cores from
+    // spinning long enough to slow the suite's timed tests.
+    const deadlineMs = 600;
+    const p = pool({ size: 2, deadlineMs });
+    await p.expand([{ url: "warm-1", etag: null, data: GOOD }, { url: "warm-2", etag: null, data: GOOD }], OCTOBER);
+    const objects = [
+      ...Array.from({ length: 5 }, (_, i) => ({ url: `https://a.example/cal/hangs-${i}.ics`, etag: `"h${i}"`, data: HANGS })),
+      { url: "https://a.example/cal/good.ics", etag: '"g"', data: GOOD },
+    ];
+    const slow = p.runOnEach(objects, "busyTimes", (o) => [o.data, OCTOBER, [], "UTC"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const started = Date.now();
+    const [good] = await p.expand([{ url: "https://b.example/cal/good.ics", etag: '"g"', data: GOOD }], OCTOBER);
+    const waited = Date.now() - started;
+    assert.equal(good.instances.length, 1);
+    assert.ok(waited < 2 * deadlineMs, `B waited ${waited} ms behind A's hanging objects`);
+    const results = await slow;
+    assert.deepEqual(
+      results.map((r) => r.status),
+      ["rejected", "rejected", "rejected", "rejected", "rejected", "fulfilled"]
+    );
+    const first = results[0];
+    assert.match(first.status === "rejected" ? reasonOf(first.reason) : "", /did not finish reading its busy times/);
   });
 
   it("skips an object that timed out before at once, with the same reason, until its ETag changes", { timeout: 30_000 }, async () => {

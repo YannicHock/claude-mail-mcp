@@ -169,7 +169,13 @@ function askedOffsetMs(ms: number, tz: string): number {
   return wall - whole;
 }
 
-const DAY_MS = 86_400_000;
+/**
+ * 24 hours in milliseconds: a span of instants, never "one calendar day",
+ * which on the day of a DST change is 23 or 25 hours (step a day on the
+ * wall clock with {@link addToWall} for that). Exported so a margin or a cap
+ * measured in days says so, instead of a bare 86_400_000.
+ */
+export const DAY_MS = 86_400_000;
 
 /** The offset in effect at a span's start, and every change in it: `at` is the first second of the new offset. */
 interface OffsetChanges {

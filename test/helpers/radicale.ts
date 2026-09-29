@@ -256,6 +256,14 @@ export interface CalDavProxyOptions {
    */
   uidConflictAs400?: boolean;
   /**
+   * Answer the PROPFIND for `calendar-user-address-set` as a principal that
+   * lists these hrefs, instead of Radicale's own non-`mailto:` one (R13):
+   * Nextcloud, whose principal's address may be another than the mailbox's
+   * (review of PR #232). Each replaces the hrefs inside the property, with
+   * the prefix Radicale wrote them with.
+   */
+  principalAddresses?: string[];
+  /**
    * Run before a request is forwarded, e.g. to delete an event between the
    * connector's lookup and its write.
    */
@@ -512,6 +520,21 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
       if (!planted) return;
       corrupted += 1;
       answer.payload = Buffer.from(xml, "utf8");
+    });
+  }
+  if (options.principalAddresses !== undefined) {
+    const hrefs = options.principalAddresses;
+    responseRewriters.push((ex, answer) => {
+      if (ex.seen.method !== "PROPFIND" || !ex.body?.toString("utf8").includes("calendar-user-address-set")) return;
+      const xml = answer.payload.toString("utf8");
+      const listed = xml.replace(
+        /<((?:\w+:)?calendar-user-address-set)([^>]*)>([\s\S]*?)<\/\1>/,
+        (_m, tag: string, attrs: string, inner: string) => {
+          const hrefTag = /<((?:\w+:)?href)>/.exec(inner)?.[1] ?? "D:href";
+          return `<${tag}${attrs}>${hrefs.map((h) => `<${hrefTag}>${h}</${hrefTag}>`).join("")}</${tag}>`;
+        }
+      );
+      answer.payload = Buffer.from(listed, "utf8");
     });
   }
   if (options.createdOnOverwrite) {
