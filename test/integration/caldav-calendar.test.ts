@@ -635,6 +635,33 @@ describe("zones on write (#208, #209)", SKIP, () => {
     // At the winter +02:00 it would be 08:00–09:00Z.
     assert.deepEqual(await serverFindsIn(own, "2026-03-28T08:00:00Z", "2026-03-28T09:00:00Z"), []);
   });
+
+  it("an event create_event wrote, moved years away and back again, stays Berlin time with a VTIMEZONE that covers it (review of #224)", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const created = await mine.createEvent({
+      calendarUrl: own.calendarUrl,
+      summary: "Created here",
+      start: "2026-12-01T10:00:00",
+      end: "2026-12-01T11:00:00",
+      timezone: "Europe/Berlin",
+    });
+    const file = `${created.uid}.ics`;
+    const listed = (await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end)).events.find((e) => e.uid === created.uid);
+    assert.ok(listed?.etag, "list_events gave no etag for the created event");
+
+    // Summer 2029, past the span the VTIMEZONE was generated for: 07:00Z.
+    const first = await mine.updateEvent({ calendarUrl: own.calendarUrl, uid: created.uid, etag: listed.etag, start: "2029-07-02T09:00:00+02:00" });
+    assert.match((await getRawEvent(own, file)) ?? "", /DTSTART;TZID=Europe\/Berlin:20290702T090000/);
+    assert.deepEqual(await serverFindsIn(own, "2029-07-02T07:00:00Z", "2029-07-02T07:30:00Z"), [file]);
+    assert.deepEqual(await serverFindsIn(own, "2029-07-02T05:30:00Z", "2029-07-02T07:00:00Z"), []);
+
+    // Again, from what Radicale stored: the block is still known as this
+    // connector's, so it follows the event a second time.
+    assert.ok(first.etag, "the first update gave no etag");
+    await mine.updateEvent({ calendarUrl: own.calendarUrl, uid: created.uid, etag: first.etag, start: "2031-07-01T09:00:00+02:00" });
+    assert.match((await getRawEvent(own, file)) ?? "", /DTSTART;TZID=Europe\/Berlin:20310701T090000/);
+    assert.deepEqual(await serverFindsIn(own, "2031-07-01T07:00:00Z", "2031-07-01T07:30:00Z"), [file]);
+  });
 });
 
 describe("update_event on a server that answers a PUT without an ETag", SKIP, () => {
@@ -835,7 +862,29 @@ describe("ETags the server hands out oddly (#210, spec §2.8)", SKIP, () => {
     }
   });
 
-  it("If-Match: * mishandled, and the event gone by the retry: what the retry created is taken back", async () => {
+  it("If-Match: * mishandled on a server that answers 201 to a replacement: the update succeeds and the event is kept (review of #224)", async () => {
+    // The retry replaces an event the second lookup has just found. Read as
+    // "created", the 201 made the connector delete the user's own event and
+    // answer that it did not exist.
+    const own = await makeRadicaleCalendar();
+    const uid = "star-201@example.com";
+    await putRawEvent(own, "star-201.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({ noEtags: true, starIfMatchBroken: true, createdOnOverwrite: true });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      await mine.updateEvent({ calendarUrl, uid, summary: "Still here" });
+      assert.equal(proxy.starRefusals(), 1, "If-Match: * was never sent, so the retry never ran");
+      assert.deepEqual(proxy.requests().filter((r) => r.method === "DELETE"), [], "the update sent a DELETE");
+      assert.match((await getRawEvent(own, "star-201.ics")) ?? "", /SUMMARY:Still here/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("If-Match: * mishandled, and the event gone by the retry: no 201 is taken as proof, so nothing is deleted (review of #224)", async () => {
+    // The second lookup found the event, and a 201 cannot tell "created" from
+    // "replaced" (above). Deleting on it would risk the user's own event to
+    // undo a race of a few milliseconds, so the retry's write stands.
     const own = await makeRadicaleCalendar();
     const uid = "star-gone@example.com";
     await putRawEvent(own, "star-gone.ics", richEvent(uid));
@@ -848,10 +897,9 @@ describe("ETags the server hands out oddly (#210, spec §2.8)", SKIP, () => {
     });
     try {
       const { client: mine, calendarUrl } = via(proxy, own);
-      const message = await refusal(mine.updateEvent({ calendarUrl, uid, summary: "x" }));
-      assert.match(message, /No event with UID "star-gone@example.com"/);
-      assert.match(message, /no event was created/);
-      assert.equal(await getRawEvent(own, "star-gone.ics"), null, "the retry left a created event behind");
+      await mine.updateEvent({ calendarUrl, uid, summary: "Written by the retry" });
+      assert.deepEqual(proxy.requests().filter((r) => r.method === "DELETE"), [], "the update sent a DELETE");
+      assert.match((await getRawEvent(own, "star-gone.ics")) ?? "", /SUMMARY:Written by the retry/);
     } finally {
       await proxy.close();
     }

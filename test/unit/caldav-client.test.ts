@@ -70,6 +70,34 @@ describe("buildIcs — the zone create_event writes (spec §2.5)", () => {
     assert.match(text, /\r\nDTSTART;VALUE=DATE:20261001\r\n/);
     assert.doesNotMatch(text, /VTIMEZONE|TZID/);
   });
+
+  it("writes an end on the second pass through the overlap in UTC, not as a wall time before the start's (review of #224)", () => {
+    // 02:45 CEST is 00:45Z and 02:15 CET is 01:15Z: half an hour, but as
+    // Berlin wall times the end would come first.
+    const text = buildIcs(
+      { ...BASE, start: "2026-10-25T02:45:00+02:00", end: "2026-10-25T02:15:00+01:00" },
+      "Europe/Berlin",
+      NOW
+    );
+    assert.match(text, /\r\nDTSTART;TZID=Europe\/Berlin:20261025T024500\r\n/);
+    assert.match(text, /\r\nDTEND:20261025T011500Z\r\n/);
+  });
+
+  it("refuses an end at or before the start, timed or all-day, and creates nothing (review of #224)", () => {
+    for (const [input, zone] of [
+      [{ start: "2026-10-01T10:00:00+02:00", end: "2026-10-01T09:00:00+02:00" }, "Europe/Berlin"],
+      [{ start: "2026-10-01T10:00:00+02:00", end: "2026-10-01T08:00:00Z" }, "UTC"],
+      [{ start: "2026-10-01", end: "2026-10-01", allDay: true }, "Europe/Berlin"],
+      [{ start: "2026-10-02", end: "2026-10-01", allDay: true }, "UTC"],
+    ] as const) {
+      assert.throws(
+        () => buildIcs({ ...BASE, ...input }, zone, NOW),
+        (err: unknown) =>
+          err instanceof ToolRefusal && /at or before it starts|on or before it starts/.test(err.message) && /Nothing was created/.test(err.message),
+        JSON.stringify(input)
+      );
+    }
+  });
 });
 
 describe("requireEtag — ETags the server hands out oddly (spec §2.8, #210)", () => {

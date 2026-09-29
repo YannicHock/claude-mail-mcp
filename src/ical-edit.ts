@@ -23,12 +23,13 @@
 import ICAL from "ical.js";
 import { parseCalendar, seriesFor } from "./ical-parse.js";
 import {
+  coverGeneratedVtimezone,
   hasOffset,
-  msOf,
   readDateTime,
-  timeIn,
+  storedInstant,
   UTC_ZONE,
   writeZoneOf,
+  writtenTime,
   type WriteZone,
 } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
@@ -169,7 +170,9 @@ export function timedBound(field: "start" | "end", value: string, zone: WriteZon
  * Write `time` into the VEVENT's `name` property, in place when it has one —
  * so the property keeps its position and every parameter but the two this
  * decides — with `TZID` as `zone` says: set for a zoned time, gone for UTC, a
- * floating time and a date.
+ * floating time and a date. `zone` is the one the time is actually written
+ * in (`WrittenTime` in src/ical-zones.ts), which for the second pass through
+ * an autumn overlap is UTC whatever the event's zone.
  */
 function setTime(vevent: ICAL.Component, name: "dtstart" | "dtend", time: ICAL.Time, zone: WriteZone | null): void {
   let prop = vevent.getFirstProperty(name);
@@ -196,6 +199,15 @@ function shown(ms: number, zone: WriteZone): string {
  * object's VTIMEZONE left byte for byte, and none added where it had none —
  * UTC for a UTC one, a date for an all-day one, and clock time for a floating
  * one. A switch from all-day to timed is written in UTC, as before.
+ *
+ * Three refinements from the review of #224. A wall time in the gap or the
+ * overlap is read by RFC 5545 §3.3.5's rule whether the zone comes from the
+ * object's VTIMEZONE or from `Intl`, so the two write the same times. A bound
+ * that lands on the second pass through an autumn overlap, which no wall
+ * time names, is written in UTC rather than as a wall time that means an
+ * hour earlier. And the one VTIMEZONE whose bytes may change is the one this
+ * connector generated for `create_event`: it is regenerated to cover the new
+ * times, since outside its span it would read the zone wrong.
  *
  * Throws {@link ToolRefusal} for a patch that cannot be applied as asked —
  * an end that is not after the start, an all-day switch without both bounds,
@@ -290,13 +302,17 @@ export function applyEventPatch(
       // length. Moving it keeps it that way rather than inventing an end —
       // and rather than refusing because the "old length" is zero.
       const hadNoEnd = !wasAllDay && endProp === null && !master.hasProperty("duration");
-      const oldStart = msOf(event.startDate);
+      // The old bounds are read by the rule the new ones are (review of
+      // #224): ical.js's own reading of a VTIMEZONE puts a wall time in the
+      // overlap on its second pass, and a length measured from there moved
+      // the end by an hour.
+      const oldStart = storedInstant(event.startDate, startZone);
       const startMs = patch.start !== undefined ? timedBound("start", patch.start, startZone, nothingDone) : oldStart;
       let endMs: number | undefined;
       if (patch.end !== undefined) endMs = timedBound("end", patch.end, endZone, nothingDone);
       else if (hadNoEnd) endMs = undefined;
       else {
-        const oldEnd = msOf(event.endDate);
+        const oldEnd = storedInstant(event.endDate, endZone);
         endMs = patch.start !== undefined ? startMs + (oldEnd - oldStart) : oldEnd;
       }
       if (endMs !== undefined && endMs <= startMs) {
@@ -304,9 +320,20 @@ export function applyEventPatch(
           `The event would end (${shown(endMs, endZone)}) at or before it starts (${shown(startMs, startZone)}). ${nothingDone}`
         );
       }
-      setTime(master, "dtstart", timeIn(startMs, startZone), startZone);
+      // Each bound in its zone, or in UTC for an instant no wall time there
+      // names: see `writtenTime`.
+      const start = writtenTime(startMs, startZone);
+      setTime(master, "dtstart", start.time, start.zone);
       if (endMs === undefined) master.removeAllProperties("dtend");
-      else setTime(master, "dtend", timeIn(endMs, endZone), endZone);
+      else {
+        const end = writtenTime(endMs, endZone);
+        setTime(master, "dtend", end.time, end.zone);
+      }
+      // A VTIMEZONE this connector generated follows the new times; any
+      // other is left byte for byte (review of #224).
+      for (const zone of new Set([startZone, endZone])) {
+        if (zone.kind === "zoned" && zone.generated === true) coverGeneratedVtimezone(vcal, zone.tzid);
+      }
     }
     master.removeAllProperties("duration");
   }

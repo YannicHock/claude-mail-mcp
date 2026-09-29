@@ -178,6 +178,15 @@ export interface CalDavProxyOptions {
    */
   starIfMatchBroken?: boolean;
   /**
+   * Answer `201 Created` to every PUT Radicale accepted, replacing an object
+   * or not — what Radicale 3.2.3 itself does (its `put.py` answers CREATED to
+   * every PUT; only later versions answer 204 to a replacement), and what
+   * RFC 9110 does not forbid. A client that reads a 201 as "this did not
+   * exist before" deletes the user's own event on such a server (review of
+   * #224).
+   */
+  createdOnOverwrite?: boolean;
+  /**
    * Run before a request is forwarded, e.g. to delete an event between the
    * connector's lookup and its write.
    */
@@ -321,6 +330,11 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
           }
         }
         await options.after?.(seen, answer.status);
+        if (options.createdOnOverwrite && req.method === "PUT" && answer.ok) {
+          res.writeHead(201, "Created", { ...out, "content-length": String(payload.length) });
+          res.end(payload);
+          return;
+        }
         res.writeHead(answer.status, answer.statusText, { ...out, "content-length": String(payload.length) });
         res.end(payload);
       })().catch((err: unknown) => {

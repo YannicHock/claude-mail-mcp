@@ -44,11 +44,11 @@ import { expansionPool, type StoredObject } from "./ical-worker-pool.js";
 import {
   calendarZone,
   canonicalZone,
+  generatedVtimezone,
   IntlTimezone,
   isUtcName,
-  timeIn,
   UTC_ZONE,
-  vtimezoneFromIntl,
+  writtenTime,
   type WriteZone,
 } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
@@ -413,12 +413,23 @@ export class CalDavClient {
    * §2.8):
    *
    *   1. look the event up again; gone, and the answer is the not-found
-   *      refusal;
-   *   2. still there, and the server mishandles `*`: write once more with no
-   *      `If-Match`;
-   *   3. and if *that* PUT answers 201, the event went away in between and the
-   *      write just created it again — delete what was created, and refuse as
-   *      not found. An update never leaves a created event behind.
+   *      refusal, with nothing written;
+   *   2. still there, and the server mishandles `*`: write once more, guarded
+   *      by the ETag that second lookup found if the server now gives one,
+   *      and with no `If-Match` otherwise.
+   *
+   * What that second write answers is taken as it comes, a `201 Created`
+   * included. Until the review of #224 a 201 here was read as "the event went
+   * away in between and this recreated it", and the connector deleted what it
+   * had just written. But a 201 says nothing of the kind: Radicale 3.2.3
+   * answers 201 to every PUT, replacement or not, and RFC 9110 does not
+   * forbid it — so on such a server every update through this path deleted
+   * the user's own event and answered that it did not exist. The second
+   * lookup has just proved the event exists; only independent proof that it
+   * is gone could justify a DELETE, and a status code is not that proof. The
+   * cost is the few milliseconds between that lookup and the write: an event
+   * deleted elsewhere inside them comes back with this update applied, which
+   * is recoverable, where deleting the user's event is not.
    */
   private async guardedWrite(
     method: "PUT" | "DELETE",
@@ -433,18 +444,8 @@ export class CalDavClient {
     if (ifMatch === "*" && res.status === 412) {
       const again = await this.findStoredEvent(calendar, uid, nothingDone);
       if (again.url !== url) throw notFound(uid, calendar.url, nothingDone);
-      res = await write(undefined);
-      if (method === "PUT" && res.status === 201) {
-        const client = await this.ensureClient();
-        const undo = await client.deleteCalendarObject({ calendarObject: { url } });
-        if (!undo.ok && undo.status !== 404) {
-          throw new Error(
-            `CalDAV server answered ${undo.status} ${undo.statusText}`.trim() +
-              ` to DELETE of ${url}, an event an update recreated after it had been deleted elsewhere`
-          );
-        }
-        throw notFound(uid, calendar.url, nothingDone);
-      }
+      // A weak ETag can never satisfy If-Match (RFC 7232 §3.1), so it guards nothing.
+      res = await write(again.etag !== null && !isWeak(again.etag) ? again.etag : undefined);
     }
     refuseLostRace(res, uid, calendar.url, nothingDone);
     assertWritten(res, method);
@@ -698,18 +699,22 @@ export function assertWritten(res: Response, method: string): void {
   }
 }
 
-/** How far either side of a new event its generated VTIMEZONE reaches (spec §2.5 A). */
-const VTIMEZONE_MARGIN_MS = 366 * 86_400_000;
-
 /**
  * The object `create_event` writes, in the IANA zone `zone` (spec 2026-09-29
  * §2.5): UTC (`…Z`, and no VTIMEZONE, as before v0.7.4) when `zone` is UTC,
  * and otherwise `TZID=zone` local time with a VTIMEZONE {@link
- * vtimezoneFromIntl} generates for the event's span and a year either side. A
- * time given without an offset is clock time in `zone`. An all-day event is
- * dates whatever the zone.
+ * generatedVtimezone} makes for the event's span and a year either side —
+ * marked as this connector's, so `update_event` regenerates it when the event
+ * moves outside that span (review of #224). A time given without an offset is
+ * clock time in `zone`. An all-day event is dates whatever the zone.
  *
- * Throws {@link ToolRefusal} for a start or end it cannot read.
+ * A bound on the second pass through an autumn overlap is written in UTC:
+ * as a wall time it would mean the first pass, an hour earlier, and could
+ * land before the start (see `writtenTime` in src/ical-zones.ts).
+ *
+ * Throws {@link ToolRefusal} for a start or end it cannot read, and for an end
+ * at or before the start — which until the review of #224 was written as it
+ * was given, an event every client shows with no length or backwards.
  */
 export function buildIcs(input: NewEventInput & { uid: string }, zone: string, now: Date = new Date()): string {
   const nothingDone = "Nothing was created.";
@@ -721,25 +726,34 @@ export function buildIcs(input: NewEventInput & { uid: string }, zone: string, n
   vevent.updatePropertyWithValue("uid", input.uid);
   vevent.updatePropertyWithValue("dtstamp", ICAL.Time.fromJSDate(now, true));
   if (input.allDay === true) {
-    vevent.updatePropertyWithValue("dtstart", ICAL.Time.fromDateString(calendarDate("start", input.start, nothingDone)));
-    vevent.updatePropertyWithValue("dtend", ICAL.Time.fromDateString(calendarDate("end", input.end, nothingDone)));
+    const start = calendarDate("start", input.start, nothingDone);
+    const end = calendarDate("end", input.end, nothingDone);
+    if (end <= start) {
+      throw new ToolRefusal(
+        `The event would end (${end}) on or before it starts (${start}). For an all-day event the end date is exclusive: a one-day event on ${start} ends the day after. ${nothingDone}`
+      );
+    }
+    vevent.updatePropertyWithValue("dtstart", ICAL.Time.fromDateString(start));
+    vevent.updatePropertyWithValue("dtend", ICAL.Time.fromDateString(end));
   } else {
     const target: WriteZone = isUtcName(zone)
       ? UTC_ZONE
       : { kind: "zoned", tzid: zone, zone: new IntlTimezone(zone, zone) };
     const startMs = timedBound("start", input.start, target, nothingDone);
     const endMs = timedBound("end", input.end, target, nothingDone);
+    if (endMs <= startMs) {
+      throw new ToolRefusal(
+        `The event would end (${new Date(endMs).toISOString()}) at or before it starts (${new Date(startMs).toISOString()}). ${nothingDone}`
+      );
+    }
     for (const [name, ms] of [["dtstart", startMs], ["dtend", endMs]] as const) {
+      const written = writtenTime(ms, target);
       const prop = new ICAL.Property(name);
-      prop.setValue(timeIn(ms, target));
-      if (target.kind === "zoned") prop.setParameter("tzid", target.tzid);
+      prop.setValue(written.time);
+      if (written.zone.kind === "zoned") prop.setParameter("tzid", written.zone.tzid);
       vevent.addProperty(prop);
     }
-    if (target.kind === "zoned") {
-      const from = Math.min(startMs, endMs) - VTIMEZONE_MARGIN_MS;
-      const to = Math.max(startMs, endMs) + VTIMEZONE_MARGIN_MS;
-      cal.addSubcomponent(new ICAL.Component(ICAL.parse(vtimezoneFromIntl(zone, from, to))));
-    }
+    if (target.kind === "zoned") cal.addSubcomponent(generatedVtimezone(zone, [startMs, endMs]));
   }
   vevent.updatePropertyWithValue("summary", input.summary);
   if (input.description) {

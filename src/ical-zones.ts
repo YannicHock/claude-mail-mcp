@@ -36,12 +36,28 @@
  * **The writing half** (plan Task 4a, #208, #209) keeps a time in the zone it
  * was stored in: {@link writeZoneOf} says which zone a stored time is written
  * back in, {@link readDateTime} reads a caller's time for it, and
- * {@link timeIn} makes the value to write. A Berlin event moved stays
+ * {@link writtenTime} makes the value to write. A Berlin event moved stays
  * `TZID=Europe/Berlin` local time, a UTC one stays UTC, a floating one stays
  * floating. The one VTIMEZONE the connector ever authors is
  * {@link vtimezoneFromIntl}'s, for `create_event`'s `timezone` (spec §2.5 A):
  * generated from `Intl` transition by transition, so it is exact where the
  * rejected package was not.
+ *
+ * The review of #224 found three ways the writing half disagreed with itself,
+ * and each has one answer here now:
+ *
+ *   - **One rule for every zone.** A VTIMEZONE and `Intl` both answer "what
+ *     offset at this instant" exactly, and every conversion is built on that
+ *     question ({@link wallToInstantBy}), so the gap and the overlap are read
+ *     by RFC 5545 §3.3.5 whichever kind of zone the object has.
+ *   - **An instant no wall time names** — the second pass through an autumn
+ *     overlap — is written in UTC ({@link writtenTime}), not as the wall time
+ *     that means the first pass.
+ *   - **The block this connector generated** covers only the span it was
+ *     made for, so it is marked, a time in its zone is computed through
+ *     `Intl`, and it is regenerated to cover every time the object holds
+ *     ({@link coverGeneratedVtimezone}). Any other VTIMEZONE is never
+ *     rewritten.
  */
 
 import ICAL from "ical.js";
@@ -238,30 +254,84 @@ export function zonedWallToInstant(
   minute: number,
   tz: string
 ): number {
-  const wall = Date.UTC(year, month - 1, day, hour, minute);
-  const before = utcOffsetMs(wall - OFFSET_SEARCH_MS, tz);
-  const after = utcOffsetMs(wall + OFFSET_SEARCH_MS, tz);
-  const candidates = new Set([before, after, utcOffsetMs(wall - before, tz), utcOffsetMs(wall - after, tz)]);
+  return wallToInstantBy(Date.UTC(year, month - 1, day, hour, minute), (ms) => utcOffsetMs(ms, tz));
+}
+
+/**
+ * A zone as one question: the UTC offset in effect at an instant, in ms. Both
+ * kinds of zone the connector does arithmetic in answer it exactly — `Intl`
+ * through {@link utcOffsetMs}, a VTIMEZONE through {@link vtimezoneOffsetMs}
+ * — and every conversion between wall time and instant is built on it, so the
+ * two kinds cannot read one wall time two ways (review of #224).
+ */
+type OffsetAt = (ms: number) => number;
+
+/**
+ * RFC 5545 §3.3.5's reading of a wall time, `wall` being its fields read as
+ * if they were UTC: {@link zonedWallToInstant}'s rule for any zone. Takes the
+ * offsets in effect a day and a half either side, keeps each one that maps
+ * back to this wall time, and picks the earliest; in a gap, where none does,
+ * the offset from before it.
+ */
+function wallToInstantBy(wall: number, offsetAt: OffsetAt): number {
+  const before = offsetAt(wall - OFFSET_SEARCH_MS);
+  const after = offsetAt(wall + OFFSET_SEARCH_MS);
+  const candidates = new Set([before, after, offsetAt(wall - before), offsetAt(wall - after)]);
   const valid = [...candidates]
     .map((offset) => wall - offset)
-    .filter((instant) => utcOffsetMs(instant, tz) === wall - instant);
+    .filter((instant) => offsetAt(instant) === wall - instant);
   // Overlap, or an ordinary time: the earliest instant showing this wall time.
   if (valid.length > 0) return Math.min(...valid);
   // Gap: no instant shows this wall time; read it with the offset before it.
   return wall - before;
 }
 
+/**
+ * The UTC offset a VTIMEZONE puts in effect at the instant `ms`, in ms.
+ *
+ * ical.js answers only the other question — the offset of a *wall* time,
+ * `Timezone.utcOffset` — and answers it naively at the two edges: a wall time
+ * in the autumn overlap gets the second pass, one in the spring gap the offset
+ * from after it. The write path used that, and so wrote an event with a
+ * VTIMEZONE an hour away from the same event without one (review of #224).
+ * But the transitions ical.js expands a VTIMEZONE into, `changes`, are
+ * instants, and the offset at an instant has exactly one answer: the one the
+ * last transition at or before it set.
+ *
+ * Before the block's first transition ical.js reads every wall time at
+ * offset 0, and so does this: it is how `list_events` reads such a time, and
+ * a write that disagreed with the reader would not come back as what was
+ * asked. The one VTIMEZONE this connector writes never leaves a time it
+ * holds outside its span (see {@link coverGeneratedVtimezone}).
+ *
+ * Expanding a VTIMEZONE's observance rules is ical.js's own bounded walk to a
+ * given year, the one every read of such a time already does; it is not an
+ * event's recurrence rule.
+ */
+function vtimezoneOffsetMs(zone: ICAL.Timezone, ms: number): number {
+  if (!zone.component) return 0;
+  zone._ensureCoverage(new Date(ms).getUTCFullYear() + 1);
+  let offset = 0;
+  for (const change of zone.changes as Array<ZonedWall & { utcOffset: number }>) {
+    const at = new Date(0).setUTCFullYear(change.year, change.month - 1, change.day) +
+      ((change.hour * 60 + change.minute) * 60 + change.second) * 1000;
+    if (at > ms) break;
+    offset = change.utcOffset * 1000;
+  }
+  return offset;
+}
+
+/** The question {@link OffsetAt} for an ical.js zone, `Intl` or VTIMEZONE. */
+function offsetsOf(zone: ICAL.Timezone): OffsetAt {
+  if (zone instanceof IntlTimezone) {
+    const iana = zone.iana;
+    return (ms) => utcOffsetMs(ms, iana);
+  }
+  return (ms) => vtimezoneOffsetMs(zone, ms);
+}
+
 /** Names `Intl` refused, so a TZID repeated on every instance costs one RangeError, not one each. */
 const notZones = new Set<string>();
-
-/**
- * {@link zonedWallToInstant} with seconds: it works in whole minutes, because
- * that is what a transition is aligned to, and a caller's `09:00:30` should
- * still come back as `09:00:30`.
- */
-function zonedWallToInstantWithSeconds(w: ZonedWall, tz: string): number {
-  return zonedWallToInstant(w.year, w.month, w.day, w.hour, w.minute, tz) + w.second * 1000;
-}
 
 /** True when `Intl` knows `name` as a zone. Offsets like `+01:00` are not zones here. */
 function isIanaZone(name: string): boolean {
@@ -433,14 +503,37 @@ export function zoneOf(prop: ICAL.Property): ZoneKind {
  *   - `zoned`: local time with `TZID=tzid`, where `tzid` is written exactly as
  *     the object stored it (`/mozilla.org/…/Europe/Berlin` stays that) and
  *     `zone` is what does the arithmetic — the object's own VTIMEZONE, or an
- *     {@link IntlTimezone} when it had none.
+ *     {@link IntlTimezone} when it had none or when the one it has is the
+ *     block this connector generated (`generated`, below).
+ *
+ * `generated` is set when the object's VTIMEZONE for `tzid` is the one
+ * {@link vtimezoneFromIntl} wrote. That block is exact only for the span it
+ * was generated for, and its last observance would otherwise stand for every
+ * year after it — so a time in such a zone is computed through `Intl`, and
+ * the writer regenerates the block with {@link coverGeneratedVtimezone} to
+ * cover every time the object then holds (review of #224).
  */
 export type WriteZone =
   | { kind: "utc" }
   | { kind: "floating" }
-  | { kind: "zoned"; tzid: string; zone: ICAL.Timezone };
+  | { kind: "zoned"; tzid: string; zone: ICAL.Timezone; generated?: true };
 
 export const UTC_ZONE: WriteZone = { kind: "utc" };
+
+/**
+ * The property {@link vtimezoneFromIntl} marks its block with. The block is
+ * this connector's to regenerate only while it carries the mark; one without
+ * it — any other client's, bounded or not — is how that client reads the
+ * event, and is never rewritten.
+ */
+const GENERATED_MARK = "x-claude-mail-mcp-generated";
+
+/** True for a VTIMEZONE {@link vtimezoneFromIntl} wrote for an IANA zone, TZID as `Intl` spells it. */
+function isGeneratedVtimezone(component: ICAL.Component | null | undefined): boolean {
+  if (!component?.hasProperty(GENERATED_MARK)) return false;
+  const tzid = String(component.getFirstPropertyValue("tzid") ?? "");
+  return canonicalZone(tzid) === tzid;
+}
 
 /**
  * The zone a stored DTSTART or DTEND is written back in (spec §2.5, #208):
@@ -459,7 +552,12 @@ export function writeZoneOf(prop: ICAL.Property): WriteZone | { kind: "unresolve
       return kind;
     default: {
       const time = prop.getFirstValue() as ICAL.Time;
-      return { kind: "zoned", tzid: String(prop.getParameter("tzid")), zone: time.zone as ICAL.Timezone };
+      const zone = time.zone as ICAL.Timezone;
+      const tzid = String(prop.getParameter("tzid"));
+      if (kind.kind === "vtimezone" && isGeneratedVtimezone(zone.component)) {
+        return { kind: "zoned", tzid, zone: new IntlTimezone(tzid, tzid), generated: true };
+      }
+      return { kind: "zoned", tzid, zone };
     }
   }
 }
@@ -502,35 +600,32 @@ function utcWall(ms: number): ZonedWall {
   };
 }
 
-/** The instant a wall time names in `zone`, by the zone's own arithmetic. */
+/**
+ * The instant a wall time names in `zone`, by RFC 5545 §3.3.5's rule
+ * ({@link wallToInstantBy}) whatever kind of zone it is: a VTIMEZONE and
+ * `Intl` read the gap and the overlap the same way (review of #224). Whole
+ * minutes, because that is what a transition is aligned to, and the seconds
+ * added back, so a caller's `09:00:30` still comes back as `09:00:30`.
+ */
 function wallToInstantIn(w: ZonedWall, zone: ICAL.Timezone): number {
-  if (zone instanceof IntlTimezone) return zonedWallToInstantWithSeconds(w, zone.iana);
-  return ICAL.Time.fromData({ ...w, isDate: false }, zone).toUnixTime() * 1000;
+  const wall = Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute);
+  return wallToInstantBy(wall, offsetsOf(zone)) + w.second * 1000;
 }
 
 /**
- * The wall time `ms` shows in `zone`.
+ * The wall time `ms` shows in `zone`, or null when that wall time names
+ * another instant.
  *
- * For an {@link IntlTimezone} that is `Intl`'s answer. A VTIMEZONE answers only
- * the other question — the offset of a wall time — so the wall time is found
- * the way {@link zonedWallToInstant} finds an instant: take the offsets in
- * effect a day and a half either side, and keep the wall time that maps back
- * to `ms`. ical.js's own conversion does it in two naive steps and lands on
- * the wrong side of a transition near one.
+ * Null is the second pass through an autumn overlap: Berlin shows 02:30 at
+ * 00:30Z and again at 01:30Z, and RFC 5545 §3.3.5 reads a TZID 02:30 as the
+ * first. Written as that wall time, 01:30Z would move an hour earlier — a
+ * one-hour event from 00:30Z would end where it starts, and one ending at
+ * 02:15 CET would end before a 02:45 CEST start (review of #224). The caller
+ * writes such an instant in UTC instead ({@link writtenTime}).
  */
-function wallIn(ms: number, zone: ICAL.Timezone): ZonedWall {
-  if (zone instanceof IntlTimezone) return instantToZonedWall(ms, zone.iana);
-  const offsets = [ms, ms - OFFSET_SEARCH_MS, ms + OFFSET_SEARCH_MS].map(
-    (probe) => zone.utcOffset(ICAL.Time.fromData({ ...utcWall(probe), isDate: false }, zone)) * 1000
-  );
-  for (const offset of offsets) {
-    const wall = utcWall(ms + offset);
-    if (wallToInstantIn(wall, zone) === ms) return wall;
-  }
-  // The second pass through an autumn overlap: no local time names it
-  // (RFC 5545 §3.3.5 reads the wall time as the first pass), so the nearest
-  // one does.
-  return utcWall(ms + offsets[0]);
+function wallIn(ms: number, zone: ICAL.Timezone): ZonedWall | null {
+  const wall = utcWall(ms + offsetsOf(zone)(ms));
+  return wallToInstantIn(wall, zone) === ms ? wall : null;
 }
 
 /**
@@ -553,23 +648,42 @@ export function readDateTime(value: string, zone: WriteZone): number {
 }
 
 /**
- * A stored time as {@link readDateTime} would have read it: the instant, or
- * for a floating time its clock time read as UTC. `toJSDate` would read a
- * floating time in the process's own zone.
+ * A stored time as {@link readDateTime} would have read it, for a time stored
+ * in `zone` (as {@link writeZoneOf} said): the instant, or for a floating time
+ * its clock time read as UTC. `toJSDate` would read a floating time in the
+ * process's own zone, and a zoned one by ical.js's naive reading of the gap
+ * and the overlap; this reads it by the same rule a new time is read by, so
+ * an event's length is measured the way its new end will be placed.
  */
-export function msOf(time: ICAL.Time): number {
-  if (isFloating(time)) {
-    return Date.UTC(time.year, time.month - 1, time.day, time.hour, time.minute, time.second);
-  }
+export function storedInstant(time: ICAL.Time, zone: WriteZone): number {
+  const wall = { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
+  if (isFloating(time)) return Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
+  if (zone.kind === "zoned") return wallToInstantIn(wall, zone.zone);
   return time.toUnixTime() * 1000;
 }
 
-/** The DATE-TIME to write for `ms` (as {@link readDateTime} returns it) in `zone`. */
-export function timeIn(ms: number, zone: WriteZone): ICAL.Time {
+/**
+ * A DATE-TIME ready to write, and the zone it is actually written in: `zone`,
+ * except for an instant no wall time in `zone` names (the second pass through
+ * an autumn overlap, see {@link wallIn}), which is written in UTC. RFC 5545
+ * lets DTSTART and DTEND — and RECURRENCE-ID, EXDATE, RDATE — each carry its
+ * own zone, and UTC is the one form every reader places at exactly that
+ * instant.
+ */
+export interface WrittenTime {
+  time: ICAL.Time;
+  zone: WriteZone;
+}
+
+/** The DATE-TIME to write for `ms` (as {@link readDateTime} returns it) in `zone`; see {@link WrittenTime}. */
+export function writtenTime(ms: number, zone: WriteZone): WrittenTime {
   const whole = Math.floor(ms / 1000) * 1000;
-  if (zone.kind === "utc") return ICAL.Time.fromJSDate(new Date(whole), true);
-  if (zone.kind === "floating") return ICAL.Time.fromData({ ...utcWall(whole), isDate: false });
-  return ICAL.Time.fromData({ ...wallIn(whole, zone.zone), isDate: false }, zone.zone);
+  if (zone.kind === "floating") return { time: ICAL.Time.fromData({ ...utcWall(whole), isDate: false }), zone };
+  if (zone.kind === "zoned") {
+    const wall = wallIn(whole, zone.zone);
+    if (wall !== null) return { time: ICAL.Time.fromData({ ...wall, isDate: false }, zone.zone), zone };
+  }
+  return { time: ICAL.Time.fromJSDate(new Date(whole), true), zone: UTC_ZONE };
 }
 
 /**
@@ -645,6 +759,11 @@ function formatLocal(w: ZonedWall): string {
  * block was measured wrong (§0.1). The first observance is the offset in
  * effect at `fromMs`. An observance is DAYLIGHT when its offset is above the
  * lowest one in the span, STANDARD otherwise.
+ *
+ * The block carries `X-CLAUDE-MAIL-MCP-GENERATED` (RFC 5545 §3.6.5 allows an
+ * x-prop in a VTIMEZONE; Radicale keeps it): the mark by which a later write
+ * knows the block is bounded and this connector's to regenerate, see
+ * {@link coverGeneratedVtimezone}.
  */
 export function vtimezoneFromIntl(tz: string, fromMs: number, toMs: number): string {
   const start = Math.floor(fromMs / 1000) * 1000;
@@ -664,9 +783,69 @@ export function vtimezoneFromIntl(tz: string, fromMs: number, toMs: number): str
   const lines = [
     "BEGIN:VTIMEZONE",
     `TZID:${tz}`,
+    // RFC 5545 §3.6.5 allows x-props here; see GENERATED_MARK.
+    `${GENERATED_MARK.toUpperCase()}:TRUE`,
     ...observance(start, first, first),
     ...changes.flatMap((c) => observance(c.at, c.from, c.to)),
     "END:VTIMEZONE",
   ];
   return `${lines.join("\r\n")}\r\n`;
+}
+
+/** How far either side of the times it serves a generated VTIMEZONE reaches (spec §2.5 A). */
+const VTIMEZONE_MARGIN_MS = 366 * 86_400_000;
+
+/**
+ * {@link vtimezoneFromIntl} for the IANA zone `tz`, covering every instant in
+ * `instants` and a year either side: what `create_event` writes, and what
+ * {@link coverGeneratedVtimezone} writes again when an event moves.
+ */
+export function generatedVtimezone(tz: string, instants: number[]): ICAL.Component {
+  const from = Math.min(...instants) - VTIMEZONE_MARGIN_MS;
+  const to = Math.max(...instants) + VTIMEZONE_MARGIN_MS;
+  return new ICAL.Component(ICAL.parse(`BEGIN:VCALENDAR\r\n${vtimezoneFromIntl(tz, from, to)}END:VCALENDAR\r\n`))
+    .getFirstSubcomponent("vtimezone") as ICAL.Component;
+}
+
+/**
+ * Regenerate the VTIMEZONE this connector generated for `tzid`, if the
+ * object holds one, so that it covers every time in the object written in
+ * that zone (review of #224). In place, and in the block's own position.
+ *
+ * A generated block is exact only across the span it was made for: before
+ * it ical.js reads the zone at offset 0, and after it the last observance
+ * stands for ever — Berlin at +0100 through every summer. Any client that
+ * reads the event by the block would place a time outside that span hours
+ * away from where it is. So whenever a writer puts a time in such a zone, it
+ * calls this, and the block is made again from `Intl` across every
+ * DTSTART, DTEND, RECURRENCE-ID, EXDATE and RDATE the object now holds with
+ * that TZID, a year either side.
+ *
+ * A block without the mark is someone else's and is left exactly as it is;
+ * so is an object whose times in the zone are all gone. An RRULE is not
+ * followed: `create_event` writes no series, and `update_event` changes no
+ * series' time, so no series holds a generated block today. The change that
+ * lets one (v0.7.4 PR 4) has to decide how far such a block reaches.
+ */
+export function coverGeneratedVtimezone(vcal: ICAL.Component, tzid: string): void {
+  // A copy: ical.js hands out its own array, which the removal below empties.
+  const subcomponents = [...vcal.getAllSubcomponents()];
+  const index = subcomponents.findIndex(
+    (c) => c.name === "vtimezone" && c.getFirstPropertyValue("tzid") === tzid && isGeneratedVtimezone(c)
+  );
+  if (index === -1) return;
+  const zone = new IntlTimezone(tzid, tzid);
+  const instants: number[] = [];
+  for (const prop of timedProperties(vcal)) {
+    if (String(prop.getParameter("tzid")) !== tzid) continue;
+    forEachTime(prop, (t) => {
+      if (!t.isDate) {
+        instants.push(wallToInstantIn({ year: t.year, month: t.month, day: t.day, hour: t.hour, minute: t.minute, second: t.second }, zone));
+      }
+    });
+  }
+  if (instants.length === 0) return;
+  subcomponents[index] = generatedVtimezone(tzid, instants);
+  vcal.removeAllSubcomponents();
+  for (const c of subcomponents) vcal.addSubcomponent(c);
 }
