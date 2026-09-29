@@ -855,9 +855,10 @@ anywhere.
    written to `/data/operator.json` on its volume. Passwords under 12 characters, and a
    password equal to the username, are refused here rather than after the instance
    is exposed.
-2. **The first mailbox.** Type an address and a password and the connector looks
+2. **The first mailbox.** Type an address and the connector looks
    the domain's settings up — autoconfig, `.well-known`, the Mozilla ISPDB, SRV
-   records — and shows what it found for confirmation. A provider list and the full
+   records — and shows what it found for confirmation, together with any warning
+   about the provider, before it asks for the password. A provider list and the full
    form are behind it. *Save and continue* runs a real IMAP and SMTP connection
    test first and writes only if both answered; a CalDAV failure is a warning, not
    a refusal. *Skip for now* configures nothing and moves on.

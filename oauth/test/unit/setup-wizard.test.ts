@@ -815,14 +815,16 @@ describe("tier 1 — the address screen", () => {
   const render = (data: Partial<MailboxAddressPageData> = {}): string =>
     renderMailboxAddressStep({ ...STEP_TWO_LINKS, email: "", errors: {}, ...data });
 
-  it("asks for two things, not eighteen", () => {
+  it("asks for the address and nothing else", () => {
     // The whole reason this screen exists ahead of the full form. If it ever
     // grows a host box, the cascade has collapsed back into the thing this
-    // milestone was written to remove.
+    // milestone was written to remove. And since #197 not a password either:
+    // the lookup this screen triggers is what says whether one can work.
     const html = render();
     assert.match(html, /Step 2 of 3 · Add your first mailbox/);
     assert.match(html, new RegExp(`name="${ADDRESS_FIELD}"`));
-    assert.match(html, new RegExp(`name="${SHARED_PASSWORD_FIELD}"`));
+    assert.equal(html.includes(`name="${SHARED_PASSWORD_FIELD}"`), false, "tier 1 asks for a password");
+    assert.equal(html.includes(`type="password"`), false, "tier 1 renders a password box");
 
     for (const name of [
       MAILBOX_FIELDS.imapHost,
@@ -844,8 +846,8 @@ describe("tier 1 — the address screen", () => {
   });
 
   it("can be skipped without mail credentials to hand", () => {
-    // `formnovalidate`, because both boxes are `required` and a browser will
-    // not submit an empty form at all — which would make Skip unpressable.
+    // `formnovalidate`, because the address box is `required` and a browser
+    // will not submit an empty form at all — which would make Skip unpressable.
     assert.match(render(), /name="_action" value="skip"[^>]*formnovalidate|formnovalidate[^>]*/);
     assert.match(render(), /value="skip"/);
   });
@@ -858,14 +860,6 @@ describe("tier 1 — the address screen", () => {
     assert.equal(html.includes("<script>"), false);
     assert.match(html, /Enter a full email address/);
     assert.match(html, /aria-invalid="true"/);
-  });
-
-  it("never writes a password back into the page", () => {
-    assert.match(
-      render(),
-      new RegExp(`name="${SHARED_PASSWORD_FIELD}"[^>]*value=""`),
-      "the password box has something in it"
-    );
   });
 });
 
@@ -987,10 +981,12 @@ describe("the confirmation screen", () => {
   });
 
   it("asks for one when the submission arrived without a password", () => {
-    // `required` on the address screen is the browser's promise, not this
-    // package's: a POST that skipped it still has to produce a usable screen.
+    // Since #197 this is the ordinary path: the address screen asks for no
+    // password, so this box is where it is typed first — and it carries the
+    // app-password hint that used to sit on the address screen.
     const html = render({ password: "" });
     assert.match(html, new RegExp(`name="${SHARED_PASSWORD_FIELD}"[^>]*type="password"`));
+    assert.match(html, /app password/i);
     assert.match(html, /never written back into this page/i);
     assert.equal(/type="hidden" name="password"/.test(html), false, html);
   });

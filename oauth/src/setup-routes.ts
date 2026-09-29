@@ -578,9 +578,10 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
 
     if (action === "lookup") {
       const email = stringField(body[ADDRESS_FIELD]).trim();
-      // The password the operator typed on the address screen. It is in this
-      // request, it is going to be needed by whichever screen comes next, and
-      // dropping it here is #120: the wizard asking for the same mailbox
+      // A password this lookup carried. Since #197 the address screen asks for
+      // none, so this is ordinarily "" and the next screen asks for it; but a
+      // request that does carry one (an older page, a hand-made POST) keeps
+      // it — dropping it here is #120: the wizard asking for the same mailbox
       // password a second time, with a screen in between that never mentioned
       // the first. It travels on in the form and reaches no file: the wizard's
       // state is still `{version, furthest}` and nothing about a mailbox is
