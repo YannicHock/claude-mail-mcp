@@ -22,8 +22,10 @@
 import ICAL from "ical.js";
 import { applyAttendeePatch } from "./ical-attendees.js";
 import {
+  mayNotifyOf,
   patchText,
   patchTimes,
+  stampOthers,
   stampRevision,
   touchesTime,
   type EditContext,
@@ -264,7 +266,11 @@ function overrideAt(vcal: ICAL.Component, uid: string, index: number): ICAL.Comp
  * Attendees (#205): `add_attendees` and `remove_attendees` change this
  * occurrence's guest list alone — the override's ATTENDEEs, which it took
  * from the master when it was made — through {@link applyAttendeePatch},
- * with `ctx.own` the account's calendar user addresses. An invitation to one
+ * with `ctx.own` the account's calendar user addresses. What decides mail
+ * reaches further (review of PR #230): an ORGANIZER the change supplies goes
+ * on every VEVENT of the UID, and with `false` every plain attendee on each
+ * is marked `SCHEDULE-AGENT=CLIENT`, since the server schedules the whole
+ * object; every VEVENT that wrote is stamped once. An invitation to one
  * instance of someone else's series is refused there, as their meeting.
  *
  * Refused, ending in `nothingDone`: switching one occurrence between all-day
@@ -303,12 +309,13 @@ export function applyOccurrencePatch(
         : overrideFromRange(master, overrideAt(vcal, uid, occurrence.range), occurrence);
     vcal.addSubcomponent(target);
   }
-  applyAttendeePatch(target, patch, own, nothingDone);
+  const guests = applyAttendeePatch(target, patch, own, nothingDone);
   patchText(target, patch);
   if (touchesTime(patch)) patchTimes(target, patch, nothingDone);
   const sequence = stampRevision(target, now);
+  stampOthers(guests, target, now);
   const override = keyOf(new ICAL.Event(target).recurrenceId, allDaySeries(master));
-  return { ics: vcal.toString(), mark: { uid, sequence, override } };
+  return { ics: vcal.toString(), mark: { uid, sequence, override }, ...mayNotifyOf(guests) };
 }
 
 /**

@@ -50,7 +50,7 @@
  */
 
 import ICAL from "ical.js";
-import { patchSeriesAttendees, touchesAttendees, type AttendeePatch } from "./ical-attendees.js";
+import { patchSeriesAttendees, touchesAttendees, type AttendeePatch, type AttendeeResult } from "./ical-attendees.js";
 import { calendarDate, dateMs, isoDate, timedBound } from "./ical-input.js";
 import { parseCalendar, seriesFor, type ParsedCalendar, type Series } from "./ical-parse.js";
 import { allDaySeries, currentOverrides, sequenceOf } from "./ical-series.js";
@@ -156,6 +156,13 @@ export interface EditResult {
   ics: string;
   /** Null when the write left no VEVENT it changed to know it by (see `excludeOccurrence` in src/ical-occurrence-edit.ts). */
   mark: WriteMark | null;
+  /**
+   * For a write that changed the guest list (#205): whom the calendar server
+   * may now email about the event — `AttendeeResult.mayNotify` in
+   * src/ical-attendees.ts, which `update_event` answers as `may_notify`.
+   * Absent for any other write.
+   */
+  mayNotify?: string[];
 }
 
 /**
@@ -268,7 +275,7 @@ export function patchText(vevent: ICAL.Component, patch: EventPatch): void {
  * The attendees first, by `patchSeriesAttendees` (src/ical-attendees.ts) —
  * so its refusals come before anything is changed — then the text fields as
  * given and the time by {@link patchTimes}; the VEVENT's revision is
- * stamped, and that of every override an attendee change reached. Throws
+ * stamped, and that of every other VEVENT the attendee change wrote. Throws
  * {@link ToolRefusal} ending in `ctx.nothingDone` for a patch that cannot be
  * applied as asked.
  */
@@ -279,12 +286,27 @@ export function applyEventPatch(parsed: ParsedCalendar, uid: string, patch: Even
   if (master === undefined) {
     throw new Error(`applyEventPatch: no main VEVENT for UID ${uid}`);
   }
-  const reached = patchSeriesAttendees(master, overrides, patch, own, nothingDone);
+  const guests = patchSeriesAttendees(master, overrides, patch, own, nothingDone);
   patchText(master, patch);
   if (touchesTime(patch)) patchTimes(master, patch, nothingDone);
   const sequence = stampRevision(master, now);
-  for (const override of reached) stampRevision(override, now);
-  return { ics: vcal.toString(), mark: { uid, sequence } };
+  stampOthers(guests, master, now);
+  return { ics: vcal.toString(), mark: { uid, sequence }, ...mayNotifyOf(guests) };
+}
+
+/**
+ * Stamp the revision of every VEVENT an attendee change wrote besides
+ * `stamped`, which the writer stamps itself — each once, however many of
+ * the change's steps reached it (the ORGANIZER, a SCHEDULE-AGENT, the guest
+ * list).
+ */
+export function stampOthers(guests: AttendeeResult | null, stamped: ICAL.Component, now: Date): void {
+  for (const vevent of guests?.changed ?? []) if (vevent !== stamped) stampRevision(vevent, now);
+}
+
+/** The {@link EditResult.mayNotify} of a write whose attendee change answered `guests`; nothing for a write that made none. */
+export function mayNotifyOf(guests: AttendeeResult | null): Pick<EditResult, "mayNotify"> {
+  return guests === null ? {} : { mayNotify: guests.mayNotify };
 }
 /**
  * Write the time `patch` asks for into `vevent` — a main VEVENT or an

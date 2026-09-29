@@ -18,6 +18,7 @@ import ICAL from "ical.js";
 import { patchSeriesAttendees } from "./ical-attendees.js";
 import {
   coverGenerated,
+  mayNotifyOf,
   patchText,
   setTime,
   shown,
@@ -124,7 +125,8 @@ export function shiftSeries(
   // Every override this write changes, for any reason, collected here and
   // stamped once at the end: one moved and given a new guest list gets one
   // new revision, not two.
-  const touched = new Set<ICAL.Component>(patchSeriesAttendees(master, overrides, patch, own, nothingDone));
+  const guests = patchSeriesAttendees(master, overrides, patch, own, nothingDone);
+  const touched = new Set<ICAL.Component>(guests?.changed ?? []);
   const anchorWall = anchor === null ? wallOf(start) : anchor.wall;
   // The lengths an override is compared against, before anything moves.
   const oldLength = new ICAL.Event(master).duration.toSeconds();
@@ -136,8 +138,9 @@ export function shiftSeries(
   }
   patchText(master, patch);
   const sequence = stampRevision(master, now);
+  touched.delete(master);
   for (const ve of touched) stampRevision(ve, now);
-  return { ics: vcal.toString(), mark: { uid, sequence } };
+  return { ics: vcal.toString(), mark: { uid, sequence }, ...mayNotifyOf(guests) };
 }
 
 /**

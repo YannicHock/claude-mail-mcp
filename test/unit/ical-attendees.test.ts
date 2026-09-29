@@ -20,20 +20,32 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { buildIcs } from "../../src/ical-build.js";
-import { addressKey, calendarUserAddresses, mailtoOf, touchesAttendees } from "../../src/ical-attendees.js";
+import {
+  addressKey,
+  applyAttendeePatch,
+  calendarUserAddresses,
+  mailtoOf,
+  patchSeriesAttendees,
+  touchesAttendees,
+  type AttendeePatch,
+} from "../../src/ical-attendees.js";
 import { applyEventPatch, changesSomething, type EventPatch } from "../../src/ical-edit.js";
 import { applyOccurrencePatch } from "../../src/ical-occurrence-edit.js";
-import { parseCalendar } from "../../src/ical-parse.js";
+import { parseCalendar, seriesFor } from "../../src/ical-parse.js";
 import { shiftSeries } from "../../src/ical-series-shift.js";
 import { ToolRefusal } from "../../src/tool-refusal.js";
-import { block, occurrence, SHAPES, unfold, UID, weekly } from "../helpers/ical-series-fixtures.js";
+import { block, occurrence, series as seriesOf, SHAPES, unfold, UID, vevents, weekly } from "../helpers/ical-series-fixtures.js";
 
 const NOW = new Date("2026-09-28T12:00:00Z");
 const CHANGED = "Nothing was changed.";
 const CREATED = "Nothing was created.";
 
-/** The account's own addresses as `ownAddresses` hands them out: the principal's first, the mailbox's last. */
-const OWN = ["mailto:me@cloud.example", "mailto:me@mail.example"] as const;
+/**
+ * The account's own addresses as `ownAddresses` hands them out for a
+ * principal that lists one `mailto:` (Nextcloud): that one alone, the
+ * mailbox's `me@mail.example` not among them (review of PR #230).
+ */
+const OWN = calendarUserAddresses(["/remote.php/dav/principals/users/me/", "mailto:me@cloud.example"], "me@mail.example");
 
 function ics(...lines: string[]): string {
   return `${lines.join("\r\n")}\r\n`;
@@ -110,13 +122,28 @@ function patched(text: string, patch: EventPatch, uid = MEETING): string {
   return unfold(applyEventPatch(parseCalendar(text), uid, patch, { nothingDone: CHANGED, now: NOW, own: OWN }).ics);
 }
 
-/** The refusal `run` throws, which must end in `nothingDone`. */
+/**
+ * `applyAttendeePatch` on the main VEVENT of `text` as it will be once
+ * acceptance A2 has shown that Nextcloud sends no cancellation for
+ * SCHEDULE-AGENT=CLIENT (`REMOVE_WITHOUT_NOTIFY_HONOURED` flipped to true),
+ * answering the new text, unfolded. Keeps the rule the flag switches on
+ * tested, so flipping it is a one-line change.
+ */
+function honouredPatched(text: string, patch: AttendeePatch, uid = MEETING): string {
+  const { vcal } = parseCalendar(text);
+  const { master } = seriesFor(vcal, uid);
+  assert.ok(master);
+  applyAttendeePatch(master, patch, OWN, CHANGED, true);
+  return unfold(vcal.toString());
+}
+
+/** The refusal `run` throws, which must end in `nothingDone`: what was not done is the last thing said. */
 function refused(run: () => unknown, nothingDone = CHANGED): string {
   try {
     run();
   } catch (err) {
     assert.ok(err instanceof ToolRefusal, `expected a ToolRefusal, got ${String(err)}`);
-    assert.match(err.message, new RegExp(nothingDone.replace(/\./g, "\\.")));
+    assert.ok(err.message.endsWith(nothingDone), `does not end in "${nothingDone}": ${err.message}`);
     return err.message;
   }
   assert.fail("the call was expected to be refused");
@@ -148,13 +175,20 @@ describe("calendar user addresses (src/ical-attendees.ts) — the one place an a
     assert.deepEqual(calendarUserAddresses(["/u1/"], "me@mail.example"), ["mailto:me@mail.example"]);
   });
 
-  it("puts the principal's mailto: first — the address the server compares ORGANIZER with — and the mailbox's after it, once", () => {
+  it("where the principal lists a mailto:, the principal's are the account's addresses, each once, and the mailbox's is not one of them (review of PR #230)", () => {
     assert.deepEqual(
       calendarUserAddresses(
-        ["/remote.php/dav/principals/users/me/", "mailto:Me@Cloud.example", "MAILTO:me@cloud.example", "mailto:me@mail.example"],
+        ["/remote.php/dav/principals/users/me/", "mailto:Me@Cloud.example", "MAILTO:me@cloud.example", "mailto:me2@cloud.example"],
         "ME@mail.example"
       ),
-      ["mailto:Me@Cloud.example", "mailto:me@mail.example"]
+      ["mailto:Me@Cloud.example", "mailto:me2@cloud.example"]
+    );
+  });
+
+  it("a principal that lists the mailbox's address itself keeps it, in the principal's order", () => {
+    assert.deepEqual(
+      calendarUserAddresses(["mailto:me@cloud.example", "mailto:me@mail.example"], "me@mail.example"),
+      ["mailto:me@cloud.example", "mailto:me@mail.example"]
     );
   });
 });
@@ -248,26 +282,44 @@ describe("update_event's add_attendees and remove_attendees (#205, spec §2.1)",
     assert.deepEqual(attendees(text), [CARA]);
   });
 
-  it("removes an attendee the server was told nothing about (SCHEDULE-AGENT=CLIENT) with notify_attendees: false", () => {
-    const text = patched(mine(), { removeAttendees: ["cara@example.com"], notifyAttendees: false });
-    assert.deepEqual(attendees(text), [BEN]);
+  // Spec §2.1: removal with `false` is honoured only if the Hetzner run (A2)
+  // shows Nextcloud sends no cancellation for an attendee who carried
+  // SCHEDULE-AGENT=CLIENT, "otherwise refused". Until A2 has been run it is
+  // refused for every attendee (`REMOVE_WITHOUT_NOTIFY_HONOURED` is false).
+  it("refuses remove_attendees with notify_attendees: false for every attendee until acceptance A2 is in, even one carrying SCHEDULE-AGENT=CLIENT, and changes nothing", () => {
+    for (const address of ["cara@example.com", "ben@example.com"]) {
+      const parsed = parseCalendar(mine());
+      const before = parsed.vcal.toString();
+      const message = refused(() =>
+        applyEventPatch(parsed, MEETING, { removeAttendees: [address], notifyAttendees: false }, { nothingDone: CHANGED, now: NOW, own: OWN })
+      );
+      assert.equal(parsed.vcal.toString(), before);
+      // What to do instead comes first, and leaving them listed first of all.
+      assert.match(message, /[Ll]eave them listed.*notify_attendees: true/);
+    }
   });
 
-  it("refuses to remove, with notify_attendees: false, an attendee the server was free to notify: it may send a cancellation whatever this says", () => {
-    const message = refused(() => patched(mine(), { removeAttendees: ["ben@example.com"], notifyAttendees: false }));
-    assert.match(message, /ben@example\.com/);
-    assert.match(message, /cancellation/);
-    assert.match(message, /notify_attendees: true/);
+  it("refuses remove_attendees with notify_attendees: false on an event with no organizer too, where nothing was ever scheduled", () => {
+    refused(() => patched(NO_ORGANIZER, { removeAttendees: ["ben@example.com"], notifyAttendees: false }));
   });
 
-  // Plan Task 6 / spec §2.1: removal with `false` is honoured only if the
-  // Hetzner run (A2) shows Nextcloud sends no cancellation for an attendee who
-  // carried SCHEDULE-AGENT=CLIENT. The case above it assumes it does not. If
-  // A2 shows Nextcloud cancels regardless, this one replaces it: un-skip it,
-  // and delete "removes an attendee the server was told nothing about".
-  it.skip("A2 fallback: remove_attendees with notify_attendees: false is refused, even for an attendee carrying SCHEDULE-AGENT=CLIENT (only if A2 shows Nextcloud cancels regardless)", () => {
-    const message = refused(() => patched(mine(), { removeAttendees: ["cara@example.com"], notifyAttendees: false }));
-    assert.match(message, /notify_attendees: true/);
+  describe("once acceptance A2 has shown Nextcloud sends no cancellation for SCHEDULE-AGENT=CLIENT (REMOVE_WITHOUT_NOTIFY_HONOURED: true)", () => {
+    it("removes an attendee the server was told nothing about (SCHEDULE-AGENT=CLIENT) with notify_attendees: false", () => {
+      const text = honouredPatched(mine(), { removeAttendees: ["cara@example.com"], notifyAttendees: false });
+      assert.deepEqual(attendees(text), [BEN]);
+    });
+
+    it("still refuses to remove, with notify_attendees: false, an attendee the server was free to notify: it may send a cancellation whatever this says", () => {
+      const message = refused(() => honouredPatched(mine(), { removeAttendees: ["ben@example.com"], notifyAttendees: false }));
+      assert.match(message, /ben@example\.com/);
+      assert.match(message, /cancellation/);
+      assert.match(message, /[Ll]eave them listed.*notify_attendees: true/);
+    });
+
+    it("with notify_attendees: false, the ORGANIZER a removal adds does not make the server notify the attendees left either", () => {
+      const text = honouredPatched(NO_ORGANIZER, { removeAttendees: ["ben@example.com"], addAttendees: ["dan@example.com"], notifyAttendees: false });
+      assert.deepEqual(attendees(text), ["ATTENDEE;SCHEDULE-AGENT=CLIENT:mailto:dan@example.com"]);
+    });
   });
 
   it("refuses notify_attendees missing, and changes nothing", () => {
@@ -314,6 +366,7 @@ describe("update_event's add_attendees and remove_attendees (#205, spec §2.1)",
     );
     assert.match(message, /anna@example\.com/);
     assert.match(message, /only its organizer/);
+    assert.match(message, /can still be changed here/);
     assert.equal(parsed.vcal.toString(), before);
     refused(() => patched(THEIRS, { removeAttendees: ["ben@example.com"], notifyAttendees: true }));
   });
@@ -325,9 +378,20 @@ describe("update_event's add_attendees and remove_attendees (#205, spec §2.1)",
     assert.equal(organizerOf(text), "ORGANIZER;CN=Anna:mailto:anna@example.com");
   });
 
-  it("takes the mailbox's address as the account's own too", () => {
-    const text = patched(mine("ORGANIZER:mailto:ME@mail.example"), { addAttendees: ["dan@example.com"], notifyAttendees: true });
-    assert.equal(attendees(text).length, 3);
+  it("takes the mailbox's address as the account's own where the principal lists none (Radicale, R13)", () => {
+    const own = calendarUserAddresses(["/u1/"], "me@mail.example");
+    const edit = applyEventPatch(
+      parseCalendar(mine("ORGANIZER:mailto:ME@mail.example")),
+      MEETING,
+      { addAttendees: ["dan@example.com"], notifyAttendees: true },
+      { nothingDone: CHANGED, now: NOW, own }
+    );
+    assert.equal(attendees(edit.ics).length, 3);
+  });
+
+  it("where the principal lists an address, an event organized by the mailbox's address is someone else's meeting: an invitation from the user's Gmail to their Nextcloud address is a copy they were sent", () => {
+    const message = refused(() => patched(mine("ORGANIZER:mailto:me@mail.example"), { addAttendees: ["dan@example.com"], notifyAttendees: true }));
+    assert.match(message, /organized by me@mail\.example/);
   });
 
   it("gives an event with attendees and no ORGANIZER one on its first attendee change: the account's first address", () => {
@@ -340,8 +404,6 @@ describe("update_event's add_attendees and remove_attendees (#205, spec §2.1)",
     // Before the ORGANIZER, the server treated none of them as invited; with
     // it, every plain ATTENDEE becomes one it would schedule. So `false`
     // reaches them too: they are affected by this call.
-    const text = patched(NO_ORGANIZER, { removeAttendees: ["ben@example.com"], addAttendees: ["dan@example.com"], notifyAttendees: false });
-    assert.deepEqual(attendees(text), ["ATTENDEE;SCHEDULE-AGENT=CLIENT:mailto:dan@example.com"]);
     const kept = patched(NO_ORGANIZER, { addAttendees: ["dan@example.com"], notifyAttendees: false });
     assert.deepEqual(attendees(kept), [
       "ATTENDEE;CN=Ben;PARTSTAT=ACCEPTED;SCHEDULE-AGENT=CLIENT:mailto:ben@example.com",
@@ -414,5 +476,148 @@ describe("attendees of a series and of one occurrence (#205 with #206, #207)", (
     refused(() =>
       applyOccurrencePatch(parseCalendar(theirs), UID, occurrence(theirs, rid), { removeAttendees: ["ben@example.com"], notifyAttendees: true }, { nothingDone: CHANGED, now: NOW, own: OWN })
     );
+  });
+});
+
+describe("a series with no ORGANIZER yet: the organizer and notify_attendees: false reach every VEVENT of the UID (review of PR #230)", () => {
+  // Sabre (Nextcloud) takes a scheduling object's organizer from any of its
+  // VEVENTs and schedules every attendee on every instance that carries no
+  // SCHEDULE-AGENT (RFC 6638 §3.2.2). So once one VEVENT of the UID gets the
+  // account as ORGANIZER, a plain ATTENDEE on any other one is someone the
+  // server may mail — and `false` has to reach them all.
+  const shape = SHAPES.find((s) => s.name === "UTC");
+  assert.ok(shape);
+  const ANN = "ATTENDEE;CN=Ann;PARTSTAT=ACCEPTED:mailto:ann@example.com";
+  const BEN_S = "ATTENDEE;CN=Ben;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT:mailto:ben@example.com";
+  const CY = "ATTENDEE;CN=Cy;PARTSTAT=NEEDS-ACTION:mailto:cy@example.com";
+  const MOVED = ["RECURRENCE-ID:20261015T090000Z", "DTSTART:20261015T110000Z", "DTEND:20261015T120000Z", "SUMMARY:Weekly (moved)", "SEQUENCE:1"];
+  /** Weekly, no ORGANIZER anywhere: Ann and Ben (and `extra`) on the master, `onMoved` on the 10-15 override. */
+  const unorganized = (extra: string[] = [], onMoved: string[] = [ANN, BEN_S]): string =>
+    seriesOf(shape, "20261001", "FREQ=WEEKLY;COUNT=5", [ANN, ...extra], [[...MOVED, ...onMoved]]);
+
+  /** Every VEVENT of `text` has the account as ORGANIZER, and every ATTENDEE on it carries SCHEDULE-AGENT=CLIENT. */
+  function quietEverywhere(text: string): void {
+    const blocks = vevents(text);
+    assert.ok(blocks.length >= 2);
+    for (const ve of blocks) {
+      assert.match(ve, /\r\nORGANIZER:mailto:me@cloud\.example\r\n/, ve);
+      for (const line of ve.split("\r\n").filter((l) => /^ATTENDEE[;:]/.test(l))) {
+        assert.match(line, /;SCHEDULE-AGENT=CLIENT[;:]/, `${line} is left for the server to schedule`);
+      }
+    }
+  }
+
+  it("(a) one occurrence given an attendee with false: the master and every other override get the ORGANIZER, and their plain attendees CLIENT, replies kept", () => {
+    const text = unorganized();
+    const rid = "2026-10-08T09:00:00.000Z";
+    const written = unfold(
+      applyOccurrencePatch(parseCalendar(text), UID, occurrence(text, rid), { addAttendees: ["dan@example.com"], notifyAttendees: false }, { nothingDone: CHANGED, now: NOW, own: OWN }).ics
+    );
+    quietEverywhere(written);
+    assert.match(block(written, null), /\r\nATTENDEE;CN=Ann;PARTSTAT=ACCEPTED;SCHEDULE-AGENT=CLIENT:mailto:ann@example\.com\r\n/);
+    assert.match(block(written, "RECURRENCE-ID:20261015T090000Z"), /\r\nSEQUENCE:2\r\n/, "a VEVENT the write changed is stamped");
+    assert.doesNotMatch(block(written, null), /dan@example\.com/);
+  });
+
+  it("(b) apply_to_series removing someone the master lists, with false, once removal with false is honoured: the untouched override's attendees are marked too", () => {
+    const { vcal } = parseCalendar(unorganized([CY]));
+    const { master, overrides } = seriesFor(vcal, UID);
+    assert.ok(master);
+    patchSeriesAttendees(master, overrides, { removeAttendees: ["cy@example.com"], notifyAttendees: false }, OWN, CHANGED, true);
+    const written = unfold(vcal.toString());
+    quietEverywhere(written);
+    assert.doesNotMatch(written, /cy@example\.com/);
+  });
+
+  it("with true, every VEVENT gets the same ORGANIZER and every attendee is left plain", () => {
+    const written = patched(unorganized(), { addAttendees: ["dan@example.com"], notifyAttendees: true }, UID);
+    for (const ve of vevents(written)) {
+      assert.match(ve, /\r\nORGANIZER:mailto:me@cloud\.example\r\n/);
+      assert.doesNotMatch(ve, /SCHEDULE-AGENT/);
+    }
+  });
+
+  it("an override with no ORGANIZER of a series that has one gets the series' own ORGANIZER line, and its attendees are left as they were", () => {
+    const text = seriesOf(shape, "20261001", "FREQ=WEEKLY;COUNT=5", ["ORGANIZER;CN=Me:mailto:me@cloud.example", ANN], [[...MOVED, ANN, BEN_S]]);
+    const rid = "2026-10-08T09:00:00.000Z";
+    const written = unfold(
+      applyOccurrencePatch(parseCalendar(text), UID, occurrence(text, rid), { addAttendees: ["dan@example.com"], notifyAttendees: false }, { nothingDone: CHANGED, now: NOW, own: OWN }).ics
+    );
+    const moved = block(written, "RECURRENCE-ID:20261015T090000Z");
+    assert.match(moved, /\r\nORGANIZER;CN=Me:mailto:me@cloud\.example\r\n/);
+    assert.match(moved, /\r\nATTENDEE;CN=Ann;PARTSTAT=ACCEPTED:mailto:ann@example\.com\r\n/);
+  });
+
+  it("a single event's guest list is written as before: nothing else in the object is touched", () => {
+    assert.deepEqual(attendees(patched(mine(), { addAttendees: ["dan@example.com"], notifyAttendees: false })), [
+      BEN,
+      CARA,
+      "ATTENDEE;SCHEDULE-AGENT=CLIENT:mailto:dan@example.com",
+    ]);
+  });
+
+  it("refuses a guest-list change on one occurrence when another VEVENT of the UID names someone else as ORGANIZER", () => {
+    const text = seriesOf(shape, "20261001", "FREQ=WEEKLY;COUNT=5", [ANN], [[...MOVED, "ORGANIZER:mailto:anna@example.com", ANN]]);
+    const rid = "2026-10-08T09:00:00.000Z";
+    const message = refused(() =>
+      applyOccurrencePatch(parseCalendar(text), UID, occurrence(text, rid), { addAttendees: ["dan@example.com"], notifyAttendees: true }, { nothingDone: CHANGED, now: NOW, own: OWN })
+    );
+    assert.match(message, /anna@example\.com/);
+  });
+});
+
+describe("apply_to_series removing someone only an override lists (review of PR #230)", () => {
+  const shape = SHAPES.find((s) => s.name === "UTC");
+  assert.ok(shape);
+  const CY = "ATTENDEE;CN=Cy;PARTSTAT=ACCEPTED:mailto:cy@example.com";
+  const text = seriesOf(shape, "20261001", "FREQ=WEEKLY;COUNT=5", ["ORGANIZER:mailto:me@cloud.example"], [
+    ["RECURRENCE-ID:20261015T090000Z", "DTSTART:20261015T110000Z", "DTEND:20261015T120000Z", "SEQUENCE:1", CY],
+  ]);
+
+  it("takes them off the occurrence that lists them: the series' guest list is every occurrence's", () => {
+    const written = patched(text, { removeAttendees: ["cy@example.com"], notifyAttendees: true }, UID);
+    assert.doesNotMatch(written, /cy@example\.com/);
+    assert.match(block(written, "RECURRENCE-ID:20261015T090000Z"), /\r\nSEQUENCE:2\r\n/);
+  });
+
+  it("refuses an address no occurrence lists, saying so, and changes nothing", () => {
+    const message = refused(() => patched(text, { removeAttendees: ["zoe@example.com"], notifyAttendees: true }, UID));
+    assert.match(message, /zoe@example\.com is not an attendee of any occurrence of this series/);
+  });
+});
+
+describe("mayNotify: whom the calendar server may now email about the event (review of PR #230)", () => {
+  /** The `mayNotify` an attendee change on `text` answers with. */
+  function mayNotify(text: string, patch: EventPatch, uid = MEETING): readonly string[] | undefined {
+    return applyEventPatch(parseCalendar(text), uid, patch, { nothingDone: CHANGED, now: NOW, own: OWN }).mayNotify;
+  }
+
+  it("names the attendees an ORGANIZER added with true makes schedulable, not only the one added", () => {
+    assert.deepEqual(mayNotify(NO_ORGANIZER, { addAttendees: ["dan@example.com"], notifyAttendees: true }), ["ben@example.com", "dan@example.com"]);
+  });
+
+  it("is empty when false reaches everyone", () => {
+    assert.deepEqual(mayNotify(NO_ORGANIZER, { addAttendees: ["dan@example.com"], notifyAttendees: false }), []);
+  });
+
+  it("names the attendees already scheduled, who may be told of the change, and never one marked CLIENT", () => {
+    assert.deepEqual(mayNotify(mine(), { addAttendees: ["dan@example.com"], notifyAttendees: false }), ["ben@example.com"]);
+  });
+
+  it("names an attendee removed with true, who may be sent a cancellation", () => {
+    assert.deepEqual(mayNotify(mine(), { removeAttendees: ["ben@example.com"], notifyAttendees: true }), ["ben@example.com"]);
+  });
+
+  it("covers every VEVENT of a series, once per person", () => {
+    const shape = SHAPES.find((s) => s.name === "UTC");
+    assert.ok(shape);
+    const text = weekly(shape, "FREQ=WEEKLY;COUNT=5", ["ORGANIZER:mailto:me@cloud.example"]);
+    const rid = "2026-10-08T09:00:00.000Z";
+    const edit = applyOccurrencePatch(parseCalendar(text), UID, occurrence(text, rid), { addAttendees: ["dan@example.com"], notifyAttendees: true }, { nothingDone: CHANGED, now: NOW, own: OWN });
+    assert.deepEqual(edit.mayNotify, ["ben@example.com", "dan@example.com"]);
+  });
+
+  it("is absent for a change that leaves the guest list alone", () => {
+    assert.equal(mayNotify(mine(), { summary: "Renamed" }), undefined);
   });
 });
