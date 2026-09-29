@@ -85,6 +85,39 @@ export interface ZonedWall {
   second: number;
 }
 
+/**
+ * The clock fields of a stored time, exactly as stored: no zone is applied.
+ * One reading for the reader (src/ical-expand.ts) and the writer that moves
+ * a series, which each had their own copy until the code-health review of
+ * PR #229.
+ */
+export function wallOf(time: ICAL.Time): ZonedWall {
+  return { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
+}
+
+/** `wall` moved by `seconds` on the clock: plain field arithmetic, no zone involved. */
+export function addToWall(wall: ZonedWall, seconds: number): ZonedWall {
+  const d = new Date(Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second) + seconds * 1000);
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+    second: d.getUTCSeconds(),
+  };
+}
+
+/** Seconds since midnight of a wall time. */
+export function clockSeconds(wall: ZonedWall): number {
+  return (wall.hour * 60 + wall.minute) * 60 + wall.second;
+}
+
+/** `YYYY-MM-DD` of a wall time. */
+export function dayOf(wall: ZonedWall): string {
+  return `${String(wall.year).padStart(4, "0")}-${String(wall.month).padStart(2, "0")}-${String(wall.day).padStart(2, "0")}`;
+}
+
 const formatters = new Map<string, Intl.DateTimeFormat>();
 
 /** One formatter per zone: constructing them is what costs, not using them. */

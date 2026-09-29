@@ -45,7 +45,10 @@
  * all-day series), not by ical.js, which compares the text of a
  * RECURRENCE-ID and so lost an override written in another zone or as a
  * midnight DATE-TIME; one that matches nothing the walk met is listed at its
- * own time (see {@link occurrencesIn}).
+ * own time (see {@link occurrencesIn}). The rules for that — the key an
+ * occurrence is matched by, which of two overrides counts, which
+ * `RANGE=THISANDFUTURE` override reaches an occurrence — live in
+ * src/ical-series.ts, shared with the writers.
  *
  * What a later change builds on: {@link occurrencesIn} is the expansion with
  * the ical.js values still attached, and {@link reportedTime} is the one place
@@ -58,7 +61,16 @@
 
 import ICAL from "ical.js";
 import { parseCalendar, seriesFor, seriesIn, type ParsedCalendar } from "./ical-parse.js";
-import { hasOffset, isFloating, wallAt, writeZoneOf, zoneNameOf, type ZonedWall } from "./ical-zones.js";
+import {
+  allDaySeries,
+  currentOverrides,
+  governingRange,
+  instantOf,
+  keyOf,
+  modifiesFuture,
+  type Override,
+} from "./ical-series.js";
+import { hasOffset, isFloating, wallAt, wallOf, writeZoneOf, zoneNameOf, type ZonedWall } from "./ical-zones.js";
 
 /** Instances listed per object and window before the rest are cut off (spec §2.2). */
 export const MAX_OCCURRENCES_PER_OBJECT = 1000;
@@ -156,15 +168,6 @@ export interface Occurrence {
 }
 
 /**
- * The instant a time names, in epoch ms. A floating time or a date has none,
- * so it is read as if it were UTC — what RFC 4791 §9.9 does with one when the
- * calendar has no zone, and what the server's own time-range filter did.
- */
-export function instantOf(time: ICAL.Time): number {
-  return time.toUnixTime() * 1000;
-}
-
-/**
  * The string `list_events` hands out for a time: `YYYY-MM-DD` for a date, a
  * clock time with no offset for a floating time (spec §2.5 — adding one would
  * claim a zone the event does not have), and an ISO instant in UTC otherwise.
@@ -223,60 +226,6 @@ export function impossibleRule(recur: ICAL.Recur): string | null {
   const longest = Math.max(...months.map((m) => LONGEST_MONTH[m - 1] ?? 0));
   if (days.some((d) => d !== 0 && Math.abs(d) <= longest)) return null;
   return `BYMONTHDAY=${days.join(",")} is a day none of BYMONTH=${months.join(",")} has`;
-}
-
-/**
- * What an occurrence of a series is matched by: the date for an all-day
- * series (or a DATE value), and the instant otherwise. ical.js matches an
- * override to an occurrence by the text of its RECURRENCE-ID, wall clock or
- * UTC, so one written in another zone, or as a midnight DATE-TIME for an
- * all-day series, matched nothing — and the master's occurrence was listed at
- * the old time while the override vanished (review of #223).
- *
- * Shared with src/ical-edit.ts (#206), so the override a write addresses is
- * the one `list_events` matched to that occurrence.
- */
-export function keyOf(time: ICAL.Time, allDay: boolean): string {
-  if (allDay || time.isDate) return `${time.year}-${time.month}-${time.day}`;
-  return String(instantOf(time));
-}
-
-/** An override VEVENT with the one ICAL.Event read from it, built once and used for its key, times and all. */
-export interface Override {
-  ve: ICAL.Component;
-  event: ICAL.Event;
-}
-
-/** `SEQUENCE`, 0 when absent or unreadable (RFC 5545 §3.8.7.4). */
-function sequenceOf(ve: ICAL.Component): number {
-  const value = Number(ve.getFirstPropertyValue("sequence") ?? 0);
-  return Number.isFinite(value) ? value : 0;
-}
-
-/**
- * The override that counts for each occurrence, by {@link keyOf} its
- * RECURRENCE-ID. Two overrides for one occurrence are two revisions of it,
- * and RFC 5545 §3.8.7.4 makes the one with the highest SEQUENCE current;
- * between equal ones the later in the object wins, as it did when ical.js
- * matched them. The others are dropped here, so none can come back as an
- * extra event the walk never met (review of #225: the first was kept, and the
- * newer one listed beside it as a phantom).
- */
-export function currentOverrides(overrides: ICAL.Component[], allDay: boolean): Map<string, Override> {
-  const byKey = new Map<string, Override>();
-  for (const ve of overrides) {
-    const event = new ICAL.Event(ve);
-    const key = keyOf(event.recurrenceId, allDay);
-    const held = byKey.get(key);
-    if (held === undefined || sequenceOf(ve) >= sequenceOf(held.ve)) byKey.set(key, { ve, event });
-  }
-  return byKey;
-}
-
-/** True for an override that also moves every later occurrence (`RANGE=THISANDFUTURE`). */
-export function modifiesFuture(ve: ICAL.Component): boolean {
-  const range = ve.getFirstProperty("recurrence-id")?.getParameter("range");
-  return typeof range === "string" && range.toUpperCase() === "THISANDFUTURE";
 }
 
 /**
@@ -362,7 +311,7 @@ export function occurrencesIn(
       master.removeProperty(prop);
       notes.push(`Its recurrence rule can never match a date (${why}), so only its start and any RDATE are listed.`);
     }
-    const allDay = (master.getFirstPropertyValue("dtstart") as ICAL.Time | null)?.isDate === true;
+    const allDay = allDaySeries(master);
     const periods = periodsOf(master, allDay);
 
     // Only the RANGE=THISANDFUTURE overrides go to ical.js, for the shift they
@@ -488,28 +437,6 @@ export interface NextOccurrence {
   overridden: boolean;
 }
 
-/**
- * The `RANGE=THISANDFUTURE` override whose change reaches the occurrence
- * starting at `at` (a rule's time, in the master's zone): of those in
- * `ranges`, the one with the latest RECURRENCE-ID not after `at`, the later
- * in the object on a tie — the one ical.js's `getOccurrenceDetails` applies
- * when {@link occurrencesIn} lists that occurrence. Its own `findRangeException`
- * is not used: its declared type (an Event) is not what it returns (a key).
- */
-export function governingRange(ranges: ICAL.Component[], at: ICAL.Time): ICAL.Component | undefined {
-  const atMs = instantOf(at);
-  let best: ICAL.Component | undefined;
-  let bestMs = -Infinity;
-  for (const ve of ranges) {
-    const ms = instantOf(new ICAL.Event(ve).recurrenceId);
-    if (ms <= atMs && ms >= bestMs) {
-      best = ve;
-      bestMs = ms;
-    }
-  }
-  return best;
-}
-
 export type OccurrenceLookup = FoundOccurrence | { found: false; reason: string };
 
 /** A time given as `list_events` gives it, reduced to what it names: a date, an instant, or a clock time. */
@@ -536,11 +463,6 @@ function reportedKey(value: string): ReportedKey | null {
 
 function sameKey(a: ReportedKey | null, b: ReportedKey): boolean {
   return a !== null && a.kind === b.kind && a.ms === b.ms;
-}
-
-/** The clock fields of a time as stored. */
-function fieldsOf(time: ICAL.Time): ZonedWall {
-  return { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
 }
 
 /**
@@ -594,7 +516,7 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
   }
   const { master, overrides } = seriesFor(vcal, uid);
   const position = new Map(vcal.getAllSubcomponents("vevent").map((ve, i) => [ve, i] as const));
-  const allDay = (master?.getFirstPropertyValue("dtstart") as ICAL.Time | null | undefined)?.isDate === true;
+  const allDay = allDaySeries(master);
   const byKey = currentOverrides(overrides, allDay);
   /** Every revision of the override for `key`, by position. */
   const revisions = (key: string): number[] =>
@@ -630,7 +552,7 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
     return {
       found: true,
       recurrenceId: reportedTime(event.recurrenceId),
-      wall: fieldsOf(event.recurrenceId),
+      wall: wallOf(event.recurrenceId),
       isDate: event.recurrenceId.isDate,
       overrides: revisions(key),
       current: position.get(ve) as number,
@@ -691,7 +613,7 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
    * master's zone is what a RECURRENCE-ID beside the master's TZID says.
    */
   const inSeriesZone = (time: ICAL.Time): ZonedWall =>
-    time.isDate || time.zone === start.zone || startZone.kind === "unresolved" ? fieldsOf(time) : wallAt(instantOf(time), startZone);
+    time.isDate || time.zone === start.zone || startZone.kind === "unresolved" ? wallOf(time) : wallAt(instantOf(time), startZone);
   /** True when the occurrence at `time` has an override of its own, matched as {@link occurrencesIn} matches one. */
   const overridden = (time: ICAL.Time): boolean => byKey.has(keyOf(time, allDay)) || (!allDay && byKey.has(keyOf(time, true)));
 

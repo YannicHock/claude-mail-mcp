@@ -17,13 +17,13 @@ import {
   changesSomething,
   describeStoredEvent,
   mainSequence,
-  sequenceOf,
   touchesTime,
   type EventPatch,
 } from "../../src/ical-edit.js";
 import { ToolRefusal } from "../../src/tool-errors.js";
 import { buildIcs } from "../../src/ical-build.js";
 import { parseCalendar } from "../../src/ical-parse.js";
+import { sequenceOf } from "../../src/ical-series.js";
 
 const NOW = new Date("2026-09-28T12:00:00Z");
 

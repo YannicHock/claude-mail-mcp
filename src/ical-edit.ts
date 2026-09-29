@@ -28,16 +28,21 @@
  */
 
 import ICAL from "ical.js";
-import { currentOverrides, keyOf, modifiesFuture, type FoundOccurrence } from "./ical-expand.js";
+import type { FoundOccurrence } from "./ical-expand.js";
 import { parseCalendar, seriesFor, type ParsedCalendar, type Series } from "./ical-parse.js";
+import { allDaySeries, currentOverrides, keyOf, modifiesFuture, sequenceOf } from "./ical-series.js";
 import {
+  addToWall,
+  clockSeconds,
   coverGeneratedVtimezone,
+  dayOf,
   hasOffset,
   instantAt,
   readDateTime,
   storedInstant,
   UTC_ZONE,
   wallAt,
+  wallOf,
   writeZoneOf,
   writtenTime,
   type WriteZone,
@@ -108,18 +113,6 @@ export function describeStoredEvent(ics: string, uid: string): StoredEventShape 
 }
 
 /**
- * A VEVENT's SEQUENCE: absent, or not a number, counts as 0. The one reading
- * both {@link mainSequence} and every edit here use (#214), because
- * `CalDavClient`'s read-back after a write trusts the two to agree — if they
- * drifted, it would hand back no etag for its own write, or someone else's
- * for it.
- */
-export function sequenceOf(vevent: ICAL.Component): number {
-  const sequence = Number(vevent.getFirstPropertyValue("sequence") ?? 0);
-  return Number.isFinite(sequence) ? sequence : 0;
-}
-
-/**
  * The SEQUENCE of the main VEVENT for `uid` (see {@link sequenceOf}), or null
  * when the object holds no main VEVENT for it. Lets a read-back after a write
  * tell its own version from one written since.
@@ -151,7 +144,7 @@ export interface WriteMark {
   sequence: number;
   /**
    * The occurrence whose override the write changed, by `keyOf`
-   * (src/ical-expand.ts) of its RECURRENCE-ID; absent for the main VEVENT.
+   * (src/ical-series.ts) of its RECURRENCE-ID; absent for the main VEVENT.
    */
   override?: string;
 }
@@ -500,11 +493,6 @@ function detachRangeAnchor(
   return plain;
 }
 
-/** True when `master` (absent for an object that holds only overrides) is an all-day series, as `list_events` keys it. */
-function allDaySeries(master: ICAL.Component | undefined): boolean {
-  return (master?.getFirstPropertyValue("dtstart") as ICAL.Time | null | undefined)?.isDate === true;
-}
-
 /** The VEVENT at `index` in `vcal` (document order), which `findOccurrence` named as an override of `uid`. */
 function overrideAt(vcal: ICAL.Component, uid: string, index: number): ICAL.Component {
   const ve = vcal.getAllSubcomponents("vevent")[index];
@@ -627,34 +615,6 @@ export function excludeOccurrence(
   return { ics: vcal.toString(), mark: { uid, sequence }, seriesEmpty };
 }
 
-/** `wall` moved by `seconds` on the clock: plain field arithmetic, no zone involved. */
-function addToWall(wall: ZonedWall, seconds: number): ZonedWall {
-  const d = new Date(Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second) + seconds * 1000);
-  return {
-    year: d.getUTCFullYear(),
-    month: d.getUTCMonth() + 1,
-    day: d.getUTCDate(),
-    hour: d.getUTCHours(),
-    minute: d.getUTCMinutes(),
-    second: d.getUTCSeconds(),
-  };
-}
-
-/** Seconds since midnight of a wall time. */
-function clockSeconds(wall: ZonedWall): number {
-  return (wall.hour * 60 + wall.minute) * 60 + wall.second;
-}
-
-/** `YYYY-MM-DD` of a wall time. */
-function dayOf(wall: ZonedWall): string {
-  return `${String(wall.year).padStart(4, "0")}-${String(wall.month).padStart(2, "0")}-${String(wall.day).padStart(2, "0")}`;
-}
-
-/** The clock fields of a stored time. */
-function wallOfTime(time: ICAL.Time): ZonedWall {
-  return { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
-}
-
 /** True when two zones are the same clock: both UTC, both floating, or one TZID. */
 function sameClock(a: WriteZone | { kind: "unresolved"; tzid: string }, b: WriteZone): boolean {
   if (a.kind === "zoned" && b.kind === "zoned") return a.tzid === b.tzid;
@@ -727,7 +687,7 @@ export function shiftSeries(
       `A series cannot be switched between all-day and timed: every occurrence it has, and every RECURRENCE-ID and EXDATE naming one, would change its form. ${nothingDone}`
     );
   }
-  const anchorWall = anchor === null ? wallOfTime(start) : anchor.wall;
+  const anchorWall = anchor === null ? wallOf(start) : anchor.wall;
   // The lengths an override is compared against, before anything moves.
   const oldLength = new ICAL.Event(master).duration.toSeconds();
 
