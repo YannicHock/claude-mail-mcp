@@ -10,6 +10,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+import { assertWritten, requireEtag } from "../../src/caldav-client.js";
 import type { ClientPool } from "../../src/client-pool.js";
 import { reportingFailures, ToolRefusal, TOOL_FAILURE_EVENT } from "../../src/tool-errors.js";
 
@@ -45,5 +46,40 @@ describe("reportingFailures", () => {
       /^Error: Account "work": .*403 Forbidden to PUT/
     );
     assert.deepEqual(lines, [{ level: "warn", message: TOOL_FAILURE_EVENT }]);
+  });
+});
+
+describe("assertWritten", () => {
+  it("accepts every 2xx", () => {
+    for (const status of [200, 201, 204]) {
+      assert.doesNotThrow(() => assertWritten(new Response(null, { status }), "PUT"));
+    }
+  });
+
+  it("turns anything else into an error naming the status and the method", () => {
+    assert.throws(
+      () => assertWritten(new Response(null, { status: 403, statusText: "Forbidden" }), "PUT"),
+      /CalDAV server answered 403 Forbidden to PUT/
+    );
+    assert.throws(
+      () => assertWritten(new Response(null, { status: 507, statusText: "Insufficient Storage" }), "DELETE"),
+      /507 Insufficient Storage to DELETE/
+    );
+  });
+});
+
+describe("requireEtag (spec §4.1)", () => {
+  const target = { calendarUrl: "https://dav.example/cal/", uid: "e@x" };
+
+  it("sends the caller's etag when there is one", () => {
+    assert.equal(requireEtag({ ...target, etag: '"a"' }, { etag: '"b"' }), '"a"');
+  });
+
+  it("writes without If-Match when the server keeps no etag", () => {
+    assert.equal(requireEtag(target, { etag: null }), undefined);
+  });
+
+  it("refuses to write blind over an object that has an etag", () => {
+    assert.throws(() => requireEtag(target, { etag: '"b"' }), (err: unknown) => err instanceof ToolRefusal);
   });
 });

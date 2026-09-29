@@ -37,3 +37,13 @@ services:
         -Dgreenmail.setup.test.all
         -Dgreenmail.hostname=0.0.0.0
         -Dgreenmail.users=alice:pw1@example.com,bob:pw2@example.com
+
+  # A real CalDAV server for the calendar writes (#152, #153). Its default
+  # config is `auth = none`: any Basic credentials are accepted and the
+  # username owns /<user>/, so each test file uses a fresh random user and
+  # needs no teardown between tests. See test/helpers/radicale.ts.
+  # Pinned by digest for the same reason as GreenMail above (Radicale 3.8.1).
+  radicale:
+    image: tomsquest/docker-radicale@sha256:419e0c005b63bd475d50f73c5e7ff2b1f04924edb94af525fa86faed213c632a
+    ports:
+      - "5232:5232"

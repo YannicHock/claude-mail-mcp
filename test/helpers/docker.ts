@@ -1,6 +1,8 @@
 /**
- * Docker Compose lifecycle helpers for the GreenMail-backed integration
- * suite. Used by more than one integration test file — currently
+ * Docker Compose lifecycle helpers for the GreenMail- and Radicale-backed
+ * integration suite. composeUp() starts every service in
+ * docker-compose.test.yml, so the calendar tests get Radicale from the same
+ * call (test/helpers/radicale.ts). Used by more than one integration test file — currently
  * test/integration/mail-server.test.ts and test/integration/probe.test.ts —
  * each of which independently calls composeUp() in its own `before()` and
  * composeDown() in its own `after()`.
@@ -8,7 +10,7 @@
  * composeUp()/composeDown() are unguarded global operations: they act on one
  * shared Docker Compose project (named after the repo directory, since
  * docker-compose.test.yml declares no explicit `name:`) and one shared set of
- * published host ports (3143/3025/3993). There is no reference counting —
+ * published host ports (3143/3025/3993 for GreenMail, 5232 for Radicale). There is no reference counting —
  * whichever file's `after()` runs first tears the fixture down for everyone,
  * including a file whose tests are still using it.
  *
