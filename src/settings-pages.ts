@@ -362,7 +362,7 @@ function saveAnywayButton(savable: boolean): string {
  *   third state exists because the first one was being used for it: under a
  *   failing IMAP row, on a 400, the panel said "Press Save to store them" — a
  *   step that cannot work, since pressing Save re-probes and refuses again, and
- *   one that contradicts the `saveRefusedNotice` a few lines above it. What is
+ *   one that contradicts the `saveRefusal` a few lines above it. What is
  *   true on that page is the other button, so the footer says nothing and lets
  *   the notice do the talking.
  */

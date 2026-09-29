@@ -61,7 +61,7 @@ import {
   PROVIDER_FIELD,
   PROVIDER_OTHER,
   SAVE_ANYWAY_FIELD,
-  saveRefusedNotice,
+  saveRefusal,
   SHARED_PASSWORD_FIELD,
   UNSUPPORTED_FIELD,
   UNSUPPORTED_FOR_FIELD,
@@ -633,7 +633,7 @@ function refusedByProbe(probe: MailboxProbeReport, message?: string): ConnectorB
     // the connector holds the provider table and can name what the operator's
     // own provider requires; `message` here defaults to exactly what the
     // connector would have said with no provider recognised.
-    createBody: { message: message ?? saveRefusedNotice(probe) ?? "", errors: {}, probe },
+    createBody: { message: message ?? saveRefusal(probe) ?? "", errors: {}, probe },
   };
 }
 
@@ -2664,7 +2664,7 @@ test("a refused save says the warning once, not once in each box", async () => {
   // #191's first finding, on the screen the operator lands on. The full form
   // gained a warning box in #186 and the connector's refusal sentence had the
   // same paragraph inside it — `rejectionNoteFor` returned the `unsupported`
-  // entry as if it were a credential note, and `saveRefusedNotice` substituted
+  // entry as if it were a credential note, and `saveRefusal` substituted
   // it for the generic remedy — so a refused save painted the paragraph in a
   // grey box and then again in the red one directly beneath.
   //
@@ -2688,7 +2688,7 @@ test("a refused save says the warning once, not once in each box", async () => {
     // the sentence fails here as well as on the connector's own suite — that is
     // the change that reintroduces the duplication, and it is made two packages
     // away from this screen.
-    const sentence = saveRefusedNotice(probe, undefined, true) ?? "";
+    const sentence = saveRefusal(probe, undefined, true) ?? "";
     assert.equal(/Bridge/.test(sentence), false, "the refusal sentence swallowed the warning");
     stubConnector(harness, {
       unsupported: PROTON_WARNING,
@@ -2814,7 +2814,7 @@ test("an address corrected the other way is not warned until the next lookup", a
 
 test("a refusal at an address the wizard was never warned about still explains itself", async () => {
   // The hole the open direction above used to leave on the one screen where it
-  // costs something. `saveRefusedNotice`'s third argument suppresses its own
+  // costs something. `saveRefusal`'s third argument suppresses its own
   // remedy on the assumption that the screen already carries the standing
   // warning — true of the connector's HTML, and asserted to JSON callers too
   // while shipping nothing they could show. So a save from this exact state
@@ -2840,7 +2840,7 @@ test("a refusal at an address the wizard was never warned about still explains i
     stubConnector(harness, {
       createStatus: 400,
       createBody: {
-        message: saveRefusedNotice(probe, undefined, true) ?? "",
+        message: saveRefusal(probe, undefined, true) ?? "",
         errors: {},
         probe,
         unsupported: PROTON_WARNING,

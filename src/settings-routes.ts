@@ -118,11 +118,10 @@ import {
   MAILBOX_SECRET_FIELDS,
   parseMailboxDraft,
   probeFailed,
-  probeRefusesSave,
   PROVIDER_FIELD,
   readSaveAnyway,
   SAVE_ANYWAY_FIELD,
-  saveRefusedNotice,
+  saveRefusal,
   SHARED_PASSWORD_FIELD,
   stepFromEdit,
   stepFromLookup,
@@ -427,7 +426,7 @@ function toWireReport(report: ProbeReport): MailboxProbeReport {
  * refused, or null.
  *
  * Whether to say anything at all is `credentialRejectionRefusesSave`, in the
- * wire contract, walking the same two services `saveRefusedNotice` walks. This
+ * wire contract, walking the same two services `saveRefusal` walks. This
  * file used to answer that question for itself, over all three services, and
  * the two disagreed about CalDAV — see that function's comment. A host that
  * never answered has said nothing about which password it wanted, which is the
@@ -458,7 +457,7 @@ function rejectionNoteFor(email: string, rejected: boolean): string | null {
  * The sentence above a refused save, carrying this provider's own requirement
  * when the failure was a rejection and the address's domain has one.
  *
- * `saveRefusedNotice` substitutes it for the generic app-password sentence
+ * `saveRefusal` substitutes it for the generic app-password sentence
  * rather than printing both — see its own comment. Three ways to get the
  * untargeted sentence back, all of them deliberate: the failure was
  * connectivity rather than credentials, the domain is not in the advice table,
@@ -472,11 +471,9 @@ function rejectionNoteFor(email: string, rejected: boolean): string | null {
  * report and the *Save anyway* escape stand alone, and the remedy is the
  * paragraph above them.
  */
-function refusalNotice(wire: MailboxProbeReport, email: string): string {
-  const note = probeRefusesSave(wire)
-    ? rejectionNoteFor(email, credentialRejectionRefusesSave(wire))
-    : null;
-  return saveRefusedNotice(wire, note ?? undefined, unsupportedNoticeFor(email) !== null) ?? "";
+function refusalNotice(wire: MailboxProbeReport, email: string): string | null {
+  const note = rejectionNoteFor(email, credentialRejectionRefusesSave(wire));
+  return saveRefusal(wire, note ?? undefined, unsupportedNoticeFor(email) !== null);
 }
 
 /**
@@ -526,7 +523,7 @@ function credentialAdvice(report: ProbeReport, email: string): { notice?: string
  * `null` is "nothing was probed", which is the operator having pressed *Save
  * anyway* — the whole of the escape hatch: a server in maintenance, a network
  * blip, or someone who knows better is not made to argue with a probe. What
- * makes a report a refusal is `probeRefusesSave`, which is in the wire contract
+ * makes a report a refusal is `saveRefusal` returning a sentence, which is in the wire contract
  * rather than here, because the wizard has to reach the same verdict.
  *
  * The rule lives here, in the connector, and in one place. Before #147 it lived
@@ -597,7 +594,9 @@ async function gateOnProbe(opts: {
   // and nothing to state afterwards either.
   if (report === null) return { proceed: true, report: undefined };
   const wire = toWireReport(report);
-  if (!probeRefusesSave(wire)) return { proceed: true, report: wire };
+  // The sentence is the gate: null is "nothing here refuses a save" (#172).
+  const notice = refusalNotice(wire, candidate.mail.defaultFrom);
+  if (notice === null) return { proceed: true, report: wire };
   log("warn", "settings: a mailbox was refused by the connection test", {
     action,
     id,
@@ -612,7 +611,7 @@ async function gateOnProbe(opts: {
     // in place of the wire contract's generic app-password sentence — a
     // replacement, never a second sentence beside it. The address comes off the
     // candidate rather than the body because that is the one already parsed.
-    notice: refusalNotice(wire, candidate.mail.defaultFrom),
+    notice,
   });
   return { proceed: false };
 }
@@ -785,7 +784,7 @@ interface DraftRefusal {
    * something that is already correct.
    */
   probe?: ProbeReport;
-  /** The sentence above the form. `saveRefusedNotice`'s, so the wizard says the same one. */
+  /** The sentence above the form. `saveRefusal`'s, so the wizard says the same one. */
   notice?: string;
   /**
    * The submitted fields, flattened, whose passwords the re-rendered form keeps.

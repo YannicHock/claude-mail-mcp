@@ -380,7 +380,7 @@ export interface MailboxErrorAnswer {
    * The standing warning about this *address*, when the table has one (#151).
    *
    * It travels with the refusal because `message` is written on the assumption
-   * that the screen already carries it — `saveRefusedNotice`'s third argument
+   * that the screen already carries it — `saveRefusal`'s third argument
    * suppresses its own remedy so the paragraph is not printed twice. That
    * assumption is the connector's to make about its own HTML, and it was
    * asserted to JSON callers too while shipping nothing they could show. A
@@ -479,11 +479,6 @@ function blockedServices(report: MailboxProbeReport): BlockedService[] {
   return blocked;
 }
 
-/** True when this report is a reason to refuse a write. */
-export function probeRefusesSave(report: MailboxProbeReport): boolean {
-  return blockedServices(report).length > 0;
-}
-
 /**
  * True when one of the services that *can* refuse a save refused it over the
  * credentials — the one condition under which anything about a password is
@@ -494,7 +489,7 @@ export function probeRefusesSave(report: MailboxProbeReport): boolean {
  * walks {@link SAVE_BLOCKING_SERVICES}. A report where IMAP was merely
  * unreachable while CalDAV rejected its credentials came out true there and
  * false here, so the provider note was looked up, handed to
- * {@link saveRefusedNotice} — and discarded by it. Harmless in what it
+ * {@link saveRefusal} — and discarded by it. Harmless in what it
  * rendered, and exactly the kind of two-predicates-one-question drift that
  * stops being harmless the moment either side is edited.
  *
@@ -511,7 +506,7 @@ export function credentialRejectionRefusesSave(report: MailboxProbeReport): bool
  * refuse a save.
  *
  * The routes that only *test* need a wider question than the ones that write.
- * A save is refused by IMAP or SMTP alone, so {@link probeRefusesSave} walks
+ * A save is refused by IMAP or SMTP alone, so {@link saveRefusal} walks
  * those two; but *Test connection* stores nothing, and a CalDAV row glowing red
  * with no explanation beside it is exactly the silence #146 was filed about.
  */
@@ -536,8 +531,33 @@ export function anyCredentialRejection(report: MailboxProbeReport): boolean {
 }
 
 /**
+ * What the operator is told about a CalDAV failure that did *not* stop the save,
+ * or null when there is nothing to say.
+ *
+ * The other half of the CalDAV rule. Refusing on it would be wrong; saying
+ * nothing would be worse, because the calendar tools will then be quietly
+ * missing for a mailbox the operator was just told was saved. So the write goes
+ * through and this is shown on the way out.
+ */
+export function caldavFailureNotice(report: MailboxProbeReport): string | null {
+  const caldav = report.caldav;
+  if (caldav === null || caldav.ok) return null;
+  return (
+    `The mailbox was saved. Its CalDAV server did not work: ${caldav.message}. ` +
+    "Mail is unaffected; the calendar tools stay unavailable for this mailbox until " +
+    "that is fixed, which can be done by editing it here at any time."
+  );
+}
+
+/**
  * What the operator is told when a probe refused their save, or null when the
  * report is not a refusal at all.
+ *
+ * The null is the gate as well as the absence of a sentence: a report is a
+ * reason to refuse a write exactly when this returns a string. It used to be
+ * two functions, `probeRefusesSave` beside this one, and every call site gated
+ * on one and then discarded the other's null in its own way — the connector
+ * with `?? ""`, the wizard with a fallback sentence of its own (#172).
  *
  * One sentence, written once, for both UIs. The connector renders it above its
  * own probe panel and the wizard renders it above its own, and neither writes a
@@ -560,26 +580,7 @@ export function anyCredentialRejection(report: MailboxProbeReport): boolean {
  * rejection changes nothing: there is no generic sentence there to replace,
  * because no server said anything about any password.
  */
-/**
- * What the operator is told about a CalDAV failure that did *not* stop the save,
- * or null when there is nothing to say.
- *
- * The other half of the CalDAV rule. Refusing on it would be wrong; saying
- * nothing would be worse, because the calendar tools will then be quietly
- * missing for a mailbox the operator was just told was saved. So the write goes
- * through and this is shown on the way out.
- */
-export function caldavFailureNotice(report: MailboxProbeReport): string | null {
-  const caldav = report.caldav;
-  if (caldav === null || caldav.ok) return null;
-  return (
-    `The mailbox was saved. Its CalDAV server did not work: ${caldav.message}. ` +
-    "Mail is unaffected; the calendar tools stay unavailable for this mailbox until " +
-    "that is fixed, which can be done by editing it here at any time."
-  );
-}
-
-export function saveRefusedNotice(
+export function saveRefusal(
   report: MailboxProbeReport,
   credentialNote?: string,
   /**

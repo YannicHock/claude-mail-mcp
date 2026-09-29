@@ -134,7 +134,7 @@ import {
   parseStampAnswer,
   PROVIDER_FIELD,
   SAVE_ANYWAY_FIELD,
-  saveRefusedNotice,
+  saveRefusal,
   SHARED_PASSWORD_FIELD,
   stepFromEdit,
   stepFromLookup,
@@ -883,21 +883,24 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         probe: refusedByProbe === undefined ? undefined : probeView(refusedByProbe),
         notice: {
           kind: "error",
+          // The connector's own sentence, so this screen and the connector's
+          // settings form say the same thing about the same refusal. Taken from
+          // the answer when it carried one — that is the sentence the connector
+          // actually wrote, and on a credential rejection it names what the
+          // operator's own provider requires (#148), which this package has no
+          // table to work out. Falling back to computing it from the report
+          // keeps a connector that sent no message saying what it said before.
+          //
+          // A report that `saveRefusal` does not read as a refusal cannot come
+          // from a connector on this release, which attaches one only to the
+          // refusal its own gate made. It gets the field-refusal sentence rather
+          // than a third wording of its own (#172): nothing was stored either way.
           message:
-            refusedByProbe === undefined
-              ? "The connector refused to store these details, so this attempt added " +
-                "nothing. What it objected to is marked below; fix that and try again."
-              : // The connector's own sentence, so this screen and the
-                // connector's settings form say the same thing about the same
-                // refusal. Taken from the answer when it carried one — that is
-                // the sentence the connector actually wrote, and on a credential
-                // rejection it names what the operator's own provider requires
-                // (#148), which this package has no table to work out. Falling
-                // back to computing it from the report keeps a connector that
-                // sent no message saying what it said before.
-                (created.message ??
-                saveRefusedNotice(refusedByProbe, undefined, warned !== null) ??
-                "Nothing was saved. Fix what failed above and try again."),
+            (refusedByProbe === undefined
+              ? null
+              : (created.message ?? saveRefusal(refusedByProbe, undefined, warned !== null))) ??
+            "The connector refused to store these details, so this attempt added " +
+              "nothing. What it objected to is marked below; fix that and try again.",
         },
       });
       return;
