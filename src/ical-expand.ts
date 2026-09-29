@@ -41,7 +41,8 @@
  */
 
 import ICAL from "ical.js";
-import { isFloating, withResolvedZones, zoneNameOf } from "./ical-zones.js";
+import { parseCalendar, seriesIn, type ParsedCalendar } from "./ical-parse.js";
+import { isFloating, zoneNameOf } from "./ical-zones.js";
 
 /** Instances listed per object and window before the rest are cut off (spec §2.2). */
 export const MAX_OCCURRENCES_PER_OBJECT = 1000;
@@ -166,7 +167,8 @@ function inWindow(start: ICAL.Time, end: ICAL.Time, window: ExpandWindow): boole
 
 /**
  * Every occurrence in `vcal` that overlaps `window`, earliest first, with at
- * most `cap` of them. `vcal` must have been through `withResolvedZones`.
+ * most `cap` of them. `vcal` must have come from `parseCalendar`
+ * (src/ical-parse.ts), which resolves its zones.
  *
  * Per UID: a master that does not recur is one occurrence; a master that does
  * is walked with its own overrides; overrides with no master (R3) are each an
@@ -181,12 +183,6 @@ export function occurrencesIn(
   window: ExpandWindow,
   cap: number = MAX_OCCURRENCES_PER_OBJECT
 ): { occurrences: Occurrence[]; truncated: boolean; gaveUp: boolean } {
-  const byUid = new Map<string, ICAL.Component[]>();
-  for (const ve of vcal.getAllSubcomponents("vevent")) {
-    const uid = String(ve.getFirstPropertyValue("uid") ?? "");
-    byUid.set(uid, [...(byUid.get(uid) ?? []), ve]);
-  }
-
   const found: Occurrence[] = [];
   let truncated = false;
   let gaveUp = false;
@@ -200,10 +196,7 @@ export function occurrencesIn(
     return true;
   };
 
-  for (const [uid, vevents] of byUid) {
-    const master = vevents.find((ve) => !ve.hasProperty("recurrence-id"));
-    const overrides = vevents.filter((ve) => ve.hasProperty("recurrence-id"));
-
+  for (const [uid, { master, overrides }] of seriesIn(vcal)) {
     if (master === undefined) {
       for (const ve of overrides) {
         const event = new ICAL.Event(ve);
@@ -297,14 +290,14 @@ function toInstance(o: Occurrence, opts: ExpandOptions): CalendarEvent {
  * and the reason in `skipped`.
  */
 export function expandObject(ics: string, window: ExpandWindow, opts: ExpandOptions): ExpandResult {
-  let vcal: ICAL.Component;
+  let parsed: ParsedCalendar;
   try {
-    vcal = new ICAL.Component(ICAL.parse(ics));
+    parsed = parseCalendar(ics);
   } catch (err) {
     return { instances: [], skipped: `The stored object could not be read as iCalendar: ${reasonFrom(err)}` };
   }
   try {
-    const { unresolved } = withResolvedZones(vcal);
+    const { vcal, unresolved } = parsed;
     if (unresolved.length > 0) {
       const names = unresolved.map((tzid) => `"${tzid}"`).join(", ");
       return {

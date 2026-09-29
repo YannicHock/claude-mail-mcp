@@ -13,10 +13,11 @@
  * "Nothing was deleted."), so a model reading it never has to guess whether
  * half of the call went through.
  *
- * It lives in a file of its own, importing nothing (#214). The pure calendar
- * modules — src/ical-edit.ts, src/ical-zones.ts, src/ical-expand.ts — throw
- * it, and taking it from tool-errors.ts pulled shared/credential-failure and
- * the client pool's types into every one of them. tool-errors.ts re-exports
+ * It lives in a file of its own, importing nothing (#214). src/ical-edit.ts,
+ * the pure module that decides what a write may do, throws it, and taking it
+ * from tool-errors.ts pulled shared/credential-failure and the client pool's
+ * types in with it. (src/ical-zones.ts and src/ical-expand.ts refuse nothing:
+ * the reader reports an object it cannot read in `skipped` instead.) tool-errors.ts re-exports
  * it, so `instanceof` holds whichever path a caller imported it by.
  */
 export class ToolRefusal extends Error {

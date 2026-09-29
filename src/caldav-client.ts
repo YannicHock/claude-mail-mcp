@@ -35,8 +35,6 @@ import {
 import { expandObject, instantOfReported, type CalendarEvent } from "./ical-expand.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
-export type { CalendarEvent } from "./ical-expand.js";
-
 // createDAVClient returns a logged-in client whose type omits the login
 // methods. Capture that shape for our field types.
 type AuthedDAVClient = Awaited<ReturnType<typeof createDAVClient>>;

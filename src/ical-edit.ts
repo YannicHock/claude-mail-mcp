@@ -15,6 +15,7 @@
  */
 
 import ICAL from "ical.js";
+import { parseCalendar, seriesFor } from "./ical-parse.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** The fields `update_event` can change. Everything else is left alone. */
@@ -58,15 +59,6 @@ export function changesSomething(patch: EventPatch): boolean {
   );
 }
 
-function veventsFor(vcal: ICAL.Component, uid: string): ICAL.Component[] {
-  return vcal
-    .getAllSubcomponents("vevent")
-    .filter((ve) => ve.getFirstPropertyValue("uid") === uid);
-}
-
-function parse(ics: string): ICAL.Component {
-  return new ICAL.Component(ICAL.parse(ics));
-}
 
 /**
  * What the stored object is, for the checks that come before any write.
@@ -76,14 +68,13 @@ function parse(ics: string): ICAL.Component {
  * hands back for `ev1` may be `ev10`'s. This is the check that catches it.
  */
 export function describeStoredEvent(ics: string, uid: string): StoredEventShape {
-  const vevents = veventsFor(parse(ics), uid);
-  if (vevents.length === 0) return { found: false, recurring: false, overrideOnly: false };
-  const recurring = vevents.some(
-    (ve) =>
-      ve.hasProperty("recurrence-id") || ve.hasProperty("rrule") || ve.hasProperty("rdate")
-  );
-  const overrideOnly = vevents.every((ve) => ve.hasProperty("recurrence-id"));
-  return { found: true, recurring, overrideOnly };
+  const { master, overrides } = seriesFor(parseCalendar(ics).vcal, uid);
+  if (master === undefined && overrides.length === 0) {
+    return { found: false, recurring: false, overrideOnly: false };
+  }
+  const recurring =
+    overrides.length > 0 || master?.hasProperty("rrule") === true || master?.hasProperty("rdate") === true;
+  return { found: true, recurring, overrideOnly: master === undefined };
 }
 
 /**
@@ -104,9 +95,8 @@ export function sequenceOf(vevent: ICAL.Component): number {
  * tell its own version from one written since.
  */
 export function mainSequence(ics: string, uid: string): number | null {
-  const master = veventsFor(parse(ics), uid).find((ve) => !ve.hasProperty("recurrence-id"));
-  if (master === undefined) return null;
-  return sequenceOf(master);
+  const { master } = seriesFor(parseCalendar(ics).vcal, uid);
+  return master === undefined ? null : sequenceOf(master);
 }
 
 /**
@@ -179,8 +169,8 @@ export function applyEventPatch(
   patch: EventPatch,
   now: Date = new Date()
 ): string {
-  const vcal = parse(ics);
-  const master = veventsFor(vcal, uid).find((ve) => !ve.hasProperty("recurrence-id"));
+  const vcal = new ICAL.Component(ICAL.parse(ics));
+  const { master } = seriesFor(vcal, uid);
   if (master === undefined) {
     throw new Error(`applyEventPatch: no main VEVENT for UID ${uid}`);
   }
