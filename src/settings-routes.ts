@@ -93,7 +93,11 @@ import { timingSafeEqual } from "node:crypto";
 import express, { type Request, type RequestHandler, type Response, type Router } from "express";
 
 import type { Logger } from "./app.js";
-import { lookupMailboxSettings, type MailboxSuggestion as LookupSuggestion } from "./autoconfig.js";
+import {
+  lookupMailboxSettings,
+  type MailboxSuggestion as LookupSuggestion,
+  type ReachChoice,
+} from "./autoconfig.js";
 import {
   AccountsStore,
   AccountsStoreError,
@@ -617,6 +621,27 @@ async function gateOnProbe(opts: {
     notice,
   });
   return { proceed: false };
+}
+
+/**
+ * What the address lookup decided when a service had rival servers (#194), as
+ * one `info` line per service.
+ *
+ * Ports and verdicts, not hosts. The lookup's other lines log a boolean and
+ * nothing else, because a host name under an operator's own domain identifies
+ * them as well as the address does. "465 closed, 587 open, chose 587" is the
+ * whole diagnosis anyway: it is what a host that filters a port looks like.
+ */
+function logReachChoice(log: Logger): (choice: ReachChoice) => void {
+  return (choice) => {
+    const portOf = (pair: string): number => Number(pair.slice(pair.lastIndexOf(":") + 1));
+    log("info", "settings: the address lookup checked which servers answer", {
+      service: choice.service,
+      ports: choice.candidates.map(portOf),
+      verdicts: choice.verdicts,
+      chosenPort: portOf(choice.chosen),
+    });
+  };
 }
 
 /**
@@ -1216,7 +1241,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         // this package, which is the half of #141 that was already easy. The §7
         // rules that make a user-derived fetch safe are in there and are not
         // restated here.
-        const found = await lookupMailboxSettings(email);
+        const found = await lookupMailboxSettings(email, { onChoice: logReachChoice(log) });
         // A boolean and nothing else. Not the address, and not the hosts.
         log("info", "settings: add mailbox looked up an address", { found: found !== null });
         // The domain is known for the first time here, which is the earliest
@@ -1541,7 +1566,9 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     // mapped field by field on purpose: if the connector's own suggestion shape
     // ever moves, this line stops compiling instead of quietly sending the
     // wizard a document it will read as unreadable.
-    const suggestion: LookupSuggestion | null = await lookupMailboxSettings(email);
+    const suggestion: LookupSuggestion | null = await lookupMailboxSettings(email, {
+      onChoice: logReachChoice(log),
+    });
 
     // #180. This is what widens the route from "what does this domain publish"
     // to "what does this connector know about this address" — which is what the

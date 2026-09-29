@@ -94,10 +94,27 @@ export const CHECKBOX_ON = "1";
 export const CONNECTOR_PROBE_BUDGET_MS = 25_000;
 
 /**
- * How long the connector gives the whole autoconfig cascade before it answers
+ * The autoconfig lookup's discovery phase: every document fetch, redirect and
+ * DNS query, one after another. What the whole lookup was before #194.
+ */
+export const CONNECTOR_AUTOCONFIG_DISCOVERY_MS = 10_000;
+
+/**
+ * The lookup's reachability phase (#194): every suggested server that has a
+ * rival is connected to at once, each within this. One slice, not one per
+ * candidate, because they run in parallel.
+ */
+export const CONNECTOR_AUTOCONFIG_REACH_MS = 3_000;
+
+/**
+ * How long the connector gives the whole address lookup before it answers
  * `null`. Shared for the same reason, and used the same way: `src/autoconfig.ts`
  * takes it as `AUTOCONFIG_TOTAL_TIMEOUT_MS`, and the wizard's lookup timeout is
  * this plus slack.
+ *
+ * Discovery plus one reach slice. The budget grew rather than having the probes
+ * squeezed into what discovery left over, because that would make the answer
+ * depend on how slow the ISPDB happened to be that minute.
  *
  * The slack matters more here than the arithmetic does. A cascade that runs to
  * the end of its deadline still has an answer to send — "nothing found" is an
@@ -105,7 +122,8 @@ export const CONNECTOR_PROBE_BUDGET_MS = 25_000;
  * number turns that into no answer at all: the same screen for the operator, and
  * a warning in the log about a connector that did precisely what it promised.
  */
-export const CONNECTOR_AUTOCONFIG_BUDGET_MS = 10_000;
+export const CONNECTOR_AUTOCONFIG_BUDGET_MS =
+  CONNECTOR_AUTOCONFIG_DISCOVERY_MS + CONNECTOR_AUTOCONFIG_REACH_MS;
 
 // ---- The draft -------------------------------------------------------------
 

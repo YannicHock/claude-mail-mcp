@@ -24,6 +24,8 @@ import {
   defaultDeps,
   AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS,
   AUTOCONFIG_TOTAL_TIMEOUT_MS,
+  AUTOCONFIG_DISCOVERY_TIMEOUT_MS,
+  AUTOCONFIG_REACH_TIMEOUT_MS,
   MAX_REDIRECTS,
   MAX_RESPONSE_BYTES,
   type AutoconfigDeps,
@@ -743,4 +745,207 @@ test("the response cap and the redirect limit are the ones §7 asks for", () => 
   // became 5, would leave every other test in this file green.
   assert.equal(MAX_RESPONSE_BYTES, 128 * 1024);
   assert.equal(MAX_REDIRECTS, 1);
+});
+
+// ------------------------------------------- which candidate answers (#194)
+
+const GMAIL = "anna@gmail.com";
+const GMAIL_ISPDB = "https://autoconfig.thunderbird.net/v1.1/gmail.com";
+
+interface XmlServer {
+  host: string;
+  port: number;
+  socket: "SSL" | "STARTTLS";
+}
+
+/** A clientConfig document with exactly these servers, in this order. */
+function xmlWith(imap: XmlServer[], smtp: XmlServer[]): string {
+  const block = (tag: string, type: string, s: XmlServer): string => `
+    <${tag} type="${type}">
+      <hostname>${s.host}</hostname>
+      <port>${s.port}</port>
+      <socketType>${s.socket}</socketType>
+      <username>%EMAILADDRESS%</username>
+      <authentication>password-cleartext</authentication>
+    </${tag}>`;
+  return `<?xml version="1.0"?>
+<clientConfig version="1.1"><emailProvider id="x">
+${imap.map((s) => block("incomingServer", "imap", s)).join("")}
+${smtp.map((s) => block("outgoingServer", "smtp", s)).join("")}
+</emailProvider></clientConfig>`;
+}
+
+/** What the ISPDB really answers for gmail.com: one SMTP server, on 465. */
+const GMAIL_XML = xmlWith(
+  [{ host: "imap.gmail.com", port: 993, socket: "SSL" }],
+  [{ host: "smtp.gmail.com", port: 465, socket: "SSL" }]
+);
+
+/**
+ * Fake deps with a `reachable` that answers from `open` ("host:port" pairs)
+ * and records every target it was asked about.
+ */
+function reachDeps(
+  opts: FakeOptions & { open?: string[]; never?: boolean } = {}
+): FakeDeps & { asked: string[] } {
+  const base = fakeDeps(opts);
+  const asked: string[] = [];
+  return {
+    ...base,
+    asked,
+    reachable(target) {
+      asked.push(`${target.host}:${target.port}`);
+      if (opts.never) return new Promise<boolean>(() => {});
+      return Promise.resolve((opts.open ?? []).includes(`${target.host}:${target.port}`));
+    },
+  };
+}
+
+test("a Gmail address on a host with 465 blocked is offered 587, from the provider table", async () => {
+  const deps = reachDeps({
+    pages: { [GMAIL_ISPDB]: ok(GMAIL_XML) },
+    open: ["imap.gmail.com:993", "smtp.gmail.com:587"],
+  });
+  const found = await lookupMailboxSettings(GMAIL, { deps });
+  assert.deepEqual(found?.smtp, {
+    host: "smtp.gmail.com",
+    port: 587,
+    tls: false,
+    socketType: "STARTTLS",
+    user: "anna@gmail.com",
+  });
+  assert.equal(found?.source, "ispdb", "the tier that answered is still the source");
+});
+
+test("where both answer, implicit TLS still wins: reachability breaks ties, it does not re-rank", async () => {
+  const deps = reachDeps({
+    pages: { [GMAIL_ISPDB]: ok(GMAIL_XML) },
+    open: ["imap.gmail.com:993", "smtp.gmail.com:465", "smtp.gmail.com:587"],
+  });
+  assert.equal((await lookupMailboxSettings(GMAIL, { deps }))?.smtp.port, 465);
+});
+
+test("where nothing answers, the suggestion is exactly today's", async () => {
+  // The probe at save time then reports the failure per service, as it always
+  // has. The lookup never turns "SMTP did not answer" into something vaguer.
+  const deps = reachDeps({ pages: { [GMAIL_ISPDB]: ok(GMAIL_XML) }, open: [] });
+  const found = await lookupMailboxSettings(GMAIL, { deps });
+  assert.equal(found?.smtp.port, 465);
+  assert.equal(found?.imap.port, 993);
+});
+
+test("a domain in no table with one candidate per service is unchanged", async () => {
+  const deps = reachDeps({ pages: { [T1]: ok(clientConfigXml()) }, open: [] });
+  const found = await lookupMailboxSettings(EMAIL, { deps });
+  assert.equal(found?.smtp.host, "smtp.example.com");
+  assert.equal(found?.smtp.port, 465);
+  // One candidate has nothing to choose between, so nothing is connected to.
+  assert.deepEqual(deps.asked, []);
+});
+
+test("both RFC 6186 submission records are candidates, not the first that exists", async () => {
+  const deps = reachDeps({
+    srv: {
+      "_imaps._tcp.example.com": [{ name: "imap.example.com", port: 993, priority: 10, weight: 1 }],
+      "_submissions._tcp.example.com": [
+        { name: "smtp.example.com", port: 465, priority: 10, weight: 1 },
+      ],
+      "_submission._tcp.example.com": [
+        { name: "smtp.example.com", port: 587, priority: 10, weight: 1 },
+      ],
+    },
+    open: ["smtp.example.com:587"],
+  });
+  const found = await lookupMailboxSettings(EMAIL, { deps });
+  assert.equal(found?.smtp.port, 587);
+  assert.equal(found?.smtp.socketType, "STARTTLS");
+});
+
+test("a candidate on a private address is never connected to at lookup", async () => {
+  const deps = reachDeps({
+    pages: {
+      [T1]: ok(
+        xmlWith(
+          [{ host: "imap.example.com", port: 993, socket: "SSL" }],
+          [
+            { host: "smtp.internal.example.com", port: 465, socket: "SSL" },
+            { host: "smtp.example.com", port: 587, socket: "STARTTLS" },
+          ]
+        )
+      ),
+    },
+    addresses: { "smtp.internal.example.com": ["10.0.0.5"] },
+    open: ["smtp.example.com:587"],
+  });
+  const found = await lookupMailboxSettings(EMAIL, { deps });
+  assert.equal(deps.asked.includes("smtp.internal.example.com:465"), false, deps.asked.join());
+  // Not known to be unreachable, so it keeps its place at the top of the ranking.
+  assert.equal(found?.smtp.host, "smtp.internal.example.com");
+});
+
+test("at most four candidates per service are connected to", async () => {
+  const smtp = [1, 2, 3, 4, 5].map((n) => ({
+    host: `smtp${n}.example.com`,
+    port: 465,
+    socket: "SSL" as const,
+  }));
+  const deps = reachDeps({
+    pages: { [T1]: ok(xmlWith([{ host: "imap.example.com", port: 993, socket: "SSL" }], smtp)) },
+    open: [],
+  });
+  await lookupMailboxSettings(EMAIL, { deps });
+  assert.equal(deps.asked.filter((t) => t.startsWith("smtp")).length, 4);
+});
+
+test("a check that never settles cannot hold the lookup past its reach budget", async () => {
+  const deps = reachDeps({ pages: { [GMAIL_ISPDB]: ok(GMAIL_XML) }, never: true });
+  const started = Date.now();
+  const found = await lookupMailboxSettings(GMAIL, { deps, reachMs: 200 });
+  assert.ok(Date.now() - started < 1_500, `took ${Date.now() - started}ms`);
+  assert.equal(found?.smtp.port, 465, "unanswered is not reachable: today's suggestion");
+});
+
+test("IMAP gets the same treatment", async () => {
+  const deps = reachDeps({
+    pages: {
+      [T1]: ok(
+        xmlWith(
+          [
+            { host: "imap.example.com", port: 993, socket: "SSL" },
+            { host: "imap.example.com", port: 143, socket: "STARTTLS" },
+          ],
+          [{ host: "smtp.example.com", port: 465, socket: "SSL" }]
+        )
+      ),
+    },
+    open: ["imap.example.com:143"],
+  });
+  const found = await lookupMailboxSettings(EMAIL, { deps });
+  assert.equal(found?.imap.port, 143);
+  assert.equal(found?.imap.tls, false);
+});
+
+test("the whole lookup budget is discovery plus one reach slice", () => {
+  assert.equal(AUTOCONFIG_TOTAL_TIMEOUT_MS, AUTOCONFIG_DISCOVERY_TIMEOUT_MS + AUTOCONFIG_REACH_TIMEOUT_MS);
+  assert.equal(AUTOCONFIG_DISCOVERY_TIMEOUT_MS, 10_000);
+  assert.equal(AUTOCONFIG_REACH_TIMEOUT_MS, 3_000);
+});
+
+test("the choice is reported per service with host:port pairs only, for the log", async () => {
+  const deps = reachDeps({
+    pages: { [GMAIL_ISPDB]: ok(GMAIL_XML) },
+    open: ["imap.gmail.com:993", "smtp.gmail.com:587"],
+  });
+  const choices: unknown[] = [];
+  await lookupMailboxSettings(GMAIL, { deps, onChoice: (c) => choices.push(c) });
+  // IMAP had no rival (the table's entry is the ISPDB's), so only SMTP chose.
+  assert.deepEqual(choices, [
+    {
+      service: "smtp",
+      candidates: ["smtp.gmail.com:465", "smtp.gmail.com:587"],
+      verdicts: ["closed", "open"],
+      chosen: "smtp.gmail.com:587",
+    },
+  ]);
+  assert.equal(JSON.stringify(choices).includes("anna"), false, "never the address");
 });

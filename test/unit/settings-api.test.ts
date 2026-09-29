@@ -1047,7 +1047,7 @@ describe("the connector's timeout budgets", () => {
     // connector's own constants. Changing one of these is a decision about how
     // long an operator waits, and it should have to be made twice.
     assert.equal(CONNECTOR_PROBE_BUDGET_MS, 25_000);
-    assert.equal(CONNECTOR_AUTOCONFIG_BUDGET_MS, 10_000);
+    assert.equal(CONNECTOR_AUTOCONFIG_BUDGET_MS, 13_000);
   });
 
   it("are numbers, in a module whose every other map is strings", () => {
