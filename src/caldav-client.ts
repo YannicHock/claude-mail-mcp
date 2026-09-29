@@ -343,22 +343,17 @@ export class CalDavClient {
     const shape = describeSeries(seriesFor(stored.parsed.vcal, update.uid));
     const target: WriteTarget = { calendar, uid: update.uid, url: stored.url, nothingDone };
     let edit: EditResult;
-    if (shape.overrideOnly) {
-      // #211.3: no master, so there is no series here to change; the one
-      // occurrence the object holds is changed like any other.
-      if (update.applyToSeries === true && touchesTime(update)) {
-        throw new ToolRefusal(
-          `"${update.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example), so the series' time cannot be changed here. To move this one occurrence, omit apply_to_series. ${nothingDone}`
-        );
-      }
+    // #211.3: an object with no master has no series here to change; the one
+    // occurrence it holds is changed like any other, with or without its
+    // recurrence_id.
+    if (shape.overrideOnly && update.applyToSeries === true && touchesTime(update)) {
+      throw new ToolRefusal(
+        `"${update.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example), so the series' time cannot be changed here. To move this one occurrence, omit apply_to_series. ${nothingDone}`
+      );
+    }
+    if (shape.overrideOnly || (recurrenceId !== undefined && update.applyToSeries !== true)) {
       const ifMatch = requireEtag(update, stored, nothingDone);
       const found = await this.occurrence(stored, update.uid, recurrenceId ?? null, nothingDone);
-      edit = applyOccurrencePatch(stored.parsed, update.uid, found, update, nothingDone);
-      return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
-    }
-    if (recurrenceId !== undefined && update.applyToSeries !== true) {
-      const ifMatch = requireEtag(update, stored, nothingDone);
-      const found = await this.occurrence(stored, update.uid, recurrenceId, nothingDone);
       edit = applyOccurrencePatch(stored.parsed, update.uid, found, update, nothingDone);
       return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
     }
