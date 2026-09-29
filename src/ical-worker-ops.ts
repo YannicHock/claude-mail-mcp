@@ -18,17 +18,24 @@
  * A write re-parses the original text on the main thread and changes that,
  * addressing what the operation found by the strings and indices it returned.
  *
- * To add one — PR 4's occurrence lookup by `recurrence_id`, say — add it to
+ * To add one — as PR 4 added the occurrence lookup by `recurrence_id` — add it to
  * {@link WORKER_OPS}, say what it does in {@link OP_ACTIONS}, and call it
  * with `ExpansionPool.runOn` (src/ical-worker-pool.ts), which also remembers
  * an object that timed out; turn a rejection into words with `reasonOf`.
  */
 
-import { expandObject } from "./ical-expand.js";
+import { expandObject, findOccurrence } from "./ical-expand.js";
 
 export const WORKER_OPS = {
   /** src/ical-expand.ts's {@link expandObject}: one stored object's instances in a window. */
   expand: expandObject,
+  /**
+   * src/ical-expand.ts's {@link findOccurrence}: the occurrence a caller's
+   * `recurrence_id` names, matched against the expanded series (#206), for
+   * `update_event` and `delete_event` on one occurrence and as the anchor of
+   * a series' new time (#207).
+   */
+  findOccurrence,
 } as const;
 
 export type WorkerOps = typeof WORKER_OPS;
@@ -41,6 +48,7 @@ export type WorkerOpName = keyof WorkerOps;
  */
 export const OP_ACTIONS: { readonly [K in WorkerOpName]: string } = {
   expand: "expanding",
+  findOccurrence: "looking for the occurrence",
 };
 
 export interface WorkerRequest<K extends WorkerOpName = WorkerOpName> {

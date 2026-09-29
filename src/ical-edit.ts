@@ -28,6 +28,7 @@
  */
 
 import ICAL from "ical.js";
+import { currentOverrides, keyOf, type FoundOccurrence } from "./ical-expand.js";
 import { parseCalendar, seriesFor, type ParsedCalendar, type Series } from "./ical-parse.js";
 import {
   coverGeneratedVtimezone,
@@ -132,7 +133,8 @@ export function mainSequence(ics: string, uid: string): number | null {
  */
 export interface EditResult {
   ics: string;
-  mark: WriteMark;
+  /** Null when the write left no VEVENT it changed to know it by (see {@link excludeOccurrence}). */
+  mark: WriteMark | null;
 }
 
 /**
@@ -144,16 +146,25 @@ export interface EditResult {
 export interface WriteMark {
   uid: string;
   sequence: number;
+  /**
+   * The occurrence whose override the write changed, by `keyOf`
+   * (src/ical-expand.ts) of its RECURRENCE-ID; absent for the main VEVENT.
+   */
+  override?: string;
 }
 
 /**
  * True when `ics` still holds the version `mark` describes: the VEVENT the
- * write changed carries the SEQUENCE the write gave it. False for an object
- * that no longer holds it, or that cannot be read.
+ * write changed — the main one, or the current override of the occurrence
+ * it names — carries the SEQUENCE the write gave it. False for an object that
+ * no longer holds it, or that cannot be read.
  */
 export function writtenBy(ics: string, mark: WriteMark): boolean {
   try {
-    return mainSequence(ics, mark.uid) === mark.sequence;
+    const { master, overrides } = seriesFor(parseCalendar(ics).vcal, mark.uid);
+    if (mark.override === undefined) return master !== undefined && sequenceOf(master) === mark.sequence;
+    const current = currentOverrides(overrides, allDaySeries(master)).get(mark.override);
+    return current !== undefined && sequenceOf(current.ve) === mark.sequence;
   } catch {
     return false;
   }
@@ -289,6 +300,150 @@ export function applyEventPatch(
   if (touchesTime(patch)) patchTimes(master, patch, nothingDone);
   const sequence = stampRevision(master, now);
   return { ics: vcal.toString(), mark: { uid, sequence } };
+}
+
+/**
+ * The time `occurrence` started at, as a value for a RECURRENCE-ID or an
+ * EXDATE beside `master`: its clock fields (as `findOccurrence` handed them
+ * back) in the zone object of the master's own DTSTART, so it is written in
+ * the master's value type and zone (spec 2026-09-29 §2.3) — a date for an
+ * all-day series, `TZID=…` local time for a zoned one, `…Z` for a UTC one,
+ * and clock time for a floating one. Nothing is converted: the fields are
+ * the ones the recurrence rule produced.
+ */
+function originalStart(master: ICAL.Component, occurrence: FoundOccurrence): { time: ICAL.Time; tzid: string | null } {
+  const startProp = master.getFirstProperty("dtstart") as ICAL.Property;
+  const start = startProp.getFirstValue() as ICAL.Time;
+  const time = ICAL.Time.fromData({ ...occurrence.wall, isDate: occurrence.isDate }, start.zone);
+  const tzid = startProp.getParameter("tzid");
+  return { time, tzid: occurrence.isDate || tzid === undefined ? null : String(tzid) };
+}
+
+/** A property `name` holding `time`, with `tzid` when it has one. */
+function timeProperty(name: string, time: ICAL.Time, tzid: string | null): ICAL.Property {
+  const prop = new ICAL.Property(name);
+  prop.setValue(time);
+  if (tzid !== null) prop.setParameter("tzid", tzid);
+  return prop;
+}
+
+/**
+ * A new override VEVENT for `occurrence`, made from `master` (spec §2.3): a
+ * copy of it — so VALARM, ATTENDEE with its parameters, ORGANIZER and every
+ * X- property come along, as another client's override would carry them —
+ * with RRULE, RDATE, EXDATE and EXRULE removed, `RECURRENCE-ID` set to the
+ * occurrence's original start in the master's type and zone, and the
+ * occurrence's own start and end: the start that RECURRENCE-ID names, and
+ * the end `list_events` showed for it (the master's length added to the
+ * start's clock, as ical.js expands it), in the start's zone. A DURATION
+ * stays a DURATION. Its SEQUENCE starts at the master's; the edit then
+ * raises it, so the override has a revision of its own.
+ */
+function overrideFrom(master: ICAL.Component, occurrence: FoundOccurrence): ICAL.Component {
+  const copy = new ICAL.Component(structuredClone(master.toJSON()));
+  for (const name of ["rrule", "rdate", "exdate", "exrule"]) copy.removeAllProperties(name);
+  const { time, tzid } = originalStart(master, occurrence);
+  const start = copy.getFirstProperty("dtstart") as ICAL.Property;
+  start.setValue(time.clone());
+  copy.addProperty(timeProperty("recurrence-id", time.clone(), tzid));
+  const end = copy.getFirstProperty("dtend");
+  if (end !== null) {
+    const until = time.clone();
+    until.addDuration(new ICAL.Event(master).duration);
+    end.setValue(until);
+    if (tzid === null) end.removeParameter("tzid");
+    else end.setParameter("tzid", tzid);
+  }
+  copy.updatePropertyWithValue("sequence", sequenceOf(master));
+  return copy;
+}
+
+/** True when `master` (absent for an object that holds only overrides) is an all-day series, as `list_events` keys it. */
+function allDaySeries(master: ICAL.Component | undefined): boolean {
+  return (master?.getFirstPropertyValue("dtstart") as ICAL.Time | null | undefined)?.isDate === true;
+}
+
+/**
+ * Change one occurrence of `uid`'s series (#206, spec 2026-09-29 §2.3), the
+ * one `findOccurrence` (src/ical-expand.ts) found in the same stored text
+ * `parsed` was read from.
+ *
+ * The occurrence's override VEVENT is edited if it has one — the current
+ * one, of several revisions — and otherwise one is made from the master
+ * ({@link overrideFrom}) and added to the object. Either way the patch is
+ * applied to the override alone, with the time logic the main event gets
+ * ({@link patchTimes}), and its revision stamped; the master and every other
+ * override are left exactly as they were. An object with no master (an
+ * invitation to one instance, #211.3) is edited the same way.
+ *
+ * Refused, ending in `nothingDone`: switching one occurrence between all-day
+ * and timed — it keeps the form of its series, whose RECURRENCE-ID must
+ * match the master's — and whatever {@link patchTimes} refuses.
+ */
+export function applyOccurrencePatch(
+  parsed: ParsedCalendar,
+  uid: string,
+  occurrence: FoundOccurrence,
+  patch: EventPatch,
+  nothingDone: string,
+  now: Date = new Date()
+): EditResult {
+  const { vcal } = parsed;
+  if (patch.allDay !== undefined && patch.allDay !== occurrence.isDate) {
+    throw new ToolRefusal(
+      `One occurrence of a series cannot be switched between all-day and timed: it keeps the form of its series. ${nothingDone}`
+    );
+  }
+  const { master } = seriesFor(vcal, uid);
+  let target: ICAL.Component;
+  if (occurrence.current !== null) {
+    target = vcal.getAllSubcomponents("vevent")[occurrence.current];
+    if (target === undefined || String(target.getFirstPropertyValue("uid")) !== uid) {
+      throw new Error(`applyOccurrencePatch: VEVENT ${occurrence.current} is not an override of ${uid}`);
+    }
+  } else {
+    if (master === undefined) throw new Error(`applyOccurrencePatch: no main VEVENT for UID ${uid} to copy`);
+    target = overrideFrom(master, occurrence);
+    vcal.addSubcomponent(target);
+  }
+  patchText(target, patch);
+  if (touchesTime(patch)) patchTimes(target, patch, nothingDone);
+  const sequence = stampRevision(target, now);
+  const override = keyOf(new ICAL.Event(target).recurrenceId, allDaySeries(master));
+  return { ics: vcal.toString(), mark: { uid, sequence, override } };
+}
+
+/**
+ * Delete one occurrence of `uid`'s series (#206, spec §2.3), the one
+ * `findOccurrence` found: an `EXDATE` for it on the master, in the master's
+ * value type and zone ({@link originalStart}), every override of it removed,
+ * and the master's revision stamped. The object itself is kept even when this
+ * was the series' last occurrence; `seriesEmpty` says so, for the answer.
+ *
+ * An object with no master has no series to exclude from: the occurrence's
+ * overrides are removed and nothing else. It is the caller's to delete the
+ * object outright when that leaves it empty, and the result then has no
+ * mark to read back by (`mark: null`), since no VEVENT left was written.
+ * `nothingDone` ends the refusals this may grow; there are none today.
+ */
+export function excludeOccurrence(
+  parsed: ParsedCalendar,
+  uid: string,
+  occurrence: FoundOccurrence,
+  nothingDone: string,
+  now: Date = new Date()
+): EditResult & { seriesEmpty: boolean } {
+  void nothingDone;
+  const { vcal } = parsed;
+  const { master } = seriesFor(vcal, uid);
+  const vevents = vcal.getAllSubcomponents("vevent");
+  for (const index of occurrence.overrides) vcal.removeSubcomponent(vevents[index]);
+  const seriesEmpty = !occurrence.others;
+  if (master === undefined) return { ics: vcal.toString(), mark: null, seriesEmpty };
+  const { time, tzid } = originalStart(master, occurrence);
+  master.addProperty(timeProperty("exdate", time, tzid));
+  const sequence = stampRevision(master, now);
+  return { ics: vcal.toString(), mark: { uid, sequence }, seriesEmpty };
 }
 
 /**

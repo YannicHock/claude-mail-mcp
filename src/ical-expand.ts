@@ -57,8 +57,8 @@
  */
 
 import ICAL from "ical.js";
-import { parseCalendar, seriesIn, type ParsedCalendar } from "./ical-parse.js";
-import { isFloating, zoneNameOf } from "./ical-zones.js";
+import { parseCalendar, seriesFor, seriesIn, type ParsedCalendar } from "./ical-parse.js";
+import { hasOffset, isFloating, wallAt, writeZoneOf, zoneNameOf, type ZonedWall } from "./ical-zones.js";
 
 /** Instances listed per object and window before the rest are cut off (spec §2.2). */
 export const MAX_OCCURRENCES_PER_OBJECT = 1000;
@@ -232,14 +232,17 @@ export function impossibleRule(recur: ICAL.Recur): string | null {
  * UTC, so one written in another zone, or as a midnight DATE-TIME for an
  * all-day series, matched nothing — and the master's occurrence was listed at
  * the old time while the override vanished (review of #223).
+ *
+ * Shared with src/ical-edit.ts (#206), so the override a write addresses is
+ * the one `list_events` matched to that occurrence.
  */
-function keyOf(time: ICAL.Time, allDay: boolean): string {
+export function keyOf(time: ICAL.Time, allDay: boolean): string {
   if (allDay || time.isDate) return `${time.year}-${time.month}-${time.day}`;
   return String(instantOf(time));
 }
 
 /** An override VEVENT with the one ICAL.Event read from it, built once and used for its key, times and all. */
-interface Override {
+export interface Override {
   ve: ICAL.Component;
   event: ICAL.Event;
 }
@@ -259,7 +262,7 @@ function sequenceOf(ve: ICAL.Component): number {
  * extra event the walk never met (review of #225: the first was kept, and the
  * newer one listed beside it as a phantom).
  */
-function currentOverrides(overrides: ICAL.Component[], allDay: boolean): Map<string, Override> {
+export function currentOverrides(overrides: ICAL.Component[], allDay: boolean): Map<string, Override> {
   const byKey = new Map<string, Override>();
   for (const ve of overrides) {
     const event = new ICAL.Event(ve);
@@ -428,6 +431,254 @@ export function occurrencesIn(
 
   found.sort((a, b) => instantOf(a.start) - instantOf(b.start));
   return { occurrences: found, truncated, gaveUp, notes };
+}
+
+/**
+ * One occurrence of a series, as {@link findOccurrence} found it: plain data
+ * that crosses the worker boundary (src/ical-worker-ops.ts), which the write
+ * on the main thread applies to its own parse of the same text.
+ */
+export interface FoundOccurrence {
+  found: true;
+  /** Its `recurrenceId` exactly as `list_events` reports it (see {@link reportedTime}). */
+  recurrenceId: string;
+  /**
+   * Its original start's clock fields in the zone of the master's DTSTART —
+   * the value a RECURRENCE-ID or EXDATE for it is written with, beside the
+   * master's own TZID (spec §2.3). For an object with no master, those of
+   * the override's own RECURRENCE-ID.
+   */
+  wall: ZonedWall;
+  /** True for an occurrence of an all-day series: `wall` is a date. */
+  isDate: boolean;
+  /**
+   * Every override VEVENT that replaces this occurrence, each revision of it
+   * — indices into the object's VEVENTs in document order
+   * (`vcal.getAllSubcomponents("vevent")`).
+   */
+  overrides: number[];
+  /** The one of {@link overrides} that counts (highest SEQUENCE, then last), or null when it has none. */
+  current: number | null;
+  /** True when the series has an occurrence besides this one: false means deleting it leaves none. */
+  others: boolean;
+}
+
+export type OccurrenceLookup = FoundOccurrence | { found: false; reason: string };
+
+/** A time given as `list_events` gives it, reduced to what it names: a date, an instant, or a clock time. */
+interface ReportedKey {
+  kind: "date" | "instant" | "clock";
+  /** Epoch ms; a date or a clock time read as if it were UTC. */
+  ms: number;
+}
+
+/**
+ * What a `recurrence_id` — or a {@link reportedTime} string — names, or null
+ * for a string that is none of the three forms `list_events` hands out. Two
+ * spellings of one instant (`…07:00:00Z`, `…09:00:00+02:00`) name the same
+ * thing; a date and a midnight never do (spec §2.3, Review Focus 2).
+ */
+function reportedKey(value: string): ReportedKey | null {
+  const text = value.trim();
+  let key: ReportedKey | null = null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) key = { kind: "date", ms: Date.parse(`${text}T00:00:00Z`) };
+  else if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(text)) key = { kind: "clock", ms: Date.parse(`${text}Z`) };
+  else if (/^\d{4}-\d{2}-\d{2}T/.test(text) && hasOffset(text)) key = { kind: "instant", ms: Date.parse(text) };
+  return key === null || Number.isNaN(key.ms) ? null : key;
+}
+
+function sameKey(a: ReportedKey | null, b: ReportedKey): boolean {
+  return a !== null && a.kind === b.kind && a.ms === b.ms;
+}
+
+/** The clock fields of a time as stored. */
+function fieldsOf(time: ICAL.Time): ZonedWall {
+  return { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
+}
+
+/**
+ * Find the occurrence of `uid`'s series that `recurrenceId` names — a worker
+ * operation (src/ical-worker-ops.ts), since it walks the recurrence rule.
+ *
+ * **Matched, never constructed** (spec 2026-09-29 §2.3). The series is
+ * expanded the way {@link occurrencesIn} expands it for `list_events`, and
+ * the occurrence is the one whose `recurrenceId`, as {@link reportedTime}
+ * reports it, names what the caller's does: the same instant however it is
+ * written, the same date, or the same clock time for a floating series. A
+ * date never matches a timed occurrence and an instant never an all-day one,
+ * so an all-day series' `2026-10-08` round-trips as a date and is never read
+ * as a midnight in some zone. What is handed back is the occurrence's own
+ * start, as the rule produced it, in the master's zone — so a RECURRENCE-ID
+ * or EXDATE written from it is in the master's value type and zone, and no
+ * question of "which form does the stored DTSTART use" is ever answered by
+ * converting strings.
+ *
+ * An override that replaces no occurrence the walk meets — one
+ * `list_events` lists at its own time — is matched by its own RECURRENCE-ID.
+ * An object with no master (an invitation to one instance, #211.3) is
+ * matched against its overrides; there `recurrenceId` may be null, meaning
+ * "its only occurrence", which is refused when it holds more than one.
+ *
+ * The walk is bounded like the expansion: {@link MAX_STEPS_PER_OBJECT} steps,
+ * and never past a day or two beyond the instant asked for; a rule
+ * {@link impossibleRule} refuses is not walked. Never throws for anything in
+ * `ics`: every failure is `{ found: false, reason }`, a sentence the caller
+ * ends with what was not done.
+ */
+export function findOccurrence(ics: string, uid: string, recurrenceId: string | null): OccurrenceLookup {
+  try {
+    return lookUpOccurrence(ics, uid, recurrenceId);
+  } catch (err) {
+    return { found: false, reason: `The stored event could not be read to find the occurrence: ${reasonFrom(err)}.` };
+  }
+}
+
+/** The walk {@link findOccurrence} does, free to throw. */
+function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null): OccurrenceLookup {
+  const { vcal, unresolved } = parseCalendar(ics);
+  if (unresolved.length > 0) {
+    const names = unresolved.map((tzid) => `"${tzid}"`).join(", ");
+    return { found: false, reason: `Its time zone ${names} has no VTIMEZONE in the event and is not an IANA time zone, so its occurrences cannot be placed.` };
+  }
+  const { master, overrides } = seriesFor(vcal, uid);
+  const position = new Map(vcal.getAllSubcomponents("vevent").map((ve, i) => [ve, i] as const));
+  const allDay = (master?.getFirstPropertyValue("dtstart") as ICAL.Time | null | undefined)?.isDate === true;
+  const byKey = currentOverrides(overrides, allDay);
+  /** Every revision of the override for `key`, by position. */
+  const revisions = (key: string): number[] =>
+    overrides.filter((ve) => keyOf(new ICAL.Event(ve).recurrenceId, allDay) === key).map((ve) => position.get(ve) as number);
+  const want = recurrenceId === null ? null : reportedKey(recurrenceId);
+  if (recurrenceId !== null && want === null) {
+    return {
+      found: false,
+      reason: `"${recurrenceId}" is not a recurrence_id: list_events reports each occurrence's as an ISO instant (2026-10-08T07:00:00.000Z), as a clock time with no offset for a floating series, or as a date (YYYY-MM-DD) for an all-day one.`,
+    };
+  }
+  const notAnOccurrence = (why: string): OccurrenceLookup => ({
+    found: false,
+    reason: `"${recurrenceId}" is not an occurrence of "${uid}": ${why} Pass a recurrenceId exactly as list_events reported it.`,
+  });
+
+  if (master === undefined) {
+    const current = [...byKey.entries()];
+    let hit: [string, Override] | undefined;
+    if (want === null) {
+      if (current.length !== 1) {
+        return {
+          found: false,
+          reason: `"${uid}" holds ${current.length} occurrences of a series whose other occurrences are not in this calendar; pass the recurrence_id list_events reported for the one you mean.`,
+        };
+      }
+      hit = current[0];
+    } else {
+      hit = current.find(([, o]) => sameKey(reportedKey(reportedTime(o.event.recurrenceId)), want));
+      if (hit === undefined) return notAnOccurrence("the object holds no occurrence that starts then.");
+    }
+    const [key, { ve, event }] = hit;
+    return {
+      found: true,
+      recurrenceId: reportedTime(event.recurrenceId),
+      wall: fieldsOf(event.recurrenceId),
+      isDate: event.recurrenceId.isDate,
+      overrides: revisions(key),
+      current: position.get(ve) as number,
+      others: current.length > 1,
+    };
+  }
+
+  if (want === null) {
+    return { found: false, reason: `"${uid}" is a recurring series: pass the recurrence_id list_events reported for the occurrence you mean.` };
+  }
+  if (!master.hasProperty("rrule") && !master.hasProperty("rdate") && overrides.length === 0) {
+    return { found: false, reason: `"${uid}" does not recur, so it has no occurrence "${recurrenceId}". Omit recurrence_id to change the event itself.` };
+  }
+
+  // Walked as occurrencesIn walks it for list_events: an impossible rule
+  // dropped, a PERIOD RDATE split, only RANGE=THISANDFUTURE given to ical.js.
+  for (const prop of master.getAllProperties("rrule")) {
+    if (impossibleRule(prop.getFirstValue() as ICAL.Recur) !== null) master.removeProperty(prop);
+  }
+  periodsOf(master, allDay);
+  const startProp = master.getFirstProperty("dtstart") as ICAL.Property;
+  const start = startProp.getFirstValue() as ICAL.Time;
+  const startZone = writeZoneOf(startProp);
+  const event = new ICAL.Event(master, { exceptions: overrides.filter(modifiesFuture) });
+  const iterator = event.iterator();
+  // Nothing more than a day or two past the instant asked for can be it; a
+  // zone's offset is at most 14 hours.
+  const limit = want.ms + 2 * 86_400_000;
+  let match: ICAL.Time | null = null;
+  let others = false;
+  let steps = 0;
+  let gaveUp = false;
+  for (let next = iterator.next(); next; next = iterator.next()) {
+    if (++steps > MAX_STEPS_PER_OBJECT) {
+      gaveUp = true;
+      break;
+    }
+    if (match === null && sameKey(reportedKey(reportedTime(next)), want)) {
+      match = next.clone();
+      if (others) break;
+      continue;
+    }
+    others = true;
+    if (match !== null || instantOf(next) > limit) break;
+  }
+
+  let wall: ZonedWall;
+  let key: string;
+  let reported: string;
+  let isDate: boolean;
+  if (match !== null) {
+    // The rule's own start, in the master's zone. An RDATE can be stored in
+    // another zone (UTC, typically); its clock time in the master's zone is
+    // what a RECURRENCE-ID beside the master's TZID has to say.
+    wall =
+      match.isDate || match.zone === start.zone || startZone.kind === "unresolved"
+        ? fieldsOf(match)
+        : wallAt(instantOf(match), startZone);
+    key = keyOf(match, allDay);
+    if (!allDay && !byKey.has(key) && byKey.has(keyOf(match, true))) key = keyOf(match, true);
+    reported = reportedTime(match);
+    isDate = match.isDate;
+  } else {
+    // An override the walk never meets is listed at its own time, by its own
+    // RECURRENCE-ID: that is what list_events reported for it.
+    const orphan = [...byKey.entries()].find(([, o]) => sameKey(reportedKey(reportedTime(o.event.recurrenceId)), want));
+    if (orphan === undefined) {
+      if (gaveUp) {
+        return {
+          found: false,
+          reason: `Its recurrence rule was walked ${MAX_STEPS_PER_OBJECT} steps from its start without reaching "${recurrenceId}", so the connector gave up looking for it.`,
+        };
+      }
+      return notAnOccurrence(
+        want.kind === "date" && !allDay
+          ? "its occurrences have times, and a date names none of them."
+          : want.kind !== "date" && allDay
+            ? "it is an all-day series, whose occurrences are dates (YYYY-MM-DD)."
+            : "no occurrence of the series starts then."
+      );
+    }
+    const rid = orphan[1].event.recurrenceId;
+    wall =
+      rid.isDate || rid.zone === start.zone || startZone.kind === "unresolved" ? fieldsOf(rid) : wallAt(instantOf(rid), startZone);
+    key = orphan[0];
+    reported = reportedTime(rid);
+    isDate = rid.isDate;
+  }
+  const current = byKey.get(key);
+  // An override for another occurrence is an occurrence list_events lists too.
+  if ([...byKey.keys()].some((k) => k !== key)) others = true;
+  return {
+    found: true,
+    recurrenceId: reported,
+    wall,
+    isDate,
+    overrides: revisions(key),
+    current: current === undefined ? null : (position.get(current.ve) as number),
+    others,
+  };
 }
 
 /** An error's message, on one line and bounded, for `skipped`. */

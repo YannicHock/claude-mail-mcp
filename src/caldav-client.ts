@@ -31,16 +31,25 @@ import { randomUUID } from "node:crypto";
 import { buildIcs, builtZoneName, type NewEventFields } from "./ical-build.js";
 import {
   applyEventPatch,
+  applyOccurrencePatch,
   changesSomething,
   describeSeries,
+  excludeOccurrence,
   touchesTime,
   writtenBy,
+  type EditResult,
   type EventPatch,
   type WriteMark,
 } from "./ical-edit.js";
-import { instantOfReported, type CalendarEvent, type StoredObject } from "./ical-expand.js";
+import {
+  instantOfReported,
+  type CalendarEvent,
+  type FoundOccurrence,
+  type OccurrenceLookup,
+  type StoredObject,
+} from "./ical-expand.js";
 import { parseCalendar, seriesFor, type ParsedCalendar } from "./ical-parse.js";
-import { expansionPool } from "./ical-worker-pool.js";
+import { expansionPool, reasonOf } from "./ical-worker-pool.js";
 import { calendarZone, canonicalZone } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 import { classifyFailure } from "../shared/credential-failure.js";
@@ -100,13 +109,31 @@ export interface EventTarget {
   uid: string;
   /** From `list_events`. Sent as If-Match; see spec §4.1 for when it may be omitted. */
   etag?: string;
-  /** Present only to be refused: single occurrences are out of scope (spec §4.3). */
+  /**
+   * One occurrence of a series, as `list_events` reported its `recurrenceId`
+   * (spec 2026-09-29 §2.3, #206). With `applyToSeries`, only the occurrence a
+   * series' new start or end describes (§2.4, #207).
+   */
   recurrenceId?: string;
-  /** Required to touch a recurring event at all. */
+  /** Required to touch a recurring event at all, unless `recurrenceId` names one occurrence. */
   applyToSeries?: boolean;
 }
 
 export interface EventUpdate extends EventTarget, EventPatch {}
+
+/** What `delete_event` answers. */
+export interface DeletedEvent {
+  uid: string;
+  url: string;
+  /**
+   * The object's new ETag, for a deletion of one occurrence that wrote the
+   * rest of the series back (#206); absent when the object was deleted, and
+   * null when the server gave none.
+   */
+  etag?: string | null;
+  /** Said when deleting one occurrence left the series with none. */
+  note?: string;
+}
 
 /**
  * Where a guarded write goes, and what its refusals end with: the one
@@ -280,29 +307,55 @@ export class CalDavClient {
    * Change an existing event in place (#152). Spec §4: the caller's ETag guards
    * the write, a series needs `applyToSeries`, and everything the patch does
    * not name survives — see src/ical-edit.ts.
+   *
+   * v0.7.4 (spec 2026-09-29 §2.3, #206): with `recurrenceId` the patch goes
+   * to that one occurrence — its override, made from the master if it has
+   * none — and `applyToSeries` is not needed. The occurrence is found by
+   * {@link occurrence}, off this thread. An object holding only an override
+   * (an invitation to one instance, #211.3) is that occurrence, changed with
+   * or without `recurrenceId`.
+   *
+   * `recurrenceId` with `applyToSeries: true` has one meaning (§2.4): the
+   * occurrence a series' new start or end describes. For a change that moves
+   * no time the two contradict each other, and the call is refused before
+   * the server is contacted.
    */
   async updateEvent(update: EventUpdate): Promise<{ uid: string; url: string; etag: string | null }> {
     const nothingDone = "Nothing was changed, and no event was created.";
-    if (update.recurrenceId !== undefined) {
-      throw new ToolRefusal(
-        "Changing a single occurrence of a recurring event is not supported yet: it needs an override (RECURRENCE-ID) this connector does not write. Nothing was changed. To change every occurrence, omit recurrence_id and pass apply_to_series: true."
-      );
-    }
     if (!changesSomething(update)) {
       throw new ToolRefusal(
         "Nothing to change: pass at least one of summary, description, location, start, end or all_day."
       );
     }
+    const recurrenceId = update.recurrenceId;
+    if (recurrenceId !== undefined && update.applyToSeries === true && !touchesTime(update)) {
+      throw new ToolRefusal(
+        `recurrence_id and apply_to_series: true contradict each other for a change that moves no time: recurrence_id changes that one occurrence, and apply_to_series every occurrence. Together they only say which occurrence a series' new start or end describes. Omit one of them. ${nothingDone}`
+      );
+    }
     const calendar = await this.findCalendar(update.calendarUrl);
     const stored = await this.findStoredEvent(calendar, update.uid, nothingDone);
     const shape = describeSeries(seriesFor(stored.parsed.vcal, update.uid));
+    const target: WriteTarget = { calendar, uid: update.uid, url: stored.url, nothingDone };
+    let edit: EditResult;
     if (shape.overrideOnly) {
-      // #211.3: there is no master to patch, so without this the patch threw a
-      // plain Error — logged as a server failure — or, without
-      // apply_to_series, the call was told this is a series it can change.
-      throw new ToolRefusal(
-        `"${update.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example), and changing such an occurrence is not supported yet. Nothing was changed.`
-      );
+      // #211.3: no master, so there is no series here to change; the one
+      // occurrence the object holds is changed like any other.
+      if (update.applyToSeries === true && touchesTime(update)) {
+        throw new ToolRefusal(
+          `"${update.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example), so the series' time cannot be changed here. To move this one occurrence, omit apply_to_series. ${nothingDone}`
+        );
+      }
+      const ifMatch = requireEtag(update, stored, nothingDone);
+      const found = await this.occurrence(stored, update.uid, recurrenceId ?? null, nothingDone);
+      edit = applyOccurrencePatch(stored.parsed, update.uid, found, update, nothingDone);
+      return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
+    }
+    if (recurrenceId !== undefined && update.applyToSeries !== true) {
+      const ifMatch = requireEtag(update, stored, nothingDone);
+      const found = await this.occurrence(stored, update.uid, recurrenceId, nothingDone);
+      edit = applyOccurrencePatch(stored.parsed, update.uid, found, update, nothingDone);
+      return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
     }
     if (shape.recurring) {
       if (update.applyToSeries !== true) throw seriesRefusal(update.uid, "change");
@@ -313,9 +366,43 @@ export class CalDavClient {
       }
     }
     const ifMatch = requireEtag(update, stored, nothingDone);
-    const edit = applyEventPatch(stored.parsed, update.uid, update, nothingDone);
-    const etag = await this.putEdit({ calendar, uid: update.uid, url: stored.url, nothingDone }, ifMatch, edit);
-    return { uid: update.uid, url: stored.url, etag };
+    if (recurrenceId !== undefined) {
+      // With apply_to_series on an event that does not recur: the lookup
+      // refuses it, saying so.
+      await this.occurrence(stored, update.uid, recurrenceId, nothingDone);
+    }
+    edit = applyEventPatch(stored.parsed, update.uid, update, nothingDone);
+    return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
+  }
+
+  /**
+   * The occurrence of `uid`'s series that `recurrenceId` names — or, for an
+   * object holding only an override, with `null`, its one occurrence — found
+   * by src/ical-expand.ts's `findOccurrence` in a worker (spec §2.3: matched
+   * against the expanded series, never built), since it walks the recurrence
+   * rule. A worker that times out or fails, and a `recurrence_id` that names
+   * no occurrence, are refusals ending in `nothingDone`.
+   */
+  private async occurrence(
+    stored: FoundObject,
+    uid: string,
+    recurrenceId: string | null,
+    nothingDone: string
+  ): Promise<FoundOccurrence> {
+    let found: OccurrenceLookup;
+    try {
+      found = await expansionPool.runOn(
+        { url: stored.url, etag: stored.etag, data: stored.data },
+        "findOccurrence",
+        stored.data,
+        uid,
+        recurrenceId
+      );
+    } catch (err) {
+      throw new ToolRefusal(`The occurrences of "${uid}" could not be looked up. ${reasonOf(err)} ${nothingDone}`);
+    }
+    if (!found.found) throw new ToolRefusal(`${found.reason} ${nothingDone}`);
+    return found;
   }
 
   /**
@@ -323,14 +410,16 @@ export class CalDavClient {
    * the new ETag: the server's answer's, or read back through
    * {@link etagAfterWrite} when it gave none.
    */
-  private async putEdit(target: WriteTarget, ifMatch: string | undefined, edit: { ics: string; mark: WriteMark }): Promise<string | null> {
+  private async putEdit(target: WriteTarget, ifMatch: string | undefined, edit: EditResult): Promise<string | null> {
     const client = await this.ensureClient();
     const res = await this.guardedWrite("PUT", target, ifMatch, (etag) =>
       client.updateCalendarObject({
         calendarObject: { url: target.url, data: edit.ics, ...(etag === undefined ? {} : { etag }) },
       })
     );
-    return res.headers.get("etag") ?? (await this.etagAfterWrite(target.calendar, target.url, edit.mark));
+    const answered = res.headers.get("etag");
+    if (answered !== null || edit.mark === null) return answered;
+    return this.etagAfterWrite(target.calendar, target.url, edit.mark);
   }
 
   /**
@@ -377,17 +466,45 @@ export class CalDavClient {
   /**
    * Delete an event, permanently (#153). The same guards as
    * {@link updateEvent}; a series is deleted whole, and only when asked to be.
+   *
+   * v0.7.4 (spec 2026-09-29 §2.3, #206): with `recurrenceId`, one occurrence
+   * — an `EXDATE` on the series, its override removed, the rest of the
+   * object written back with a PUT, so the answer carries the new `etag`. If
+   * that was the series' last occurrence the object is kept and the answer's
+   * `note` says the series has none left. An object holding only overrides
+   * (#211.3) has no series to exclude from: the occurrence is removed, and
+   * the object deleted when it held nothing else. `recurrenceId` with
+   * `applyToSeries: true` is contradictory and refused before the server is
+   * contacted.
    */
-  async deleteEvent(target: EventTarget): Promise<{ uid: string; url: string }> {
+  async deleteEvent(target: EventTarget): Promise<DeletedEvent> {
     const nothingDone = "Nothing was deleted.";
-    if (target.recurrenceId !== undefined) {
+    const recurrenceId = target.recurrenceId;
+    if (recurrenceId !== undefined && target.applyToSeries === true) {
       throw new ToolRefusal(
-        "Deleting a single occurrence of a recurring event is not supported yet: that is an EXDATE on the series, not a deletion. Nothing was deleted. To delete every occurrence, omit recurrence_id and pass apply_to_series: true."
+        `recurrence_id and apply_to_series: true contradict each other: recurrence_id deletes that one occurrence, and apply_to_series the whole series. Omit one of them. ${nothingDone}`
       );
     }
     const calendar = await this.findCalendar(target.calendarUrl);
     const stored = await this.findStoredEvent(calendar, target.uid, nothingDone);
     const shape = describeSeries(seriesFor(stored.parsed.vcal, target.uid));
+    const writeTarget: WriteTarget = { calendar, uid: target.uid, url: stored.url, nothingDone };
+    if (recurrenceId !== undefined) {
+      const ifMatch = requireEtag(target, stored, nothingDone);
+      const found = await this.occurrence(stored, target.uid, recurrenceId, nothingDone);
+      const edit = excludeOccurrence(stored.parsed, target.uid, found, nothingDone);
+      if (!(shape.overrideOnly && edit.seriesEmpty)) {
+        const etag = await this.putEdit(writeTarget, ifMatch, edit);
+        const note =
+          edit.seriesEmpty
+            ? "That was the series' last occurrence: it has no occurrences left, but the event itself was kept. Delete it with apply_to_series: true to remove it."
+            : undefined;
+        return { uid: target.uid, url: stored.url, etag, ...(note === undefined ? {} : { note }) };
+      }
+      // The only occurrence of an object with no master: nothing would be left.
+      await this.deleteObject(writeTarget, ifMatch);
+      return { uid: target.uid, url: stored.url };
+    }
     if (shape.overrideOnly && target.applyToSeries !== true) {
       // #211.3: not "every occurrence" — the object holds only this one.
       throw new ToolRefusal(
@@ -397,14 +514,18 @@ export class CalDavClient {
     if (shape.recurring && target.applyToSeries !== true) {
       throw seriesRefusal(target.uid, "delete");
     }
-    const ifMatch = requireEtag(target, stored, nothingDone);
+    await this.deleteObject(writeTarget, requireEtag(target, stored, nothingDone));
+    return { uid: target.uid, url: stored.url };
+  }
+
+  /** DELETE the stored object `target` names, guarded by `ifMatch` through {@link guardedWrite}. */
+  private async deleteObject(target: WriteTarget, ifMatch: string | undefined): Promise<void> {
     const client = await this.ensureClient();
-    await this.guardedWrite("DELETE", { calendar, uid: target.uid, url: stored.url, nothingDone }, ifMatch, (etag) =>
+    await this.guardedWrite("DELETE", target, ifMatch, (etag) =>
       client.deleteCalendarObject({
-        calendarObject: { url: stored.url, ...(etag === undefined ? {} : { etag }) },
+        calendarObject: { url: target.url, ...(etag === undefined ? {} : { etag }) },
       })
     );
-    return { uid: target.uid, url: stored.url };
   }
 
   /**

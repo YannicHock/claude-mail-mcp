@@ -690,6 +690,28 @@ export function readDateTime(value: string, zone: WriteZone): number {
 }
 
 /**
+ * The wall-clock fields the instant `ms` shows in `zone` — for a floating
+ * zone, the clock time `ms` stands for (it is read as UTC, see
+ * {@link readDateTime}). Unlike {@link writtenTime} it never falls back to
+ * UTC: on the second pass through an autumn overlap it is the wall time the
+ * zone's clocks show, which is what a series' "same clock time" (#207) is
+ * measured in.
+ */
+export function wallAt(ms: number, zone: WriteZone): ZonedWall {
+  return zone.kind === "zoned" ? utcWall(ms + offsetsOf(zone.zone)(ms)) : utcWall(ms);
+}
+
+/**
+ * The instant a wall time names in `zone`, by RFC 5545 §3.3.5's rule for a
+ * zoned one ({@link wallToInstantBy}); a UTC or floating wall time read as
+ * UTC. The inverse of {@link wallAt} everywhere but in a gap.
+ */
+export function instantAt(wall: ZonedWall, zone: WriteZone): number {
+  if (zone.kind === "zoned") return wallToInstantIn(wall, zone.zone);
+  return Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
+}
+
+/**
  * A stored time as {@link readDateTime} would have read it, for a time stored
  * in `zone` (as {@link writeZoneOf} said): the instant, or for a floating time
  * its clock time read as UTC. `toJSDate` would read a floating time in the

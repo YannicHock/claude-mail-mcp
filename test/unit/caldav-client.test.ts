@@ -175,6 +175,41 @@ describe("CalDavClient — a failed ETag read-back (#210.4)", () => {
   });
 });
 
+describe("CalDavClient — recurrence_id together with apply_to_series (spec 2026-09-29 §2.3, §2.4)", () => {
+  // Port 1 on loopback refuses every connection: a call that reached the
+  // server would fail with a connection error, not a refusal.
+  const client = new CalDavClient({ url: "http://127.0.0.1:1/", user: "alice", pass: "pw" });
+  const target = {
+    calendarUrl: "http://127.0.0.1:1/cal/",
+    uid: "weekly@example.com",
+    etag: '"e"',
+    recurrenceId: "2026-10-08T07:00:00.000Z",
+    applyToSeries: true,
+  };
+
+  it("refuses a delete as contradictory, before the server is contacted", async () => {
+    await assert.rejects(
+      client.deleteEvent(target),
+      (err: unknown) =>
+        err instanceof ToolRefusal &&
+        /contradict/.test(err.message) &&
+        /recurrence_id/.test(err.message) &&
+        err.message.endsWith("Nothing was deleted.")
+    );
+  });
+
+  it("refuses a change that touches no time as contradictory: recurrence_id only anchors a series' new time", async () => {
+    await assert.rejects(
+      client.updateEvent({ ...target, summary: "Renamed" }),
+      (err: unknown) =>
+        err instanceof ToolRefusal &&
+        /contradict/.test(err.message) &&
+        /start or end/.test(err.message) &&
+        /Nothing was changed/.test(err.message)
+    );
+  });
+});
+
 describe("CalDavClient.createEvent — the timezone it is given", () => {
   it("refuses a name that is no IANA zone before it contacts the server", async () => {
     // Port 1 on loopback refuses every connection: reaching it would fail differently.
