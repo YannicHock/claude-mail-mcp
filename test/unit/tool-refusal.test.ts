@@ -10,7 +10,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { assertWritten, requireEtag } from "../../src/caldav-client.js";
+import { assertWritten, DavWriteError, requireEtag } from "../../src/caldav-etag.js";
 import type { ClientPool } from "../../src/client-pool.js";
 import { reportingFailures, ToolRefusal, TOOL_FAILURE_EVENT } from "../../src/tool-errors.js";
 import { ToolRefusal as ToolRefusalItself } from "../../src/tool-refusal.js";
@@ -83,6 +83,13 @@ describe("assertWritten", () => {
       /507 Insufficient Storage to DELETE/
     );
   });
+
+  it("keeps the status on the error, for a caller that has to know what the server said (review of PR #231)", () => {
+    assert.throws(
+      () => assertWritten(new Response(null, { status: 403, statusText: "Forbidden" }), "DELETE"),
+      (err: unknown) => err instanceof DavWriteError && err.status === 403 && String(err).startsWith("Error: CalDAV server answered 403")
+    );
+  });
 });
 
 describe("requireEtag (spec §4.1)", () => {
@@ -98,5 +105,14 @@ describe("requireEtag (spec §4.1)", () => {
 
   it("refuses to write blind over an object that has an etag", () => {
     assert.throws(() => requireEtag(target, { etag: '"b"' }), (err: unknown) => err instanceof ToolRefusal);
+  });
+
+  it("strict: refuses a strong mismatch itself, for a server that ignores If-Match (move_event, R11)", () => {
+    assert.throws(
+      () => requireEtag({ ...target, etag: '"a"' }, { etag: '"b"' }, "Nothing was moved.", { strict: true }),
+      (err: unknown) => err instanceof ToolRefusal && /changed after you read it/.test(err.message)
+    );
+    assert.equal(requireEtag({ ...target, etag: "b" }, { etag: '"b"' }, "Nothing was moved.", { strict: true }), '"b"');
+    assert.equal(requireEtag(target, { etag: null }, "Nothing was moved.", { strict: true }), "*");
   });
 });

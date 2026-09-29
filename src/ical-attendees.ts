@@ -293,16 +293,29 @@ function clientScheduled(prop: ICAL.Property): boolean {
  * nothing was changed.
  */
 function checkOrganizer(vevents: readonly ICAL.Component[], own: readonly string[], nothingDone: string): void {
+  const foreign = foreignOrganizer(vevents, own);
+  if (foreign === undefined) return;
+  throw new ToolRefusal(
+    `This event is organized by ${addressKey(foreign)}, not by this account (${[...new Set(own.map(addressKey))].join(", ")}), and only its organizer changes who is invited. Its title, description, location and time can still be changed here. ${nothingDone}`
+  );
+}
+
+/**
+ * The first ORGANIZER on any of `vevents` — every VEVENT of one UID — that
+ * is none of the account's `own` addresses, as written (a `mailto:` URI), or
+ * undefined when every one named is the account's, or none is named: the
+ * one test of "someone else's meeting" that {@link checkOrganizer} and
+ * {@link mayNotifyOnMove} share (code-health review of PR #231).
+ */
+function foreignOrganizer(vevents: readonly ICAL.Component[], own: readonly string[]): string | undefined {
   const mine = new Set(own.map(addressKey));
   for (const vevent of vevents) {
     for (const organizer of vevent.getAllProperties("organizer")) {
-      const address = addressKey(String(organizer.getFirstValue()));
-      if (mine.has(address)) continue;
-      throw new ToolRefusal(
-        `This event is organized by ${address}, not by this account (${[...mine].join(", ")}), and only its organizer changes who is invited. Its title, description, location and time can still be changed here. ${nothingDone}`
-      );
+      const address = String(organizer.getFirstValue());
+      if (!mine.has(addressKey(address))) return address;
     }
   }
+  return undefined;
 }
 
 /**
@@ -396,6 +409,42 @@ export function schedulable(vevents: readonly ICAL.Component[], removed: readonl
     }
   }
   return [...named.values()];
+}
+
+/**
+ * True when `vevents` — every VEVENT of one UID — make a scheduling object a
+ * calendar server acts on (RFC 6638 §3.1): some VEVENT names an ORGANIZER,
+ * and some names an ATTENDEE. Attendees with no organizer are no meeting to
+ * Sabre, which is why `create_event` writes one (#204). `move_event` asks it
+ * to know whether the account's addresses are needed at all (#212).
+ */
+export function schedulingObject(vevents: readonly ICAL.Component[]): boolean {
+  return vevents.some((ve) => ve.hasProperty("organizer")) && vevents.some((ve) => ve.hasProperty("attendee"));
+}
+
+/**
+ * Whom the calendar server may email when `vevents` — every VEVENT of one
+ * UID — are moved to another calendar (`move_event`, #212, spec 2026-09-29
+ * §2.6), or undefined for an event it does not schedule at all
+ * ({@link schedulingObject}).
+ *
+ * A move changes nothing in the object, but a server may see it as a
+ * deletion in one calendar and a creation in the other, and schedule both —
+ * whether Nextcloud does is acceptance A5's to record. So, the same honesty
+ * rule as `may_notify` everywhere else:
+ *
+ *   - **The account's own meeting:** every attendee it is free to schedule
+ *     ({@link schedulable}), who may be sent a cancellation and a new
+ *     invitation.
+ *   - **Someone else's:** its organizer — the account is an attendee there,
+ *     and deleting an invitation may send the organizer a decline, as
+ *     `delete_event` already says for Nextcloud.
+ */
+export function mayNotifyOnMove(vevents: readonly ICAL.Component[], own: readonly string[]): string[] | undefined {
+  if (!schedulingObject(vevents)) return undefined;
+  const foreign = foreignOrganizer(vevents, own);
+  if (foreign !== undefined) return [foreign.trim().replace(MAILTO, "")];
+  return schedulable(vevents, [], own);
 }
 
 /**

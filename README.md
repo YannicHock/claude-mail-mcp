@@ -14,7 +14,7 @@ Self-hosted **IMAP / SMTP / CalDAV connector for Claude** with multi-account sup
 
 ## What it does
 
-Exposes 16 MCP tools to Claude:
+Exposes 17 MCP tools to Claude:
 
 **Accounts (1)**
 
@@ -36,7 +36,7 @@ Exposes 16 MCP tools to Claude:
 | `move_message` | Move between folders |
 | `delete_message` | Delete (destructive — prefer move to Trash) |
 
-**Calendar (6)**
+**Calendar (7)**
 
 | Tool | Purpose |
 |------|---------|
@@ -45,6 +45,7 @@ Exposes 16 MCP tools to Claude:
 | `create_event` | Add new event (writes to CalDAV) |
 | `update_event` | Change an event's time, title, location or description (ETag-guarded) |
 | `delete_event` | Delete an event (permanent — CalDAV has no trash) |
+| `move_event` | Move an event, unchanged, into another calendar of the same account (ETag-guarded) |
 | `find_free_slot` | Compute free intervals across one or more calendars |
 
 Every tool accepts an optional `account: "<id>"` parameter to pick a mailbox; omit it to use the default account. So "list unread in INBOX of work account" vs "compare today's calendar across work and personal" both work in one connector.
