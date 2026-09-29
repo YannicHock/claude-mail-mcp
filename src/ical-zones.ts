@@ -80,6 +80,9 @@ function formatterFor(tz: string): Intl.DateTimeFormat {
       second: "numeric",
       era: "short",
     });
+    // Intl takes a name in any letter case, so the keys are not bounded by
+    // the zone list; the cap keeps stored TZIDs from growing this forever.
+    if (formatters.size >= 1000) formatters.clear();
     formatters.set(tz, f);
   }
   return f;
@@ -156,13 +159,19 @@ export function zonedWallToInstant(
   return wall - before;
 }
 
+/** Names `Intl` refused, so a TZID repeated on every instance costs one RangeError, not one each. */
+const notZones = new Set<string>();
+
 /** True when `Intl` knows `name` as a zone. Offsets like `+01:00` are not zones here. */
 function isIanaZone(name: string): boolean {
-  if (!/^[A-Za-z]/.test(name)) return false;
+  if (!/^[A-Za-z]/.test(name) || notZones.has(name)) return false;
   try {
     formatterFor(name);
     return true;
   } catch {
+    // Bounded: TZIDs come from whatever other clients stored.
+    if (notZones.size >= 1000) notZones.clear();
+    notZones.add(name);
     return false;
   }
 }
