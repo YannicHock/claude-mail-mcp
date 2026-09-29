@@ -145,6 +145,17 @@ export function reportedTime(time: ICAL.Time): string {
   return new Date(instantOf(time)).toISOString();
 }
 
+/**
+ * {@link instantOf} for a string {@link reportedTime} produced, so events from
+ * different objects sort, and count as busy, by the same rule. `Date.parse`
+ * alone would read a floating clock time in the process's own zone.
+ */
+export function instantOfReported(reported: string): number {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(reported)) return Date.parse(`${reported}T00:00:00Z`);
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(reported)) return Date.parse(`${reported}Z`);
+  return Date.parse(reported);
+}
+
 /** RFC 4791 §9.9: overlaps the window; a zero-length event must start inside it. */
 function inWindow(start: ICAL.Time, end: ICAL.Time, window: ExpandWindow): boolean {
   const s = instantOf(start);

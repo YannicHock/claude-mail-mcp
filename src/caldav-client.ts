@@ -7,6 +7,13 @@
  * v0.1 trade-off: we discover calendars on each call rather than caching,
  * because tsdav's discovery is cheap (one PROPFIND) and stale caches are
  * worse than a small extra request. v0.2 will introduce a short TTL cache.
+ *
+ * v0.7.4 (spec 2026-09-29 §2.2): recurrence is expanded here, not on the
+ * server — `listEvents` asks for every object with an occurrence in the
+ * window and src/ical-expand.ts turns each into instances. Every object the
+ * server lists is read, whatever its href is called (#211.1), and one that
+ * cannot be read is named in `skipped` instead of failing the calendar
+ * (#211.2).
  */
 
 import {
@@ -25,7 +32,10 @@ import {
   touchesTime,
   type EventPatch,
 } from "./ical-edit.js";
+import { expandObject, instantOfReported, type CalendarEvent } from "./ical-expand.js";
 import { ToolRefusal } from "./tool-refusal.js";
+
+export type { CalendarEvent } from "./ical-expand.js";
 
 // createDAVClient returns a logged-in client whose type omits the login
 // methods. Capture that shape for our field types.
@@ -46,25 +56,16 @@ export interface CalendarSummary {
   components: string[];
 }
 
-export interface CalendarEvent {
-  uid: string;
+/** An object `listEvents` could not list, and why (#211.2). */
+export interface SkippedObject {
   url: string;
-  summary: string | null;
-  description: string | null;
-  location: string | null;
-  start: string; // ISO
-  end: string; // ISO
-  allDay: boolean;
-  organizer: string | null;
-  attendees: string[];
-  status: string | null;
-  recurrenceId: string | null;
-  /**
-   * The stored object's ETag exactly as the server sent it, quotes included,
-   * or null when it sent none. What `update_event` and `delete_event` take as
-   * `etag` (#152, #153). Instances expanded from one series share it.
-   */
-  etag: string | null;
+  reason: string;
+}
+
+export interface EventListing {
+  events: CalendarEvent[];
+  /** Empty when every object in the window was read. */
+  skipped: SkippedObject[];
 }
 
 export interface NewEventInput {
@@ -144,11 +145,16 @@ export class CalDavClient {
     }));
   }
 
-  async listEvents(
-    calendarUrl: string,
-    rangeStart: string,
-    rangeEnd: string
-  ): Promise<CalendarEvent[]> {
+  /**
+   * Every instance in the window, expanded in the connector (spec §2.2).
+   *
+   * The query is a `calendar-query` with a `time-range` and no `expand`: the
+   * server only picks the objects with an occurrence in the window, which it
+   * does for every shape (R4), and returns them as stored. Asking it to
+   * expand as well failed the whole REPORT on an all-day series, a floating
+   * series or an override with no master (R1–R3).
+   */
+  async listEvents(calendarUrl: string, rangeStart: string, rangeEnd: string): Promise<EventListing> {
     const calendar = await this.findCalendar(calendarUrl);
     const client = await this.ensureClient();
     const objects: DAVCalendarObject[] = await client.fetchCalendarObjects({
@@ -157,16 +163,22 @@ export class CalDavClient {
         start: rangeStart,
         end: rangeEnd,
       },
-      expand: true,
+      urlFilter: everyObjectIn(calendar),
     });
+    const window = { start: Date.parse(rangeStart), end: Date.parse(rangeEnd) };
     const events: CalendarEvent[] = [];
+    const skipped: SkippedObject[] = [];
     for (const obj of objects) {
-      if (!obj.data) continue;
-      const parsed = parseICalEvents(obj.data, obj.url, obj.etag ?? null);
-      events.push(...parsed);
+      if (typeof obj.data !== "string" || obj.data === "") {
+        skipped.push({ url: obj.url, reason: "The server sent no calendar data for it." });
+        continue;
+      }
+      const expanded = expandObject(obj.data, window, { url: obj.url, etag: obj.etag ?? null });
+      events.push(...expanded.instances);
+      if (expanded.skipped !== undefined) skipped.push({ url: obj.url, reason: expanded.skipped });
     }
-    events.sort((a, b) => a.start.localeCompare(b.start));
-    return events;
+    events.sort((a, b) => instantOfReported(a.start) - instantOfReported(b.start));
+    return { events, skipped };
   }
 
   async createEvent(input: NewEventInput): Promise<{ url: string; uid: string }> {
@@ -204,7 +216,16 @@ export class CalDavClient {
     }
     const calendar = await this.findCalendar(update.calendarUrl);
     const stored = await this.findStoredEvent(calendar, update.uid, nothingDone);
-    if (describeStoredEvent(stored.data, update.uid).recurring) {
+    const shape = describeStoredEvent(stored.data, update.uid);
+    if (shape.overrideOnly) {
+      // #211.3: there is no master to patch, so without this the patch threw a
+      // plain Error — logged as a server failure — or, without
+      // apply_to_series, the call was told this is a series it can change.
+      throw new ToolRefusal(
+        `"${update.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example), and changing such an occurrence is not supported yet. Nothing was changed.`
+      );
+    }
+    if (shape.recurring) {
       if (update.applyToSeries !== true) throw seriesRefusal(update.uid, "change");
       if (touchesTime(update)) {
         throw new ToolRefusal(
@@ -273,7 +294,14 @@ export class CalDavClient {
     }
     const calendar = await this.findCalendar(target.calendarUrl);
     const stored = await this.findStoredEvent(calendar, target.uid, nothingDone);
-    if (describeStoredEvent(stored.data, target.uid).recurring && target.applyToSeries !== true) {
+    const shape = describeStoredEvent(stored.data, target.uid);
+    if (shape.overrideOnly && target.applyToSeries !== true) {
+      // #211.3: not "every occurrence" — the object holds only this one.
+      throw new ToolRefusal(
+        `"${target.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example). Deleting it removes the whole stored object. Nothing was deleted. Pass apply_to_series: true if that is what you intend.`
+      );
+    }
+    if (shape.recurring && target.applyToSeries !== true) {
       throw seriesRefusal(target.uid, "delete");
     }
     const ifMatch = requireEtag(target, stored);
@@ -289,6 +317,11 @@ export class CalDavClient {
   /**
    * The stored object holding `uid`, found by a UID `calendar-query` and then
    * checked exactly: RFC 4791's text-match is a substring match (spec §4.2).
+   *
+   * Every object the query returns is a candidate, whatever its href is
+   * called (#211.1), and one that cannot be parsed is passed over rather than
+   * ending the search (#211.2): the query matched it on a substring, so the
+   * exact match may well be a later one.
    */
   private async findStoredEvent(
     calendar: DAVCalendar,
@@ -299,11 +332,17 @@ export class CalDavClient {
     const objects: DAVCalendarObject[] = await client.fetchCalendarObjects({
       calendar,
       filters: uidFilter(uid),
+      urlFilter: everyObjectIn(calendar),
     });
     for (const obj of objects) {
-      if (typeof obj.data === "string" && describeStoredEvent(obj.data, uid).found) {
-        return { url: obj.url, etag: obj.etag ?? null, data: obj.data };
+      if (typeof obj.data !== "string") continue;
+      let found: boolean;
+      try {
+        found = describeStoredEvent(obj.data, uid).found;
+      } catch {
+        continue;
       }
+      if (found) return { url: obj.url, etag: obj.etag ?? null, data: obj.data };
     }
     throw notFound(uid, calendar.url, nothingDone);
   }
@@ -317,11 +356,11 @@ export class CalDavClient {
   ): Promise<FreeSlot[]> {
     const busy: Array<{ start: number; end: number }> = [];
     for (const url of calendarUrls) {
-      const events = await this.listEvents(url, rangeStart, rangeEnd);
+      const { events } = await this.listEvents(url, rangeStart, rangeEnd);
       for (const e of events) {
         busy.push({
-          start: new Date(e.start).getTime(),
-          end: new Date(e.end).getTime(),
+          start: instantOfReported(e.start),
+          end: instantOfReported(e.end),
         });
       }
     }
@@ -402,6 +441,18 @@ export class CalDavClient {
 }
 
 /**
+ * tsdav's `urlFilter` for a query in `calendar`: every href except the
+ * collection's own, which a server may list among the answers. tsdav's
+ * default keeps only hrefs containing `.ics`, and a server that names its
+ * objects without the extension then had events neither `list_events` nor
+ * the UID lookup could see (#211.1, R7).
+ */
+function everyObjectIn(calendar: DAVCalendar): (url: string) => boolean {
+  const own = calendar.url.replace(/\/+$/, "");
+  return (url) => url !== "" && url.replace(/\/+$/, "") !== own;
+}
+
+/**
  * A `calendar-query` filter for one UID, in tsdav's xml-js compact form. The
  * shape mirrors tsdav's own default filter (VCALENDAR > VEVENT), with a
  * `prop-filter` where the time range would go.
@@ -468,36 +519,6 @@ export function assertWritten(res: Response, method: string): void {
   if (!res.ok) {
     throw new Error(`CalDAV server answered ${res.status} ${res.statusText}`.trim() + ` to ${method}`);
   }
-}
-
-function parseICalEvents(icsData: string, objectUrl: string, etag: string | null): CalendarEvent[] {
-  const jcal = ICAL.parse(icsData);
-  const vcal = new ICAL.Component(jcal);
-  const vevents = vcal.getAllSubcomponents("vevent");
-  return vevents.map((ve) => {
-    const event = new ICAL.Event(ve);
-    const start = event.startDate;
-    const end = event.endDate;
-    const attendeeProps = ve.getAllProperties("attendee");
-    const organizerProp = ve.getFirstProperty("organizer");
-    return {
-      uid: event.uid ?? "",
-      url: objectUrl,
-      summary: event.summary ?? null,
-      description: event.description ?? null,
-      location: event.location ?? null,
-      start: start.toJSDate().toISOString(),
-      end: end.toJSDate().toISOString(),
-      allDay: Boolean(start.isDate),
-      organizer: organizerProp ? String(organizerProp.getFirstValue()) : null,
-      attendees: attendeeProps.map((p) => String(p.getFirstValue())),
-      status: (ve.getFirstPropertyValue("status") as string | null) ?? null,
-      recurrenceId: event.recurrenceId
-        ? event.recurrenceId.toJSDate().toISOString()
-        : null,
-      etag,
-    };
-  });
 }
 
 function buildIcs(input: NewEventInput & { uid: string }): string {

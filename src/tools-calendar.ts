@@ -121,7 +121,7 @@ export function registerCalendarTools(
     "list_events",
     {
       description:
-        "List events in a calendar between two timestamps. Recurring events are expanded into individual instances.",
+        "List events in a calendar between two timestamps. Recurring events are expanded into individual instances, each with the `recurrenceId` of the occurrence it is (a date, YYYY-MM-DD, for an all-day series). Each event carries `timezone`: its IANA zone, \"UTC\", or \"floating\" — a clock time with no zone, whose `start` and `end` are given without an offset. `transparent: true` means it does not block time. An event whose stored data cannot be read is left out and named in `skipped` with the reason, rather than failing the whole calendar.",
       inputSchema: {
         calendar_url: z
           .string()
@@ -134,10 +134,10 @@ export function registerCalendarTools(
     },
     async ({ calendar_url, start, end, account }) => {
       const { caldav, id } = requireCaldav(pool, account);
-      const events = await reportingFailures(pool, "list_events", id, () =>
+      const { events, skipped } = await reportingFailures(pool, "list_events", id, () =>
         caldav.listEvents(calendar_url, start, end)
       );
-      return asJson({ count: events.length, events });
+      return asJson({ count: events.length, events, skipped });
     }
   );
 

@@ -17,6 +17,7 @@ import {
   changesSomething,
   describeStoredEvent,
   mainSequence,
+  sequenceOf,
   touchesTime,
 } from "../../src/ical-edit.js";
 import { ToolRefusal } from "../../src/tool-errors.js";
@@ -143,6 +144,7 @@ describe("describeStoredEvent", () => {
     assert.deepEqual(describeStoredEvent(RICH, "rich-1@example.com"), {
       found: true,
       recurring: false,
+      overrideOnly: false,
     });
   });
 
@@ -150,12 +152,22 @@ describe("describeStoredEvent", () => {
     assert.deepEqual(describeStoredEvent(SERIES, "series-1@example.com"), {
       found: true,
       recurring: true,
+      overrideOnly: false,
     });
   });
 
   it("compares the UID exactly, not as the substring CalDAV's text-match uses", () => {
     assert.equal(describeStoredEvent(RICH, "rich-1@example.co").found, false);
     assert.equal(describeStoredEvent(RICH, "rich-1").found, false);
+  });
+
+  it("tells an object holding only an override from a series (#211.3)", () => {
+    const overrideOnly = SERIES.replace(/BEGIN:VEVENT[\s\S]*?END:VEVENT\r\n/, "");
+    assert.deepEqual(describeStoredEvent(overrideOnly, "series-1@example.com"), {
+      found: true,
+      recurring: true,
+      overrideOnly: true,
+    });
   });
 });
 
@@ -253,9 +265,13 @@ describe("applyEventPatch — what it changes", () => {
     assert.equal(master(out, "allday-1@example.com").getFirstPropertyValue("dtstart")?.toString(), "2026-10-05");
   });
 
-  it("treats removing a description the event never had as nothing to do", () => {
+  it("removes a description the event never had without complaint, and still counts it as a change", () => {
+    // Not "nothing to do": the object is still written, with SEQUENCE raised
+    // (#214 — the old title claimed otherwise).
     const out = applyEventPatch(ALL_DAY, "allday-1@example.com", { description: "" }, NOW);
-    assert.equal(master(out, "allday-1@example.com").hasProperty("description"), false);
+    const ve = master(out, "allday-1@example.com");
+    assert.equal(ve.hasProperty("description"), false);
+    assert.equal(ve.getFirstPropertyValue("sequence"), 1);
   });
 });
 
@@ -404,5 +420,19 @@ describe("mainSequence (PR 3 review)", () => {
 
   it("answers null for a UID the object does not hold", () => {
     assert.equal(mainSequence(RICH, "someone-else@example.com"), null);
+  });
+});
+
+describe("sequenceOf (#214)", () => {
+  it("is the reading both mainSequence and applyEventPatch use: absent or garbage is 0", () => {
+    const withSequence = (value: string | null): ICAL.Component => {
+      const text = value === null ? ALL_DAY : ALL_DAY.replace("SUMMARY:", `SEQUENCE:${value}\r\nSUMMARY:`);
+      return master(text, "allday-1@example.com");
+    };
+    assert.equal(sequenceOf(withSequence(null)), 0);
+    assert.equal(sequenceOf(withSequence("4")), 4);
+    // What applyEventPatch writes is what mainSequence then reads back.
+    const written = applyEventPatch(RICH, "rich-1@example.com", { summary: "x" }, NOW);
+    assert.equal(mainSequence(written, "rich-1@example.com"), sequenceOf(master(RICH, "rich-1@example.com")) + 1);
   });
 });

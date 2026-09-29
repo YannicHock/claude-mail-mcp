@@ -35,6 +35,12 @@ export interface StoredEventShape {
   found: boolean;
   /** RRULE or RDATE on the main VEVENT, or any VEVENT with a RECURRENCE-ID. */
   recurring: boolean;
+  /**
+   * Only overrides for the UID, no main VEVENT: one occurrence of a series
+   * that lives elsewhere, as an invitation to a single instance is stored
+   * (#211.3, R3). `recurring` is true for it as well.
+   */
+  overrideOnly: boolean;
 }
 
 /** True when the patch touches the event's time, which a series refuses (§4.3). */
@@ -71,24 +77,36 @@ function parse(ics: string): ICAL.Component {
  */
 export function describeStoredEvent(ics: string, uid: string): StoredEventShape {
   const vevents = veventsFor(parse(ics), uid);
-  if (vevents.length === 0) return { found: false, recurring: false };
+  if (vevents.length === 0) return { found: false, recurring: false, overrideOnly: false };
   const recurring = vevents.some(
     (ve) =>
       ve.hasProperty("recurrence-id") || ve.hasProperty("rrule") || ve.hasProperty("rdate")
   );
-  return { found: true, recurring };
+  const overrideOnly = vevents.every((ve) => ve.hasProperty("recurrence-id"));
+  return { found: true, recurring, overrideOnly };
 }
 
 /**
- * The SEQUENCE of the main VEVENT for `uid` (absent counts as 0, as in
- * {@link applyEventPatch}), or null when the object holds no main VEVENT for it.
- * Lets a read-back after a write tell its own version from one written since.
+ * A VEVENT's SEQUENCE: absent, or not a number, counts as 0. The one reading
+ * both {@link mainSequence} and {@link applyEventPatch} use (#214), because
+ * `CalDavClient`'s read-back after a write trusts the two to agree — if they
+ * drifted, it would hand back no etag for its own write, or someone else's
+ * for it.
+ */
+export function sequenceOf(vevent: ICAL.Component): number {
+  const sequence = Number(vevent.getFirstPropertyValue("sequence") ?? 0);
+  return Number.isFinite(sequence) ? sequence : 0;
+}
+
+/**
+ * The SEQUENCE of the main VEVENT for `uid` (see {@link sequenceOf}), or null
+ * when the object holds no main VEVENT for it. Lets a read-back after a write
+ * tell its own version from one written since.
  */
 export function mainSequence(ics: string, uid: string): number | null {
   const master = veventsFor(parse(ics), uid).find((ve) => !ve.hasProperty("recurrence-id"));
   if (master === undefined) return null;
-  const sequence = Number(master.getFirstPropertyValue("sequence") ?? 0);
-  return Number.isFinite(sequence) ? sequence : 0;
+  return sequenceOf(master);
 }
 
 /**
@@ -243,8 +261,7 @@ export function applyEventPatch(
     if (end !== undefined) master.updatePropertyWithValue("dtend", icalTimeFor(end, allDay));
   }
 
-  const sequence = Number(master.getFirstPropertyValue("sequence") ?? 0);
-  master.updatePropertyWithValue("sequence", (Number.isFinite(sequence) ? sequence : 0) + 1);
+  master.updatePropertyWithValue("sequence", sequenceOf(master) + 1);
   const stamp = ICAL.Time.fromJSDate(now, true);
   master.updatePropertyWithValue("dtstamp", stamp);
   master.updatePropertyWithValue("last-modified", stamp);
