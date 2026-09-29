@@ -20,8 +20,12 @@
  *   greeting already proves the port is open and a mail server is behind it.
  *
  * `addresses` are the ones the caller already resolved and checked, and they
- * are connected to directly, in order, so the name is never resolved a second
- * time between the check and the socket. Always resolves; never throws.
+ * are connected to directly, so the name is never resolved a second time
+ * between the check and the socket. All of them at once, and the first that
+ * answers decides: tried one after another under one deadline, an IPv6 route
+ * that drops SYNs rather than refusing them — which `dns.lookup` can list
+ * first — spent the whole slice, and a port that answers over IPv4 came back
+ * as unreachable as the filtered one. Always resolves; never throws.
  */
 
 import net from "node:net";
@@ -44,13 +48,17 @@ export async function reachable(
   timeoutMs: number,
   opts: { ca?: string | Buffer } = {}
 ): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  for (const address of addresses) {
-    const left = deadline - Date.now();
-    if (left <= 0) return false;
-    if (await answersAt(target, address, left, opts)) return true;
-  }
-  return false;
+  if (addresses.length === 0) return false;
+  return new Promise<boolean>((resolve) => {
+    let pending = addresses.length;
+    for (const address of addresses) {
+      void answersAt(target, address, timeoutMs, opts).then((answered) => {
+        pending -= 1;
+        if (answered) resolve(true);
+        else if (pending === 0) resolve(false);
+      });
+    }
+  });
 }
 
 function answersAt(
@@ -88,7 +96,11 @@ function answersAt(
         if (greeting.length >= 5 || greeting.includes("\n")) finish(MAIL_GREETING.test(greeting));
       });
     }
-    socket.once("error", () => finish(false));
+    // `on`, not `once`: a socket can report a second error after the first has
+    // settled this, and an emitter with no 'error' listener left rethrows it
+    // as an uncaught exception — the process, not this check. `finish` is
+    // idempotent, so the listener stays for the socket's whole life.
+    socket.on("error", () => finish(false));
     socket.once("close", () => finish(false));
   });
 }

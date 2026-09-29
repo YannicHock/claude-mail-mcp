@@ -161,3 +161,43 @@ test("a second address is tried when the first does not answer", async () => {
     await server.close();
   }
 });
+
+test("an address that swallows the connection does not use up the others' time", async () => {
+  // An IPv6 route that drops SYNs instead of refusing them looks like this:
+  // accepted into nothing, never a word back. `dns.lookup` can hand that
+  // address over first, and tried one after another it spent the whole slice,
+  // so 587 came back as unreachable as 465 on exactly the host #194 is for.
+  const port = await freePort();
+  const silent = await plainServerOn("127.0.0.1", port, null);
+  const greeter = await plainServerOn("127.0.0.2", port, "220 ready\r\n");
+  try {
+    const started = Date.now();
+    assert.equal(
+      await reachable({ host: "localhost", port, socketType: "STARTTLS" }, ["127.0.0.1", "127.0.0.2"], 1_000),
+      true
+    );
+    assert.ok(Date.now() - started < 500, `took ${Date.now() - started}ms`);
+  } finally {
+    await silent.close();
+    await greeter.close();
+  }
+});
+
+async function freePort(): Promise<number> {
+  const probe = net.createServer();
+  const port = await listen(probe);
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  return port;
+}
+
+/** {@link plainServer}, bound to one loopback address and port. */
+async function plainServerOn(host: string, port: number, greeting: string | null) {
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    if (greeting !== null) socket.write(greeting);
+  });
+  await new Promise<void>((resolve) => server.listen(port, host, resolve));
+  return { close: () => closeServer(server, sockets) };
+}
