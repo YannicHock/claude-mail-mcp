@@ -16,6 +16,7 @@ import {
   applyEventPatch,
   changesSomething,
   describeStoredEvent,
+  mainSequence,
   touchesTime,
 } from "../../src/ical-edit.js";
 import { ToolRefusal } from "../../src/tool-errors.js";
@@ -392,5 +393,16 @@ describe("touchesTime / changesSomething", () => {
     assert.equal(touchesTime({ allDay: false }), true);
     assert.equal(changesSomething({}), false);
     assert.equal(changesSomething({ location: "" }), true);
+  });
+});
+
+describe("mainSequence (PR 3 review)", () => {
+  it("reads the main VEVENT's SEQUENCE, treating an absent one as 0", () => {
+    assert.equal(mainSequence(RICH, "rich-1@example.com"), 2);
+    assert.equal(mainSequence(ALL_DAY, "allday-1@example.com"), 0);
+  });
+
+  it("answers null for a UID the object does not hold", () => {
+    assert.equal(mainSequence(RICH, "someone-else@example.com"), null);
   });
 });
