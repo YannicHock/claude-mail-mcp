@@ -551,6 +551,18 @@ export type WriteZone =
 export const UTC_ZONE: WriteZone = { kind: "utc" };
 
 /**
+ * The zone a new event is written in for the IANA name `iana` (as
+ * {@link canonicalZone} spells it): UTC for a name that means UTC, written as
+ * `…Z`, and otherwise `TZID=iana` local time whose arithmetic is `Intl`'s.
+ * The one place a {@link WriteZone} is made from a name rather than read off
+ * a stored property, so no caller assembles an {@link IntlTimezone} by hand
+ * (code-health review of PR 3).
+ */
+export function zonedWriteZone(iana: string): WriteZone {
+  return isUtcName(iana) ? UTC_ZONE : { kind: "zoned", tzid: iana, zone: new IntlTimezone(iana, iana) };
+}
+
+/**
  * The property {@link vtimezoneFromIntl} marks its block with. The block is
  * this connector's to regenerate only while it carries the mark; one without
  * it — any other client's, bounded or not — is how that client reads the

@@ -27,30 +27,21 @@ import {
   DAVCalendar,
   DAVCalendarObject,
 } from "tsdav";
-import ICAL from "ical.js";
 import { randomUUID } from "node:crypto";
+import { buildIcs, builtZoneName, type NewEventFields } from "./ical-build.js";
 import {
   applyEventPatch,
-  calendarDate,
   changesSomething,
-  describeStoredEvent,
-  mainSequence,
-  timedBound,
+  describeSeries,
   touchesTime,
+  writtenBy,
   type EventPatch,
+  type WriteMark,
 } from "./ical-edit.js";
 import { instantOfReported, type CalendarEvent, type StoredObject } from "./ical-expand.js";
+import { parseCalendar, seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { expansionPool } from "./ical-worker-pool.js";
-import {
-  calendarZone,
-  canonicalZone,
-  generatedVtimezone,
-  IntlTimezone,
-  isUtcName,
-  UTC_ZONE,
-  writtenTime,
-  type WriteZone,
-} from "./ical-zones.js";
+import { calendarZone, canonicalZone } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 import { classifyFailure } from "../shared/credential-failure.js";
 import type { Logger } from "../shared/log.js";
@@ -86,16 +77,8 @@ export interface EventListing {
   skipped: SkippedObject[];
 }
 
-export interface NewEventInput {
+export interface NewEventInput extends NewEventFields {
   calendarUrl: string;
-  summary: string;
-  description?: string;
-  location?: string;
-  /** ISO 8601; with no offset, clock time in the zone the event is written in. */
-  start: string;
-  end: string;
-  allDay?: boolean;
-  attendees?: string[];
   /**
    * The IANA zone to write the event in (spec 2026-09-29 §2.5). Omitted, it is
    * the calendar's own zone when the server reports one, and UTC otherwise.
@@ -124,6 +107,26 @@ export interface EventTarget {
 }
 
 export interface EventUpdate extends EventTarget, EventPatch {}
+
+/**
+ * Where a guarded write goes, and what its refusals end with: the one
+ * argument {@link CalDavClient}'s `guardedWrite` takes about the event, in
+ * place of the five it took one by one (code-health review of PR 3).
+ * `move_event` (#212) passes the source's.
+ */
+export interface WriteTarget {
+  calendar: DAVCalendar;
+  uid: string;
+  /** The object's URL, as the lookup found it. */
+  url: string;
+  /** "Nothing was changed." and the like: what a refusal says was not done. */
+  nothingDone: string;
+}
+
+/** A stored object the UID lookup found, with the one parse of it every write reuses. */
+interface FoundObject extends StoredObject {
+  parsed: ParsedCalendar;
+}
 
 export interface FreeSlot {
   start: string;
@@ -247,12 +250,13 @@ export class CalDavClient {
    * before v0.7.4. The answer says which zone it was.
    */
   async createEvent(input: NewEventInput): Promise<CreatedEvent> {
+    const nothingDone = "Nothing was created.";
     let zone: string | null = null;
     if (input.timezone !== undefined) {
       zone = canonicalZone(input.timezone);
       if (zone === null) {
         throw new ToolRefusal(
-          `"${input.timezone}" is not an IANA time zone. Pass a name like Europe/Berlin or America/New_York, or omit timezone to use the calendar's own. Nothing was created.`
+          `"${input.timezone}" is not an IANA time zone. Pass a name like Europe/Berlin or America/New_York, or omit timezone to use the calendar's own. ${nothingDone}`
         );
       }
     }
@@ -260,7 +264,7 @@ export class CalDavClient {
     zone ??= calendarZone(calendar.timezone) ?? "UTC";
     const client = await this.ensureClient();
     const uid = `${randomUUID()}@claude-mail-mcp`;
-    const ics = buildIcs({ ...input, uid }, zone);
+    const ics = buildIcs({ ...input, uid }, zone, nothingDone);
     const filename = `${uid}.ics`;
     const res = await client.createCalendarObject({
       calendar,
@@ -269,8 +273,7 @@ export class CalDavClient {
     });
     assertWritten(res, "PUT");
     const base = calendar.url.endsWith("/") ? calendar.url : `${calendar.url}/`;
-    const timezone = input.allDay === true ? "floating" : isUtcName(zone) ? "UTC" : zone;
-    return { url: `${base}${filename}`, uid, timezone };
+    return { url: `${base}${filename}`, uid, timezone: builtZoneName(ics) };
   }
 
   /**
@@ -292,7 +295,7 @@ export class CalDavClient {
     }
     const calendar = await this.findCalendar(update.calendarUrl);
     const stored = await this.findStoredEvent(calendar, update.uid, nothingDone);
-    const shape = describeStoredEvent(stored.data, update.uid);
+    const shape = describeSeries(seriesFor(stored.parsed.vcal, update.uid));
     if (shape.overrideOnly) {
       // #211.3: there is no master to patch, so without this the patch threw a
       // plain Error — logged as a server failure — or, without
@@ -310,17 +313,24 @@ export class CalDavClient {
       }
     }
     const ifMatch = requireEtag(update, stored, nothingDone);
-    const data = applyEventPatch(stored.data, update.uid, update);
+    const edit = applyEventPatch(stored.parsed, update.uid, update, nothingDone);
+    const etag = await this.putEdit({ calendar, uid: update.uid, url: stored.url, nothingDone }, ifMatch, edit);
+    return { uid: update.uid, url: stored.url, etag };
+  }
+
+  /**
+   * PUT an edit of a stored object through {@link guardedWrite}, and return
+   * the new ETag: the server's answer's, or read back through
+   * {@link etagAfterWrite} when it gave none.
+   */
+  private async putEdit(target: WriteTarget, ifMatch: string | undefined, edit: { ics: string; mark: WriteMark }): Promise<string | null> {
     const client = await this.ensureClient();
-    const res = await this.guardedWrite("PUT", calendar, update.uid, stored.url, ifMatch, nothingDone, (etag) =>
+    const res = await this.guardedWrite("PUT", target, ifMatch, (etag) =>
       client.updateCalendarObject({
-        calendarObject: { url: stored.url, data, ...(etag === undefined ? {} : { etag }) },
+        calendarObject: { url: target.url, data: edit.ics, ...(etag === undefined ? {} : { etag }) },
       })
     );
-    const etag =
-      res.headers.get("etag") ??
-      (await this.etagAfterWrite(calendar, update.uid, stored.url, mainSequence(data, update.uid)));
-    return { uid: update.uid, url: stored.url, etag };
+    return res.headers.get("etag") ?? (await this.etagAfterWrite(target.calendar, target.url, edit.mark));
   }
 
   /**
@@ -336,7 +346,8 @@ export class CalDavClient {
    * read the event again in that case.
    *
    * An ETag is handed back only for what is recognisably this write: the same
-   * object URL, and the SEQUENCE this update just wrote. Otherwise someone
+   * object URL, and the SEQUENCE this update just wrote on the VEVENT it
+   * changed (`mark`, see `writtenBy` in src/ical-edit.ts). Otherwise someone
    * else's version landed in between (a phone syncing, a server applying an
    * attendee's reply that bumps it), and giving the caller *that* etag would
    * let its next update overwrite the other change unseen — `null` sends it to
@@ -349,15 +360,10 @@ export class CalDavClient {
    * `classifyFailure`'s bounded reading of the message, never the error
    * object, which can carry the connection's credentials.
    */
-  private async etagAfterWrite(
-    calendar: DAVCalendar,
-    uid: string,
-    url: string,
-    sequence: number | null
-  ): Promise<string | null> {
+  private async etagAfterWrite(calendar: DAVCalendar, url: string, mark: WriteMark): Promise<string | null> {
     try {
-      const now = await this.findStoredEvent(calendar, uid, "");
-      if (now.url !== url || sequence === null || mainSequence(now.data, uid) !== sequence) return null;
+      const now = await this.findStoredEvent(calendar, mark.uid, "");
+      if (now.url !== url || !writtenBy(now.data, mark)) return null;
       return now.etag;
     } catch (err) {
       this.log("info", "caldav: the etag of a write could not be read back", {
@@ -381,7 +387,7 @@ export class CalDavClient {
     }
     const calendar = await this.findCalendar(target.calendarUrl);
     const stored = await this.findStoredEvent(calendar, target.uid, nothingDone);
-    const shape = describeStoredEvent(stored.data, target.uid);
+    const shape = describeSeries(seriesFor(stored.parsed.vcal, target.uid));
     if (shape.overrideOnly && target.applyToSeries !== true) {
       // #211.3: not "every occurrence" — the object holds only this one.
       throw new ToolRefusal(
@@ -393,7 +399,7 @@ export class CalDavClient {
     }
     const ifMatch = requireEtag(target, stored, nothingDone);
     const client = await this.ensureClient();
-    await this.guardedWrite("DELETE", calendar, target.uid, stored.url, ifMatch, nothingDone, (etag) =>
+    await this.guardedWrite("DELETE", { calendar, uid: target.uid, url: stored.url, nothingDone }, ifMatch, (etag) =>
       client.deleteCalendarObject({
         calendarObject: { url: stored.url, ...(etag === undefined ? {} : { etag }) },
       })
@@ -433,13 +439,11 @@ export class CalDavClient {
    */
   private async guardedWrite(
     method: "PUT" | "DELETE",
-    calendar: DAVCalendar,
-    uid: string,
-    url: string,
+    target: WriteTarget,
     ifMatch: string | undefined,
-    nothingDone: string,
     write: (ifMatch: string | undefined) => Promise<Response>
   ): Promise<Response> {
+    const { calendar, uid, url, nothingDone } = target;
     let res = await write(ifMatch);
     if (ifMatch === "*" && res.status === 412) {
       const again = await this.findStoredEvent(calendar, uid, nothingDone);
@@ -460,12 +464,11 @@ export class CalDavClient {
    * called (#211.1), and one that cannot be parsed is passed over rather than
    * ending the search (#211.2): the query matched it on a substring, so the
    * exact match may well be a later one.
+   *
+   * The match comes back with its parse, which the write that asked for it
+   * reuses rather than parsing the same text again.
    */
-  private async findStoredEvent(
-    calendar: DAVCalendar,
-    uid: string,
-    nothingDone: string
-  ): Promise<{ url: string; etag: string | null; data: string }> {
+  private async findStoredEvent(calendar: DAVCalendar, uid: string, nothingDone: string): Promise<FoundObject> {
     const client = await this.ensureClient();
     const objects: DAVCalendarObject[] = await client.fetchCalendarObjects({
       calendar,
@@ -474,13 +477,15 @@ export class CalDavClient {
     });
     for (const obj of objects) {
       if (typeof obj.data !== "string") continue;
-      let found: boolean;
+      let parsed: ParsedCalendar;
       try {
-        found = describeStoredEvent(obj.data, uid).found;
+        parsed = parseCalendar(obj.data);
       } catch {
         continue;
       }
-      if (found) return { url: obj.url, etag: obj.etag ?? null, data: obj.data };
+      if (describeSeries(seriesFor(parsed.vcal, uid)).found) {
+        return { url: obj.url, etag: obj.etag ?? null, data: obj.data, parsed };
+      }
     }
     throw notFound(uid, calendar.url, nothingDone);
   }
@@ -697,76 +702,4 @@ export function assertWritten(res: Response, method: string): void {
   if (!res.ok) {
     throw new Error(`CalDAV server answered ${res.status} ${res.statusText}`.trim() + ` to ${method}`);
   }
-}
-
-/**
- * The object `create_event` writes, in the IANA zone `zone` (spec 2026-09-29
- * §2.5): UTC (`…Z`, and no VTIMEZONE, as before v0.7.4) when `zone` is UTC,
- * and otherwise `TZID=zone` local time with a VTIMEZONE {@link
- * generatedVtimezone} makes for the event's span and a year either side —
- * marked as this connector's, so `update_event` regenerates it when the event
- * moves outside that span (review of #224). A time given without an offset is
- * clock time in `zone`. An all-day event is dates whatever the zone.
- *
- * A bound on the second pass through an autumn overlap is written in UTC:
- * as a wall time it would mean the first pass, an hour earlier, and could
- * land before the start (see `writtenTime` in src/ical-zones.ts).
- *
- * Throws {@link ToolRefusal} for a start or end it cannot read, and for an end
- * at or before the start — which until the review of #224 was written as it
- * was given, an event every client shows with no length or backwards.
- */
-export function buildIcs(input: NewEventInput & { uid: string }, zone: string, now: Date = new Date()): string {
-  const nothingDone = "Nothing was created.";
-  const cal = new ICAL.Component(["vcalendar", [], []]);
-  cal.updatePropertyWithValue("prodid", "-//claude-mail-mcp//EN");
-  cal.updatePropertyWithValue("version", "2.0");
-
-  const vevent = new ICAL.Component("vevent");
-  vevent.updatePropertyWithValue("uid", input.uid);
-  vevent.updatePropertyWithValue("dtstamp", ICAL.Time.fromJSDate(now, true));
-  if (input.allDay === true) {
-    const start = calendarDate("start", input.start, nothingDone);
-    const end = calendarDate("end", input.end, nothingDone);
-    if (end <= start) {
-      throw new ToolRefusal(
-        `The event would end (${end}) on or before it starts (${start}). For an all-day event the end date is exclusive: a one-day event on ${start} ends the day after. ${nothingDone}`
-      );
-    }
-    vevent.updatePropertyWithValue("dtstart", ICAL.Time.fromDateString(start));
-    vevent.updatePropertyWithValue("dtend", ICAL.Time.fromDateString(end));
-  } else {
-    const target: WriteZone = isUtcName(zone)
-      ? UTC_ZONE
-      : { kind: "zoned", tzid: zone, zone: new IntlTimezone(zone, zone) };
-    const startMs = timedBound("start", input.start, target, nothingDone);
-    const endMs = timedBound("end", input.end, target, nothingDone);
-    if (endMs <= startMs) {
-      throw new ToolRefusal(
-        `The event would end (${new Date(endMs).toISOString()}) at or before it starts (${new Date(startMs).toISOString()}). ${nothingDone}`
-      );
-    }
-    for (const [name, ms] of [["dtstart", startMs], ["dtend", endMs]] as const) {
-      const written = writtenTime(ms, target);
-      const prop = new ICAL.Property(name);
-      prop.setValue(written.time);
-      if (written.zone.kind === "zoned") prop.setParameter("tzid", written.zone.tzid);
-      vevent.addProperty(prop);
-    }
-    if (target.kind === "zoned") cal.addSubcomponent(generatedVtimezone(zone, [startMs, endMs]));
-  }
-  vevent.updatePropertyWithValue("summary", input.summary);
-  if (input.description) {
-    vevent.updatePropertyWithValue("description", input.description);
-  }
-  if (input.location) {
-    vevent.updatePropertyWithValue("location", input.location);
-  }
-  for (const a of input.attendees ?? []) {
-    const prop = new ICAL.Property("attendee");
-    prop.setValue(a.startsWith("mailto:") ? a : `mailto:${a}`);
-    vevent.addProperty(prop);
-  }
-  cal.addSubcomponent(vevent);
-  return cal.toString();
 }

@@ -28,6 +28,8 @@ import {
   withResolvedZones,
   zonedWallToInstant,
   zoneOf,
+  zonedWriteZone,
+  IntlTimezone,
 } from "../../src/ical-zones.js";
 
 const ZONES = ["Europe/Berlin", "America/New_York", "Australia/Sydney", "Asia/Jerusalem", "Africa/Casablanca"];
@@ -381,5 +383,13 @@ describe("the zone a new event is written in", () => {
     for (const value of ["", undefined, null, 42, { _cdata: "Europe/Berlin" }, "W. Europe Standard Time", "BEGIN:VCALENDAR\r\nnonsense"]) {
       assert.equal(calendarZone(value), null, JSON.stringify(value));
     }
+  });
+
+  it("zonedWriteZone is UTC for a name that means UTC, and TZID local time through Intl otherwise (code-health review of PR 3)", () => {
+    assert.deepEqual(zonedWriteZone("UTC"), { kind: "utc" });
+    assert.deepEqual(zonedWriteZone("Etc/UTC"), { kind: "utc" });
+    const berlin = zonedWriteZone("Europe/Berlin");
+    assert.ok(berlin.kind === "zoned" && berlin.tzid === "Europe/Berlin", JSON.stringify(berlin.kind));
+    assert.ok(berlin.zone instanceof IntlTimezone && berlin.zone.iana === "Europe/Berlin");
   });
 });

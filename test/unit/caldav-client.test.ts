@@ -9,11 +9,17 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import ICAL from "ical.js";
 
-import { CalDavClient, buildIcs, requireEtag } from "../../src/caldav-client.js";
+import { CalDavClient, requireEtag } from "../../src/caldav-client.js";
+import { buildIcs, builtZoneName } from "../../src/ical-build.js";
 import { utcOffsetMs } from "../../src/ical-zones.js";
 import { ToolRefusal } from "../../src/tool-refusal.js";
 
 const NOW = new Date("2026-09-28T12:00:00Z");
+
+/** {@link buildIcs} with the refusal ending `create_event` passes. */
+function built(input: Parameters<typeof buildIcs>[0], zone: string, now: Date): string {
+  return buildIcs(input, zone, "Nothing was created.", now);
+}
 
 function parsed(text: string): { vcal: ICAL.Component; vevent: ICAL.Component } {
   const vcal = new ICAL.Component(ICAL.parse(text));
@@ -28,7 +34,7 @@ describe("buildIcs — the zone create_event writes (spec §2.5)", () => {
   it("writes an event in Asia/Jerusalem with a VTIMEZONE whose offsets match Intl at its start and end", () => {
     // Jerusalem moves to summer time on Friday 2026-03-27, between the two:
     // the start is at +02:00 and the end at +03:00.
-    const text = buildIcs(
+    const text = built(
       { ...BASE, start: "2026-03-26T10:00:00+02:00", end: "2026-03-28T10:00:00+03:00" },
       "Asia/Jerusalem",
       NOW
@@ -53,20 +59,20 @@ describe("buildIcs — the zone create_event writes (spec §2.5)", () => {
   });
 
   it("reads a time with no offset as clock time in the event's zone", () => {
-    const text = buildIcs({ ...BASE, start: "2026-10-01T09:00:00", end: "2026-10-01T10:00:00" }, "Europe/Berlin", NOW);
+    const text = built({ ...BASE, start: "2026-10-01T09:00:00", end: "2026-10-01T10:00:00" }, "Europe/Berlin", NOW);
     assert.match(text, /\r\nDTSTART;TZID=Europe\/Berlin:20261001T090000\r\n/);
     assert.match(text, /\r\nDTEND;TZID=Europe\/Berlin:20261001T100000\r\n/);
   });
 
   it("writes UTC, and no VTIMEZONE, when the zone is UTC — as every event was written before v0.7.4", () => {
-    const text = buildIcs({ ...BASE, start: "2026-10-01T09:00:00+02:00", end: "2026-10-01T10:00:00+02:00" }, "UTC", NOW);
+    const text = built({ ...BASE, start: "2026-10-01T09:00:00+02:00", end: "2026-10-01T10:00:00+02:00" }, "UTC", NOW);
     assert.match(text, /\r\nDTSTART:20261001T070000Z\r\n/);
     assert.match(text, /\r\nDTEND:20261001T080000Z\r\n/);
     assert.doesNotMatch(text, /VTIMEZONE/);
   });
 
   it("writes an all-day event as dates, whatever the zone", () => {
-    const text = buildIcs({ ...BASE, start: "2026-10-01", end: "2026-10-02", allDay: true }, "Asia/Jerusalem", NOW);
+    const text = built({ ...BASE, start: "2026-10-01", end: "2026-10-02", allDay: true }, "Asia/Jerusalem", NOW);
     assert.match(text, /\r\nDTSTART;VALUE=DATE:20261001\r\n/);
     assert.doesNotMatch(text, /VTIMEZONE|TZID/);
   });
@@ -74,7 +80,7 @@ describe("buildIcs — the zone create_event writes (spec §2.5)", () => {
   it("writes an end on the second pass through the overlap in UTC, not as a wall time before the start's (review of #224)", () => {
     // 02:45 CEST is 00:45Z and 02:15 CET is 01:15Z: half an hour, but as
     // Berlin wall times the end would come first.
-    const text = buildIcs(
+    const text = built(
       { ...BASE, start: "2026-10-25T02:45:00+02:00", end: "2026-10-25T02:15:00+01:00" },
       "Europe/Berlin",
       NOW
@@ -91,12 +97,27 @@ describe("buildIcs — the zone create_event writes (spec §2.5)", () => {
       [{ start: "2026-10-02", end: "2026-10-01", allDay: true }, "UTC"],
     ] as const) {
       assert.throws(
-        () => buildIcs({ ...BASE, ...input }, zone, NOW),
+        () => built({ ...BASE, ...input }, zone, NOW),
         (err: unknown) =>
           err instanceof ToolRefusal && /at or before it starts|on or before it starts/.test(err.message) && /Nothing was created/.test(err.message),
         JSON.stringify(input)
       );
     }
+  });
+});
+
+describe("builtZoneName — the timezone create_event answers with, read off what it built (code-health review of PR 3)", () => {
+  it("is the zone list_events will report: the IANA name, UTC, or floating for an all-day event", () => {
+    const timed = { ...BASE, start: "2026-10-01T09:00:00", end: "2026-10-01T10:00:00" };
+    assert.equal(builtZoneName(built(timed, "Europe/Berlin", NOW)), "Europe/Berlin");
+    assert.equal(builtZoneName(built(timed, "Etc/UTC", NOW)), "UTC");
+    assert.equal(builtZoneName(built({ ...BASE, start: "2026-10-01", end: "2026-10-02", allDay: true }, "Europe/Berlin", NOW)), "floating");
+  });
+
+  it("says UTC for a start on the second pass through the overlap, which is written in UTC", () => {
+    const text = built({ ...BASE, start: "2026-10-25T02:30:00+01:00", end: "2026-10-25T04:00:00+01:00" }, "Europe/Berlin", NOW);
+    assert.match(text, /\r\nDTSTART:20261025T013000Z\r\n/);
+    assert.equal(builtZoneName(text), "UTC");
   });
 });
 
