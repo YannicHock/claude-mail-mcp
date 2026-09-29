@@ -8,6 +8,20 @@
  *
  * All times are ISO 8601 with timezone offset (e.g. 2026-05-22T09:00:00+02:00).
  *
+ * What the calendar can do: list calendars and events, create an event, find
+ * free time, and since v0.7.2 change (`update_event`, #152) and delete
+ * (`delete_event`, #153) an existing one. Both writes are guarded by the ETag
+ * `list_events` returns, refuse a single occurrence of a series, and need
+ * `apply_to_series` to touch a series at all (spec 2026-09-28 §4). An update
+ * edits the stored object in place — see src/ical-edit.ts — so attendees,
+ * alarms and anything else this connector does not model survive it.
+ * Neither tool notifies attendees: there is no iMIP yet (#29).
+ *
+ * Those refusals are answers, not failures. They are thrown as `ToolRefusal`,
+ * which `reportingFailures()` passes through word for word with no log line: a
+ * model retrying after a conflict is the tool working, and a `warn` for it
+ * would bury the lines #146 exists for.
+ *
  * v0.7.1 (#146): a CalDAV failure names the account and leaves exactly one
  * `warn` line, the same as the mail tools, through `reportingFailures()`.
  *
@@ -161,6 +175,105 @@ export function registerCalendarTools(
           end: args.end,
           allDay: args.all_day,
           attendees: args.attendees,
+        })
+      );
+      return asJson({ success: true, ...result });
+    }
+  );
+
+  server.registerTool(
+    "update_event",
+    {
+      description:
+        "Change an existing calendar event. WRITE OPERATION. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. `start` alone moves the event and keeps its length. Attendees are NOT notified: this connector does not send calendar invitations yet. A recurring event needs apply_to_series=true, and then only its summary, description and location can change; a single occurrence cannot be changed yet.",
+      inputSchema: {
+        calendar_url: z
+          .string()
+          .url()
+          .describe("Calendar URL as returned by list_calendars"),
+        uid: z.string().min(1).describe("Event UID as returned by list_events"),
+        etag: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("The event's etag as returned by list_events. Required unless list_events returned null for it."),
+        summary: z.string().min(1).optional().describe("New title"),
+        description: z.string().optional().describe("New description; an empty string removes it"),
+        location: z.string().optional().describe("New location; an empty string removes it"),
+        start: isoDateTime.optional().describe("New start. Alone, it moves the event and keeps its length."),
+        end: isoDateTime.optional().describe("New end"),
+        all_day: z
+          .boolean()
+          .optional()
+          .describe("Switch between all-day and timed; needs both start and end (YYYY-MM-DD, end exclusive, when all-day)"),
+        recurrence_id: z
+          .string()
+          .optional()
+          .describe("Not supported yet: a single occurrence of a series cannot be changed. Passing it is refused."),
+        apply_to_series: z
+          .boolean()
+          .optional()
+          .describe("Required to change a recurring event; the change then applies to every occurrence"),
+        account: accountSchema,
+      },
+    },
+    async (args) => {
+      const { caldav, id } = requireCaldav(pool, args.account);
+      const result = await reportingFailures(pool, "update_event", id, () =>
+        caldav.updateEvent({
+          calendarUrl: args.calendar_url,
+          uid: args.uid,
+          etag: args.etag,
+          summary: args.summary,
+          description: args.description,
+          location: args.location,
+          start: args.start,
+          end: args.end,
+          allDay: args.all_day,
+          recurrenceId: args.recurrence_id,
+          applyToSeries: args.apply_to_series,
+        })
+      );
+      return asJson({ success: true, ...result });
+    }
+  );
+
+  server.registerTool(
+    "delete_event",
+    {
+      description:
+        "Delete a calendar event. DESTRUCTIVE AND PERMANENT: CalDAV has no trash, so a deleted event cannot be recovered. Attendees are NOT sent a cancellation. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is deleted. A recurring event needs apply_to_series=true and is then deleted with every occurrence; a single occurrence cannot be deleted yet.",
+      inputSchema: {
+        calendar_url: z
+          .string()
+          .url()
+          .describe("Calendar URL as returned by list_calendars"),
+        uid: z.string().min(1).describe("Event UID as returned by list_events"),
+        etag: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("The event's etag as returned by list_events. Required unless list_events returned null for it."),
+        recurrence_id: z
+          .string()
+          .optional()
+          .describe("Not supported yet: a single occurrence of a series cannot be deleted. Passing it is refused."),
+        apply_to_series: z
+          .boolean()
+          .optional()
+          .describe("Required to delete a recurring event; every occurrence is deleted"),
+        account: accountSchema,
+      },
+    },
+    async (args) => {
+      const { caldav, id } = requireCaldav(pool, args.account);
+      const result = await reportingFailures(pool, "delete_event", id, () =>
+        caldav.deleteEvent({
+          calendarUrl: args.calendar_url,
+          uid: args.uid,
+          etag: args.etag,
+          recurrenceId: args.recurrence_id,
+          applyToSeries: args.apply_to_series,
         })
       );
       return asJson({ success: true, ...result });

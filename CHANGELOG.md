@@ -4,7 +4,16 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## [Unreleased]
 
+### Added
+
+- **`update_event` changes an existing calendar event.** (#152) It edits the stored object in place, so attendees, reminders, recurrence rules and anything else this connector does not model survive; `start` alone moves the event and keeps its length. It takes the `etag` `list_events` returned and sends it as `If-Match`: an event changed elsewhere since it was read is refused with nothing written. A single occurrence of a series is refused, a series needs `apply_to_series: true`, and a series' time cannot be changed yet. Attendees are not notified — there is no iMIP yet (#29).
+- **`delete_event` deletes a calendar event, permanently.** (#153) CalDAV has no trash, and the tool description says so. It is guarded by the same `etag`, refuses a single occurrence, and deletes a whole series only with `apply_to_series: true`. Attendees are not sent a cancellation.
+- **`list_events` reports each event's `etag`**, exactly as the server sent it, or `null` when it sent none — what the two tools above take.
+- The integration suite runs the calendar writes against a real CalDAV server: Radicale 3.8.1 joins GreenMail in `docker-compose.test.yml`, on port 5232.
+
 ### Fixed
+
+- **`create_event` no longer reports success when the server refuses the write.** The CalDAV library returns the raw response for every write and throws on none, so a `403` or a `507` came back as `{ success: true }`. Every calendar write now checks the status; a refusal about the event itself (changed since read, gone, a series) is an answer and leaves no `warn` line, and anything else is a server failure reported like any other.
 
 - **The setup wizard no longer asks for a mailbox password before it can say none will work.** The address screen asked for the address and the password together, so an operator with an `@outlook.com` address typed a password before the lookup could tell them Microsoft accepts no password over IMAP. It now asks for the address alone; the screen after the lookup shows the warning, then asks for the password once. (#197)
 

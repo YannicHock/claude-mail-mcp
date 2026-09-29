@@ -27,7 +27,7 @@ import {
 
 const AUTH_TOKEN = "protocol-test-token-please-do-not-reuse";
 
-// 10 mail tools (registerMailTools) + 4 calendar tools (registerCalendarTools).
+// 10 mail tools (registerMailTools) + 6 calendar tools (registerCalendarTools).
 const EXPECTED_TOOL_NAMES = [
   "list_accounts",
   "list_folders",
@@ -42,6 +42,8 @@ const EXPECTED_TOOL_NAMES = [
   "list_calendars",
   "list_events",
   "create_event",
+  "update_event",
+  "delete_event",
   "find_free_slot",
 ].sort();
 
@@ -108,12 +110,12 @@ test("initialize negotiates the expected protocolVersion and serverInfo", async 
   }
 });
 
-test("tools/list returns exactly the 14 registered tools", async () => {
+test("tools/list returns exactly the 16 registered tools", async () => {
   const { client, transport } = connectedClient();
   try {
     await client.connect(transport);
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 14);
+    assert.equal(tools.length, 16);
     assert.deepEqual(
       tools.map((t) => t.name).sort(),
       EXPECTED_TOOL_NAMES
