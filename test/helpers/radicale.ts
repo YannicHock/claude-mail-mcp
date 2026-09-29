@@ -217,12 +217,44 @@ export interface CalDavProxyOptions {
    */
   refuseMove?: 403 | 405 | 501 | 502;
   /**
-   * Answer `412 Precondition Failed` to every DELETE of an object under this
-   * path on Radicale — a collection's, e.g. `/u…/cal/`: the source's event
-   * changed after `move_event` copied it into the target, so the copy has to
-   * be removed again (plan v0.7.4, Review Focus 3).
+   * The body `refuseMove` answers with, e.g. Radicale's own "Remote
+   * destination not supported" beside its 502, or a `<C:no-uid-conflict/>`
+   * precondition beside a 403 (review of PR #231). Empty by default.
+   */
+  refuseMoveBody?: string;
+  /**
+   * Pass every MOVE on to Radicale (`perform: true`) or not, and answer it
+   * with `answer` either way: a 502 or 504 from a gateway in front of the
+   * server (NPM on Hetzner), which says nothing about whether the MOVE
+   * happened, or `"drop"`, the connection closed with no answer at all.
+   * With `thenDown`, every request after the MOVE is dropped too: the server
+   * gone just as the move was sent (review of PR #231).
+   */
+  garbleMove?: { perform: boolean; answer: 502 | 504 | "drop"; thenDown?: boolean };
+  /**
+   * Answer `failSourceDeleteWith` (412 Precondition Failed by default) to
+   * every DELETE of an object under this path on Radicale — a collection's,
+   * e.g. `/u…/cal/`: the source's event changed after `move_event` copied it
+   * into the target (412), or the source is read-only (403), so the copy has
+   * to be removed again (plan v0.7.4, Review Focus 3).
    */
   failSourceDelete?: string;
+  failSourceDeleteWith?: number;
+  /**
+   * Answer `failTargetPutWith` (403 by default) to every PUT of an object
+   * under this path on Radicale: a target calendar that refuses the
+   * fallback's copy — 403 for a read-only calendar, 507 for one that is full
+   * (review of PR #231).
+   */
+  failTargetPut?: string;
+  failTargetPutWith?: number;
+  /**
+   * Answer `400 Bad Request` with Sabre's "already exists" message where
+   * Radicale answers a PUT `409 <C:no-uid-conflict/>`: how Nextcloud refuses
+   * an object whose UID the calendar already holds, with no precondition
+   * name to give it away (review of PR #231).
+   */
+  uidConflictAs400?: boolean;
   /**
    * Run before a request is forwarded, e.g. to delete an event between the
    * connector's lookup and its write.
@@ -300,11 +332,15 @@ interface Exchange {
   body: ReturnType<typeof Buffer.concat> | undefined;
 }
 
-/** An answer the proxy gives itself, without asking Radicale. */
+/**
+ * An answer the proxy gives itself, without asking Radicale — or, with
+ * `drop`, none: the connection is closed, as a server that went away does.
+ */
 interface ShortAnswer {
   status: number;
   statusText: string;
   body?: string;
+  drop?: boolean;
 }
 
 /** Radicale's answer on its way back: what a {@link ResponseRewriter} may change before it is passed on. */
@@ -326,6 +362,7 @@ type RequestRewriter = (ex: Exchange) => Promise<ShortAnswer | null>;
 type ResponseRewriter = (ex: Exchange, answer: Answer) => void;
 
 const PRECONDITION_FAILED: ShortAnswer = { status: 412, statusText: "Precondition Failed" };
+const DROPPED: ShortAnswer = { status: 0, statusText: "", drop: true };
 
 /**
  * A proxy in front of Radicale that behaves the way {@link CalDavProxyOptions}
@@ -351,6 +388,8 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
   let starRefused = 0;
   let failedLookups = 0;
   let movesRefused = 0;
+  /** Set by `garbleMove.thenDown` once the MOVE is through: every request after it is dropped. */
+  let down = false;
   const log: ProxiedRequest[] = [];
   const { createServer } = await import("node:http");
   const upstream = new URL(RADICALE_URL);
@@ -397,19 +436,57 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
       }
     });
   }
+  if (options.garbleMove?.thenDown) {
+    requestRewriters.push(async () => (down ? DROPPED : null));
+  }
   if (options.refuseMove !== undefined) {
     const status = options.refuseMove;
+    const body = options.refuseMoveBody;
     requestRewriters.push(async (ex) => {
       if (ex.seen.method !== "MOVE") return null;
       movesRefused += 1;
-      return { status, statusText: "Refused by the proxy" };
+      return { status, statusText: "Refused by the proxy", ...(body === undefined ? {} : { body }) };
+    });
+  }
+  if (options.garbleMove !== undefined) {
+    const { perform, answer, thenDown } = options.garbleMove;
+    requestRewriters.push(async (ex) => {
+      if (ex.seen.method !== "MOVE") return null;
+      if (perform) {
+        const moved = await fetch(ex.upstreamUrl, { method: "MOVE", headers: ex.headers, redirect: "manual" });
+        await moved.arrayBuffer();
+      }
+      if (thenDown === true) down = true;
+      if (answer === "drop") return DROPPED;
+      return { status: answer, statusText: answer === 502 ? "Bad Gateway" : "Gateway Timeout", body: "<html>gateway</html>" };
     });
   }
   if (options.failSourceDelete !== undefined) {
     const collection = options.failSourceDelete;
+    const status = options.failSourceDeleteWith ?? 412;
     requestRewriters.push(async (ex) => {
       if (ex.seen.method !== "DELETE" || !ex.seen.path.startsWith(collection)) return null;
-      return PRECONDITION_FAILED;
+      return status === 412 ? PRECONDITION_FAILED : { status, statusText: "Refused by the proxy" };
+    });
+  }
+  if (options.failTargetPut !== undefined) {
+    const collection = options.failTargetPut;
+    const status = options.failTargetPutWith ?? 403;
+    requestRewriters.push(async (ex) => {
+      if (ex.seen.method !== "PUT" || !ex.seen.path.startsWith(collection)) return null;
+      return { status, statusText: "Refused by the proxy" };
+    });
+  }
+  if (options.uidConflictAs400) {
+    responseRewriters.push((ex, answer) => {
+      if (ex.seen.method !== "PUT" || answer.status !== 409) return;
+      answer.status = 400;
+      answer.statusText = "Bad Request";
+      answer.headers["content-type"] = "application/xml; charset=utf-8";
+      answer.payload = Buffer.from(
+        '<?xml version="1.0" encoding="utf-8"?>\n<d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns"><s:message>Calendar object with uid already exists in this calendar collection.</s:message></d:error>',
+        "utf8"
+      );
     });
   }
   if (options.etaglessPuts) {
@@ -472,6 +549,10 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
         for (const rewrite of requestRewriters) {
           const short = await rewrite(ex);
           if (short === null) continue;
+          if (short.drop === true) {
+            res.socket?.destroy();
+            return;
+          }
           const body = short.body ?? "";
           res.writeHead(short.status, short.statusText, {
             ...(body === "" ? {} : { "content-type": "text/plain" }),
