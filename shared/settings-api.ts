@@ -1418,10 +1418,17 @@ export type MailboxSetupStep =
  * Tier 1's Continue: the address screen, given what the lookup answered.
  *
  * `found === null` is not a failure and is never rendered as one — the next
- * screen is simply the provider list, carrying the address and the password, so
- * neither is typed twice. A connector that was unreachable, one on a release
- * whose answer could not be read, and a domain that publishes nothing all arrive
- * here as the same `null` on purpose.
+ * screen is simply the provider list, carrying the address so it is not typed
+ * twice. A connector that was unreachable, one on a release whose answer could
+ * not be read, and a domain that publishes nothing all arrive here as the same
+ * `null` on purpose.
+ *
+ * `password` is ordinarily "" (#197 in the wizard, #203 on the connector's own
+ * page): neither address screen asks for one any more, because the lookup this
+ * answers is what says whether a password can work at all — outlook.com's
+ * warning has to come before anybody types one. The screens after it ask for it
+ * themselves (the confirmation screen's own box, or the full form's). A lookup that still carries a password — an older page, a back
+ * button — is passed straight through, so it is typed once either way (#120).
  */
 export function stepFromLookup(input: {
   email: string;

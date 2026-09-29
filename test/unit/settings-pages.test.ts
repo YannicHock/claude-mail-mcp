@@ -287,10 +287,18 @@ function suggested(overrides: Record<string, string> = {}): Record<string, strin
 }
 
 describe("tier 1 — the address screen", () => {
-  it("asks for an address and a password, and for nothing else", () => {
+  it("asks for the address and nothing else", () => {
+    // #203, the connector's half of #197: no password until the lookup has said
+    // whether one can work. An operator adding an @outlook.com mailbox used to
+    // type one here before the next screen told them none would ever connect.
+    // "Exactly one box a person types into" rather than only "no password box",
+    // so that nothing else creeps back onto this screen either.
     const html = renderMailboxAddress({ csrf: "c", email: "" });
-    assert.match(html, new RegExp(`name="${MAILBOX_FIELDS.mailDefaultFrom}"`));
-    assert.match(html, /name="password"[^>]*type="password"/);
+    const typed = (html.match(/<input\b[^>]*>/g) ?? []).filter((input) => !/type="hidden"/.test(input));
+    assert.equal(typed.length, 1, typed.join("\n"));
+    assert.ok(typed[0]!.includes(`name="${MAILBOX_FIELDS.mailDefaultFrom}"`), typed[0]);
+    assert.equal(html.includes('type="password"'), false, "the address screen renders a password box");
+    assert.equal(html.includes('name="password"'), false, "the address screen asks for a password");
     // The point of the screen is that it is not the eighteen-box form.
     for (const name of [MAILBOX_FIELDS.imapHost, MAILBOX_FIELDS.smtpHost, MAILBOX_FIELDS.caldavUrl]) {
       assert.equal(html.includes(`name="${name}"`), false, name);
@@ -318,12 +326,6 @@ describe("tier 1 — the address screen", () => {
     });
     assert.match(html, /value="anna"/);
     assert.match(html, /Enter a full email address/);
-  });
-
-  it("never writes a password back into itself", () => {
-    const html = renderMailboxAddress({ csrf: "c", email: "anna@example.com" });
-    const box = /<input[^>]*name="password"[^>]*>/.exec(html)?.[0] ?? "";
-    assert.match(box, /value=""/);
   });
 });
 
@@ -386,10 +388,13 @@ describe("tier 1's answer — the confirmation screen", () => {
   });
 
   it("asks for the password when the submission arrived without one", () => {
-    // `required` on the address screen is the browser's promise, not this
-    // module's, and a POST that skipped it still has to be finishable.
+    // Since #203 this is the ordinary path: the address screen asks for no
+    // password, so this box is where it is typed first — and it carries the
+    // app-password hint that used to sit on the address screen.
     const html = render({ password: "" });
     assert.match(html, /name="password"[^>]*type="password"/);
+    assert.match(html, /app password/i, "the hint the address screen used to carry is gone");
+    assert.match(html, /never written back into this page/i);
     assert.equal(/type="hidden" name="password"/.test(html), false);
   });
 
