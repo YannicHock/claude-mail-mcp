@@ -274,7 +274,7 @@ export function currentOverrides(overrides: ICAL.Component[], allDay: boolean): 
 }
 
 /** True for an override that also moves every later occurrence (`RANGE=THISANDFUTURE`). */
-function modifiesFuture(ve: ICAL.Component): boolean {
+export function modifiesFuture(ve: ICAL.Component): boolean {
   const range = ve.getFirstProperty("recurrence-id")?.getParameter("range");
   return typeof range === "string" && range.toUpperCase() === "THISANDFUTURE";
 }
@@ -461,6 +461,53 @@ export interface FoundOccurrence {
   current: number | null;
   /** True when the series has an occurrence besides this one: false means deleting it leaves none. */
   others: boolean;
+  /**
+   * The `RANGE=THISANDFUTURE` override of an *earlier* occurrence whose
+   * change reaches this one — its index, as for {@link overrides} — or null
+   * when none does, or when this occurrence has an override of its own
+   * (which then wins). `list_events` lists such an occurrence moved and
+   * retitled by that override, so a new override for it is made from that
+   * override, not the master (fix-pass review of PR #229).
+   */
+  range: number | null;
+  /**
+   * The series' next occurrence after this one, as the walk met it: null
+   * when there is none, `"unknown"` when the walk stopped before finding out
+   * or this occurrence is one the walk never met. What a write needs to
+   * change the occurrence a `RANGE=THISANDFUTURE` override starts at alone:
+   * that override moves on to the next one (src/ical-edit.ts).
+   */
+  next: NextOccurrence | null | "unknown";
+}
+
+/** The occurrence after a {@link FoundOccurrence}: plain data, as that is. */
+export interface NextOccurrence {
+  /** Its original start's clock fields in the zone of the master's DTSTART, as {@link FoundOccurrence.wall}. */
+  wall: ZonedWall;
+  /** True when it has an override of its own. */
+  overridden: boolean;
+}
+
+/**
+ * The `RANGE=THISANDFUTURE` override whose change reaches the occurrence
+ * starting at `at` (a rule's time, in the master's zone): of those in
+ * `ranges`, the one with the latest RECURRENCE-ID not after `at`, the later
+ * in the object on a tie — the one ical.js's `getOccurrenceDetails` applies
+ * when {@link occurrencesIn} lists that occurrence. Its own `findRangeException`
+ * is not used: its declared type (an Event) is not what it returns (a key).
+ */
+export function governingRange(ranges: ICAL.Component[], at: ICAL.Time): ICAL.Component | undefined {
+  const atMs = instantOf(at);
+  let best: ICAL.Component | undefined;
+  let bestMs = -Infinity;
+  for (const ve of ranges) {
+    const ms = instantOf(new ICAL.Event(ve).recurrenceId);
+    if (ms <= atMs && ms >= bestMs) {
+      best = ve;
+      bestMs = ms;
+    }
+  }
+  return best;
 }
 
 export type OccurrenceLookup = FoundOccurrence | { found: false; reason: string };
@@ -518,6 +565,11 @@ function fieldsOf(time: ICAL.Time): ZonedWall {
  * An object with no master (an invitation to one instance, #211.3) is
  * matched against its overrides; there `recurrenceId` may be null, meaning
  * "its only occurrence", which is refused when it holds more than one.
+ *
+ * Beside the occurrence, it says what a write needs to keep a
+ * `RANGE=THISANDFUTURE` override's change where `list_events` showed it:
+ * which such override reaches this occurrence (`range`), and the series' next
+ * occurrence (`next`), one step past the match.
  *
  * The walk is bounded like the expansion: {@link MAX_STEPS_PER_OBJECT} steps,
  * and never past a day or two beyond the instant asked for; a rule
@@ -583,6 +635,8 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
       overrides: revisions(key),
       current: position.get(ve) as number,
       others: current.length > 1,
+      range: null,
+      next: "unknown",
     };
   }
 
@@ -602,12 +656,16 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
   const startProp = master.getFirstProperty("dtstart") as ICAL.Property;
   const start = startProp.getFirstValue() as ICAL.Time;
   const startZone = writeZoneOf(startProp);
-  const event = new ICAL.Event(master, { exceptions: overrides.filter(modifiesFuture) });
+  const ranges = overrides.filter(modifiesFuture);
+  const event = new ICAL.Event(master, { exceptions: ranges });
   const iterator = event.iterator();
   // Nothing more than a day or two past the instant asked for can be it; a
   // zone's offset is at most 14 hours.
   const limit = want.ms + 2 * 86_400_000;
   let match: ICAL.Time | null = null;
+  // The occurrence right after the match: one step more, so that a write can
+  // move a RANGE=THISANDFUTURE override on to it (`FoundOccurrence.next`).
+  let following: ICAL.Time | null = null;
   let others = false;
   let steps = 0;
   let gaveUp = false;
@@ -618,29 +676,44 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
     }
     if (match === null && sameKey(reportedKey(reportedTime(next)), want)) {
       match = next.clone();
-      if (others) break;
       continue;
     }
     others = true;
-    if (match !== null || instantOf(next) > limit) break;
+    if (match !== null) {
+      following = next.clone();
+      break;
+    }
+    if (instantOf(next) > limit) break;
   }
+  /**
+   * A time the rule produced, as clock fields in the master's zone. An RDATE
+   * can be stored in another zone (UTC, typically); its clock time in the
+   * master's zone is what a RECURRENCE-ID beside the master's TZID says.
+   */
+  const inSeriesZone = (time: ICAL.Time): ZonedWall =>
+    time.isDate || time.zone === start.zone || startZone.kind === "unresolved" ? fieldsOf(time) : wallAt(instantOf(time), startZone);
+  /** True when the occurrence at `time` has an override of its own, matched as {@link occurrencesIn} matches one. */
+  const overridden = (time: ICAL.Time): boolean => byKey.has(keyOf(time, allDay)) || (!allDay && byKey.has(keyOf(time, true)));
 
   let wall: ZonedWall;
   let key: string;
   let reported: string;
   let isDate: boolean;
+  let range: number | null = null;
+  let next: NextOccurrence | null | "unknown" = "unknown";
   if (match !== null) {
-    // The rule's own start, in the master's zone. An RDATE can be stored in
-    // another zone (UTC, typically); its clock time in the master's zone is
-    // what a RECURRENCE-ID beside the master's TZID has to say.
-    wall =
-      match.isDate || match.zone === start.zone || startZone.kind === "unresolved"
-        ? fieldsOf(match)
-        : wallAt(instantOf(match), startZone);
+    // The rule's own start, in the master's zone.
+    wall = inSeriesZone(match);
     key = keyOf(match, allDay);
     if (!allDay && !byKey.has(key) && byKey.has(keyOf(match, true))) key = keyOf(match, true);
     reported = reportedTime(match);
     isDate = match.isDate;
+    if (!byKey.has(key)) {
+      const governing = governingRange(ranges, match);
+      range = governing === undefined ? null : (position.get(governing) as number);
+    }
+    if (following !== null) next = { wall: inSeriesZone(following), overridden: overridden(following) };
+    else if (!gaveUp) next = null;
   } else {
     // An override the walk never meets is listed at its own time, by its own
     // RECURRENCE-ID: that is what list_events reported for it.
@@ -661,8 +734,7 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
       );
     }
     const rid = orphan[1].event.recurrenceId;
-    wall =
-      rid.isDate || rid.zone === start.zone || startZone.kind === "unresolved" ? fieldsOf(rid) : wallAt(instantOf(rid), startZone);
+    wall = inSeriesZone(rid);
     key = orphan[0];
     reported = reportedTime(rid);
     isDate = rid.isDate;
@@ -678,6 +750,8 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
     overrides: revisions(key),
     current: current === undefined ? null : (position.get(current.ve) as number),
     others,
+    range,
+    next,
   };
 }
 

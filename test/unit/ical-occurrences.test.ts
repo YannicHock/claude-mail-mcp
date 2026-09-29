@@ -18,7 +18,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { applyOccurrencePatch, excludeOccurrence, shiftSeries, type EventPatch } from "../../src/ical-edit.js";
+import { applyOccurrencePatch, excludeOccurrence, shiftSeries, writtenBy, type EventPatch } from "../../src/ical-edit.js";
 import { expandObject, findOccurrence, type FoundOccurrence } from "../../src/ical-expand.js";
 import { buildIcs } from "../../src/ical-build.js";
 import { parseCalendar } from "../../src/ical-parse.js";
@@ -375,6 +375,146 @@ describe("applyOccurrencePatch — one occurrence changed (#206)", () => {
       (err: unknown) => err instanceof ToolRefusal && /floating/.test(err.message) && /Nothing was changed/.test(err.message)
     );
   });
+});
+
+/**
+ * A change another client made to "this and all following occurrences": an
+ * override with `RECURRENCE-ID;RANGE=THISANDFUTURE`, which moves and retitles
+ * every occurrence from its own on. Each one-occurrence write must change
+ * exactly the occurrence it names — the fix-pass review of PR #229 found all
+ * three ignoring RANGE: a new override copied from the master reverted the
+ * occurrence to the series' old time and title, deleting the anchor took the
+ * override and every later occurrence's change with it, and editing the
+ * anchor edited the override, RANGE and all, so every later one moved too.
+ */
+describe("RANGE=THISANDFUTURE — a one-occurrence write changes exactly one occurrence (fix-pass review of PR #229)", () => {
+  /** The instant list_events reports for `hour`:00 on `ymd` in `shape`'s clock. */
+  function at(shape: Shape, ymd: string, hour: number): string {
+    return shape.name === "UTC" ? `${ymd}T${String(hour).padStart(2, "0")}:00:00.000Z` : berlinUtc(ymd, hour);
+  }
+
+  /**
+   * Six Thursdays from 2026-10-01, 09:00–10:00 "A" on `shape`'s clock; from
+   * 2026-10-15 on, a THISANDFUTURE override makes them 11:00–12:00 "B".
+   * `extra` are further override VEVENTs, as their lines.
+   */
+  function ranged(shape: Shape, count = 6, extra: string[][] = []): string {
+    return series(shape, "20261001", `FREQ=WEEKLY;COUNT=${count}`, [], [
+      [
+        shape.line("RECURRENCE-ID;RANGE=THISANDFUTURE", "20261015", "0900"),
+        shape.line("DTSTART", "20261015", "1100"),
+        shape.line("DTEND", "20261015", "1200"),
+        "SUMMARY:B",
+        "SEQUENCE:5",
+      ],
+      ...extra,
+    ]).replace("SUMMARY:Weekly", "SUMMARY:A");
+  }
+
+  interface Row {
+    recurrenceId: string | null;
+    start: string;
+    end: string;
+    summary: string | null;
+    location: string | null;
+  }
+
+  /** Every occurrence list_events lists, with what a one-occurrence write may change. */
+  function rows(text: string): Row[] {
+    const { instances, skipped } = expandObject(
+      text,
+      { start: Date.parse("2026-09-01T00:00:00Z"), end: Date.parse("2027-12-31T00:00:00Z") },
+      { url: "u", etag: null }
+    );
+    assert.equal(skipped, undefined, `the object could not be listed: ${skipped}`);
+    return instances.map(({ recurrenceId, start, end, summary, location }) => ({ recurrenceId, start, end, summary, location }));
+  }
+
+  /** `before` with the row for `rid` replaced by `change` applied to it, or removed for null. */
+  function onlyChanged(before: Row[], rid: string, change: Partial<Row> | null): Row[] {
+    assert.ok(before.some((r) => r.recurrenceId === rid), `no occurrence ${rid} before the write`);
+    return before.flatMap((r) => (r.recurrenceId !== rid ? [r] : change === null ? [] : [{ ...r, ...change }]));
+  }
+
+  for (const shape of [SHAPES[2], SHAPES[0], SHAPES[1]]) {
+    describe(shape.name, () => {
+      it("the fixture lists as intended: A at 09:00 before 2026-10-15, B at 11:00 from then on", () => {
+        assert.deepEqual(
+          rows(ranged(shape)).map((r) => [r.start, r.summary]),
+          [
+            [at(shape, "2026-10-01", 9), "A"],
+            [at(shape, "2026-10-08", 9), "A"],
+            [at(shape, "2026-10-15", 11), "B"],
+            [at(shape, "2026-10-22", 11), "B"],
+            [at(shape, "2026-10-29", 11), "B"],
+            [at(shape, "2026-11-05", 11), "B"],
+          ]
+        );
+      });
+
+      it("(a) a new override for an occurrence the range governs is made from the occurrence as listed — B at 11:00 — and never copies RANGE", () => {
+        const text = ranged(shape);
+        const rid = shape.reported("2026-10-29");
+        const out = updateOne(text, rid, { location: "Room 7" });
+        assert.deepEqual(rows(out), onlyChanged(rows(text), rid, { location: "Room 7" }));
+        const override = block(out, shape.line("RECURRENCE-ID", "20261029", "0900"));
+        assert.doesNotMatch(override, /RANGE=/);
+      });
+
+      it("(b) deleting the occurrence the range starts at takes out that one occurrence; the later ones stay B at 11:00", () => {
+        const text = ranged(shape);
+        const rid = shape.reported("2026-10-15");
+        assert.deepEqual(rows(deleteOne(text, rid)), onlyChanged(rows(text), rid, null));
+      });
+
+      it("(b) deleting an occurrence the range governs takes out that one occurrence", () => {
+        const text = ranged(shape);
+        const rid = shape.reported("2026-10-29");
+        assert.deepEqual(rows(deleteOne(text, rid)), onlyChanged(rows(text), rid, null));
+      });
+
+      it("(c) moving the occurrence the range starts at moves that one occurrence; the later ones stay at 11:00", () => {
+        const text = ranged(shape);
+        const rid = shape.reported("2026-10-15");
+        const found = occurrence(text, rid);
+        const edit = applyOccurrencePatch(parseCalendar(text), UID, found, { start: "2026-10-15T13:00:00" }, CHANGED, NOW);
+        assert.deepEqual(
+          rows(edit.ics),
+          onlyChanged(rows(text), rid, { start: at(shape, "2026-10-15", 13), end: at(shape, "2026-10-15", 14) })
+        );
+        // The read-back after the write knows it by the override it made.
+        assert.ok(edit.mark !== null && writtenBy(edit.ics, edit.mark));
+      });
+
+      it("a text change of the occurrence the range starts at changes that one occurrence only", () => {
+        const text = ranged(shape);
+        const rid = shape.reported("2026-10-15");
+        assert.deepEqual(rows(updateOne(text, rid, { location: "Room 7" })), onlyChanged(rows(text), rid, { location: "Room 7" }));
+      });
+
+      it("the range's own occurrence, when it is the series' last, is changed like any override", () => {
+        const text = ranged(shape, 3);
+        const rid = shape.reported("2026-10-15");
+        assert.deepEqual(rows(updateOne(text, rid, { summary: "C" })), onlyChanged(rows(text), rid, { summary: "C" }));
+        assert.deepEqual(rows(deleteOne(text, rid)), onlyChanged(rows(text), rid, null));
+      });
+
+      it("refuses to change or delete the range's own occurrence alone when the next one has an override of its own, and says how to do it instead", () => {
+        const text = ranged(shape, 6, [
+          [shape.line("RECURRENCE-ID", "20261022", "0900"), shape.line("DTSTART", "20261022", "1400"), shape.line("DTEND", "20261022", "1500"), "SUMMARY:Own"],
+        ]);
+        const rid = shape.reported("2026-10-15");
+        assert.throws(
+          () => updateOne(text, rid, { start: "2026-10-15T13:00:00" }),
+          (err: unknown) => err instanceof ToolRefusal && /THISANDFUTURE/.test(err.message) && /calendar app/.test(err.message) && err.message.endsWith(CHANGED)
+        );
+        assert.throws(
+          () => deleteOne(text, rid),
+          (err: unknown) => err instanceof ToolRefusal && /THISANDFUTURE/.test(err.message) && err.message.endsWith(DELETED)
+        );
+      });
+    });
+  }
 });
 
 /** One VEVENT with a RECURRENCE-ID and no master: an invitation to a single instance (#211.3). */
