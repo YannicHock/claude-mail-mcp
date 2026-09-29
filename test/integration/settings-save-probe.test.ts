@@ -324,7 +324,7 @@ test("an edit whose CalDAV fails lands on the list by 303 too, not on the edit U
       }),
       _stamp: await stampOf(accountsPath),
     });
-    assert.equal(res.status, 303);
+    assert.equal(res.status, 303, res.status === 303 ? "" : await res.text());
     const page = await followNotice(url, res);
     assert.match(page, /The mailbox was saved/);
     assert.equal((await storedAccounts(accountsPath))[0]?.caldav?.url, caldav.url);
