@@ -23,6 +23,7 @@ import { config } from "./config.js";
 import { AccountsStore } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
 import { createApp, VERSION } from "./app.js";
+import { expansionPool } from "./ical-worker-pool.js";
 import { canCreateFilesIn, dataDirectoryAdvice, logSecretReport } from "../shared/secrets.js";
 
 export { createApp, SERVER_NAME, VERSION } from "./app.js";
@@ -134,6 +135,7 @@ async function main(): Promise<void> {
     log("info", "shutting down", { signal });
     store.stop();
     await pool.closeAll().catch(() => {});
+    await expansionPool.close().catch(() => {});
     process.exit(0);
   };
   process.on("SIGTERM", () => void shutdown("SIGTERM"));

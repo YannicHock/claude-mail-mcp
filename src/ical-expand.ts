@@ -111,6 +111,16 @@ export interface CalendarEvent {
   etag: string | null;
 }
 
+/**
+ * A stored object as `CalDavClient` fetched it: what src/ical-worker-pool.ts
+ * expands, and knows an object that timed out by (its URL and ETag).
+ */
+export interface StoredObject {
+  url: string;
+  etag: string | null;
+  data: string;
+}
+
 /** A window in epoch milliseconds: start inclusive, end exclusive. */
 export interface ExpandWindow {
   start: number;
@@ -203,6 +213,8 @@ const LONGEST_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
  * src/ical-worker-pool.ts runs every expansion under, which also catches the
  * shapes this does not (`BYWEEKNO=1;BYMONTH=6`), and a rule that does match
  * but so rarely that one `next()` walks for minutes.
+ *
+ * @internal Exported for its unit tests; {@link occurrencesIn} is its one caller.
  */
 export function impossibleRule(recur: ICAL.Recur): string | null {
   const months = recur.parts.BYMONTH;
@@ -224,6 +236,38 @@ export function impossibleRule(recur: ICAL.Recur): string | null {
 function keyOf(time: ICAL.Time, allDay: boolean): string {
   if (allDay || time.isDate) return `${time.year}-${time.month}-${time.day}`;
   return String(instantOf(time));
+}
+
+/** An override VEVENT with the one ICAL.Event read from it, built once and used for its key, times and all. */
+interface Override {
+  ve: ICAL.Component;
+  event: ICAL.Event;
+}
+
+/** `SEQUENCE`, 0 when absent or unreadable (RFC 5545 §3.8.7.4). */
+function sequenceOf(ve: ICAL.Component): number {
+  const value = Number(ve.getFirstPropertyValue("sequence") ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * The override that counts for each occurrence, by {@link keyOf} its
+ * RECURRENCE-ID. Two overrides for one occurrence are two revisions of it,
+ * and RFC 5545 §3.8.7.4 makes the one with the highest SEQUENCE current;
+ * between equal ones the later in the object wins, as it did when ical.js
+ * matched them. The others are dropped here, so none can come back as an
+ * extra event the walk never met (review of #225: the first was kept, and the
+ * newer one listed beside it as a phantom).
+ */
+function currentOverrides(overrides: ICAL.Component[], allDay: boolean): Map<string, Override> {
+  const byKey = new Map<string, Override>();
+  for (const ve of overrides) {
+    const event = new ICAL.Event(ve);
+    const key = keyOf(event.recurrenceId, allDay);
+    const held = byKey.get(key);
+    if (held === undefined || sequenceOf(ve) >= sequenceOf(held.ve)) byKey.set(key, { ve, event });
+  }
+  return byKey;
 }
 
 /** True for an override that also moves every later occurrence (`RANGE=THISANDFUTURE`). */
@@ -274,6 +318,10 @@ function periodsOf(master: ICAL.Component, allDay: boolean): Map<string, ICAL.Pe
  * DTSTART when that is in the window: it is an event the organizer sent, and
  * dropping it was how overrides silently disappeared.
  *
+ * Of two overrides for one occurrence only the current one counts — highest
+ * SEQUENCE, then later in the object ({@link currentOverrides}) — and a
+ * RECURRENCE-ID given as a DATE on a timed series matches by its day.
+ *
  * `notes` says what was left out of the walk, for `skipped`: today, a rule
  * {@link impossibleRule} refused.
  */
@@ -298,8 +346,7 @@ export function occurrencesIn(
 
   for (const [uid, { master, overrides }] of seriesIn(vcal)) {
     if (master === undefined) {
-      for (const ve of overrides) {
-        const event = new ICAL.Event(ve);
+      for (const { ve, event } of currentOverrides(overrides, false).values()) {
         if (!add({ uid, recurrenceId: event.recurrenceId, start: event.startDate, end: event.endDate, vevent: ve })) break;
       }
       continue;
@@ -320,14 +367,10 @@ export function occurrencesIn(
     // `keyOf`. Given none at all, ical.js relates every override in the
     // object to the master, whatever its UID.
     const event = new ICAL.Event(master, { exceptions: overrides.filter(modifiesFuture) });
-    const byKey = new Map<string, ICAL.Component>();
-    for (const ve of overrides) {
-      const key = keyOf(new ICAL.Event(ve).recurrenceId, allDay);
-      if (!byKey.has(key)) byKey.set(key, ve);
-    }
+    const byKey = currentOverrides(overrides, allDay);
 
     const iterator = event.iterator();
-    const met = new Set<ICAL.Component>();
+    const met = new Set<Override>();
     // Walking up to the window is most of the work for an old series; an
     // occurrence that ends well before it, with no override or period to
     // move or stretch it, is passed over without asking for its details. A
@@ -346,12 +389,19 @@ export function occurrencesIn(
       if (at >= window.end) break;
       const recurrenceId = recurs ? next.clone() : null;
       const key = keyOf(next, allDay);
-      const override = byKey.get(key);
+      let override = byKey.get(key);
+      if (override === undefined && !allDay) {
+        // A RECURRENCE-ID;VALUE=DATE on a timed series names a day, not an
+        // instant: it replaces the first occurrence on that day the walk
+        // meets, rather than matching nothing and doubling it.
+        const onDate = byKey.get(keyOf(next, true));
+        if (onDate !== undefined && !met.has(onDate)) override = onDate;
+      }
       let occurrence: Occurrence;
       if (override !== undefined) {
         met.add(override);
-        const moved = new ICAL.Event(override);
-        occurrence = { uid, recurrenceId, start: moved.startDate, end: moved.endDate, vevent: override };
+        const moved = override.event;
+        occurrence = { uid, recurrenceId, start: moved.startDate, end: moved.endDate, vevent: override.ve };
       } else {
         const details = event.getOccurrenceDetails(next);
         const period = periods.get(key);
@@ -369,9 +419,9 @@ export function occurrencesIn(
       if (!add(occurrence)) break;
     }
     if (truncated) continue;
-    for (const ve of overrides) {
-      if (met.has(ve)) continue;
-      const own = new ICAL.Event(ve);
+    for (const override of byKey.values()) {
+      if (met.has(override)) continue;
+      const { ve, event: own } = override;
       if (!add({ uid, recurrenceId: own.recurrenceId, start: own.startDate, end: own.endDate, vevent: ve })) break;
     }
   }

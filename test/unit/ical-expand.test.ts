@@ -586,3 +586,108 @@ describe("expandObject — an IANA zone with no VTIMEZONE costs about what one w
     );
   });
 });
+
+describe("expandObject — one override per RECURRENCE-ID (review of #225)", () => {
+  /** Weekly on Thursdays 09:00Z from 2026-10-01, three times. */
+  const MASTER = [
+    "UID:dup@example.com",
+    "DTSTART:20261001T090000Z",
+    "DTEND:20261001T093000Z",
+    "RRULE:FREQ=WEEKLY;COUNT=3",
+    "SUMMARY:Standup",
+  ];
+  function override(sequence: number | null, summary: string, hour: string): string[] {
+    return vevent(
+      "UID:dup@example.com",
+      "RECURRENCE-ID:20261008T090000Z",
+      ...(sequence === null ? [] : [`SEQUENCE:${sequence}`]),
+      `DTSTART:20261008T${hour}0000Z`,
+      `DTEND:20261008T${hour}3000Z`,
+      `SUMMARY:${summary}`
+    );
+  }
+
+  it("keeps the one with the highest SEQUENCE, wherever it is, and lists no other as an extra event", () => {
+    for (const obj of [
+      calendar(vevent(...MASTER), override(1, "Old", "11"), override(2, "New", "12")),
+      calendar(vevent(...MASTER), override(2, "New", "12"), override(1, "Old", "11")),
+    ]) {
+      const { instances, skipped } = expandObject(obj, OCTOBER, OPTS);
+      assert.equal(skipped, undefined);
+      assert.deepEqual(
+        instances.map((e) => [e.recurrenceId, e.start, e.summary]),
+        [
+          ["2026-10-01T09:00:00.000Z", "2026-10-01T09:00:00.000Z", "Standup"],
+          ["2026-10-08T09:00:00.000Z", "2026-10-08T12:00:00.000Z", "New"],
+          ["2026-10-15T09:00:00.000Z", "2026-10-15T09:00:00.000Z", "Standup"],
+        ]
+      );
+    }
+  });
+
+  it("keeps the later one in the object when their SEQUENCE ties (a missing SEQUENCE is 0)", () => {
+    const obj = calendar(vevent(...MASTER), override(null, "First", "11"), override(0, "Second", "12"));
+    const { instances } = expandObject(obj, OCTOBER, OPTS);
+    assert.deepEqual(
+      instances.map((e) => e.summary),
+      ["Standup", "Second", "Standup"]
+    );
+  });
+
+  it("does the same for overrides with no master (R3)", () => {
+    const obj = calendar(override(3, "New", "12"), override(1, "Old", "11"));
+    const { instances } = expandObject(obj, OCTOBER, OPTS);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.summary]),
+      [["2026-10-08T09:00:00.000Z", "New"]]
+    );
+  });
+
+  it("matches a RECURRENCE-ID;VALUE=DATE to the timed occurrence on that date, rather than listing both", () => {
+    const obj = calendar(
+      vevent(...MASTER),
+      vevent(
+        "UID:dup@example.com",
+        "RECURRENCE-ID;VALUE=DATE:20261008",
+        "DTSTART:20261008T140000Z",
+        "DTEND:20261008T143000Z",
+        "SUMMARY:Afternoon"
+      )
+    );
+    const { instances } = expandObject(obj, OCTOBER, OPTS);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.start, e.summary]),
+      [
+        ["2026-10-01T09:00:00.000Z", "2026-10-01T09:00:00.000Z", "Standup"],
+        ["2026-10-08T09:00:00.000Z", "2026-10-08T14:00:00.000Z", "Afternoon"],
+        ["2026-10-15T09:00:00.000Z", "2026-10-15T09:00:00.000Z", "Standup"],
+      ]
+    );
+  });
+});
+
+describe("expandObject — a long sparse series in an IANA zone stays well inside the deadline (review of #225)", () => {
+  it("expands a yearly series since the year 100 in New York, cold, in under a second", () => {
+    // 1,926 years from its start to 2026. Scanning every UTC year it touched
+    // day by day cost 3.7 s — past the worker's 3 s deadline, so an honest
+    // event was skipped as one that may never end.
+    const obj = calendar(
+      vevent(
+        "UID:ancient@example.com",
+        "DTSTART;TZID=America/New_York:01000101T090000",
+        "DURATION:PT1H",
+        "RRULE:FREQ=YEARLY",
+        "SUMMARY:New year"
+      )
+    );
+    const started = performance.now();
+    const { instances, skipped } = expandObject(obj, window("2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"), OPTS);
+    const elapsed = performance.now() - started;
+    assert.equal(skipped, undefined);
+    assert.deepEqual(
+      instances.map((e) => e.start),
+      ["2026-01-01T14:00:00.000Z"]
+    );
+    assert.ok(elapsed < 1000, `took ${elapsed.toFixed(0)} ms`);
+  });
+});

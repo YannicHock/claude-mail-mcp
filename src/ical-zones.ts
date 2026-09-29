@@ -131,7 +131,9 @@ function askedOffsetMs(ms: number, tz: string): number {
   const w = instantToZonedWall(ms, tz);
   // Whole seconds: Intl formats no milliseconds, so compare like with like.
   const whole = Math.floor(ms / 1000) * 1000;
-  return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) - whole;
+  // Not `Date.UTC`, which reads a year 0–99 as 1900–1999.
+  const wall = new Date(0).setUTCFullYear(w.year, w.month - 1, w.day) + ((w.hour * 60 + w.minute) * 60 + w.second) * 1000;
+  return wall - whole;
 }
 
 const DAY_MS = 86_400_000;
@@ -175,11 +177,31 @@ function offsetChanges(tz: string, fromMs: number, toMs: number): OffsetChanges 
 }
 
 /**
- * Each zone's offsets, one calendar year (UTC) at a time, as
- * {@link offsetChanges} found them. Bounded like the formatters: TZIDs come
- * from whatever other clients stored.
+ * What is known of one zone's offsets in one calendar year (UTC): how often
+ * it was asked for, and, once that passed {@link DIRECT_ASKS_PER_YEAR}, the
+ * year's changes as {@link offsetChanges} found them.
  */
-const offsetYears = new Map<string, Map<number, OffsetChanges>>();
+interface OffsetYear {
+  asks: number;
+  scanned: OffsetChanges | null;
+}
+
+/**
+ * Each zone's years. Bounded like the formatters: TZIDs come from whatever
+ * other clients stored.
+ */
+const offsetYears = new Map<string, Map<number, OffsetYear>>();
+
+/**
+ * Questions about one zone and year answered by asking `Intl` directly, one
+ * `formatToParts` each, before the year is scanned instead — about 370 of
+ * them — and every later question is a lookup. A daily series passes this in
+ * its first weeks of each year; a yearly or monthly one, a dozen or so
+ * questions per occurrence, never does, and never pays for the scan (review
+ * of #225: scanning every year a yearly series since the year 100 touched
+ * took 3.7 s, past the worker's deadline).
+ */
+const DIRECT_ASKS_PER_YEAR = 64;
 
 /** 00:00Z on 1 January of `year`; `Date.UTC` would read 0–99 as 1900–1999. */
 function startOfYear(year: number): number {
@@ -194,8 +216,11 @@ function startOfYear(year: number): number {
  * `formatToParts` per call, and {@link IntlTimezone} asks eight or so per
  * occurrence expanded, so a daily series since 2016 in a zone with no
  * VTIMEZONE took 390 ms against 70 ms with one, and a daily series since 1990
- * over a second and a half. A year's offsets are found once — a daily scan,
- * a few milliseconds — and every later call is a lookup.
+ * over a second and a half. A year asked often is scanned once — a daily
+ * scan, a few milliseconds — and every later call is a lookup; a year asked
+ * only a few times is answered directly ({@link DIRECT_ASKS_PER_YEAR}), since
+ * a scan would cost more than every question it saves. Both are `Intl`'s
+ * own answer, so which one a call gets never changes the result.
  */
 export function utcOffsetMs(ms: number, tz: string): number {
   if (!Number.isFinite(ms)) return askedOffsetMs(ms, tz);
@@ -206,12 +231,17 @@ export function utcOffsetMs(ms: number, tz: string): number {
     years = new Map();
     offsetYears.set(tz, years);
   }
-  let known = years.get(year);
-  if (known === undefined) {
+  let entry = years.get(year);
+  if (entry === undefined) {
     if (years.size >= 1000) years.clear();
-    known = offsetChanges(tz, startOfYear(year), startOfYear(year + 1));
-    years.set(year, known);
+    entry = { asks: 0, scanned: null };
+    years.set(year, entry);
   }
+  if (entry.scanned === null) {
+    if (++entry.asks <= DIRECT_ASKS_PER_YEAR) return askedOffsetMs(ms, tz);
+    entry.scanned = offsetChanges(tz, startOfYear(year), startOfYear(year + 1));
+  }
+  const known = entry.scanned;
   let offset = known.first;
   for (const change of known.changes) {
     if (change.at > ms) break;

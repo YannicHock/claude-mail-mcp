@@ -126,6 +126,40 @@ describe("utcOffsetMs — remembered per zone and year, still Intl's answer (rev
     assert.equal(utcOffsetMs(lordHowe - 1000, "Australia/Lord_Howe"), 11 * 3600_000);
     assert.equal(utcOffsetMs(lordHowe, "Australia/Lord_Howe"), 10.5 * 3600_000);
   });
+
+  // Review of #225: a year asked only a few times — a yearly series walked
+  // from long ago — is answered by asking Intl directly rather than scanning
+  // the whole year, and that answer must be the same one to the second.
+  it("answers a year asked only a few times exactly as Intl does: year edges, before 1970, local mean time", () => {
+    const probes: Array<[string, string]> = [
+      ["America/New_York", "0100-01-01T14:00:00Z"],
+      ["America/New_York", "1883-11-18T16:59:59Z"],
+      ["America/New_York", "1883-11-18T17:00:00Z"],
+      ["America/New_York", "1969-12-31T23:59:59Z"],
+      ["America/New_York", "1970-01-01T00:00:00Z"],
+      ["Pacific/Kiritimati", "1994-12-31T09:59:59Z"],
+      ["Pacific/Kiritimati", "1995-01-01T10:00:00Z"],
+      ["Pacific/Auckland", "1975-12-31T23:59:59Z"],
+      ["Pacific/Auckland", "1976-01-01T00:00:00Z"],
+      ["Asia/Kolkata", "1941-10-01T00:00:00Z"],
+    ];
+    for (const [tz, iso] of probes) {
+      const ms = at(iso);
+      assert.equal(utcOffsetMs(ms, tz), asked(ms, tz), `${tz} ${iso}`);
+    }
+  });
+
+  it("reads the gap and the overlap of a year it has not scanned by RFC 5545's rule", () => {
+    // Berlin's first DST after 1949: no 02:30 on 1980-04-06, two on 1980-09-28.
+    assert.equal(zonedWallToInstant(1980, 4, 6, 2, 30, "Europe/Berlin"), at("1980-04-06T01:30:00Z"));
+    assert.equal(zonedWallToInstant(1980, 9, 28, 2, 30, "Europe/Berlin"), at("1980-09-28T00:30:00Z"));
+    // And the same in a year then asked often enough to be scanned.
+    for (let ms = at("1980-01-01T00:00:00Z"); ms < at("1981-01-01T00:00:00Z"); ms += 3 * 3600_000) {
+      assert.equal(utcOffsetMs(ms, "Europe/Berlin"), asked(ms, "Europe/Berlin"), new Date(ms).toISOString());
+    }
+    assert.equal(zonedWallToInstant(1980, 4, 6, 2, 30, "Europe/Berlin"), at("1980-04-06T01:30:00Z"));
+    assert.equal(zonedWallToInstant(1980, 9, 28, 2, 30, "Europe/Berlin"), at("1980-09-28T00:30:00Z"));
+  });
 });
 
 describe("resolveUnknownTzid", () => {

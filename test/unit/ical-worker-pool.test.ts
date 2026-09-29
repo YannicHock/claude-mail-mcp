@@ -13,7 +13,7 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { ExpansionPool } from "../../src/ical-worker-pool.js";
+import { ExpansionPool, startExpansionWorker, type ExpansionPoolOptions } from "../../src/ical-worker-pool.js";
 
 function ics(...lines: string[]): string {
   return `${lines.join("\r\n")}\r\n`;
@@ -53,7 +53,7 @@ const HANGS = event(
 );
 
 const pools: ExpansionPool[] = [];
-function pool(options: { size?: number; deadlineMs?: number }): ExpansionPool {
+function pool(options: ExpansionPoolOptions): ExpansionPool {
   const p = new ExpansionPool(options);
   pools.push(p);
   return p;
@@ -123,6 +123,83 @@ describe("ExpansionPool", () => {
   it("answers again after a timeout, with a fresh worker", { timeout: 20_000 }, async () => {
     const p = pool({ size: 1, deadlineMs: 500 });
     await p.expand([{ url: "hangs", etag: null, data: HANGS }], OCTOBER);
+    const [good] = await p.expand([{ url: "good", etag: null, data: GOOD }], OCTOBER);
+    assert.equal(good.instances.length, 1);
+  });
+});
+
+describe("ExpansionPool — one slow calendar does not stall the others (review of #225)", () => {
+  it("serves a second request between the first one's objects, not after all of them", { timeout: 30_000 }, async () => {
+    // Account A's calendar holds six objects that never finish; account B
+    // asks for one ordinary event while A's are being tried. In one FIFO,
+    // B waited for all six: three deadlines with two workers (9 s measured
+    // at the real 3 s). Taken in turn, B waits for at most one.
+    const deadlineMs = 1000;
+    const p = pool({ size: 2, deadlineMs });
+    await p.expand([{ url: "warm-1", etag: null, data: GOOD }, { url: "warm-2", etag: null, data: GOOD }], OCTOBER);
+    const hanging = Array.from({ length: 6 }, (_, i) => ({
+      url: `https://a.example/cal/hangs-${i}.ics`,
+      etag: `"h${i}"`,
+      data: HANGS,
+    }));
+    const slow = p.expand(hanging, OCTOBER);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const started = Date.now();
+    const [good] = await p.expand([{ url: "https://b.example/cal/good.ics", etag: '"g"', data: GOOD }], OCTOBER);
+    const waited = Date.now() - started;
+    assert.equal(good.instances.length, 1);
+    assert.ok(waited < 2 * deadlineMs, `B waited ${waited} ms behind A's hanging objects`);
+    const results = await slow;
+    assert.ok(results.every((r) => /did not finish expanding/.test(r.skipped ?? "")));
+  });
+
+  it("skips an object that timed out before at once, with the same reason, until its ETag changes", { timeout: 30_000 }, async () => {
+    const p = pool({ size: 1, deadlineMs: 750 });
+    const object = { url: "https://a.example/cal/hangs.ics", etag: '"v1"', data: HANGS };
+    const [first] = await p.expand([object], OCTOBER);
+    assert.match(first.skipped ?? "", /did not finish expanding within 0\.75 s/);
+
+    const started = Date.now();
+    const [again] = await p.expand([object, { url: "good", etag: '"g"', data: GOOD }], OCTOBER);
+    const waited = Date.now() - started;
+    assert.equal(again.skipped, first.skipped);
+    assert.ok(waited < 500, `the second call waited ${waited} ms for an object already known to hang`);
+
+    // A new ETag is a new object, and gets its own try.
+    const changed = Date.now();
+    const [edited] = await p.expand([{ ...object, etag: '"v2"' }], OCTOBER);
+    assert.match(edited.skipped ?? "", /did not finish/);
+    assert.ok(Date.now() - changed >= 700, "an edited object was skipped without being tried");
+  });
+});
+
+describe("ExpansionPool — a worker that cannot start never takes the process down (review of #225)", () => {
+  it("fails the waiting objects, not the connector, when a replacement worker cannot be created", { timeout: 20_000 }, async () => {
+    // The replacement for a timed-out worker is created from the deadline's
+    // timer. `new Worker` throws synchronously there on EMFILE or
+    // ERR_WORKER_INIT_FAILED, and a throw in a timer is an uncaught exception.
+    let created = 0;
+    const p = pool({
+      size: 1,
+      deadlineMs: 500,
+      startWorker: () => {
+        created++;
+        if (created === 2) throw Object.assign(new Error("EMFILE: too many open files"), { code: "EMFILE" });
+        return startExpansionWorker();
+      },
+    });
+    const results = await p.expand(
+      [
+        { url: "hangs", etag: null, data: HANGS },
+        { url: "good", etag: null, data: GOOD },
+      ],
+      OCTOBER
+    );
+    assert.match(results[0].skipped ?? "", /did not finish/);
+    assert.equal(results[1].instances.length, 0);
+    assert.match(results[1].skipped ?? "", /could not start.*EMFILE/);
+
+    // Once workers can be created again, the pool answers again.
     const [good] = await p.expand([{ url: "good", etag: null, data: GOOD }], OCTOBER);
     assert.equal(good.instances.length, 1);
   });
