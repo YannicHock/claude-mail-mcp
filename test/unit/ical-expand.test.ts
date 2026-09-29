@@ -13,7 +13,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { expandObject, MAX_OCCURRENCES_PER_OBJECT } from "../../src/ical-expand.js";
+import ICAL from "ical.js";
+
+import { expandObject, impossibleRule, MAX_OCCURRENCES_PER_OBJECT } from "../../src/ical-expand.js";
 
 function ics(...lines: string[]): string {
   return `${lines.join("\r\n")}\r\n`;
@@ -319,5 +321,268 @@ describe("expandObject — a plain event", () => {
       .replace("RDATE:20261003T090000Z\r\n", "")
       .replace("EXDATE:20261015T090000Z\r\n", "");
     assert.deepEqual(expandObject(plain, window("2026-11-01T00:00:00Z", "2026-11-30T00:00:00Z"), OPTS).instances, []);
+  });
+});
+
+/** A VEVENT's lines, for the review cases below. */
+function vevent(...lines: string[]): string[] {
+  return ["BEGIN:VEVENT", "DTSTAMP:20260901T080000Z", ...lines, "END:VEVENT"];
+}
+
+function calendar(...components: string[][]): string {
+  return ics("BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Other Client//EN", ...components.flat(), "END:VCALENDAR");
+}
+
+describe("impossibleRule — a rule that can never match a date is refused before it is walked", () => {
+  const rule = (text: string): ICAL.Recur => ICAL.Recur.fromString(text);
+
+  it("names BYMONTHDAY past the last day of every BYMONTH given", () => {
+    assert.match(impossibleRule(rule("FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30")) ?? "", /BYMONTHDAY=30.*BYMONTH=2/);
+    assert.match(impossibleRule(rule("FREQ=HOURLY;BYMONTH=4,6,9,11;BYMONTHDAY=31")) ?? "", /BYMONTHDAY=31/);
+    assert.match(impossibleRule(rule("FREQ=DAILY;BYMONTH=2;BYMONTHDAY=-30,-31")) ?? "", /BYMONTHDAY=-30,-31/);
+  });
+
+  it("lets through every combination that has a date, however rare", () => {
+    assert.equal(impossibleRule(rule("FREQ=DAILY;BYMONTH=2;BYMONTHDAY=29")), null, "every leap year");
+    assert.equal(impossibleRule(rule("FREQ=DAILY;BYMONTH=2,4;BYMONTHDAY=30")), null, "April has a 30th");
+    assert.equal(impossibleRule(rule("FREQ=DAILY;BYMONTH=2;BYMONTHDAY=-29")), null);
+    assert.equal(impossibleRule(rule("FREQ=DAILY;BYMONTHDAY=31")), null, "no BYMONTH: seven months have one");
+    assert.equal(impossibleRule(rule("FREQ=WEEKLY;BYDAY=MO")), null);
+  });
+
+  it("lists a series whose rule can never match without walking it: its start, and says why (the review's hang)", () => {
+    for (const rrule of ["RRULE:FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30", "RRULE:FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30;COUNT=3"]) {
+      const obj = calendar(
+        vevent("UID:never@example.com", "DTSTART:20261005T090000Z", "DTEND:20261005T100000Z", rrule, "SUMMARY:Never")
+      );
+      const started = Date.now();
+      const { instances, skipped } = expandObject(obj, OCTOBER, OPTS);
+      assert.ok(Date.now() - started < 1000, "the rule was walked");
+      assert.deepEqual(
+        instances.map((e) => [e.start, e.recurrenceId]),
+        [["2026-10-05T09:00:00.000Z", "2026-10-05T09:00:00.000Z"]]
+      );
+      assert.match(skipped ?? "", /can never match/);
+    }
+  });
+});
+
+describe("expandObject — overrides the walk does not meet (review of #223)", () => {
+  /** Weekly on Thursdays 09:00Z from 2026-10-01, four times. */
+  const MASTER = [
+    "UID:ov@example.com",
+    "DTSTART:20261001T090000Z",
+    "DTEND:20261001T093000Z",
+    "RRULE:FREQ=WEEKLY;COUNT=4",
+    "SUMMARY:Standup",
+  ];
+
+  it("(a) lists an override whose occurrence is also in EXDATE, at its own time", () => {
+    const obj = calendar(
+      vevent(...MASTER, "EXDATE:20261008T090000Z"),
+      vevent(
+        "UID:ov@example.com",
+        "RECURRENCE-ID:20261008T090000Z",
+        "DTSTART:20261008T110000Z",
+        "DTEND:20261008T113000Z",
+        "SUMMARY:Moved"
+      )
+    );
+    const { instances, skipped } = expandObject(obj, OCTOBER, OPTS);
+    assert.equal(skipped, undefined);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.start, e.summary]),
+      [
+        ["2026-10-01T09:00:00.000Z", "2026-10-01T09:00:00.000Z", "Standup"],
+        ["2026-10-08T09:00:00.000Z", "2026-10-08T11:00:00.000Z", "Moved"],
+        ["2026-10-15T09:00:00.000Z", "2026-10-15T09:00:00.000Z", "Standup"],
+        ["2026-10-22T09:00:00.000Z", "2026-10-22T09:00:00.000Z", "Standup"],
+      ]
+    );
+  });
+
+  it("(b) matches an override whose RECURRENCE-ID is in another zone by its instant, and drops the master's occurrence", () => {
+    const obj = calendar(
+      vevent(
+        "UID:zoned@example.com",
+        "DTSTART;TZID=Europe/Berlin:20261001T090000",
+        "DTEND;TZID=Europe/Berlin:20261001T100000",
+        "RRULE:FREQ=WEEKLY;COUNT=3",
+        "SUMMARY:Berlin"
+      ),
+      // 03:00 in New York on 2026-10-08 is 09:00 in Berlin: the second occurrence.
+      vevent(
+        "UID:zoned@example.com",
+        "RECURRENCE-ID;TZID=America/New_York:20261008T030000",
+        "DTSTART;TZID=Europe/Berlin:20261008T140000",
+        "DTEND;TZID=Europe/Berlin:20261008T150000",
+        "SUMMARY:Berlin (afternoon)"
+      )
+    );
+    const { instances } = expandObject(obj, OCTOBER, OPTS);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.start, e.summary]),
+      [
+        ["2026-10-01T07:00:00.000Z", "2026-10-01T07:00:00.000Z", "Berlin"],
+        ["2026-10-08T07:00:00.000Z", "2026-10-08T12:00:00.000Z", "Berlin (afternoon)"],
+        ["2026-10-15T07:00:00.000Z", "2026-10-15T07:00:00.000Z", "Berlin"],
+      ]
+    );
+  });
+
+  it("(c) matches a DATE-TIME RECURRENCE-ID to an all-day series by its date", () => {
+    const obj = calendar(
+      vevent(
+        "UID:bins@example.com",
+        "DTSTART;VALUE=DATE:20261001",
+        "DTEND;VALUE=DATE:20261002",
+        "RRULE:FREQ=WEEKLY;COUNT=3",
+        "SUMMARY:Bins"
+      ),
+      vevent(
+        "UID:bins@example.com",
+        "RECURRENCE-ID:20261008T000000",
+        "DTSTART;VALUE=DATE:20261009",
+        "DTEND;VALUE=DATE:20261010",
+        "SUMMARY:Bins (Friday)"
+      )
+    );
+    const { instances } = expandObject(obj, OCTOBER, OPTS);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.start, e.summary]),
+      [
+        ["2026-10-01", "2026-10-01", "Bins"],
+        ["2026-10-08", "2026-10-09", "Bins (Friday)"],
+        ["2026-10-15", "2026-10-15", "Bins"],
+      ]
+    );
+  });
+
+  it("(d) lists an override whose RECURRENCE-ID matches no occurrence, at its own time, beside the whole series", () => {
+    const obj = calendar(
+      vevent(...MASTER),
+      vevent(
+        "UID:ov@example.com",
+        "RECURRENCE-ID:20261010T090000Z",
+        "DTSTART:20261010T100000Z",
+        "DTEND:20261010T110000Z",
+        "SUMMARY:Orphan"
+      )
+    );
+    const { instances } = expandObject(obj, OCTOBER, OPTS);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.start, e.summary]),
+      [
+        ["2026-10-01T09:00:00.000Z", "2026-10-01T09:00:00.000Z", "Standup"],
+        ["2026-10-08T09:00:00.000Z", "2026-10-08T09:00:00.000Z", "Standup"],
+        ["2026-10-10T09:00:00.000Z", "2026-10-10T10:00:00.000Z", "Orphan"],
+        ["2026-10-15T09:00:00.000Z", "2026-10-15T09:00:00.000Z", "Standup"],
+        ["2026-10-22T09:00:00.000Z", "2026-10-22T09:00:00.000Z", "Standup"],
+      ]
+    );
+  });
+
+  it("keeps RANGE=THISANDFUTURE: every later occurrence is shifted and renamed", () => {
+    const obj = calendar(
+      vevent(...MASTER),
+      vevent(
+        "UID:ov@example.com",
+        "RECURRENCE-ID;RANGE=THISANDFUTURE:20261015T090000Z",
+        "DTSTART:20261015T100000Z",
+        "DTEND:20261015T103000Z",
+        "SUMMARY:Later"
+      )
+    );
+    const { instances } = expandObject(obj, OCTOBER, OPTS);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.start, e.summary]),
+      [
+        ["2026-10-01T09:00:00.000Z", "2026-10-01T09:00:00.000Z", "Standup"],
+        ["2026-10-08T09:00:00.000Z", "2026-10-08T09:00:00.000Z", "Standup"],
+        ["2026-10-15T09:00:00.000Z", "2026-10-15T10:00:00.000Z", "Later"],
+        ["2026-10-22T09:00:00.000Z", "2026-10-22T10:00:00.000Z", "Later"],
+      ]
+    );
+  });
+});
+
+describe("expandObject — RDATE;VALUE=PERIOD (review of #223)", () => {
+  it("lists each period from its start to its end, or its start plus its duration", () => {
+    const obj = calendar(
+      vevent(
+        "UID:period@example.com",
+        "DTSTART:20261001T090000Z",
+        "DTEND:20261001T093000Z",
+        "RRULE:FREQ=WEEKLY;COUNT=2",
+        "RDATE;VALUE=PERIOD:20261005T090000Z/20261005T120000Z,20261006T090000Z/PT45M",
+        "SUMMARY:Workshop"
+      )
+    );
+    const { instances, skipped } = expandObject(obj, OCTOBER, OPTS);
+    assert.equal(skipped, undefined);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.start, e.end]),
+      [
+        ["2026-10-01T09:00:00.000Z", "2026-10-01T09:00:00.000Z", "2026-10-01T09:30:00.000Z"],
+        ["2026-10-05T09:00:00.000Z", "2026-10-05T09:00:00.000Z", "2026-10-05T12:00:00.000Z"],
+        ["2026-10-06T09:00:00.000Z", "2026-10-06T09:00:00.000Z", "2026-10-06T09:45:00.000Z"],
+        ["2026-10-08T09:00:00.000Z", "2026-10-08T09:00:00.000Z", "2026-10-08T09:30:00.000Z"],
+      ]
+    );
+  });
+
+  it("places a zoned period by its TZID, with or without a VTIMEZONE", () => {
+    for (const withVtimezone of [true, false]) {
+      const obj = calendar(
+        ...(withVtimezone ? [BERLIN_VTIMEZONE] : []),
+        vevent(
+          "UID:period-berlin@example.com",
+          "DTSTART;TZID=Europe/Berlin:20261001T090000",
+          "DTEND;TZID=Europe/Berlin:20261001T093000",
+          "RRULE:FREQ=WEEKLY;COUNT=1",
+          "RDATE;VALUE=PERIOD;TZID=Europe/Berlin:20261005T090000/PT2H"
+        )
+      );
+      const { instances } = expandObject(obj, OCTOBER, OPTS);
+      assert.deepEqual(
+        instances.map((e) => [e.start, e.end, e.timezone]),
+        [
+          ["2026-10-01T07:00:00.000Z", "2026-10-01T07:30:00.000Z", "Europe/Berlin"],
+          ["2026-10-05T07:00:00.000Z", "2026-10-05T09:00:00.000Z", "Europe/Berlin"],
+        ],
+        `withVtimezone: ${withVtimezone}`
+      );
+    }
+  });
+});
+
+describe("expandObject — an IANA zone with no VTIMEZONE costs about what one with it does (review of #223)", () => {
+  /** Daily at 09:00 Berlin since 2016: about 3,900 steps from its start to October 2026. */
+  function dailySince2016(withVtimezone: boolean): string {
+    return calendar(
+      ...(withVtimezone ? [BERLIN_VTIMEZONE] : []),
+      vevent("UID:daily@example.com", "DTSTART;TZID=Europe/Berlin:20160101T090000", "DURATION:PT1H", "RRULE:FREQ=DAILY")
+    );
+  }
+
+  /** The best of three runs, so one garbage collection does not decide the test. */
+  function fastest(obj: string): number {
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const started = performance.now();
+      const { instances } = expandObject(obj, OCTOBER, OPTS);
+      best = Math.min(best, performance.now() - started);
+      assert.equal(instances.length, 31);
+    }
+    return best;
+  }
+
+  it("expands through Intl within 2.5× of the VTIMEZONE's time (it was 5–6×)", () => {
+    const withVtimezone = fastest(dailySince2016(true));
+    const throughIntl = fastest(dailySince2016(false));
+    assert.ok(
+      throughIntl < withVtimezone * 2.5,
+      `Intl took ${throughIntl.toFixed(0)} ms, the VTIMEZONE ${withVtimezone.toFixed(0)} ms`
+    );
   });
 });

@@ -13,7 +13,13 @@
  * window and src/ical-expand.ts turns each into instances. Every object the
  * server lists is read, whatever its href is called (#211.1), and one that
  * cannot be read is named in `skipped` instead of failing the calendar
- * (#211.2).
+ * (#211.2). The expansion itself runs off this thread, in
+ * src/ical-worker-pool.ts, where a rule that never ends can be stopped.
+ *
+ * Nothing else here walks a recurrence rule: the UID lookup and the writes
+ * (src/ical-edit.ts) only ask whether an object recurs. Anything that needs
+ * an occurrence found by walking — addressing one by `recurrence_id` — goes
+ * through the same pool (src/ical-worker-ops.ts).
  */
 
 import {
@@ -33,7 +39,8 @@ import {
   touchesTime,
   type EventPatch,
 } from "./ical-edit.js";
-import { expandObject, instantOfReported, type CalendarEvent } from "./ical-expand.js";
+import { instantOfReported, type CalendarEvent } from "./ical-expand.js";
+import { expansionPool, type StoredObject } from "./ical-worker-pool.js";
 import {
   calendarZone,
   canonicalZone,
@@ -194,6 +201,11 @@ export class CalDavClient {
    * does for every shape (R4), and returns them as stored. Asking it to
    * expand as well failed the whole REPORT on an all-day series, a floating
    * series or an override with no master (R1–R3).
+   *
+   * The expansion runs in src/ical-worker-pool.ts's workers, each object
+   * under a deadline: one recurrence rule ical.js never returns from is a
+   * `skipped` entry, not a connector that no longer answers anyone (review of
+   * #223). `find_free_slot` reads through here, so it is covered too.
    */
   async listEvents(calendarUrl: string, rangeStart: string, rangeEnd: string): Promise<EventListing> {
     const calendar = await this.findCalendar(calendarUrl);
@@ -209,15 +221,20 @@ export class CalDavClient {
     const window = { start: Date.parse(rangeStart), end: Date.parse(rangeEnd) };
     const events: CalendarEvent[] = [];
     const skipped: SkippedObject[] = [];
+    const stored: StoredObject[] = [];
     for (const obj of objects) {
       if (typeof obj.data !== "string" || obj.data === "") {
         skipped.push({ url: obj.url, reason: "The server sent no calendar data for it." });
         continue;
       }
-      const expanded = expandObject(obj.data, window, { url: obj.url, etag: obj.etag ?? null });
-      events.push(...expanded.instances);
-      if (expanded.skipped !== undefined) skipped.push({ url: obj.url, reason: expanded.skipped });
+      stored.push({ url: obj.url, etag: obj.etag ?? null, data: obj.data });
     }
+    // Off this thread, each object under a deadline: see src/ical-worker-pool.ts.
+    const expanded = await expansionPool.expand(stored, window);
+    expanded.forEach((result, i) => {
+      events.push(...result.instances);
+      if (result.skipped !== undefined) skipped.push({ url: stored[i].url, reason: result.skipped });
+    });
     events.sort((a, b) => instantOfReported(a.start) - instantOfReported(b.start));
     return { events, skipped };
   }

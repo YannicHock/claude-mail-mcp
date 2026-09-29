@@ -332,6 +332,43 @@ describe("lookup robustness (#211)", SKIP, () => {
     }
   });
 
+  it("a recurrence rule ical.js never returns from costs only its own object, not the connector (review of #223)", { timeout: 60_000 }, async () => {
+    const own = await makeRadicaleCalendar();
+    await putRawEvent(own, "a-hangs.ics", richEvent("hangs@example.com", "Stand-in"));
+    await putRawEvent(own, "b-good.ics", richEvent("good@example.com", "Readable"));
+    // No day of ISO week 1 is in June, and impossibleRule does not know that:
+    // only the worker's deadline stands between this and a frozen process.
+    const hangs = ics(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Other Client//EN",
+      "BEGIN:VEVENT",
+      "UID:hangs@example.com",
+      "DTSTAMP:20200101T000000Z",
+      "DTSTART:20200101T090000Z",
+      "DURATION:PT1H",
+      "RRULE:FREQ=DAILY;BYWEEKNO=1;BYMONTH=6",
+      "END:VEVENT",
+      "END:VCALENDAR"
+    );
+    const proxy = await startCalDavProxy({ corruptObject: "a-hangs.ics", corruptWith: hangs });
+    try {
+      const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+      const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
+      const { events, skipped } = await viaProxy.listEvents(calendarUrl, WINDOW.start, WINDOW.end);
+      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the object");
+      assert.deepEqual(
+        events.map((e) => e.summary),
+        ["Readable"]
+      );
+      assert.equal(skipped.length, 1);
+      assert.match(skipped[0].url, /\/a-hangs\.ics$/);
+      assert.match(skipped[0].reason, /did not finish expanding/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
   it("#211.2: update_event finds the exact UID past an earlier object it cannot read", async () => {
     const own = await makeRadicaleCalendar();
     // Both match the UID query's substring text-match; the proxy puts the
