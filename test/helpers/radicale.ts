@@ -114,3 +114,62 @@ export async function editBehindTheBack(
   if (!res.ok) throw new Error(`PUT ${filename} answered ${res.status}`);
   return res.headers.get("etag") ?? "";
 }
+
+/**
+ * A proxy in front of Radicale that drops the ETag header from every PUT
+ * answer — what Nextcloud does when it rewrites the object it stores (its
+ * scheduling plugin adds SCHEDULE-STATUS), and what RFC 4791 §5.3.4 allows.
+ * Found on the v0.7.2 acceptance run: `update_event` then answered
+ * `etag: null`. Everything else is passed through untouched.
+ */
+export async function startEtaglessPutProxy(): Promise<{
+  url: string;
+  /** PUT answers an ETag was actually removed from — proof the fallback path ran. */
+  strippedPuts: () => number;
+  close: () => Promise<void>;
+}> {
+  let stripped = 0;
+  const { createServer } = await import("node:http");
+  const upstream = new URL(RADICALE_URL);
+  // Hop-by-hop, or no longer true once fetch has decoded the body.
+  const dropped = new Set(["connection", "transfer-encoding", "content-length", "content-encoding", "keep-alive"]);
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (v === undefined || k === "host" || dropped.has(k)) continue;
+        headers.set(k, Array.isArray(v) ? v.join(", ") : v);
+      }
+      const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
+      fetch(new URL(req.url ?? "/", upstream), { method: req.method, headers, body, redirect: "manual" })
+        .then(async (answer) => {
+          const out: Record<string, string> = {};
+          answer.headers.forEach((v, k) => {
+            if (dropped.has(k)) return;
+            if (req.method === "PUT" && k === "etag") {
+              stripped += 1;
+              return;
+            }
+            out[k] = v;
+          });
+          const payload = Buffer.from(await answer.arrayBuffer());
+          res.writeHead(answer.status, answer.statusText, { ...out, "content-length": String(payload.length) });
+          res.end(payload);
+        })
+        .catch((err: unknown) => {
+          res.writeHead(502);
+          res.end(String(err));
+        });
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("proxy has no port");
+  return {
+    url: `http://127.0.0.1:${address.port}/`,
+    strippedPuts: () => stripped,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}

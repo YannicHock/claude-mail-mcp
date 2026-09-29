@@ -24,6 +24,7 @@ import { composeDown, composeUp, isDockerAvailable } from "../helpers/docker.js"
 import {
   RADICALE_PASSWORD,
   RADICALE_URL,
+  startEtaglessPutProxy,
   editBehindTheBack,
   getRawEvent,
   makeRadicaleCalendar,
@@ -243,6 +244,32 @@ describe("update_event", SKIP, () => {
       })
     );
     assert.match(message, /single occurrence.*not supported yet/);
+  });
+});
+
+describe("update_event on a server that answers a PUT without an ETag", SKIP, () => {
+  // The v0.7.2 acceptance run on Nextcloud: update_event answered etag: null,
+  // so a second change needed a list_events in between. The connector now
+  // reads the new ETag back itself when the PUT did not carry one.
+  it("returns the new etag anyway, and it carries a second update straight away", async () => {
+    const proxy = await startEtaglessPutProxy();
+    try {
+      const viaProxy = new CalDavClient({ url: proxy.url, user: cal.user, pass: RADICALE_PASSWORD });
+      const calendarUrl = cal.calendarUrl.replace(RADICALE_URL, proxy.url);
+      const uid = "etagless@example.com";
+      await putRawEvent(cal, "etagless.ics", richEvent(uid));
+
+      const first = await viaProxy.updateEvent({ calendarUrl, uid, etag: await etagOf(uid), summary: "One" });
+      assert.ok(first.etag, "update_event still answers etag: null");
+      assert.equal(first.etag, await etagOf(uid), "the etag handed back is not the stored one");
+
+      const second = await viaProxy.updateEvent({ calendarUrl, uid, etag: first.etag, summary: "Two" });
+      assert.ok(second.etag);
+      assert.match((await getRawEvent(cal, "etagless.ics")) ?? "", /SUMMARY:Two/);
+      assert.equal(proxy.strippedPuts(), 2, "the proxy never took an ETag away, so the fallback was not exercised");
+    } finally {
+      await proxy.close();
+    }
   });
 });
 

@@ -15,7 +15,10 @@
  * `apply_to_series` to touch a series at all (spec 2026-09-28 §4). An update
  * edits the stored object in place — see src/ical-edit.ts — so attendees,
  * alarms and anything else this connector does not model survive it.
- * Neither tool notifies attendees: there is no iMIP yet (#29).
+ * Neither tool sends mail to attendees: there is no iMIP yet (#29). The
+ * calendar server may send its own, though — Nextcloud mails attendees of an
+ * event you organize when it is changed or deleted (found on the v0.7.2
+ * acceptance run) — so both descriptions tell the model to confirm first.
  *
  * Those refusals are answers, not failures. They are thrown as `ToolRefusal`,
  * which `reportingFailures()` passes through word for word with no log line: a
@@ -158,7 +161,7 @@ export function registerCalendarTools(
           .array(z.string().email())
           .optional()
           .describe(
-            "Email addresses of attendees. Note: CalDAV does NOT send invitations on its own — most servers expect the client to mail the iMIP invite separately."
+            "Email addresses of attendees. Attendees may or may not receive an invitation, depending on the calendar server. CalDAV itself does not mail invitations, and this connector does not send them."
           ),
         account: accountSchema,
       },
@@ -185,7 +188,7 @@ export function registerCalendarTools(
     "update_event",
     {
       description:
-        "Change an existing calendar event. WRITE OPERATION. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. `start` alone moves the event and keeps its length. Attendees are NOT notified: this connector does not send calendar invitations yet. A recurring event needs apply_to_series=true, and then only its summary, description and location can change; a single occurrence cannot be changed yet.",
+        "Change an existing calendar event. WRITE OPERATION. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. `start` alone moves the event and keeps its length. The answer carries the event's new `etag` for a further change; if it is null, call list_events before changing it again. This connector sends no invitation or update mail itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees when an event you organize is changed. Treat changing an event that has attendees as a message to real people, and confirm with the user first. A recurring event needs apply_to_series=true, and then only its summary, description and location can change; a single occurrence cannot be changed yet.",
       inputSchema: {
         calendar_url: z
           .string()
@@ -242,7 +245,7 @@ export function registerCalendarTools(
     "delete_event",
     {
       description:
-        "Delete a calendar event. DESTRUCTIVE AND PERMANENT: CalDAV has no trash, so a deleted event cannot be recovered. Attendees are NOT sent a cancellation. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is deleted. A recurring event needs apply_to_series=true and is then deleted with every occurrence; a single occurrence cannot be deleted yet.",
+        "Delete a calendar event. DESTRUCTIVE AND PERMANENT: CalDAV has no trash, so a deleted event cannot be recovered. This connector sends no cancellation itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees a cancellation when an event you organize is deleted, and that mail cannot be recalled. Confirm with the user first if the event has attendees. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is deleted. A recurring event needs apply_to_series=true and is then deleted with every occurrence; a single occurrence cannot be deleted yet.",
       inputSchema: {
         calendar_url: z
           .string()

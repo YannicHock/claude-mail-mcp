@@ -21,6 +21,7 @@ import {
   changesSomething,
   describeStoredEvent,
   icalTimeFor,
+  mainSequence,
   touchesTime,
   type EventPatch,
 } from "./ical-edit.js";
@@ -219,7 +220,44 @@ export class CalDavClient {
     });
     refuseLostRace(res, update.uid, calendar.url, nothingDone);
     assertWritten(res, "PUT");
-    return { uid: update.uid, url: stored.url, etag: res.headers.get("etag") };
+    const etag =
+      res.headers.get("etag") ??
+      (await this.etagAfterWrite(calendar, update.uid, stored.url, mainSequence(data, update.uid)));
+    return { uid: update.uid, url: stored.url, etag };
+  }
+
+  /**
+   * The ETag of an object just written, read back with the same UID query the
+   * write started from. RFC 4791 §5.3.4 lets a server answer a PUT without an
+   * ETag when it stored something other than what was sent, and Nextcloud does
+   * exactly that for an event it schedules — found on the v0.7.2 acceptance
+   * run, where `update_event` answered `etag: null` and a second change needed
+   * a `list_events` in between.
+   *
+   * The write has already succeeded, so this never turns it into a failure:
+   * anything going wrong here is `null`, and the tool text tells the caller to
+   * read the event again in that case.
+   *
+   * An ETag is handed back only for what is recognisably this write: the same
+   * object URL, and the SEQUENCE this update just wrote. Otherwise someone
+   * else's version landed in between (a phone syncing, a server applying an
+   * attendee's reply that bumps it), and giving the caller *that* etag would
+   * let its next update overwrite the other change unseen — `null` sends it to
+   * `list_events` instead.
+   */
+  private async etagAfterWrite(
+    calendar: DAVCalendar,
+    uid: string,
+    url: string,
+    sequence: number | null
+  ): Promise<string | null> {
+    try {
+      const now = await this.findStoredEvent(calendar, uid, "");
+      if (now.url !== url || sequence === null || mainSequence(now.data, uid) !== sequence) return null;
+      return now.etag;
+    } catch {
+      return null;
+    }
   }
 
   /**

@@ -80,6 +80,18 @@ export function describeStoredEvent(ics: string, uid: string): StoredEventShape 
 }
 
 /**
+ * The SEQUENCE of the main VEVENT for `uid` (absent counts as 0, as in
+ * {@link applyEventPatch}), or null when the object holds no main VEVENT for it.
+ * Lets a read-back after a write tell its own version from one written since.
+ */
+export function mainSequence(ics: string, uid: string): number | null {
+  const master = veventsFor(parse(ics), uid).find((ve) => !ve.hasProperty("recurrence-id"));
+  if (master === undefined) return null;
+  const sequence = Number(master.getFirstPropertyValue("sequence") ?? 0);
+  return Number.isFinite(sequence) ? sequence : 0;
+}
+
+/**
  * The ICAL value for a start or end, the way `create_event` has always written
  * it: a DATE for an all-day event, otherwise a UTC DATE-TIME (spec §2.4).
  */
