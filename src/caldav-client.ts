@@ -39,8 +39,8 @@ import {
   touchesTime,
   type EventPatch,
 } from "./ical-edit.js";
-import { instantOfReported, type CalendarEvent } from "./ical-expand.js";
-import { expansionPool, type StoredObject } from "./ical-worker-pool.js";
+import { instantOfReported, type CalendarEvent, type StoredObject } from "./ical-expand.js";
+import { expansionPool } from "./ical-worker-pool.js";
 import {
   calendarZone,
   canonicalZone,

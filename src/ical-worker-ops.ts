@@ -4,12 +4,24 @@
  *
  * Every operation that walks a recurrence rule belongs here, and nowhere
  * else runs one on the connector's own thread (review of #223): the pool is
- * what bounds it. An operation is pure and synchronous, takes and returns
- * only what structured clone carries (strings, numbers, plain objects — no
- * ICAL.Time), and never throws for anything in its input.
+ * what bounds it. An operation is pure and synchronous, and never throws for
+ * anything in its input.
+ *
+ * **What crosses the boundary** (review of #225). An operation takes the
+ * stored object as its text and parses it afresh, in the worker; it returns
+ * plain data that structured clone carries — strings such as
+ * `reportedTime` produces, numbers, indices into the object, plain objects —
+ * and never an ICAL.Time, ICAL.Component or any other ical.js value, which
+ * would arrive as a bare object with its prototype gone. Nor does it return
+ * a calendar `occurrencesIn` walked: that one was changed in memory (an
+ * impossible RRULE dropped, a PERIOD RDATE split) and is for reading only.
+ * A write re-parses the original text on the main thread and changes that,
+ * addressing what the operation found by the strings and indices it returned.
  *
  * To add one — PR 4's occurrence lookup by `recurrence_id`, say — add it to
- * {@link WORKER_OPS} and call it with `ExpansionPool.run`.
+ * {@link WORKER_OPS}, say what it does in {@link OP_ACTIONS}, and call it
+ * with `ExpansionPool.runOn` (src/ical-worker-pool.ts), which also remembers
+ * an object that timed out; turn a rejection into words with `reasonOf`.
  */
 
 import { expandObject } from "./ical-expand.js";
@@ -21,6 +33,15 @@ export const WORKER_OPS = {
 
 export type WorkerOps = typeof WORKER_OPS;
 export type WorkerOpName = keyof WorkerOps;
+
+/**
+ * Each operation as the words "It did not finish … within 3 s" takes, for
+ * the `ExpansionTimeout` it can end in. Typed over {@link WorkerOpName}, so an
+ * operation added without one does not compile.
+ */
+export const OP_ACTIONS: { readonly [K in WorkerOpName]: string } = {
+  expand: "expanding",
+};
 
 export interface WorkerRequest<K extends WorkerOpName = WorkerOpName> {
   id: number;
