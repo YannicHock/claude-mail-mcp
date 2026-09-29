@@ -27,7 +27,7 @@ import {
 
 const AUTH_TOKEN = "protocol-test-token-please-do-not-reuse";
 
-// 10 mail tools (registerMailTools) + 6 calendar tools (registerCalendarTools).
+// 1 account + 9 mail tools (registerMailTools) + 6 calendar tools (registerCalendarTools).
 const EXPECTED_TOOL_NAMES = [
   "list_accounts",
   "list_folders",
