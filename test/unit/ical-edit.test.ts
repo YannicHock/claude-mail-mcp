@@ -274,6 +274,117 @@ describe("applyEventPatch — what it refuses", () => {
   });
 });
 
+/** A timed event whose TZID has no VTIMEZONE in the object: ical.js cannot place it. */
+const UNRESOLVED_TZID = ics(
+  "BEGIN:VCALENDAR",
+  "VERSION:2.0",
+  "PRODID:-//Other Client//EN",
+  "BEGIN:VEVENT",
+  "UID:nozone-1@example.com",
+  "DTSTAMP:20260901T080000Z",
+  "DTSTART;TZID=Europe/Berlin:20261001T090000",
+  "DTEND;TZID=Europe/Berlin:20261001T100000",
+  "SUMMARY:Planning",
+  "END:VEVENT",
+  "END:VCALENDAR"
+);
+
+/** A floating timed event: a clock time with no zone at all. */
+const FLOATING = ics(
+  "BEGIN:VCALENDAR",
+  "VERSION:2.0",
+  "PRODID:-//Other Client//EN",
+  "BEGIN:VEVENT",
+  "UID:float-1@example.com",
+  "DTSTAMP:20260901T080000Z",
+  "DTSTART:20261001T090000",
+  "DTEND:20261001T100000",
+  "SUMMARY:Planning",
+  "END:VEVENT",
+  "END:VCALENDAR"
+);
+
+/** A timed event with neither DTEND nor DURATION: RFC 5545 gives it no length. */
+const NO_END = ics(
+  "BEGIN:VCALENDAR",
+  "VERSION:2.0",
+  "PRODID:-//Other Client//EN",
+  "BEGIN:VEVENT",
+  "UID:noend-1@example.com",
+  "DTSTAMP:20260901T080000Z",
+  "DTSTART:20261001T090000Z",
+  "SUMMARY:Reminder",
+  "END:VEVENT",
+  "END:VCALENDAR"
+);
+
+describe("applyEventPatch — times it cannot place (final review)", () => {
+  it("refuses an end-only change on a TZID it has no VTIMEZONE for, rather than moving the start", () => {
+    for (const end of ["2026-10-01T12:00:00+02:00", "2026-10-01T11:00:00+02:00"]) {
+      assert.throws(
+        () => applyEventPatch(UNRESOLVED_TZID, "nozone-1@example.com", { end }, NOW),
+        (err: unknown) =>
+          err instanceof ToolRefusal && /time zone/.test(err.message) && /Nothing was changed/.test(err.message)
+      );
+    }
+  });
+
+  it("refuses a start-only move of a floating event, which would need its old length", () => {
+    assert.throws(
+      () => applyEventPatch(FLOATING, "float-1@example.com", { start: "2026-10-02T09:00:00Z" }, NOW),
+      (err: unknown) => err instanceof ToolRefusal && /time zone/.test(err.message)
+    );
+  });
+
+  it("still moves such an event when given both bounds, since neither old time is needed", () => {
+    const out = applyEventPatch(
+      UNRESOLVED_TZID,
+      "nozone-1@example.com",
+      { start: "2026-10-01T11:00:00+02:00", end: "2026-10-01T12:00:00+02:00" },
+      NOW
+    );
+    const ve = master(out, "nozone-1@example.com");
+    assert.equal(iso(ve.getFirstPropertyValue("dtstart")), "2026-10-01T09:00:00.000Z");
+    assert.equal(iso(ve.getFirstPropertyValue("dtend")), "2026-10-01T10:00:00.000Z");
+  });
+});
+
+describe("applyEventPatch — an event with no end (final review)", () => {
+  it("moves it by its start and still gives it no end", () => {
+    const out = applyEventPatch(NO_END, "noend-1@example.com", { start: "2026-10-02T09:00:00Z" }, NOW);
+    const ve = master(out, "noend-1@example.com");
+    assert.equal(iso(ve.getFirstPropertyValue("dtstart")), "2026-10-02T09:00:00.000Z");
+    assert.equal(ve.hasProperty("dtend"), false);
+    assert.equal(ve.hasProperty("duration"), false);
+  });
+
+  it("gives it an end when one is asked for", () => {
+    const out = applyEventPatch(NO_END, "noend-1@example.com", { end: "2026-10-01T09:30:00Z" }, NOW);
+    assert.equal(iso(master(out, "noend-1@example.com").getFirstPropertyValue("dtend")), "2026-10-01T09:30:00.000Z");
+  });
+});
+
+describe("applyEventPatch — dates it cannot read (final review)", () => {
+  it("refuses an unparseable timed start as an answer, not a server failure", () => {
+    assert.throws(
+      () => applyEventPatch(RICH, "rich-1@example.com", { start: "tomorrow 9am" }, NOW),
+      (err: unknown) => err instanceof ToolRefusal && /"tomorrow 9am"/.test(err.message)
+    );
+  });
+
+  it("refuses an all-day date that is not a calendar date, instead of writing a rolled-over one", () => {
+    for (const patch of [
+      { start: "2026-10-05", end: "2026-13-45" },
+      { start: "next monday", end: "next tuesday" },
+    ]) {
+      assert.throws(
+        () => applyEventPatch(ALL_DAY, "allday-1@example.com", patch, NOW),
+        (err: unknown) => err instanceof ToolRefusal && /Nothing was changed/.test(err.message)
+      );
+    }
+  });
+});
+
 describe("touchesTime / changesSomething", () => {
   it("tells a text-only patch from a time patch, and an empty one from both", () => {
     assert.equal(touchesTime({ summary: "x" }), false);

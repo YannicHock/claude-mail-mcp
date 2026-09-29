@@ -99,11 +99,49 @@ function isoDate(ms: number): string {
 }
 
 /**
+ * A caller's timed bound as epoch ms, or a refusal. Unchecked, `Date.parse`
+ * returns NaN and the RangeError that follows reaches the operator's log as a
+ * server failure — the noise spec §4.5 exists to keep out of it.
+ */
+function instant(field: "start" | "end", value: string): number {
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) {
+    throw new ToolRefusal(
+      `${field} "${value}" is not an ISO 8601 date-time, like 2026-10-01T09:00:00+02:00. Nothing was changed.`
+    );
+  }
+  return ms;
+}
+
+/**
+ * A caller's all-day bound as `YYYY-MM-DD`, or a refusal. The round trip
+ * catches a date that parses but does not exist: `2026-13-45` would otherwise
+ * roll over and be written as a date in 2027.
+ */
+function calendarDate(field: "start" | "end", value: string): string {
+  const day = value.slice(0, 10);
+  const ms = /^\d{4}-\d{2}-\d{2}$/.test(day) ? dateMs(day) : NaN;
+  if (Number.isNaN(ms) || isoDate(ms) !== day) {
+    throw new ToolRefusal(
+      `${field} "${value}" is not a calendar date (YYYY-MM-DD) for an all-day event. Nothing was changed.`
+    );
+  }
+  return day;
+}
+
+/** True when ical.js could not place a time on the clock (floating, or an unknown TZID). */
+function unplaced(time: ICAL.Time): boolean {
+  return !time.isDate && time.zone?.tzid === "floating";
+}
+
+/**
  * Apply `patch` to the main VEVENT of `uid` and return the new object.
  *
  * Throws {@link ToolRefusal} for a patch that cannot be applied as asked —
- * an end that is not after the start, or an all-day switch without both
- * bounds. The caller has already established that the UID is present.
+ * an end that is not after the start, an all-day switch without both bounds,
+ * a date it cannot read, or a one-sided time change on an event whose stored
+ * time it cannot place. The caller has already established that the UID is
+ * present.
  */
 export function applyEventPatch(
   ics: string,
@@ -136,34 +174,50 @@ export function applyEventPatch(
     }
 
     let start: string;
-    let end: string;
+    let end: string | undefined;
     if (allDay) {
       const oldStart = event.startDate.toString().slice(0, 10);
       const oldEnd = event.endDate.toString().slice(0, 10);
-      start = patch.start ?? oldStart;
+      start = patch.start !== undefined ? calendarDate("start", patch.start) : oldStart;
       end =
-        patch.end ??
-        (patch.start !== undefined
-          ? isoDate(dateMs(start) + (dateMs(oldEnd) - dateMs(oldStart)))
-          : oldEnd);
+        patch.end !== undefined
+          ? calendarDate("end", patch.end)
+          : patch.start !== undefined
+            ? isoDate(dateMs(start) + (dateMs(oldEnd) - dateMs(oldStart)))
+            : oldEnd;
       if (dateMs(end) <= dateMs(start)) {
         throw new ToolRefusal(
           `The event would end (${end}) on or before it starts (${start}). For an all-day event the end date is exclusive. Nothing was changed.`
         );
       }
     } else {
-      const oldStart = event.startDate.toJSDate().getTime();
-      const oldEnd = event.endDate.toJSDate().getTime();
-      const startMs = patch.start !== undefined ? Date.parse(patch.start) : oldStart;
-      const endMs =
-        patch.end !== undefined
-          ? Date.parse(patch.end)
-          : patch.start !== undefined
-            ? startMs + (oldEnd - oldStart)
-            : oldEnd;
+      // A timed result that keeps one of the old bounds needs the old time as
+      // an instant. ical.js can give it only when the zone is known: a floating
+      // time, or a TZID with no VTIMEZONE in the object, comes back read as the
+      // process's local time, and writing that back as UTC would move the
+      // event by hours while reporting success (final review of #152).
+      const keepsOldBound = patch.start === undefined || patch.end === undefined;
+      if (keepsOldBound && !wasAllDay && (unplaced(event.startDate) || unplaced(event.endDate))) {
+        throw new ToolRefusal(
+          "This event's time is stored without a time zone this connector can resolve (a floating time, or a TZID with no VTIMEZONE), so changing only one end of it could shift it by hours. Nothing was changed. Pass both start and end to set its time outright."
+        );
+      }
+      // RFC 5545 §3.6.1: a timed event with neither DTEND nor DURATION has no
+      // length. Moving it keeps it that way rather than inventing an end —
+      // and rather than refusing because the "old length" is zero.
+      const hadNoEnd = !wasAllDay && !master.hasProperty("dtend") && !master.hasProperty("duration");
+      const startMs = patch.start !== undefined ? instant("start", patch.start) : event.startDate.toJSDate().getTime();
+      let endMs: number | undefined;
+      if (patch.end !== undefined) endMs = instant("end", patch.end);
+      else if (hadNoEnd) endMs = undefined;
+      else {
+        const oldStart = event.startDate.toJSDate().getTime();
+        const oldEnd = event.endDate.toJSDate().getTime();
+        endMs = patch.start !== undefined ? startMs + (oldEnd - oldStart) : oldEnd;
+      }
       start = new Date(startMs).toISOString();
-      end = new Date(endMs).toISOString();
-      if (endMs <= startMs) {
+      end = endMs === undefined ? undefined : new Date(endMs).toISOString();
+      if (endMs !== undefined && endMs <= startMs) {
         throw new ToolRefusal(
           `The event would end (${end}) at or before it starts (${start}). Nothing was changed.`
         );
@@ -174,7 +228,7 @@ export function applyEventPatch(
     master.removeAllProperties("dtend");
     master.removeAllProperties("duration");
     master.updatePropertyWithValue("dtstart", icalTimeFor(start, allDay));
-    master.updatePropertyWithValue("dtend", icalTimeFor(end, allDay));
+    if (end !== undefined) master.updatePropertyWithValue("dtend", icalTimeFor(end, allDay));
   }
 
   const sequence = Number(master.getFirstPropertyValue("sequence") ?? 0);
