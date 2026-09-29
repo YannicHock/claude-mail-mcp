@@ -93,7 +93,11 @@ import { timingSafeEqual } from "node:crypto";
 import express, { type Request, type RequestHandler, type Response, type Router } from "express";
 
 import type { Logger } from "./app.js";
-import { lookupMailboxSettings, type MailboxSuggestion as LookupSuggestion } from "./autoconfig.js";
+import {
+  lookupMailboxSettings,
+  type MailboxSuggestion as LookupSuggestion,
+  type ReachChoice,
+} from "./autoconfig.js";
 import {
   AccountsStore,
   AccountsStoreError,
@@ -105,6 +109,7 @@ import {
   type CalDavCreds,
 } from "./accounts.js";
 import { StaleStampError } from "./accounts-writer.js";
+import { createNoticeFlash, type NoticeFlash } from "./notice-flash.js";
 import { probeAccount, type ProbeReport } from "./probe.js";
 import { credentialNoteFor, providerPresets, unsupportedNoticeFor } from "./providers.js";
 import {
@@ -118,11 +123,10 @@ import {
   MAILBOX_SECRET_FIELDS,
   parseMailboxDraft,
   probeFailed,
-  probeRefusesSave,
   PROVIDER_FIELD,
   readSaveAnyway,
   SAVE_ANYWAY_FIELD,
-  saveRefusedNotice,
+  saveRefusal,
   SHARED_PASSWORD_FIELD,
   stepFromEdit,
   stepFromLookup,
@@ -156,6 +160,8 @@ export interface SettingsRouterDeps {
   issuer: string;
   settingsKey: string;
   log: Logger;
+  /** Where a save's notice waits for the redirect. A fresh one when absent. */
+  notices?: NoticeFlash;
 }
 
 // The three per-service passwords a draft has, plus the cascade's own single
@@ -427,7 +433,7 @@ function toWireReport(report: ProbeReport): MailboxProbeReport {
  * refused, or null.
  *
  * Whether to say anything at all is `credentialRejectionRefusesSave`, in the
- * wire contract, walking the same two services `saveRefusedNotice` walks. This
+ * wire contract, walking the same two services `saveRefusal` walks. This
  * file used to answer that question for itself, over all three services, and
  * the two disagreed about CalDAV — see that function's comment. A host that
  * never answered has said nothing about which password it wanted, which is the
@@ -458,7 +464,7 @@ function rejectionNoteFor(email: string, rejected: boolean): string | null {
  * The sentence above a refused save, carrying this provider's own requirement
  * when the failure was a rejection and the address's domain has one.
  *
- * `saveRefusedNotice` substitutes it for the generic app-password sentence
+ * `saveRefusal` substitutes it for the generic app-password sentence
  * rather than printing both — see its own comment. Three ways to get the
  * untargeted sentence back, all of them deliberate: the failure was
  * connectivity rather than credentials, the domain is not in the advice table,
@@ -472,11 +478,9 @@ function rejectionNoteFor(email: string, rejected: boolean): string | null {
  * report and the *Save anyway* escape stand alone, and the remedy is the
  * paragraph above them.
  */
-function refusalNotice(wire: MailboxProbeReport, email: string): string {
-  const note = probeRefusesSave(wire)
-    ? rejectionNoteFor(email, credentialRejectionRefusesSave(wire))
-    : null;
-  return saveRefusedNotice(wire, note ?? undefined, unsupportedNoticeFor(email) !== null) ?? "";
+function refusalNotice(wire: MailboxProbeReport, email: string): string | null {
+  const note = rejectionNoteFor(email, credentialRejectionRefusesSave(wire));
+  return saveRefusal(wire, note ?? undefined, unsupportedNoticeFor(email) !== null);
 }
 
 /**
@@ -526,7 +530,7 @@ function credentialAdvice(report: ProbeReport, email: string): { notice?: string
  * `null` is "nothing was probed", which is the operator having pressed *Save
  * anyway* — the whole of the escape hatch: a server in maintenance, a network
  * blip, or someone who knows better is not made to argue with a probe. What
- * makes a report a refusal is `probeRefusesSave`, which is in the wire contract
+ * makes a report a refusal is `saveRefusal` returning a sentence, which is in the wire contract
  * rather than here, because the wizard has to reach the same verdict.
  *
  * The rule lives here, in the connector, and in one place. Before #147 it lived
@@ -597,7 +601,9 @@ async function gateOnProbe(opts: {
   // and nothing to state afterwards either.
   if (report === null) return { proceed: true, report: undefined };
   const wire = toWireReport(report);
-  if (!probeRefusesSave(wire)) return { proceed: true, report: wire };
+  // The sentence is the gate: null is "nothing here refuses a save" (#172).
+  const notice = refusalNotice(wire, candidate.mail.defaultFrom);
+  if (notice === null) return { proceed: true, report: wire };
   log("warn", "settings: a mailbox was refused by the connection test", {
     action,
     id,
@@ -612,9 +618,50 @@ async function gateOnProbe(opts: {
     // in place of the wire contract's generic app-password sentence — a
     // replacement, never a second sentence beside it. The address comes off the
     // candidate rather than the body because that is the one already parsed.
-    notice: refusalNotice(wire, candidate.mail.defaultFrom),
+    notice,
   });
   return { proceed: false };
+}
+
+/**
+ * What the address lookup decided when a service had rival servers (#194), as
+ * one `info` line per service.
+ *
+ * Ports and verdicts, not hosts. The lookup's other lines log a boolean and
+ * nothing else, because a host name under an operator's own domain identifies
+ * them as well as the address does. "465 closed, 587 open, chose 587" is the
+ * whole diagnosis anyway: it is what a host that filters a port looks like.
+ */
+function logReachChoice(log: Logger): (choice: ReachChoice) => void {
+  return (choice) => {
+    const portOf = (pair: string): number => Number(pair.slice(pair.lastIndexOf(":") + 1));
+    log("info", "settings: the address lookup checked which servers answer", {
+      service: choice.service,
+      ports: choice.candidates.map(portOf),
+      verdicts: choice.verdicts,
+      chosenPort: portOf(choice.chosen),
+    });
+  };
+}
+
+/**
+ * The line a successful write leaves, beside the `warn` a refused one leaves.
+ *
+ * `probed` is the whole point (#173): a mailbox stored through *Save anyway*
+ * was never authenticated, and an operator whose mailbox then fails every tool
+ * call has to be able to read that off the log. The wizard's own line already
+ * carried it; the settings UI, the path used for every mailbox after the first,
+ * left nothing at all. Written only once the store call has returned, so it can
+ * never claim a save that then lost to a stale stamp. The id and one boolean —
+ * never anything the operator typed.
+ */
+function logSaved(
+  log: Logger,
+  action: "create" | "edit",
+  id: string,
+  report: MailboxProbeReport | undefined
+): void {
+  log("info", "settings: a mailbox was saved", { action, id, probed: report !== undefined });
 }
 
 function findAccount(store: AccountsStore, id: string): Account | undefined {
@@ -785,7 +832,7 @@ interface DraftRefusal {
    * something that is already correct.
    */
   probe?: ProbeReport;
-  /** The sentence above the form. `saveRefusedNotice`'s, so the wizard says the same one. */
+  /** The sentence above the form. `saveRefusal`'s, so the wizard says the same one. */
   notice?: string;
   /**
    * The submitted fields, flattened, whose passwords the re-rendered form keeps.
@@ -910,6 +957,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   const jsonBody = express.json({ limit: "64kb" });
   const guardAssertion = requireSettingsAssertion({ key: settingsKey, issuer, log });
   const guardCsrf = requireFormCsrf();
+  const notices = deps.notices ?? createNoticeFlash();
 
   /**
    * What a new mailbox starts out as, before a lookup or a preset fills it in.
@@ -1050,45 +1098,31 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   }
 
   /**
-   * Where a browser lands after a save: the mailbox list.
+   * Where a browser lands after a save: the mailbox list, by 303, always — so a
+   * reload of the list cannot re-submit the form.
    *
-   * Still a 303 when there is nothing extra to say, so a reload of the list
-   * cannot re-submit the form. The one exception is the failure the save
-   * deliberately does not refuse on — a CalDAV block that did not work. That
-   * has to be *shown*, and a redirect carries nothing, so the list is rendered
-   * here instead with the notice on it. The operator is on the same page either
-   * way; they are simply told the one thing a 303 could not have told them.
+   * The failure the save deliberately does not refuse on, a CalDAV block that
+   * did not work, has to be *shown*. It used to be, on a 200 rendered out of
+   * the POST, which gave up exactly the property the 303 is for (#173). It now
+   * rides the redirect as a token; see `src/notice-flash.ts` for why the
+   * sentence itself never goes into the URL.
    */
-  async function sendSavedPage(
-    res: Response,
-    csrf: string,
-    report: MailboxProbeReport | undefined
-  ): Promise<void> {
+  function sendSavedPage(res: Response, report: MailboxProbeReport | undefined): void {
     const notice = report === undefined ? null : caldavFailureNotice(report);
-    if (notice === null) {
-      sendRedirect(res, 303, "/settings/mailboxes");
-      return;
-    }
-    const accounts = store.list();
-    sendHtml(
+    sendRedirect(
       res,
-      200,
-      renderMailboxList({
-        csrf,
-        stamp: await store.stamp(),
-        accounts,
-        notice,
-        rowNotices: Object.fromEntries(
-          reservedIdAccounts(accounts).map((a) => [a.id, reservedIdNotice(a.id)])
-        ),
-      })
+      303,
+      notice === null ? "/settings/mailboxes" : `/settings/mailboxes?notice=${notices.put(notice)}`
     );
   }
 
-  router.get("/settings/mailboxes", guardAssertion, async (_req, res) => {
+  router.get("/settings/mailboxes", guardAssertion, async (req, res) => {
     const assertion = assertionOf(res);
     const stamp = await store.stamp();
     const accounts = store.list();
+    // The one thing a save's 303 carries. An unknown or expired token is no
+    // notice, not an error: a bookmarked URL is not a fault.
+    const notice = notices.get(req.query.notice);
     sendHtml(
       res,
       200,
@@ -1096,6 +1130,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         csrf: assertion.csrf,
         stamp,
         accounts,
+        ...(notice === null ? {} : { notice }),
         // An account that predates the create-time check (or was hand-written
         // into accounts.json) keeps a broken in-place edit, and the list page is
         // the one place its operator is certain to look. See RESERVED_IDS in
@@ -1206,7 +1241,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         // this package, which is the half of #141 that was already easy. The §7
         // rules that make a user-derived fetch safe are in there and are not
         // restated here.
-        const found = await lookupMailboxSettings(email);
+        const found = await lookupMailboxSettings(email, { onChoice: logReachChoice(log) });
         // A boolean and nothing else. Not the address, and not the hosts.
         log("info", "settings: add mailbox looked up an address", { found: found !== null });
         // The domain is known for the first time here, which is the earliest
@@ -1388,14 +1423,15 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         throw err;
       }
       const wireReport = gate.report;
+      logSaved(log, "create", parsed.account.id, wireReport);
       if (json) {
         // 201 and not the browser's 303: there is nowhere to send a caller that
         // is not a browser, and the two facts it wants are the id it now has
         // and where accounts.json got to. The status is what says "stored" —
-        // the setup wizard reads nothing else out of this body, and an answer
+        // the setup wizard reads only the report out of this body, and an answer
         // that never arrives is settled by asking for the stamp again. The
-        // report rides along so a caller that wants to say something about a
-        // CalDAV block that did not work can, without probing a second time.
+        // report rides along so the wizard can say what a CalDAV block that
+        // did not work means for this mailbox without probing a second time.
         sendJson(res, 201, {
           id: parsed.account.id,
           stamp: await store.stamp(),
@@ -1403,7 +1439,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         });
         return;
       }
-      await sendSavedPage(res, assertion.csrf, wireReport);
+      sendSavedPage(res, wireReport);
     }
   );
 
@@ -1530,7 +1566,9 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     // mapped field by field on purpose: if the connector's own suggestion shape
     // ever moves, this line stops compiling instead of quietly sending the
     // wizard a document it will read as unreadable.
-    const suggestion: LookupSuggestion | null = await lookupMailboxSettings(email);
+    const suggestion: LookupSuggestion | null = await lookupMailboxSettings(email, {
+      onChoice: logReachChoice(log),
+    });
 
     // #180. This is what widens the route from "what does this domain publish"
     // to "what does this connector know about this address" — which is what the
@@ -1634,7 +1672,8 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       }
       throw err;
     }
-    await sendSavedPage(res, assertion.csrf, gate.report);
+    logSaved(log, "edit", existing.id, gate.report);
+    sendSavedPage(res, gate.report);
   });
 
   router.post("/settings/mailboxes/:id/test", guardAssertion, formBody, guardCsrf, async (req, res) => {

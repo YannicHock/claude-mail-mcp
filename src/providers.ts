@@ -586,6 +586,38 @@ export function credentialNoteFor(email: string): string | null {
   return adviceForAddress(email)?.credentialNote ?? null;
 }
 
+/** A preset's server with its placeholders filled in for one address. */
+export interface PresetServer {
+  host: string;
+  port: number;
+  tls: boolean;
+  user: string;
+}
+
+/**
+ * The verified preset for an address whose domain the advice table knows, or
+ * null (#194).
+ *
+ * What makes the address lookup's answer never worse than this table's: the
+ * ISPDB gives `gmail.com` exactly one SMTP server, on 465, while Google's own
+ * setup table — and so this one — says 587. The lookup offers both and keeps
+ * the one that answers from this host. Matched by domain through
+ * {@link PROVIDER_ADVICE} and by id into {@link MAIL_PROVIDERS}, so a provider
+ * needs an entry in both, and a host still holding a placeholder is no preset.
+ */
+export function presetServersFor(email: string): { imap: PresetServer; smtp: PresetServer } | null {
+  const advice = adviceForAddress(email);
+  const provider = advice === null ? null : findProvider(advice.id);
+  if (provider === null) return null;
+  const server = (s: ProviderServer): PresetServer | null => {
+    const host = fillTemplate(s.host, email);
+    return host === "" ? null : { host, port: s.port, tls: s.tls, user: loginFor(s.user, email) };
+  };
+  const imap = server(provider.imap);
+  const smtp = server(provider.smtp);
+  return imap === null || smtp === null ? null : { imap, smtp };
+}
+
 /** #151: what to say at address lookup, or null when there is nothing to say. */
 export function unsupportedNoticeFor(email: string): string | null {
   return adviceForAddress(email)?.unsupported ?? null;

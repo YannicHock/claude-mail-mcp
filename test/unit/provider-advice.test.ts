@@ -25,7 +25,7 @@ import {
   unsupportedNoticeFor,
 } from "../../src/providers.js";
 import {
-  saveRefusedNotice,
+  saveRefusal,
   type MailboxProbeOutcome,
   type MailboxProbeReport,
 } from "../../shared/settings-api.js";
@@ -219,7 +219,7 @@ describe("Gmail as a preset (#150)", () => {
   });
 });
 
-describe("saveRefusedNotice takes the note in place of its generic sentence", () => {
+describe("saveRefusal takes the note in place of its generic sentence", () => {
   const REJECTED = { ok: false as const, message: "no", credentialRejection: true };
   const UNREACHABLE = { ok: false as const, message: "connect ECONNREFUSED" };
   const GENERIC = /some providers want an app password rather than the account one/;
@@ -232,13 +232,13 @@ describe("saveRefusedNotice takes the note in place of its generic sentence", ()
   });
 
   it("says the generic sentence when no note was passed", () => {
-    assert.match(saveRefusedNotice(report(REJECTED)) ?? "", GENERIC);
+    assert.match(saveRefusal(report(REJECTED)) ?? "", GENERIC);
   });
 
   it("says the note instead of it, never as well as it", () => {
     // Both on one screen would say the same thing twice, the second time
     // specifically, and the argument for the note is that it is targeted.
-    const notice = saveRefusedNotice(report(REJECTED), NOTE) ?? "";
+    const notice = saveRefusal(report(REJECTED), NOTE) ?? "";
     assert.ok(notice.includes(NOTE), notice);
     assert.equal(GENERIC.test(notice), false, notice);
     assert.match(notice, /IMAP rejected these credentials, so nothing was saved\./);
@@ -253,18 +253,18 @@ describe("saveRefusedNotice takes the note in place of its generic sentence", ()
     // connectivity, and gating here swallowed the one entry that explains it.
     // Whether a note applies is now the caller's question; this function only
     // puts the one it is given in place of its own generic sentence.
-    const notice = saveRefusedNotice(report(UNREACHABLE), NOTE) ?? "";
+    const notice = saveRefusal(report(UNREACHABLE), NOTE) ?? "";
     assert.ok(notice.includes(NOTE), notice);
     assert.match(notice, /did not answer/, "it still names what failed");
     assert.doesNotMatch(notice, /Check what failed above/, "never the note and the generic one");
   });
 
   it("reads an empty note as no note, the way ProviderPreset.note already does", () => {
-    assert.match(saveRefusedNotice(report(REJECTED), "") ?? "", GENERIC);
+    assert.match(saveRefusal(report(REJECTED), "") ?? "", GENERIC);
   });
 
   it("is still null when the report is not a refusal at all", () => {
-    assert.equal(saveRefusedNotice(report({ ok: true }), NOTE), null);
+    assert.equal(saveRefusal(report({ ok: true }), NOTE), null);
   });
 
   it("stands aside for a warning the screen is already showing", () => {
@@ -273,7 +273,7 @@ describe("saveRefusedNotice takes the note in place of its generic sentence", ()
     // form has a warning box of its own, that is the same paragraph twice, one
     // above the other. So the caller says the screen is already showing it and
     // this sentence prints no remedy: what failed, and the way past the gate.
-    const notice = saveRefusedNotice(report(REJECTED), undefined, true) ?? "";
+    const notice = saveRefusal(report(REJECTED), undefined, true) ?? "";
     assert.match(notice, /IMAP rejected these credentials, so nothing was saved\./);
     assert.match(notice, /Save anyway/, "the way past the gate must survive it");
     // Not the generic clause either, and that is the whole point of the flag
@@ -285,11 +285,11 @@ describe("saveRefusedNotice takes the note in place of its generic sentence", ()
   });
 
   it("still prefers a note over standing aside, when the caller has both", () => {
-    const notice = saveRefusedNotice(report(REJECTED), NOTE, true) ?? "";
+    const notice = saveRefusal(report(REJECTED), NOTE, true) ?? "";
     assert.ok(notice.includes(NOTE), notice);
   });
 
   it("says the generic sentence when nothing is warned, flag or no flag", () => {
-    assert.match(saveRefusedNotice(report(REJECTED), undefined, false) ?? "", GENERIC);
+    assert.match(saveRefusal(report(REJECTED), undefined, false) ?? "", GENERIC);
   });
 });

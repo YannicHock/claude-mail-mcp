@@ -53,6 +53,7 @@ import test from "node:test";
 import { ASSERTION_HEADER } from "../../src/assertion.js";
 import { verifyPassword } from "../../src/passwords.js";
 import { SESSION_COOKIE } from "../../src/session.js";
+import { SAVE_ANYWAY_ACTION } from "../../src/setup-pages.js";
 import {
   ADDRESS_FIELD,
   flattenDraft,
@@ -61,7 +62,7 @@ import {
   PROVIDER_FIELD,
   PROVIDER_OTHER,
   SAVE_ANYWAY_FIELD,
-  saveRefusedNotice,
+  saveRefusal,
   SHARED_PASSWORD_FIELD,
   UNSUPPORTED_FIELD,
   UNSUPPORTED_FOR_FIELD,
@@ -633,7 +634,7 @@ function refusedByProbe(probe: MailboxProbeReport, message?: string): ConnectorB
     // the connector holds the provider table and can name what the operator's
     // own provider requires; `message` here defaults to exactly what the
     // connector would have said with no provider recognised.
-    createBody: { message: message ?? saveRefusedNotice(probe) ?? "", errors: {}, probe },
+    createBody: { message: message ?? saveRefusal(probe) ?? "", errors: {}, probe },
   };
 }
 
@@ -877,9 +878,40 @@ test("CalDAV alone failing does not stop a working mailbox being saved", async (
     assert.equal(res.status, 303);
     assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
     assert.equal(upstreamPosts(harness, "/settings/mailboxes"), 1);
+
+    // ...and step 3 says so, once (#172). The settings form has always shown
+    // this sentence for the same outcome; the wizard received it on the 201
+    // and dropped it, so the same save told two UIs two different amounts.
+    const first = await (await getSetup(harness, "/connect")).text();
+    assert.ok(first.includes("The mailbox was saved. Its CalDAV server did not work: 404 Not Found."), first);
+    const again = await (await getSetup(harness, "/connect")).text();
+    assert.equal(again.includes("CalDAV server did not work"), false, "shown once, not on every visit");
   } finally {
     await harness.close();
   }
+});
+
+test("a 201 with no report, or one this build cannot read, still advances and says nothing", async () => {
+  // The status is the fact (#82): an unreadable body is still a stored account.
+  for (const createBody of [{ id: "main", stamp: STAMP_AFTER }, "not json at all"]) {
+    const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+    try {
+      await reachStep2(harness);
+      stubConnector(harness, { createBody });
+      const res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
+      assert.equal(res.status, 303);
+      const page = await (await getSetup(harness, "/connect")).text();
+      assert.equal(page.includes("CalDAV server did not work"), false);
+    } finally {
+      await harness.close();
+    }
+  }
+});
+
+test("the wizard's Save anyway button posts the wire contract's own field name", () => {
+  // Equal by derivation, not by coincidence: rename the wire field and the
+  // button must follow, or the wizard's escape hatch silently stops working.
+  assert.equal(SAVE_ANYWAY_ACTION, SAVE_ANYWAY_FIELD);
 });
 
 test("a saved mailbox reaches the connector with the credentials it expects", async () => {
@@ -2664,7 +2696,7 @@ test("a refused save says the warning once, not once in each box", async () => {
   // #191's first finding, on the screen the operator lands on. The full form
   // gained a warning box in #186 and the connector's refusal sentence had the
   // same paragraph inside it — `rejectionNoteFor` returned the `unsupported`
-  // entry as if it were a credential note, and `saveRefusedNotice` substituted
+  // entry as if it were a credential note, and `saveRefusal` substituted
   // it for the generic remedy — so a refused save painted the paragraph in a
   // grey box and then again in the red one directly beneath.
   //
@@ -2688,7 +2720,7 @@ test("a refused save says the warning once, not once in each box", async () => {
     // the sentence fails here as well as on the connector's own suite — that is
     // the change that reintroduces the duplication, and it is made two packages
     // away from this screen.
-    const sentence = saveRefusedNotice(probe, undefined, true) ?? "";
+    const sentence = saveRefusal(probe, undefined, true) ?? "";
     assert.equal(/Bridge/.test(sentence), false, "the refusal sentence swallowed the warning");
     stubConnector(harness, {
       unsupported: PROTON_WARNING,
@@ -2814,7 +2846,7 @@ test("an address corrected the other way is not warned until the next lookup", a
 
 test("a refusal at an address the wizard was never warned about still explains itself", async () => {
   // The hole the open direction above used to leave on the one screen where it
-  // costs something. `saveRefusedNotice`'s third argument suppresses its own
+  // costs something. `saveRefusal`'s third argument suppresses its own
   // remedy on the assumption that the screen already carries the standing
   // warning — true of the connector's HTML, and asserted to JSON callers too
   // while shipping nothing they could show. So a save from this exact state
@@ -2840,7 +2872,7 @@ test("a refusal at an address the wizard was never warned about still explains i
     stubConnector(harness, {
       createStatus: 400,
       createBody: {
-        message: saveRefusedNotice(probe, undefined, true) ?? "",
+        message: saveRefusal(probe, undefined, true) ?? "",
         errors: {},
         probe,
         unsupported: PROTON_WARNING,

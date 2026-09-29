@@ -116,6 +116,7 @@ import { isSameOrigin, renderErrorPage } from "./login.js";
 import { OperatorRecord, validateNewCredentials } from "./operator.js";
 import {
   ADDRESS_FIELD,
+  caldavFailureNotice,
   carrying,
   CHECKBOX_ON,
   CONNECTOR_AUTOCONFIG_BUDGET_MS,
@@ -128,13 +129,14 @@ import {
   MAILBOX_FIELDS,
   MAILBOX_SECRET_FIELDS,
   parseAutoconfigAnswer,
+  parseCreatedAnswer,
   parseErrorAnswer,
   parseProbeAnswer,
   parseProvidersAnswer,
   parseStampAnswer,
   PROVIDER_FIELD,
   SAVE_ANYWAY_FIELD,
-  saveRefusedNotice,
+  saveRefusal,
   SHARED_PASSWORD_FIELD,
   stepFromEdit,
   stepFromLookup,
@@ -210,6 +212,18 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
   const operatorFile = requireOperatorFile(config);
   const state = SetupState.open(config.wizardStateFile, log);
   const mailboxes = createMailboxClient(config, log);
+  /**
+   * What step 3 has to say about the save that led to it, said once (#172).
+   *
+   * A save whose CalDAV block did not work still stores the mailbox — CalDAV
+   * cannot refuse a save — and the connector says so on the 201. The redirect
+   * to step 3 carries nothing, so the sentence waits here for the next render
+   * of that screen and is cleared by it. A closure variable rather than
+   * anything keyed: one instance has one claim token and one operator, and the
+   * worst a lost value costs is a sentence the connector's settings page also
+   * shows on the next edit.
+   */
+  let pendingConnectNotice: string | null = null;
 
   return {
     async handle(req, res, setup) {
@@ -366,6 +380,8 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     }
 
     const links = stepTwoLinks(base);
+    // Whatever this submission does, a notice from an earlier save is stale.
+    pendingConnectNotice = null;
 
     /**
      * The connector's warning about this address, as this submission carried it.
@@ -755,7 +771,6 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       const probe = probeView(tested.value);
       // Booleans only. Nothing the operator typed is logged here, on any path.
       log("info", "setup step 2 tested a mailbox", {
-        action,
         imap: probe.imap.ok,
         smtp: probe.smtp.ok,
         caldav: probe.caldav.tested ? probe.caldav.ok : null,
@@ -883,21 +898,24 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         probe: refusedByProbe === undefined ? undefined : probeView(refusedByProbe),
         notice: {
           kind: "error",
+          // The connector's own sentence, so this screen and the connector's
+          // settings form say the same thing about the same refusal. Taken from
+          // the answer when it carried one — that is the sentence the connector
+          // actually wrote, and on a credential rejection it names what the
+          // operator's own provider requires (#148), which this package has no
+          // table to work out. Falling back to computing it from the report
+          // keeps a connector that sent no message saying what it said before.
+          //
+          // A report that `saveRefusal` does not read as a refusal cannot come
+          // from a connector on this release, which attaches one only to the
+          // refusal its own gate made. It gets the field-refusal sentence rather
+          // than a third wording of its own (#172): nothing was stored either way.
           message:
-            refusedByProbe === undefined
-              ? "The connector refused to store these details, so this attempt added " +
-                "nothing. What it objected to is marked below; fix that and try again."
-              : // The connector's own sentence, so this screen and the
-                // connector's settings form say the same thing about the same
-                // refusal. Taken from the answer when it carried one — that is
-                // the sentence the connector actually wrote, and on a credential
-                // rejection it names what the operator's own provider requires
-                // (#148), which this package has no table to work out. Falling
-                // back to computing it from the report keeps a connector that
-                // sent no message saying what it said before.
-                (created.message ??
-                saveRefusedNotice(refusedByProbe, undefined, warned !== null) ??
-                "Nothing was saved. Fix what failed above and try again."),
+            (refusedByProbe === undefined
+              ? null
+              : (created.message ?? saveRefusal(refusedByProbe, undefined, warned !== null))) ??
+            "The connector refused to store these details, so this attempt added " +
+              "nothing. What it objected to is marked below; fix that and try again.",
         },
       });
       return;
@@ -917,6 +935,8 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     // the other half of #82: it would send the operator into a retry the
     // connector answers with "an account with id … already exists".
     log("info", "setup step 2 completed: a mailbox was saved", { probed: !saveAnyway });
+    const probe = created.kind === "ok" ? created.value.probe : undefined;
+    pendingConnectNotice = probe === undefined ? null : caldavFailureNotice(probe);
     await state.advanceTo("connect");
     redirect(res, `${base}/connect`, 303);
   }
@@ -1059,7 +1079,12 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       }
       return renderMailboxAddressStep({ ...links, email: "", errors: {} });
     }
-    return renderConnectStep(await connectPageData(base));
+    const notice = pendingConnectNotice;
+    pendingConnectNotice = null;
+    return renderConnectStep({
+      ...(await connectPageData(base)),
+      ...(notice === null ? {} : { notice: { kind: "info" as const, message: notice } }),
+    });
   }
 
   /** Everything step 3 shows before a submission adds anything to it. */
@@ -1327,8 +1352,9 @@ const SETUP_SUBJECT = "setup-wizard";
  * itself, and `oauth/test/unit/setup-wizard.test.ts` pins that it is positive.
  *
  * The derivation holds for the connector's *default* budget, which is what the
- * routes this wizard calls actually run under. `probeAccount` and
- * `lookupMailboxSettings` both accept a `totalMs` override, and nothing but a
+ * routes this wizard calls actually run under. `probeAccount` accepts a
+ * `totalMs` override and `lookupMailboxSettings` a `discoveryMs` and a
+ * `reachMs` one, and nothing but a
  * test passes one today; a future caller that does owns this invariant itself,
  * because no arithmetic here can see its argument.
  *
@@ -1440,8 +1466,16 @@ type ConnectorAnswer<T> =
   | { kind: "unreadable" }
   | { kind: "unreachable"; error: string };
 
-/** The 201 body is a courtesy; the status is the fact. See {@link handleMailbox}. */
-const STORED = "stored";
+/**
+ * What a 201 told the wizard beyond the fact of the write.
+ *
+ * The body is a courtesy; the status is the fact. See {@link handleMailbox}.
+ * `probe` is the one part of it this screen uses: the report, when CalDAV has
+ * something to say about itself on a save it could not refuse (#172).
+ */
+interface Stored {
+  probe?: MailboxProbeReport;
+}
 
 interface MailboxClient {
   /** Probe without saving: the connector's own "Test connection" action. */
@@ -1482,7 +1516,7 @@ interface MailboxClient {
     draft: MailboxDraft,
     stamp: string,
     saveAnyway: boolean
-  ): Promise<ConnectorAnswer<typeof STORED>>;
+  ): Promise<ConnectorAnswer<Stored>>;
 }
 
 /**
@@ -1596,9 +1630,13 @@ function createMailboxClient(config: OAuthConfig, log: Logger): MailboxClient | 
         // be, which is the one case that really is just a file write.
         timeoutMs: saveTimeoutMs(saveAnyway),
         okStatus: 201,
-        // Not `parseCreatedAnswer`. The 201 is what says the account is there,
-        // and nothing on this screen depends on the id or the stamp it echoes.
-        read: () => STORED,
+        // The 201 is what says the account is there, so a body this build
+        // cannot read still reads as stored, with nothing more to say about it.
+        // The report is carried only for the notice step 3 shows (#172).
+        read: (payload): Stored => {
+          const probe = parseCreatedAnswer(payload)?.probe;
+          return probe === undefined ? {} : { probe };
+        },
       }),
 
     /**

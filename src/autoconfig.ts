@@ -19,6 +19,20 @@
  * `_caldavs._tcp`. Not finding it is normal, not a failure — CalDAV is
  * optional for this connector.
  *
+ * ## Which of several servers answers from here (#194)
+ *
+ * The tier that answers can name more than one server per service, and the
+ * provider table (`src/providers.ts`) may know a verified one besides. When a
+ * service has rivals, each is connected to — a connect and a TLS handshake or
+ * a greeting, never a login — and the best-ranked one that is not known to be
+ * unreachable is suggested. The ranking is still {@link ranked}'s; reachability
+ * only breaks ties, so a host where 465 and 587 both answer still gets 465.
+ * When none answers, the top-ranked one is suggested exactly as before, and the
+ * probe at save time says which service failed. A candidate whose host
+ * resolves to a non-public address is never connected to: it keeps its place
+ * as "not known to be unreachable", and the lookup does not become a port
+ * scanner of the connector's own network.
+ *
  * ## The result is a suggestion, not a configuration
  *
  * {@link MailboxSuggestion} deliberately has no password field anywhere in it,
@@ -45,7 +59,9 @@
  *     rebinding) — the check and the socket see the same answer.
  *   - At most one redirect, re-checked against exactly the same rules.
  *   - {@link AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS} per attempt (a redirect is another
- *     attempt), {@link AUTOCONFIG_TOTAL_TIMEOUT_MS} for the whole cascade.
+ *     attempt), {@link AUTOCONFIG_DISCOVERY_TIMEOUT_MS} for the whole cascade,
+ *     then {@link AUTOCONFIG_REACH_TIMEOUT_MS} to check the servers it found —
+ *     {@link AUTOCONFIG_TOTAL_TIMEOUT_MS} in all.
  *   - {@link MAX_RESPONSE_BYTES} of body, after which the socket is destroyed
  *     rather than the buffer grown.
  *
@@ -68,8 +84,14 @@ import net from "node:net";
 import type { LookupFunction } from "node:net";
 import type { Readable } from "node:stream";
 
+import { reachable as reachableDefault, type ReachTarget } from "./lookup-reachability.js";
+import { presetServersFor } from "./providers.js";
 import { withTimeout } from "./timeout.js";
-import { CONNECTOR_AUTOCONFIG_BUDGET_MS } from "../shared/settings-api.js";
+import {
+  CONNECTOR_AUTOCONFIG_BUDGET_MS,
+  CONNECTOR_AUTOCONFIG_DISCOVERY_MS,
+  CONNECTOR_AUTOCONFIG_REACH_MS,
+} from "../shared/settings-api.js";
 
 export const AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS = 3_000;
 
@@ -79,6 +101,12 @@ export const AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS = 3_000;
  * wizard, which waits on this lookup and has to wait longer than it (#134).
  */
 export const AUTOCONFIG_TOTAL_TIMEOUT_MS = CONNECTOR_AUTOCONFIG_BUDGET_MS;
+/** The document fetches and DNS queries, one after another. */
+export const AUTOCONFIG_DISCOVERY_TIMEOUT_MS = CONNECTOR_AUTOCONFIG_DISCOVERY_MS;
+/** Every rival server connected to at once, each within this (#194). */
+export const AUTOCONFIG_REACH_TIMEOUT_MS = CONNECTOR_AUTOCONFIG_REACH_MS;
+/** How many servers per service are connected to at most; the rest keep their rank. */
+export const MAX_REACH_CANDIDATES = 4;
 export const MAX_RESPONSE_BYTES = 128 * 1024;
 export const MAX_REDIRECTS = 1;
 
@@ -152,12 +180,36 @@ export interface AutoconfigDeps {
    */
   httpsGet(url: URL, addresses: readonly string[], timeoutMs: number): Promise<HttpResponse>;
   resolveSrv(name: string): Promise<SrvRecord[]>;
+  /**
+   * Whether `target` answers at one of `addresses` within `timeoutMs` — see
+   * `src/lookup-reachability.ts`. Optional: without it, no server is connected
+   * to and the top-ranked one is suggested, which is the lookup as it was
+   * before #194.
+   */
+  reachable?(target: ReachTarget, addresses: readonly string[], timeoutMs: number): Promise<boolean>;
 }
 
+/** What the reachability phase decided for one service, for the caller's log. */
+export interface ReachChoice {
+  service: "imap" | "smtp";
+  /** `host:port`, in rank order. */
+  candidates: string[];
+  /** Per candidate: answered, did not, or was not connected to. */
+  verdicts: Verdict[];
+  chosen: string;
+}
+
+export type Verdict = "open" | "closed" | "unknown";
+
 export interface LookupOptions {
-  totalMs?: number;
+  /** The discovery phase's budget. Default {@link AUTOCONFIG_DISCOVERY_TIMEOUT_MS}. */
+  discoveryMs?: number;
   perAttemptMs?: number;
+  /** The reachability phase's budget. Default {@link AUTOCONFIG_REACH_TIMEOUT_MS}. */
+  reachMs?: number;
   deps?: AutoconfigDeps;
+  /** Told about every service that had rivals to choose between. */
+  onChoice?: (choice: ReachChoice) => void;
 }
 
 // ---------------------------------------------------------------- addresses
@@ -386,6 +438,8 @@ export const defaultDeps: AutoconfigDeps = {
       req.end();
     });
   },
+
+  reachable: (target, addresses, timeoutMs) => reachableDefault(target, addresses, timeoutMs),
 
   async resolveSrv(name) {
     const records = await dns.resolveSrv(name);
@@ -621,11 +675,15 @@ function toCandidate(inner: string): ServerCandidate | null {
   };
 }
 
-/** Implicit TLS beats STARTTLS; a server we can log into beats one we cannot. */
-function best(candidates: ServerCandidate[]): ServerCandidate | null {
+/**
+ * Implicit TLS beats STARTTLS; a server we can log into beats one we cannot.
+ * Stable, so equals keep the document's order. The top of this list is what
+ * a service gets when nothing is connected to (the old `best()`).
+ */
+function ranked(candidates: ServerCandidate[]): ServerCandidate[] {
   const score = (c: ServerCandidate): number =>
     (c.passwordAuth ? 4 : 0) + (c.socketType === "SSL" ? 2 : 1);
-  return [...candidates].sort((a, b) => score(b) - score(a))[0] ?? null;
+  return [...candidates].sort((a, b) => score(b) - score(a));
 }
 
 function resolveUsername(template: string | null, address: Address): string {
@@ -647,6 +705,12 @@ function toServer(candidate: ServerCandidate, address: Address): SuggestedServer
   };
 }
 
+/** Every usable server for each service, best first. Neither list is empty. */
+interface Ranked {
+  imap: SuggestedServer[];
+  smtp: SuggestedServer[];
+}
+
 /**
  * Read a Mozilla clientConfig document. Returns null unless it yields *both*
  * an IMAP and an SMTP server: half a suggestion would send the operator to the
@@ -656,6 +720,12 @@ export function parseClientConfig(
   xml: string,
   email: string
 ): { imap: SuggestedServer; smtp: SuggestedServer } | null {
+  const ranked = rankClientConfig(xml, email);
+  return ranked === null ? null : { imap: ranked.imap[0]!, smtp: ranked.smtp[0]! };
+}
+
+/** {@link parseClientConfig}, keeping every usable server in {@link ranked}'s order. */
+function rankClientConfig(xml: string, email: string): Ranked | null {
   const address = parseAddress(email);
   if (!address) return null;
   if (!/<clientConfig\b/i.test(xml)) return null;
@@ -673,10 +743,13 @@ export function parseClientConfig(
     .map((b) => toCandidate(b.inner))
     .filter((c): c is ServerCandidate => c !== null);
 
-  const imap = best(incoming);
-  const smtp = best(outgoing);
-  if (!imap || !smtp) return null;
-  return { imap: toServer(imap, address), smtp: toServer(smtp, address) };
+  const imap = ranked(incoming);
+  const smtp = ranked(outgoing);
+  if (imap.length === 0 || smtp.length === 0) return null;
+  return {
+    imap: imap.map((c) => toServer(c, address)),
+    smtp: smtp.map((c) => toServer(c, address)),
+  };
 }
 
 // ------------------------------------------------------------------ DNS SRV
@@ -708,35 +781,41 @@ async function lookupSrv(
  * are never fetched by this module, so they are checked for shape rather than
  * for where they resolve.
  */
-async function fromSrv(
-  address: Address,
-  deps: AutoconfigDeps,
-  budget: Budget
-): Promise<{ imap: SuggestedServer; smtp: SuggestedServer } | null> {
+async function fromSrv(address: Address, deps: AutoconfigDeps, budget: Budget): Promise<Ranked | null> {
   const imapRecord = await lookupSrv(`_imaps._tcp.${address.domain}`, deps, budget);
   if (!imapRecord) return null;
 
-  // `_submissions` is implicit TLS (RFC 8314), `_submission` is STARTTLS.
+  // `_submissions` is implicit TLS (RFC 8314), `_submission` is STARTTLS. Both
+  // are asked for since #194: a domain can publish both, and the one this
+  // connector's host can reach is not always the one that ranks first.
   const implicit = await lookupSrv(`_submissions._tcp.${address.domain}`, deps, budget);
-  const starttls = implicit ? null : await lookupSrv(`_submission._tcp.${address.domain}`, deps, budget);
-  const smtpRecord = implicit ?? starttls;
-  if (!smtpRecord) return null;
+  const starttls = await lookupSrv(`_submission._tcp.${address.domain}`, deps, budget);
+  const smtp: SuggestedServer[] = [];
+  if (implicit) {
+    smtp.push({ host: implicit.name, port: implicit.port, tls: true, socketType: "SSL", user: address.full });
+  }
+  if (starttls) {
+    smtp.push({
+      host: starttls.name,
+      port: starttls.port,
+      tls: false,
+      socketType: "STARTTLS",
+      user: address.full,
+    });
+  }
+  if (smtp.length === 0) return null;
 
   return {
-    imap: {
-      host: imapRecord.name,
-      port: imapRecord.port,
-      tls: true,
-      socketType: "SSL",
-      user: address.full,
-    },
-    smtp: {
-      host: smtpRecord.name,
-      port: smtpRecord.port,
-      tls: implicit !== null,
-      socketType: implicit !== null ? "SSL" : "STARTTLS",
-      user: address.full,
-    },
+    imap: [
+      {
+        host: imapRecord.name,
+        port: imapRecord.port,
+        tls: true,
+        socketType: "SSL",
+        user: address.full,
+      },
+    ],
+    smtp,
   };
 }
 
@@ -803,22 +882,98 @@ async function fetchClientConfig(
   address: Address,
   deps: AutoconfigDeps,
   budget: Budget
-): Promise<{ imap: SuggestedServer; smtp: SuggestedServer } | null> {
+): Promise<Ranked | null> {
   const hop = await getGuarded(url, deps, budget, MAX_REDIRECTS);
   if (!hop || hop.status < 200 || hop.status >= 300) return null;
   try {
-    return parseClientConfig(hop.body, address.full);
+    return rankClientConfig(hop.body, address.full);
   } catch {
     return null;
   }
+}
+
+// ------------------------------------------------------ reachability (#194)
+
+const keyOf = (s: SuggestedServer): string => `${s.host.toLowerCase()}:${s.port}`;
+
+/**
+ * The provider table's servers for this address, after whatever the tier
+ * found, unless the tier already named them. A verified answer is then never
+ * worse than an ISPDB one: it is at least a candidate.
+ */
+function withPreset(found: Ranked, address: Address): Ranked {
+  const preset = presetServersFor(address.full);
+  if (preset === null) return found;
+  const append = (list: SuggestedServer[], s: SuggestedServer): SuggestedServer[] =>
+    list.some((c) => keyOf(c) === keyOf(s)) ? list : [...list, s];
+  const toSuggested = (p: { host: string; port: number; tls: boolean; user: string }): SuggestedServer => ({
+    host: p.host,
+    port: p.port,
+    tls: p.tls,
+    socketType: p.tls ? "SSL" : "STARTTLS",
+    user: p.user,
+  });
+  return {
+    imap: append(found.imap, toSuggested(preset.imap)),
+    smtp: append(found.smtp, toSuggested(preset.smtp)),
+  };
+}
+
+/**
+ * One candidate's verdict, never slower than `ms`. A host that does not
+ * resolve cannot be reached; one that resolves anywhere non-public is not
+ * connected to at all and stays "unknown".
+ */
+async function verdictFor(
+  server: SuggestedServer,
+  deps: AutoconfigDeps,
+  reach: NonNullable<AutoconfigDeps["reachable"]>,
+  ms: number
+): Promise<Verdict> {
+  const deadline = Date.now() + ms;
+  try {
+    const addresses = await withTimeout(deps.resolveAddresses(server.host), ms);
+    if (addresses.length === 0) return "closed";
+    if (!addresses.every(isPublicIp)) return "unknown";
+    const left = deadline - Date.now();
+    if (left <= 0) return "closed";
+    return (await withTimeout(reach(server, addresses, left), left)) ? "open" : "closed";
+  } catch {
+    // Unresolvable, refused, or not answered in time: none of them reachable.
+    return "closed";
+  }
+}
+
+/**
+ * The server a service is suggested: the best-ranked one not known to be
+ * unreachable, or the best-ranked one outright when every rival failed. A
+ * service with no rival is not connected to at all.
+ */
+async function choose(
+  service: "imap" | "smtp",
+  candidates: SuggestedServer[],
+  deps: AutoconfigDeps,
+  ms: number,
+  onChoice: LookupOptions["onChoice"]
+): Promise<SuggestedServer> {
+  const top = candidates[0]!;
+  const reach = deps.reachable;
+  if (reach === undefined || candidates.length < 2) return top;
+  const tried = candidates.slice(0, MAX_REACH_CANDIDATES);
+  const verdicts = await Promise.all(tried.map((c) => verdictFor(c, deps, reach, ms)));
+  const index = verdicts.findIndex((v) => v !== "closed");
+  const chosen = index === -1 ? top : tried[index]!;
+  onChoice?.({ service, candidates: tried.map(keyOf), verdicts, chosen: keyOf(chosen) });
+  return chosen;
 }
 
 /**
  * Look up `email`'s mailbox settings. Resolves with a {@link MailboxSuggestion}
  * to show the operator for confirmation, or with `null` — which is not an
  * error and carries no reason, because the wizard's response to it is simply
- * the provider list. Never rejects, and never takes longer than `totalMs`
- * (default {@link AUTOCONFIG_TOTAL_TIMEOUT_MS}) plus the time to unwind.
+ * the provider list. Never rejects, and never takes longer than `discoveryMs`
+ * plus `reachMs` (by default {@link AUTOCONFIG_TOTAL_TIMEOUT_MS}) plus the time
+ * to unwind.
  */
 export async function lookupMailboxSettings(
   email: string,
@@ -826,9 +981,10 @@ export async function lookupMailboxSettings(
 ): Promise<MailboxSuggestion | null> {
   const deps = opts.deps ?? defaultDeps;
   const budget = new Budget(
-    opts.totalMs ?? AUTOCONFIG_TOTAL_TIMEOUT_MS,
+    opts.discoveryMs ?? AUTOCONFIG_DISCOVERY_TIMEOUT_MS,
     opts.perAttemptMs ?? AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS
   );
+  const reachMs = opts.reachMs ?? AUTOCONFIG_REACH_TIMEOUT_MS;
 
   try {
     const address = parseAddress(email);
@@ -852,7 +1008,7 @@ export async function lookupMailboxSettings(
     ];
 
     let source: SuggestionSource = "dns-srv";
-    let servers: { imap: SuggestedServer; smtp: SuggestedServer } | null = null;
+    let servers: Ranked | null = null;
     for (const tier of tiers) {
       servers = await fetchClientConfig(tier.url, address, deps, budget);
       if (servers) {
@@ -862,14 +1018,23 @@ export async function lookupMailboxSettings(
     }
     if (!servers) servers = await fromSrv(address, deps, budget);
     if (!servers) return null;
+    const candidates = withPreset(servers, address);
+
+    // CalDAV discovery spends what is left of the discovery budget; the servers
+    // are checked in their own slice beside it rather than after it.
+    const [imap, smtp, caldav] = await Promise.all([
+      choose("imap", candidates.imap, deps, reachMs, opts.onChoice),
+      choose("smtp", candidates.smtp, deps, reachMs, opts.onChoice),
+      findCalDav(address, deps, budget),
+    ]);
 
     return {
       email: address.full,
       domain: address.domain,
       source,
-      imap: servers.imap,
-      smtp: servers.smtp,
-      caldav: await findCalDav(address, deps, budget),
+      imap,
+      smtp,
+      caldav,
     };
   } catch {
     // Best-effort by contract: no autoconfig failure is ever surfaced to the

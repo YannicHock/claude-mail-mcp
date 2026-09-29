@@ -48,13 +48,12 @@ import {
   anyCredentialRejection,
   credentialRejectionRefusesSave,
   probeFailed,
-  probeRefusesSave,
   PROVIDER_FIELD,
   PROVIDER_OTHER,
   PROVIDER_REQUIRED,
   readSaveAnyway,
   SAVE_ANYWAY_FIELD,
-  saveRefusedNotice,
+  saveRefusal,
   SHARED_PASSWORD_FIELD,
   stepFromEdit,
   stepFromLookup,
@@ -889,24 +888,23 @@ describe("the *Save anyway* override, as the wire carries it", () => {
 
 describe("what a probe report means for a save", () => {
   it("refuses the write when IMAP failed", () => {
-    assert.equal(probeRefusesSave(report({ imap: REJECTED })), true);
+    assert.notEqual(saveRefusal(report({ imap: REJECTED })), null);
   });
 
   it("refuses the write when SMTP failed", () => {
-    assert.equal(probeRefusesSave(report({ smtp: UNREACHABLE })), true);
+    assert.notEqual(saveRefusal(report({ smtp: UNREACHABLE })), null);
   });
 
   it("does not refuse the write when only CalDAV failed", () => {
     // The whole of the CalDAV rule, in one assertion. It is optional in the
     // account model and fails for benign reasons far too often to gate a
     // mailbox on: showing it is right, refusing on it is not.
-    assert.equal(probeRefusesSave(report({ caldav: REJECTED })), false);
-    assert.equal(probeRefusesSave(report({ caldav: UNREACHABLE })), false);
+    assert.equal(saveRefusal(report({ caldav: REJECTED })), null);
+    assert.equal(saveRefusal(report({ caldav: UNREACHABLE })), null);
   });
 
   it("does not refuse a write nothing objected to", () => {
-    assert.equal(probeRefusesSave(report()), false);
-    assert.equal(saveRefusedNotice(report()), null);
+    assert.equal(saveRefusal(report()), null);
   });
 
   it("says a refusal was about the credentials only when a blocking service said so", () => {
@@ -922,7 +920,7 @@ describe("what a probe report means for a save", () => {
   it("is false for a CalDAV rejection beside an unreachable IMAP, as the notice already was", () => {
     // The save-scoped question, and it stays false: a CalDAV rejection cannot
     // refuse a save, whatever else is wrong. What changed is the second half of
-    // this test, which used to assert that `saveRefusedNotice` discarded a note
+    // this test, which used to assert that `saveRefusal` discarded a note
     // handed to it here. It no longer does — the two scopes now live in the
     // caller, because the test-only routes need the wider one. See
     // `anyCredentialRejection`, which answers true for this same report.
@@ -935,7 +933,7 @@ describe("what a probe report means for a save", () => {
 
 describe("what the operator is told when a probe refused the save", () => {
   it("names the service that refused, not just that something did", () => {
-    const notice = saveRefusedNotice(report({ imap: REJECTED })) ?? "";
+    const notice = saveRefusal(report({ imap: REJECTED })) ?? "";
     assert.match(notice, /IMAP/);
     assert.equal(notice.includes("SMTP"), false, notice);
     assert.match(notice, /nothing was saved/i);
@@ -946,8 +944,8 @@ describe("what the operator is told when a probe refused the save", () => {
     // one of these is fixed by typing a different password and the other is
     // not, and telling an operator to check their password when the server is
     // down is the confusion #146 was filed about.
-    const rejected = saveRefusedNotice(report({ imap: REJECTED })) ?? "";
-    const unreachable = saveRefusedNotice(report({ imap: UNREACHABLE })) ?? "";
+    const rejected = saveRefusal(report({ imap: REJECTED })) ?? "";
+    const unreachable = saveRefusal(report({ imap: UNREACHABLE })) ?? "";
     assert.match(rejected, /rejected these credentials/);
     assert.match(rejected, /app password/);
     assert.match(unreachable, /did not answer/);
@@ -955,17 +953,17 @@ describe("what the operator is told when a probe refused the save", () => {
   });
 
   it("names both services when both failed, and says which did what", () => {
-    const notice = saveRefusedNotice(report({ imap: REJECTED, smtp: UNREACHABLE })) ?? "";
+    const notice = saveRefusal(report({ imap: REJECTED, smtp: UNREACHABLE })) ?? "";
     assert.match(notice, /IMAP rejected these credentials/);
     assert.match(notice, /SMTP did not answer/);
   });
 
   it("points at the way past it", () => {
-    assert.match(saveRefusedNotice(report({ smtp: UNREACHABLE })) ?? "", /Save anyway/);
+    assert.match(saveRefusal(report({ smtp: UNREACHABLE })) ?? "", /Save anyway/);
   });
 
   it("never names CalDAV, however badly CalDAV went", () => {
-    const notice = saveRefusedNotice(report({ imap: UNREACHABLE, caldav: REJECTED })) ?? "";
+    const notice = saveRefusal(report({ imap: UNREACHABLE, caldav: REJECTED })) ?? "";
     assert.equal(notice.includes("CalDAV"), false, notice);
   });
 });
@@ -998,8 +996,8 @@ describe("the classification, on the wire", () => {
       probe: { imap: { ok: false, message: "nope" }, smtp: { ok: true } },
     });
     assert.equal(parsed?.imap.ok === false && parsed.imap.credentialRejection, undefined);
-    assert.equal(probeRefusesSave(parsed!), true);
-    assert.match(saveRefusedNotice(parsed!) ?? "", /did not answer/);
+    assert.notEqual(saveRefusal(parsed!), null);
+    assert.match(saveRefusal(parsed!) ?? "", /did not answer/);
   });
 
   it("carries the report out of a refusal, so a caller need not probe twice", () => {
@@ -1049,7 +1047,7 @@ describe("the connector's timeout budgets", () => {
     // connector's own constants. Changing one of these is a decision about how
     // long an operator waits, and it should have to be made twice.
     assert.equal(CONNECTOR_PROBE_BUDGET_MS, 25_000);
-    assert.equal(CONNECTOR_AUTOCONFIG_BUDGET_MS, 10_000);
+    assert.equal(CONNECTOR_AUTOCONFIG_BUDGET_MS, 13_000);
   });
 
   it("are numbers, in a module whose every other map is strings", () => {

@@ -1354,10 +1354,13 @@ describe("the wizard waits longer than the connector it is waiting on", () => {
     );
   });
 
-  it("still waits the two lengths it has always waited", () => {
-    // The move changed how these are written, not how long an operator waits.
+  it("waits the two lengths an operator is promised", () => {
+    // Deliberate literals. The lookup grew by one reach slice in #194, when it
+    // started checking which suggested ports answer from this host; the
+    // derivation above carried that here without this file changing a line of
+    // its own logic, which is the point of #134.
     assert.equal(PROBE_TIMEOUT_MS, 30_000);
-    assert.equal(LOOKUP_TIMEOUT_MS, 13_000);
+    assert.equal(LOOKUP_TIMEOUT_MS, 16_000);
   });
 
   /**
