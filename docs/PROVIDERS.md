@@ -13,7 +13,9 @@ typed.
 
 Finding the right **hosts and ports** is a different problem, already solved by the
 address-first cascade — autoconfig first, then the table in
-[`src/providers.ts`](../src/providers.ts), then the full form. This page is about
+[`src/providers.ts`](../src/providers.ts), then the full form. Since v0.7.3 the table
+is also a candidate at the first step: where autoconfig and the table disagree about
+a port, the lookup offers the one that answers from this host. This page is about
 what happens *after* those are right and the server still says no.
 
 ## How to read this page

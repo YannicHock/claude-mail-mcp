@@ -770,8 +770,13 @@ hosts `accounts.json` names, plus whatever autoconfig discovery resolves to — 
 last one is deliberately constrained (HTTPS only including after a redirect,
 resolve-then-refuse for loopback, link-local and RFC 1918, at most one redirect
 under the same rules, per-attempt and total timeouts, a body cap) but it is still
-outbound traffic to a host derived from an address someone typed. If you want an
-allowlist, enforce it at the host firewall or with `IPAddressAllow=` under systemd.
+outbound traffic to a host derived from an address someone typed. Since v0.7.3 the
+lookup also opens a TCP connection to each suggested mail server that has a rival,
+to see which one answers from here (at most four per service, 3 seconds, in
+parallel). That is a connect and a TLS handshake or the server's greeting: no
+login, and nothing sent beyond a TLS ClientHello. A server that resolves to a
+non-public address is never connected to at lookup. If you want an allowlist,
+enforce it at the host firewall or with `IPAddressAllow=` under systemd.
 
 **A dedicated audit log.** Both services log structured JSON — authentication
 failures, tool invocations, rejected requests, and one `secret resolved` line per

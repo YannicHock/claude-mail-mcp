@@ -858,7 +858,12 @@ anywhere.
 2. **The first mailbox.** Type an address and the connector looks
    the domain's settings up — autoconfig, `.well-known`, the Mozilla ISPDB, SRV
    records — and shows what it found for confirmation, together with any warning
-   about the provider, before it asks for the password. A provider list and the full
+   about the provider, before it asks for the password. When a service has more
+   than one candidate server (Gmail's ISPDB entry says SMTP on 465, Google's own
+   table and this connector's say 587), each is connected to, without logging in,
+   and the best one that answers from this host is shown. A host that filters
+   outbound 465, as Hetzner does, is offered 587. The lookup takes up to 13
+   seconds: 10 to find the settings, 3 to check them. A provider list and the full
    form are behind it. *Save and continue* runs a real IMAP and SMTP connection
    test first and writes only if both answered; a CalDAV failure is a warning, not
    a refusal. *Skip for now* configures nothing and moves on.

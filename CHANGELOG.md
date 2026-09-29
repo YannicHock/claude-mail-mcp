@@ -2,6 +2,18 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **The address lookup suggests a mail port that answers from this host.** (#194) The Mozilla ISPDB names exactly one SMTP server for `gmail.com`, on port 465, and some hosts filter outbound 465: Hetzner's do. So a Gmail mailbox added by address connected over IMAP and failed over SMTP, while the connector's own provider table held Google's documented 587. The lookup now gathers every candidate the answering source names, both RFC 6186 submission records and the provider table's entry for the domain, and connects to each rival once, without logging in. It suggests the best-ranked one that answers. Where both answer, implicit TLS still wins, and where none does, the suggestion is the one it always was. Servers on non-public addresses are never connected to at lookup. The lookup's budget grows from 10 to 13 seconds (the setup wizard's wait follows it), and one `info` line per service records the ports tried and the one chosen.
+
+### Fixed
+
+- **A mailbox saved with a CalDAV block that does not work lands on the list by redirect, like every other save.** (#173) The page that said so was rendered straight out of the form submission, so reloading it re-submitted the form: another 25-second connection test and then a "changed since you loaded it" refusal, with the edit URL left in the address bar. The notice now survives the redirect as a short-lived token, and the sentence itself never goes into the URL.
+- **The setup wizard says when the first mailbox's calendar did not work.** (#172) The connector told it on the save, and the wizard discarded that and moved on in silence, while the settings page shows the same sentence for the same save. Step 3 now shows it once.
+- **A save that skipped the connection test says so in the connector's log.** (#173) A refused save left a `warn` line and a successful one left nothing, so a mailbox stored with *Save anyway* could not be told from one that had authenticated. Every successful create and edit now logs `settings: a mailbox was saved` with the account id and `probed: true|false`, and nothing the operator typed.
+
 ## [0.7.2] — 2026-09-29
 
 **The calendar can take back what it adds.** Until now Claude could put an appointment in a
