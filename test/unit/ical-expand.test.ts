@@ -540,7 +540,7 @@ describe("expandObject — RDATE;VALUE=PERIOD (review of #223)", () => {
           "UID:period-berlin@example.com",
           "DTSTART;TZID=Europe/Berlin:20261001T090000",
           "DTEND;TZID=Europe/Berlin:20261001T093000",
-          "RRULE:FREQ=WEEKLY;COUNT=1",
+          // No RRULE: the DTSTART instance is listed all the same (#226).
           "RDATE;VALUE=PERIOD;TZID=Europe/Berlin:20261005T090000/PT2H"
         )
       );
@@ -697,5 +697,103 @@ describe("expandObject — a long sparse series in an IANA zone stays well insid
     // that may never end. Half the deadline still fails that by more than
     // two times, and says how close to the deadline an honest series may come.
     assert.ok(elapsed < EXPANSION_DEADLINE_MS / 2, `took ${elapsed.toFixed(0)} ms, against a deadline of ${EXPANSION_DEADLINE_MS} ms`);
+  });
+});
+
+describe("expandObject — a series of DTSTART and RDATE with no RRULE keeps its first occurrence (#226)", () => {
+  // RFC 5545 §3.8.5.2: the recurrence set is the DTSTART instance, plus every
+  // RRULE and RDATE instance, minus EXDATE. ical.js's iterator, given RDATE
+  // and no RRULE, lists the RDATEs and leaves the DTSTART instance out.
+  const rdateOnly = (...extra: string[]): string =>
+    calendar(
+      vevent("UID:rdate@example.com", "DTSTART:20261001T090000Z", "DTEND:20261001T100000Z", ...extra, "SUMMARY:Talks")
+    );
+
+  it("lists the DTSTART occurrence before the RDATE ones", () => {
+    const { instances, skipped } = expandObject(rdateOnly("RDATE:20261005T090000Z,20261008T090000Z"), OCTOBER, OPTS);
+    assert.equal(skipped, undefined);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.start, e.end]),
+      [
+        ["2026-10-01T09:00:00.000Z", "2026-10-01T09:00:00.000Z", "2026-10-01T10:00:00.000Z"],
+        ["2026-10-05T09:00:00.000Z", "2026-10-05T09:00:00.000Z", "2026-10-05T10:00:00.000Z"],
+        ["2026-10-08T09:00:00.000Z", "2026-10-08T09:00:00.000Z", "2026-10-08T10:00:00.000Z"],
+      ]
+    );
+  });
+
+  it("lists an RDATE equal to DTSTART once, however it is written", () => {
+    for (const same of ["RDATE:20261001T090000Z", "RDATE;TZID=Europe/Berlin:20261001T110000"]) {
+      const { instances } = expandObject(rdateOnly(same, "RDATE:20261008T090000Z"), OCTOBER, OPTS);
+      assert.deepEqual(
+        instances.map((e) => e.start),
+        ["2026-10-01T09:00:00.000Z", "2026-10-08T09:00:00.000Z"],
+        same
+      );
+    }
+  });
+
+  it("puts an RDATE before DTSTART in its place, and leaves DTSTART out when an EXDATE names it", () => {
+    const early = expandObject(rdateOnly("RDATE:20260920T090000Z"), window("2026-09-01T00:00:00Z", "2026-11-01T00:00:00Z"), OPTS);
+    assert.deepEqual(
+      early.instances.map((e) => e.start),
+      ["2026-09-20T09:00:00.000Z", "2026-10-01T09:00:00.000Z"]
+    );
+    const excluded = expandObject(rdateOnly("RDATE:20261005T090000Z", "EXDATE:20261001T090000Z"), OCTOBER, OPTS);
+    assert.deepEqual(
+      excluded.instances.map((e) => e.start),
+      ["2026-10-05T09:00:00.000Z"]
+    );
+  });
+
+  it("does the same for an all-day series, a zoned one, and one whose impossible RRULE was dropped", () => {
+    const allDay = calendar(
+      vevent("UID:rdate-day@example.com", "DTSTART;VALUE=DATE:20261001", "DTEND;VALUE=DATE:20261002", "RDATE;VALUE=DATE:20261005")
+    );
+    assert.deepEqual(
+      expandObject(allDay, OCTOBER, OPTS).instances.map((e) => e.recurrenceId),
+      ["2026-10-01", "2026-10-05"]
+    );
+    const zoned = calendar(
+      vevent(
+        "UID:rdate-berlin@example.com",
+        "DTSTART;TZID=Europe/Berlin:20261001T090000",
+        "DTEND;TZID=Europe/Berlin:20261001T100000",
+        "RDATE;TZID=Europe/Berlin:20261029T090000"
+      )
+    );
+    assert.deepEqual(
+      expandObject(zoned, OCTOBER, OPTS).instances.map((e) => e.start),
+      ["2026-10-01T07:00:00.000Z", "2026-10-29T08:00:00.000Z"]
+    );
+    // The note says "only its start and any RDATE are listed": its start too.
+    const impossible = rdateOnly("RRULE:FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30", "RDATE:20261005T090000Z");
+    const { instances, skipped } = expandObject(impossible, OCTOBER, OPTS);
+    assert.match(skipped ?? "", /can never match/);
+    assert.deepEqual(
+      instances.map((e) => e.start),
+      ["2026-10-01T09:00:00.000Z", "2026-10-05T09:00:00.000Z"]
+    );
+  });
+
+  it("gives the DTSTART occurrence its override, like any other", () => {
+    const obj = calendar(
+      vevent("UID:rdate@example.com", "DTSTART:20261001T090000Z", "DTEND:20261001T100000Z", "RDATE:20261005T090000Z", "SUMMARY:Talks"),
+      vevent(
+        "UID:rdate@example.com",
+        "RECURRENCE-ID:20261001T090000Z",
+        "DTSTART:20261001T140000Z",
+        "DTEND:20261001T150000Z",
+        "SUMMARY:Talks (moved)"
+      )
+    );
+    const { instances } = expandObject(obj, OCTOBER, OPTS);
+    assert.deepEqual(
+      instances.map((e) => [e.recurrenceId, e.start, e.summary]),
+      [
+        ["2026-10-01T09:00:00.000Z", "2026-10-01T14:00:00.000Z", "Talks (moved)"],
+        ["2026-10-05T09:00:00.000Z", "2026-10-05T09:00:00.000Z", "Talks"],
+      ]
+    );
   });
 });

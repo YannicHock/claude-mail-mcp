@@ -126,6 +126,28 @@ describe("ExpansionPool", () => {
     const [good] = await p.expand([{ url: "good", etag: null, data: GOOD }], OCTOBER);
     assert.equal(good.instances.length, 1);
   });
+
+  it("lists a series of DTSTART and RDATE with no RRULE from its DTSTART, and finds that occurrence by its recurrence_id (#226)", { timeout: 20_000 }, async () => {
+    const data = event(
+      "rdate@example.com",
+      "DTSTART:20261001T090000Z",
+      "DTEND:20261001T100000Z",
+      "RDATE:20261008T090000Z",
+      "RDATE:20261015T090000Z",
+      "SUMMARY:Talks"
+    );
+    const object = { url: "https://dav.example/cal/rdate.ics", etag: null, data };
+    const p = pool({});
+    const [listed] = await p.expand([object], OCTOBER);
+    assert.equal(listed.skipped, undefined);
+    assert.deepEqual(
+      listed.instances.map((e) => e.recurrenceId),
+      ["2026-10-01T09:00:00.000Z", "2026-10-08T09:00:00.000Z", "2026-10-15T09:00:00.000Z"]
+    );
+    const found = await p.runOn(object, "findOccurrence", data, "rdate@example.com", "2026-10-01T09:00:00.000Z");
+    assert.equal(found.found, true);
+    assert.equal(found.found && found.recurrenceId, "2026-10-01T09:00:00.000Z");
+  });
 });
 
 describe("ExpansionPool — one slow calendar does not stall the others (review of #225)", () => {
