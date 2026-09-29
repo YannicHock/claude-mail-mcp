@@ -35,6 +35,13 @@
  * edits the stored object in place — see src/ical-edit.ts — so attendees,
  * alarms and anything else this connector does not model survive it.
  *
+ * `move_event` (v0.7.4, #212, spec 2026-09-29 §2.6) moves an event, whole,
+ * into another calendar of the same account, unchanged: a WebDAV MOVE, or a
+ * copy into the target and a delete from the source where the server
+ * refuses MOVE, and the answer's `via` says which. Its ETag is compared in
+ * the connector before anything is sent, since Radicale ignores `If-Match`
+ * on MOVE (R11).
+ *
  * Attendees (v0.7.4, #204, #205, spec 2026-09-29 §2.1). No tool sends mail
  * to attendees: there is no iMIP yet (#29). The calendar server may send its
  * own, though — Nextcloud mails attendees of an event you organize when it
@@ -155,6 +162,17 @@ const applyToSeriesSchema = z
  */
 const SERVER_MAY_MAIL =
   "This connector sends no mail itself. However, your calendar server may: Nextcloud, for example, may email the attendees of an event you organize when it is created, changed or deleted, and that mail cannot be recalled. Confirm with the user before creating, changing or deleting an event that has attendees.";
+
+/**
+ * {@link SERVER_MAY_MAIL} for `move_event` (#212, spec 2026-09-29 §2.1,
+ * §2.6). Whether a server mails anyone for a move is acceptance A5's to
+ * record on Nextcloud, so until then the sentence says how it might — a move
+ * seen as a deletion in one calendar and a creation in the other — and
+ * never that it will. Once A5 is in, "moved" either joins the list in
+ * {@link SERVER_MAY_MAIL} and this goes, or this says it does not.
+ */
+const SERVER_MAY_MAIL_ON_MOVE =
+  "This connector sends no mail itself. However, your calendar server may: it may treat a move as a deletion from one calendar and a creation in the other, and email the attendees of an event you organize (or the organizer of someone else's meeting) accordingly, and that mail cannot be recalled. Confirm with the user before moving an event that has attendees.";
 
 /** Why `notify_attendees` is refused missing: the refinement's message, which the model is shown. */
 const NOTIFY_REQUIRED =
@@ -409,6 +427,41 @@ export function registerCalendarTools(
         })
       );
       return asJson({ success: true, ...result });
+    }
+  );
+
+  server.registerTool(
+    "move_event",
+    {
+      description:
+        `Move an event to another calendar of the same account. WRITE OPERATION. The event is moved as it is stored: its UID, attendees, reminders and everything else stay unchanged. Pass the \`etag\` list_events returned: if the event was changed elsewhere since, nothing is moved. A recurring event moves whole and needs apply_to_series=true; one occurrence cannot be moved to another calendar, so recurrence_id is refused. Refused, with nothing moved, when the target calendar already has an event with this UID or an object of the same name. The answer gives the event's new \`url\` and \`etag\`, and \`via\`: "move" when the server moved it itself, "copy-then-delete" when it refused to and the event was copied into the target calendar and then deleted from the source (if that deletion is refused, the copy is removed again and nothing is moved). ${SERVER_MAY_MAIL_ON_MOVE} The answer's \`may_notify\` then lists whom the calendar server may email.`,
+      inputSchema: {
+        calendar_url: calendarUrlSchema.describe("The calendar the event is in now, as returned by list_calendars"),
+        uid: uidSchema,
+        etag: etagSchema,
+        target_calendar_url: calendarUrlSchema.describe(
+          "The calendar to move the event into, as returned by list_calendars: another calendar of the same account"
+        ),
+        apply_to_series: applyToSeriesSchema.describe("Required to move a recurring event, which moves with every occurrence"),
+        recurrence_id: recurrenceIdSchema.describe(
+          "Refused: one occurrence of a series cannot be moved to another calendar. Move the whole series with apply_to_series=true instead"
+        ),
+        account: accountSchema,
+      },
+    },
+    async (args) => {
+      const { caldav, id } = requireCaldav(pool, args.account);
+      const result = await reportingFailures(pool, "move_event", id, () =>
+        caldav.moveEvent({
+          calendarUrl: args.calendar_url,
+          uid: args.uid,
+          etag: args.etag,
+          targetCalendarUrl: args.target_calendar_url,
+          applyToSeries: args.apply_to_series,
+          recurrenceId: args.recurrence_id,
+        })
+      );
+      return asJson(withMayNotify(result));
     }
   );
 

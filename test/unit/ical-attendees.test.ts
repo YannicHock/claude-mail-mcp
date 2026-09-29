@@ -18,6 +18,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import type ICAL from "ical.js";
 
 import { buildIcs } from "../../src/ical-build.js";
 import {
@@ -25,7 +26,9 @@ import {
   applyAttendeePatch,
   calendarUserAddresses,
   mailtoOf,
+  mayNotifyOnMove,
   patchSeriesAttendees,
+  schedulingObject,
   touchesAttendees,
   type AttendeePatch,
 } from "../../src/ical-attendees.js";
@@ -619,5 +622,26 @@ describe("mayNotify: whom the calendar server may now email about the event (rev
 
   it("is absent for a change that leaves the guest list alone", () => {
     assert.equal(mayNotify(mine(), { summary: "Renamed" }), undefined);
+  });
+});
+
+describe("mayNotifyOnMove — whom the server may email when an event changes calendars (#212, spec 2026-09-29 §2.6)", () => {
+  const every = (text: string): ICAL.Component[] => parseCalendar(text).vcal.getAllSubcomponents("vevent");
+
+  it("the account's own meeting: every attendee the server is free to schedule, never one marked CLIENT", () => {
+    assert.equal(schedulingObject(every(mine())), true);
+    assert.deepEqual(mayNotifyOnMove(every(mine()), OWN), ["ben@example.com"]);
+  });
+
+  it("someone else's meeting: its organizer, who may be sent a reply as for a deletion", () => {
+    assert.equal(schedulingObject(every(THEIRS)), true);
+    assert.deepEqual(mayNotifyOnMove(every(THEIRS), OWN), ["anna@example.com"]);
+  });
+
+  it("nothing for attendees with no ORGANIZER, which no server schedules, and nothing for an event without attendees", () => {
+    for (const text of [NO_ORGANIZER, PLAIN]) {
+      assert.equal(schedulingObject(every(text)), false);
+      assert.equal(mayNotifyOnMove(every(text), OWN), undefined);
+    }
   });
 });

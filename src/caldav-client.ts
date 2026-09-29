@@ -29,7 +29,14 @@ import {
 } from "tsdav";
 import { randomUUID } from "node:crypto";
 import { buildIcs, builtZoneName, type NewEventFields } from "./ical-build.js";
-import { calendarUserAddresses, notifyChoice, schedulable, touchesAttendees } from "./ical-attendees.js";
+import {
+  calendarUserAddresses,
+  mayNotifyOnMove,
+  notifyChoice,
+  schedulable,
+  schedulingObject,
+  touchesAttendees,
+} from "./ical-attendees.js";
 import {
   applyEventPatch,
   changesSomething,
@@ -155,6 +162,48 @@ export interface DeletedEvent {
   /** Said when deleting one occurrence left the series with none. */
   note?: string;
 }
+
+/** Which event `move_event` moves, and where to (#212, spec 2026-09-29 §2.6). */
+export interface EventMove extends EventTarget {
+  /** The calendar to move it into: another calendar of the same account. */
+  targetCalendarUrl: string;
+}
+
+/**
+ * Which way a move went, for acceptance A5: `"move"` when the server moved
+ * the object itself (WebDAV MOVE, RFC 4918 §9.9), `"copy-then-delete"` when
+ * it refused that and the event was put into the target and then deleted
+ * from the source.
+ */
+export type MoveMethod = "move" | "copy-then-delete";
+
+/** What `move_event` answers: the event at its new place. */
+export interface MovedEvent {
+  uid: string;
+  /** The object's URL in the target calendar. It keeps its file name. */
+  url: string;
+  /**
+   * Its ETag there: a move changes no content, so on Radicale it is the one
+   * it had (R11). Null when the server gave none and it could not be read
+   * back.
+   */
+  etag: string | null;
+  via: MoveMethod;
+  /**
+   * For an event the server schedules: whom it may email about the move —
+   * `mayNotifyOnMove` in src/ical-attendees.ts. Absent otherwise.
+   */
+  mayNotify?: string[];
+}
+
+/**
+ * The statuses by which a server says it does not do MOVE between these two
+ * collections, rather than anything about the event (spec §2.6): forbidden,
+ * not allowed, not implemented, and 502 — Radicale's answer to a destination
+ * on another host, which is what a MOVE looks like to it when a reverse
+ * proxy in front rewrites the host.
+ */
+const MOVE_REFUSED = new Set([403, 405, 501, 502]);
 
 /**
  * Where a guarded write goes, and what its refusals end with: the one
@@ -580,6 +629,214 @@ export class CalDavClient {
   }
 
   /**
+   * Move an event, whole, into another calendar of the same account (#212,
+   * spec 2026-09-29 §2.6). Moving is not an edit: the object's text, its UID,
+   * SEQUENCE and file name stay what they were, and on Radicale its ETag too
+   * (R11).
+   *
+   * Refused before the server is contacted: any `recurrenceId` — one
+   * occurrence cannot live in another calendar — and a target that is the
+   * source. Refused after the lookup, before anything is written: a series
+   * without `applyToSeries`, and an `etag` that is not the stored one.
+   *
+   * That last comparison is made here, explicitly, because Radicale ignores
+   * `If-Match` on MOVE (R11: its `move.py` has no precondition code), so an
+   * event changed on a phone since `list_events` would otherwise be moved
+   * with the change unseen. `If-Match` is still sent, for servers that honour
+   * it.
+   *
+   * The MOVE goes with `Overwrite: F`, so an object of the same name in the
+   * target is never replaced (412). A target that already holds the UID
+   * answers 409 (`no-uid-conflict`, RFC 4791 §5.3.2.1). Both are refusals
+   * with nothing moved. A server that refuses MOVE itself
+   * ({@link MOVE_REFUSED}) gets {@link copyThenDelete} instead; the answer's
+   * `via` says which ran, which acceptance A5 records.
+   *
+   * For an event the server schedules, the answer's `mayNotify` names whom
+   * it may email ({@link mayNotifyOnMove}), which needs the account's
+   * addresses: a lookup of them that fails is a refusal ({@link ownFor}).
+   */
+  async moveEvent(move: EventMove): Promise<MovedEvent> {
+    const nothingDone = "Nothing was moved.";
+    if (move.recurrenceId !== undefined) {
+      throw new ToolRefusal(
+        `One occurrence of a series cannot be moved to another calendar: a series moves whole, with apply_to_series: true. Omit recurrence_id. ${nothingDone}`
+      );
+    }
+    if (sameCollection(move.calendarUrl, move.targetCalendarUrl)) throw alreadyThere(nothingDone);
+    const source = await this.findCalendar(move.calendarUrl);
+    const target = await this.findCalendar(move.targetCalendarUrl);
+    if (sameCollection(source.url, target.url)) throw alreadyThere(nothingDone);
+    const stored = await this.findStoredEvent(source, move.uid, nothingDone);
+    const series = seriesFor(stored.parsed.vcal, move.uid);
+    if (describeSeries(series).recurring && move.applyToSeries !== true) {
+      throw new ToolRefusal(
+        `"${move.uid}" is a recurring series, so this would move every occurrence. Pass apply_to_series: true if that is what you intend. ${nothingDone}`
+      );
+    }
+    const ifMatch = requireEtag(move, stored, nothingDone);
+    // R11: Radicale moves whatever If-Match says, so the ETag is compared here.
+    if (move.etag !== undefined && stored.etag !== null && opaqueTag(move.etag) !== opaqueTag(stored.etag)) {
+      throw changedSinceRead(move.uid, nothingDone);
+    }
+    const vevents = [...(series.master === undefined ? [] : [series.master]), ...series.overrides];
+    const own = schedulingObject(vevents) ? await this.ownFor(nothingDone) : [];
+    const mayNotify = mayNotifyOnMove(vevents, own);
+    const name = objectName(stored.url);
+    const destination = new URL(name, withSlash(target.url)).href;
+    const res = await this.davFetch("MOVE", stored.url, {
+      destination,
+      overwrite: "F",
+      ...(ifMatch === undefined ? {} : { "if-match": ifMatch }),
+    });
+    let moved: Pick<MovedEvent, "etag" | "via">;
+    if (res.ok) {
+      await res.arrayBuffer();
+      moved = { via: "move", etag: res.headers.get("etag") ?? (await this.etagAt(target, move.uid, destination)) };
+    } else if (MOVE_REFUSED.has(res.status)) {
+      await res.arrayBuffer();
+      const from: WriteTarget = { calendar: source, uid: move.uid, url: stored.url, nothingDone };
+      moved = await this.copyThenDelete(from, stored.data, target, name, ifMatch);
+    } else {
+      const body = await res.text();
+      if (uidConflict(res.status, body)) throw uidTaken(move.uid, nothingDone);
+      if (res.status === 412) {
+        throw new ToolRefusal(
+          `The target calendar already holds an object named ${name}, or the event changed after you read it. Call list_events on both calendars to see which. ${nothingDone}`
+        );
+      }
+      refuseLostRace(res, move.uid, source.url, nothingDone);
+      assertWritten(res, "MOVE");
+      throw new Error(`CalDAV server answered ${res.status} to MOVE`);
+    }
+    return {
+      uid: move.uid,
+      url: destination,
+      ...moved,
+      ...(mayNotify === undefined ? {} : { mayNotify }),
+    };
+  }
+
+  /**
+   * The fallback for a server that refuses MOVE (spec §2.6, step 4): PUT the
+   * stored text into `target` under the same file name with
+   * `If-None-Match: *`, so nothing there is ever replaced, then DELETE the
+   * source through {@link guardedWrite}, guarded by `ifMatch`.
+   *
+   * If that DELETE is refused — the event changed (412) or went away (404)
+   * after the lookup — the copy is removed again ({@link removeCopy}) and the
+   * refusal passed on: the event is in exactly one place, the source, and
+   * nothing was moved (plan v0.7.4, Review Focus 3). If the copy cannot be
+   * removed, or the DELETE failed any other way, so that whether the source
+   * is still there is unknown, the copy is left alone and the refusal names
+   * both URLs: an event in two calendars can be tidied up, one deleted by a
+   * guess cannot be brought back. That refusal also leaves a `warn` line,
+   * since it is the one outcome of a move that needs a person.
+   */
+  private async copyThenDelete(
+    from: WriteTarget,
+    data: string,
+    target: DAVCalendar,
+    name: string,
+    ifMatch: string | undefined
+  ): Promise<Pick<MovedEvent, "etag" | "via">> {
+    const client = await this.ensureClient();
+    const copyUrl = new URL(name, withSlash(target.url)).href;
+    const put = await client.createCalendarObject({ calendar: target, filename: name, iCalString: data });
+    if (!put.ok) {
+      const body = await put.text();
+      if (uidConflict(put.status, body)) throw uidTaken(from.uid, from.nothingDone);
+      if (put.status === 412) {
+        throw new ToolRefusal(`The target calendar already holds an object named ${name}. ${from.nothingDone}`);
+      }
+      assertWritten(put, "PUT");
+    }
+    const copyEtag = put.headers.get("etag");
+    try {
+      await this.guardedWrite("DELETE", from, ifMatch, (etag) =>
+        client.deleteCalendarObject({ calendarObject: { url: from.url, ...(etag === undefined ? {} : { etag }) } })
+      );
+    } catch (err) {
+      const kept =
+        err instanceof ToolRefusal
+          ? await this.removeCopy(copyUrl, data, copyEtag)
+          : `removing it from the source failed (${classifyFailure(err).reason}), so it may still be there`;
+      if (kept === null) throw err;
+      this.log("warn", "caldav: move_event left an event in two calendars", {
+        account: this.accountId,
+        source: from.url,
+        target: copyUrl,
+      });
+      throw new ToolRefusal(
+        `The event "${from.uid}" was copied to ${copyUrl} but not removed from ${from.url}, and the copy was left in place: ${kept}. It may now be in both calendars. Call list_events on both and delete the one that should not be there.`
+      );
+    }
+    return { via: "copy-then-delete", etag: copyEtag ?? (await this.etagAt(target, from.uid, copyUrl)) };
+  }
+
+  /**
+   * Remove the copy {@link copyThenDelete} put at `url` — and only that copy.
+   * Returns null once it is gone, or why it was left in place.
+   *
+   * With the strong ETag the PUT answered, the DELETE carries it as
+   * `If-Match`, so an object changed since cannot be deleted. Without one
+   * (Nextcloud answers a PUT without an ETag when it stores something else,
+   * RFC 4791 §5.3.4), the object is read first and deleted only if its text
+   * is still what was put — compared after line endings and folding, and
+   * nothing else, so a server that rewrote it leaves it in place — and then
+   * with the ETag that read gave, where it gave a strong one.
+   */
+  private async removeCopy(url: string, data: string, copyEtag: string | null): Promise<string | null> {
+    let guard: string | undefined;
+    if (copyEtag !== null && !isWeak(copyEtag)) {
+      guard = copyEtag;
+    } else {
+      const now = await this.davFetch("GET", url);
+      if (!now.ok) {
+        await now.arrayBuffer();
+        return `it could not be read back to check it (the server answered ${now.status})`;
+      }
+      if (unfoldedIcs(await now.text()) !== unfoldedIcs(data)) return "it changed after it was written";
+      const tag = now.headers.get("etag");
+      guard = tag !== null && !isWeak(tag) ? tag : undefined;
+    }
+    const res = await this.davFetch("DELETE", url, guard === undefined ? {} : { "if-match": guard });
+    await res.arrayBuffer();
+    if (res.ok) return null;
+    if (res.status === 412) return "it changed after it was written";
+    return `the server answered ${res.status} to deleting it`;
+  }
+
+  /**
+   * One request to the CalDAV server outside tsdav, which has no MOVE and
+   * whose `davRequest` would parse the answer as XML: the account's Basic
+   * credentials, as tsdav sends them, and the headers given.
+   */
+  private async davFetch(method: string, url: string, headers: Record<string, string> = {}): Promise<Response> {
+    const credentials = Buffer.from(`${this.auth.user}:${this.auth.pass}`, "latin1").toString("base64");
+    return fetch(url, { method, headers: { authorization: `Basic ${credentials}`, ...headers } });
+  }
+
+  /**
+   * The ETag of the object at `url` holding `uid`, read back with the UID
+   * query, for a MOVE or PUT whose answer carried none. The move has
+   * succeeded, so this never fails it: anything going wrong is `null`, with
+   * one `info` line, as in {@link etagAfterWrite}.
+   */
+  private async etagAt(calendar: DAVCalendar, uid: string, url: string): Promise<string | null> {
+    try {
+      const now = await this.findStoredEvent(calendar, uid, "");
+      return now.url === url ? now.etag : null;
+    } catch (err) {
+      this.log("info", "caldav: the etag of a moved event could not be read back", {
+        account: this.accountId,
+        reason: classifyFailure(err).reason,
+      });
+      return null;
+    }
+  }
+
+  /**
    * Run a write guarded by `ifMatch` (from {@link requireEtag}) and turn its
    * answer into a result or a refusal. Returns the successful response.
    *
@@ -887,6 +1144,51 @@ function uidFilter(uid: string) {
 /** What `updateEvent` answers for a write of `edit`: its `mayNotify` only when it changed the guest list. */
 function updated(uid: string, url: string, etag: string | null, edit: EditResult): UpdatedEvent {
   return { uid, url, etag, ...(edit.mayNotify === undefined ? {} : { mayNotify: edit.mayNotify }) };
+}
+
+/** True when two calendar URLs name one collection: equal but for trailing slashes. */
+function sameCollection(a: string, b: string): boolean {
+  return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+}
+
+/** `url` with one trailing slash, so a file name resolved against it lands inside the collection. */
+function withSlash(url: string): string {
+  return url.endsWith("/") ? url : `${url}/`;
+}
+
+/** The last path segment of an object's URL, as the server encoded it: the file name a move keeps. */
+function objectName(url: string): string {
+  return new URL(url).pathname.replace(/\/+$/, "").split("/").pop() ?? "";
+}
+
+/** `move_event`'s refusal of a target that is the source. */
+function alreadyThere(nothingDone: string): ToolRefusal {
+  return new ToolRefusal(
+    `The event is already in that calendar: calendar_url and target_calendar_url name the same one, so there is nothing to do. ${nothingDone}`
+  );
+}
+
+/**
+ * True for a server's answer that the target calendar already holds the
+ * UID: 409 (Radicale answers `<C:no-uid-conflict/>` with it, RFC 4791
+ * §5.3.2.1), or that precondition named in the body of another status, as
+ * a server may send it with 403.
+ */
+function uidConflict(status: number, body: string): boolean {
+  return status === 409 || /no-uid-conflict/i.test(body);
+}
+
+function uidTaken(uid: string, nothingDone: string): ToolRefusal {
+  return new ToolRefusal(`The target calendar already has an event with UID "${uid}". ${nothingDone}`);
+}
+
+/**
+ * iCalendar text with CRLF made LF and folded lines joined (RFC 5545
+ * §3.1): two texts equal under it are the same object, however each was
+ * sent. What {@link CalDavClient}'s `removeCopy` compares.
+ */
+function unfoldedIcs(text: string): string {
+  return text.replace(/\r\n?/g, "\n").replace(/\n[ \t]/g, "").trimEnd();
 }
 
 function notFound(uid: string, calendarUrl: string, nothingDone: string): ToolRefusal {

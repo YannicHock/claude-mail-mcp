@@ -65,6 +65,20 @@ export async function makeRadicaleCalendar(): Promise<RadicaleCalendar> {
 }
 
 /**
+ * A second calendar of `cal`'s user, named `name`: what `move_event` moves
+ * an event into (#212). Radicale moves between two calendars of one user
+ * (R11), and between users not at all.
+ */
+export async function addRadicaleCalendar(cal: RadicaleCalendar, name: string): Promise<RadicaleCalendar> {
+  const calendarUrl = `${RADICALE_URL}${cal.user}/${name}/`;
+  const res = await fetch(calendarUrl, { method: "MKCALENDAR", headers: { authorization: cal.authHeader } });
+  if (res.status !== 201) {
+    throw new Error(`MKCALENDAR ${calendarUrl} answered ${res.status}`);
+  }
+  return { ...cal, calendarUrl };
+}
+
+/**
  * Store an object exactly as given, the way another client would — so a test
  * can start from properties this connector never writes (VALARM, X-, RRULE).
  * Returns the new ETag.

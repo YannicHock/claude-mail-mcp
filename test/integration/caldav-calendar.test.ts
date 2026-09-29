@@ -29,6 +29,7 @@ import { composeDown, composeUp, isDockerAvailable } from "../helpers/docker.js"
 import {
   RADICALE_PASSWORD,
   RADICALE_URL,
+  addRadicaleCalendar,
   startCalDavProxy,
   deleteBehindTheBack,
   editBehindTheBack,
@@ -1250,6 +1251,285 @@ describe("delete_event", SKIP, () => {
     assert.match(message, /is not an occurrence/);
     assert.match(message, /Nothing was deleted/);
     assert.equal(await etagOf(uid), etag);
+  });
+});
+
+describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
+  /** A fresh user with two calendars, `cal/` and `other/`, and a client for them, direct or through `proxy`. */
+  async function twoCalendars(proxy?: CalDavProxy): Promise<{
+    source: RadicaleCalendar;
+    target: RadicaleCalendar;
+    mover: CalDavClient;
+    /** The calendar URLs as the client sees them: through the proxy when there is one. */
+    sourceUrl: string;
+    targetUrl: string;
+  }> {
+    const source = await makeRadicaleCalendar();
+    const target = await addRadicaleCalendar(source, "other");
+    const base = proxy?.url ?? RADICALE_URL;
+    return {
+      source,
+      target,
+      mover: new CalDavClient({ url: base, user: source.user, pass: RADICALE_PASSWORD }),
+      sourceUrl: source.calendarUrl.replace(RADICALE_URL, base),
+      targetUrl: target.calendarUrl.replace(RADICALE_URL, base),
+    };
+  }
+
+  /** Only the calendar's path, as the proxy's `failSourceDelete` takes it. */
+  const pathOf = (calendar: RadicaleCalendar): string => new URL(calendar.calendarUrl).pathname;
+
+  it("moves an event with a VALARM and an ATTENDEE by MOVE: the source answers 404, the target holds the same text, the etag is the stored one", async () => {
+    const { source, target, mover, sourceUrl, targetUrl } = await twoCalendars();
+    const uid = "move-me@example.com";
+    const etag = await putRawEvent(source, "move-me.ics", richEvent(uid));
+    const before = await getRawEvent(source, "move-me.ics");
+    const moved = await mover.moveEvent({ calendarUrl: sourceUrl, uid, etag, targetCalendarUrl: targetUrl });
+    assert.equal(moved.via, "move");
+    assert.equal(moved.uid, uid);
+    assert.equal(moved.url, `${target.calendarUrl}move-me.ics`);
+    assert.equal(moved.etag, etag);
+    assert.equal(await getRawEvent(source, "move-me.ics"), null);
+    const after = await getRawEvent(target, "move-me.ics");
+    assert.equal(after, before);
+    assert.match(after ?? "", /BEGIN:VALARM/);
+    assert.match(after ?? "", /ATTENDEE;CN=Ben;PARTSTAT=ACCEPTED/);
+  });
+
+  it("refuses a stale etag before any MOVE, which Radicale would carry out anyway (R11)", async () => {
+    const { source, target, mover, sourceUrl, targetUrl } = await twoCalendars();
+    const uid = "move-stale@example.com";
+    const stale = await putRawEvent(source, "move-stale.ics", richEvent(uid));
+    await editBehindTheBack(source, "move-stale.ics", richEvent(uid, "Changed on the phone"));
+    const message = await refusal(mover.moveEvent({ calendarUrl: sourceUrl, uid, etag: stale, targetCalendarUrl: targetUrl }));
+    assert.match(message, /changed after you read it/);
+    assert.match(message, /Nothing was moved/);
+    assert.match((await getRawEvent(source, "move-stale.ics")) ?? "", /Changed on the phone/);
+    assert.equal(await getRawEvent(target, "move-stale.ics"), null);
+  });
+
+  it("refuses when the target already holds the UID (Radicale's 409), and moves nothing", async () => {
+    const { source, target, mover, sourceUrl, targetUrl } = await twoCalendars();
+    const uid = "move-twin@example.com";
+    const etag = await putRawEvent(source, "move-twin.ics", richEvent(uid));
+    await putRawEvent(target, "twin-elsewhere.ics", richEvent(uid, "The twin"));
+    const message = await refusal(mover.moveEvent({ calendarUrl: sourceUrl, uid, etag, targetCalendarUrl: targetUrl }));
+    assert.match(message, /already has an event with UID "move-twin@example\.com"/);
+    assert.ok(message.endsWith("Nothing was moved."), message);
+    assert.notEqual(await getRawEvent(source, "move-twin.ics"), null);
+    assert.equal(await getRawEvent(target, "move-twin.ics"), null);
+    assert.match((await getRawEvent(target, "twin-elsewhere.ics")) ?? "", /The twin/);
+  });
+
+  it("refuses when the target holds another object under the same name (Overwrite: F), and leaves both alone", async () => {
+    const { source, target, mover, sourceUrl, targetUrl } = await twoCalendars();
+    const uid = "move-name@example.com";
+    const etag = await putRawEvent(source, "same-name.ics", richEvent(uid));
+    await putRawEvent(target, "same-name.ics", richEvent("someone-else@example.com", "Already here"));
+    const message = await refusal(mover.moveEvent({ calendarUrl: sourceUrl, uid, etag, targetCalendarUrl: targetUrl }));
+    assert.match(message, /same-name\.ics/);
+    assert.ok(message.endsWith("Nothing was moved."), message);
+    assert.notEqual(await getRawEvent(source, "same-name.ics"), null);
+    assert.match((await getRawEvent(target, "same-name.ics")) ?? "", /Already here/);
+  });
+
+  it("refuses a series without apply_to_series, and moves it whole with it", async () => {
+    const { source, target, mover, sourceUrl, targetUrl } = await twoCalendars();
+    const uid = "move-series@example.com";
+    const etag = await putRawEvent(source, "move-series.ics", seriesEvent(uid));
+    const message = await refusal(mover.moveEvent({ calendarUrl: sourceUrl, uid, etag, targetCalendarUrl: targetUrl }));
+    assert.match(message, /recurring series/);
+    assert.match(message, /apply_to_series/);
+    assert.ok(message.endsWith("Nothing was moved."), message);
+    assert.notEqual(await getRawEvent(source, "move-series.ics"), null);
+    await mover.moveEvent({ calendarUrl: sourceUrl, uid, etag, targetCalendarUrl: targetUrl, applyToSeries: true });
+    assert.equal(await getRawEvent(source, "move-series.ics"), null);
+    assert.match((await getRawEvent(target, "move-series.ics")) ?? "", /RRULE:FREQ=WEEKLY;COUNT=5/);
+  });
+
+  it("a server that refuses MOVE (405): the event is put into the target and deleted from the source, and the answer says so", async () => {
+    const proxy = await startCalDavProxy({ refuseMove: 405 });
+    try {
+      const { source, target, mover, sourceUrl, targetUrl } = await twoCalendars(proxy);
+      const uid = "move-copy@example.com";
+      const etag = await putRawEvent(source, "move-copy.ics", richEvent(uid));
+      const before = await getRawEvent(source, "move-copy.ics");
+      const moved = await mover.moveEvent({ calendarUrl: sourceUrl, uid, etag, targetCalendarUrl: targetUrl });
+      assert.equal(proxy.refusedMoves(), 1);
+      assert.equal(moved.via, "copy-then-delete");
+      assert.equal(moved.url, `${targetUrl}move-copy.ics`);
+      assert.equal(await getRawEvent(source, "move-copy.ics"), null);
+      assert.equal(await getRawEvent(target, "move-copy.ics"), before);
+      const listed = (await mover.listEvents(targetUrl, WINDOW.start, WINDOW.end)).events.find((e) => e.uid === uid);
+      assert.equal(moved.etag, listed?.etag);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("MOVE refused and the source's DELETE answering 412: the copy is removed, the call refused, the event exists once, in the source", async () => {
+    const own = await makeRadicaleCalendar();
+    const target = await addRadicaleCalendar(own, "other");
+    const proxy = await startCalDavProxy({ refuseMove: 405, failSourceDelete: pathOf(own) });
+    try {
+      const mover = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+      const uid = "move-rollback@example.com";
+      const etag = await putRawEvent(own, "move-rollback.ics", richEvent(uid));
+      const message = await refusal(
+        mover.moveEvent({
+          calendarUrl: own.calendarUrl.replace(RADICALE_URL, proxy.url),
+          uid,
+          etag,
+          targetCalendarUrl: target.calendarUrl.replace(RADICALE_URL, proxy.url),
+        })
+      );
+      assert.match(message, /changed after you read it/);
+      assert.match(message, /Nothing was moved/);
+      assert.equal(await getRawEvent(target, "move-rollback.ics"), null, "the copy in the target was left behind");
+      assert.notEqual(await getRawEvent(own, "move-rollback.ics"), null);
+      const deletes = proxy.requests().filter((r) => r.method === "DELETE");
+      assert.equal(deletes.length, 2, JSON.stringify(deletes));
+      assert.ok(deletes[1].path.startsWith(pathOf(target)));
+      assert.ok(deletes[1].ifMatch, "the copy was deleted without an If-Match naming the ETag the PUT returned");
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("the same rollback on a server whose PUT answers no ETag: the copy is compared with what was put, then removed", async () => {
+    const own = await makeRadicaleCalendar();
+    const proxy = await startCalDavProxy({ refuseMove: 405, failSourceDelete: pathOf(own), etaglessPuts: true });
+    try {
+      const target = await addRadicaleCalendar(own, "other");
+      const mover = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+      const uid = "move-rollback-etagless@example.com";
+      const etag = await putRawEvent(own, "move-rollback-etagless.ics", richEvent(uid));
+      const message = await refusal(
+        mover.moveEvent({
+          calendarUrl: own.calendarUrl.replace(RADICALE_URL, proxy.url),
+          uid,
+          etag,
+          targetCalendarUrl: target.calendarUrl.replace(RADICALE_URL, proxy.url),
+        })
+      );
+      assert.match(message, /Nothing was moved/);
+      assert.equal(proxy.strippedPuts(), 1);
+      assert.equal(await getRawEvent(target, "move-rollback-etagless.ics"), null);
+      assert.notEqual(await getRawEvent(own, "move-rollback-etagless.ics"), null);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  for (const etagless of [false, true]) {
+    it(`the rollback never removes an object that is no longer the copy it put${etagless ? " (PUT answered no ETag)" : ""}: it names both URLs instead`, async () => {
+      const own = await makeRadicaleCalendar();
+      const target = await addRadicaleCalendar(own, "other");
+      const proxy = await startCalDavProxy({
+        refuseMove: 405,
+        failSourceDelete: pathOf(own),
+        etaglessPuts: etagless,
+        // Someone edits the copy in the target the moment it is written.
+        after: async ({ method, path }, status) => {
+          if (method === "PUT" && status < 300 && path.startsWith(pathOf(target))) {
+            await editBehindTheBack(target, "move-overtaken.ics", richEvent("move-overtaken@example.com", "Edited in the target"));
+          }
+        },
+      });
+      try {
+        const mover = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+        const uid = "move-overtaken@example.com";
+        const etag = await putRawEvent(own, "move-overtaken.ics", richEvent(uid));
+        const call = mover.moveEvent({
+          calendarUrl: own.calendarUrl.replace(RADICALE_URL, proxy.url),
+          uid,
+          etag,
+          targetCalendarUrl: target.calendarUrl.replace(RADICALE_URL, proxy.url),
+        });
+        const message = await refusal(call);
+        assert.match(message, /move-overtaken\.ics/);
+        assert.ok(message.includes(`${target.calendarUrl.replace(RADICALE_URL, proxy.url)}move-overtaken.ics`), message);
+        assert.ok(message.includes(`${own.calendarUrl.replace(RADICALE_URL, proxy.url)}move-overtaken.ics`), message);
+        assert.doesNotMatch(message, /Nothing was moved/);
+        assert.match((await getRawEvent(target, "move-overtaken.ics")) ?? "", /Edited in the target/);
+        assert.notEqual(await getRawEvent(own, "move-overtaken.ics"), null);
+      } finally {
+        await proxy.close();
+      }
+    });
+  }
+
+  it("a server that refuses MOVE, and a target that already holds the name: the PUT is refused, the object there never deleted", async () => {
+    const own = await makeRadicaleCalendar();
+    const target = await addRadicaleCalendar(own, "other");
+    const proxy = await startCalDavProxy({ refuseMove: 405, failSourceDelete: pathOf(own) });
+    try {
+      const mover = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+      const uid = "move-occupied@example.com";
+      const etag = await putRawEvent(own, "occupied.ics", richEvent(uid));
+      await putRawEvent(target, "occupied.ics", richEvent("resident@example.com", "Resident"));
+      const message = await refusal(
+        mover.moveEvent({
+          calendarUrl: own.calendarUrl.replace(RADICALE_URL, proxy.url),
+          uid,
+          etag,
+          targetCalendarUrl: target.calendarUrl.replace(RADICALE_URL, proxy.url),
+        })
+      );
+      assert.ok(message.endsWith("Nothing was moved."), message);
+      assert.match((await getRawEvent(target, "occupied.ics")) ?? "", /Resident/);
+      assert.notEqual(await getRawEvent(own, "occupied.ics"), null);
+      assert.equal(proxy.requests().filter((r) => r.method === "DELETE").length, 0);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("move_event answers which way it moved, and may_notify for a meeting the account organizes", async () => {
+    const MAILBOX = "me@mail.example";
+    const own = await makeRadicaleCalendar();
+    const target = await addRadicaleCalendar(own, "other");
+    const dir = await makeTmpDir();
+    try {
+      const file = await makeAccountsFile(dir, [
+        makeAccount({
+          id: "work",
+          default: true,
+          mail: { defaultFrom: MAILBOX, draftsFolder: "Drafts", sentFolder: "Sent" },
+          caldav: { url: RADICALE_URL, user: own.user, pass: RADICALE_PASSWORD },
+        }),
+      ]);
+      const store = new AccountsStore(file);
+      await store.reload();
+      type Handler = (args: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;
+      const handlers = new Map<string, Handler>();
+      const server = {
+        registerTool: (name: string, _config: unknown, handler: Handler) => handlers.set(name, handler),
+      } as unknown as McpServer;
+      registerCalendarTools(server, new ClientPool(store));
+      const moveEvent = handlers.get("move_event");
+      assert.ok(moveEvent, "no move_event");
+      const call = async (args: Record<string, unknown>): Promise<Record<string, unknown>> =>
+        JSON.parse((await moveEvent(args)).content[0].text) as Record<string, unknown>;
+
+      const organized = "move-organized@example.com";
+      const etag = await putRawEvent(
+        own,
+        "move-organized.ics",
+        richEvent(organized).replace("SUMMARY:Planning\r\n", `SUMMARY:Planning\r\nORGANIZER:mailto:${MAILBOX}\r\n`)
+      );
+      const moved = await call({ calendar_url: own.calendarUrl, uid: organized, etag, target_calendar_url: target.calendarUrl });
+      assert.equal(moved.success, true);
+      assert.equal(moved.via, "move");
+      assert.deepEqual(moved.may_notify, ["ben@example.com"]);
+
+      const plain = "move-plain@example.com";
+      const plainEtag = await putRawEvent(own, "move-plain.ics", richEvent(plain));
+      const quiet = await call({ calendar_url: own.calendarUrl, uid: plain, etag: plainEtag, target_calendar_url: target.calendarUrl });
+      assert.equal("may_notify" in quiet, false, "attendees with no organizer are no meeting a server schedules");
+    } finally {
+      await cleanupTmpDir(dir);
+    }
   });
 });
 

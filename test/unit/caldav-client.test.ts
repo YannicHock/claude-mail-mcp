@@ -210,6 +210,41 @@ describe("CalDavClient — recurrence_id together with apply_to_series (spec 202
   });
 });
 
+describe("CalDavClient.moveEvent — what is refused before the server is contacted (#212, spec 2026-09-29 §2.6)", () => {
+  // Port 1 on loopback refuses every connection: a call that reached the
+  // server would fail with a connection error, not a refusal.
+  const client = new CalDavClient({ url: "http://127.0.0.1:1/", user: "alice", pass: "pw" });
+  const move = {
+    calendarUrl: "http://127.0.0.1:1/alice/cal/",
+    targetCalendarUrl: "http://127.0.0.1:1/alice/work/",
+    uid: "weekly@example.com",
+    etag: '"e"',
+  };
+
+  it("refuses any recurrence_id: one occurrence cannot live in another calendar", async () => {
+    for (const applyToSeries of [undefined, true]) {
+      await assert.rejects(
+        client.moveEvent({ ...move, recurrenceId: "2026-10-08T07:00:00.000Z", applyToSeries }),
+        (err: unknown) =>
+          err instanceof ToolRefusal &&
+          /one occurrence/i.test(err.message) &&
+          /apply_to_series/.test(err.message) &&
+          err.message.endsWith("Nothing was moved.")
+      );
+    }
+  });
+
+  it("refuses the same calendar as source and target as nothing to do, with or without its trailing slash", async () => {
+    for (const targetCalendarUrl of [move.calendarUrl, move.calendarUrl.replace(/\/$/, "")]) {
+      await assert.rejects(
+        client.moveEvent({ ...move, targetCalendarUrl }),
+        (err: unknown) =>
+          err instanceof ToolRefusal && /already in that calendar/.test(err.message) && err.message.endsWith("Nothing was moved.")
+      );
+    }
+  });
+});
+
 describe("CalDavClient.createEvent — the timezone it is given", () => {
   it("refuses a name that is no IANA zone before it contacts the server", async () => {
     // Port 1 on loopback refuses every connection: reaching it would fail differently.
