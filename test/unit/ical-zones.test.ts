@@ -19,9 +19,14 @@ import assert from "node:assert/strict";
 import ICAL from "ical.js";
 
 import {
+  addToWall,
   calendarZone,
   canonicalZone,
+  instantAt,
   instantToZonedWall,
+  readDateTime,
+  storedInstant,
+  UTC_ZONE,
   vtimezoneFromIntl,
   resolveUnknownTzid,
   utcOffsetMs,
@@ -391,5 +396,43 @@ describe("the zone a new event is written in", () => {
     const berlin = zonedWriteZone("Europe/Berlin");
     assert.ok(berlin.kind === "zoned" && berlin.tzid === "Europe/Berlin", JSON.stringify(berlin.kind));
     assert.ok(berlin.zone instanceof IntlTimezone && berlin.zone.iana === "Europe/Berlin");
+  });
+});
+
+/**
+ * `Date.UTC` reads a year 0–99 as 1900–1999, so every wall time built with it
+ * in those years landed 1900 years late (found in the fix pass of PR #232).
+ * iCalendar has such years — a yearly series since the year 50 is valid —
+ * and `Date.parse` of an ISO string reads them right, so it is the reference.
+ */
+describe("wall times in the years 0–99 are those years, not 1900–1999", () => {
+  const wall = { year: 50, month: 1, day: 1, hour: 9, minute: 0, second: 30 };
+  const utc = at("0050-01-01T09:00:30Z");
+
+  it("instantAt reads a UTC, a floating and a zoned wall time in the year 50", () => {
+    assert.equal(instantAt(wall, UTC_ZONE), utc);
+    assert.equal(instantAt(wall, { kind: "floating" }), utc);
+    const ms = instantAt(wall, zonedWriteZone("Europe/Berlin"));
+    assert.deepEqual(instantToZonedWall(ms, "Europe/Berlin"), wall);
+  });
+
+  it("zonedWallToInstant and IntlTimezone place the year 50 by the offset Intl gives then", () => {
+    const ms = zonedWallToInstant(50, 1, 1, 9, 0, "Europe/Berlin");
+    assert.deepEqual(instantToZonedWall(ms, "Europe/Berlin"), { ...wall, second: 0 });
+    const tz = new IntlTimezone("Europe/Berlin", "Europe/Berlin");
+    const time = new ICAL.Time({ year: 50, month: 1, day: 1, hour: 9, minute: 0, second: 0, isDate: false });
+    assert.equal(tz.utcOffset(time) * 1000, utcOffsetMs(ms, "Europe/Berlin"));
+  });
+
+  it("readDateTime takes a clock time in the year 50 instead of refusing it as no date", () => {
+    assert.equal(readDateTime("0050-01-01T09:00:30", UTC_ZONE), utc);
+    assert.equal(readDateTime("0050-01-01T09:00:30", { kind: "floating" }), utc);
+  });
+
+  it("storedInstant reads a floating time in the year 50, and addToWall steps it on its own clock", () => {
+    const floating = new ICAL.Time({ year: 50, month: 1, day: 1, hour: 9, minute: 0, second: 30, isDate: false });
+    assert.equal(storedInstant(floating, { kind: "floating" }), utc);
+    assert.deepEqual(addToWall(wall, 86_400), { ...wall, day: 2 });
+    assert.deepEqual(addToWall({ ...wall, year: 99, month: 12, day: 31 }, 86_400), { ...wall, year: 100 });
   });
 });

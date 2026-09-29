@@ -95,9 +95,25 @@ export function wallOf(time: ICAL.Time): ZonedWall {
   return { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
 }
 
+/**
+ * The epoch ms of clock fields read as UTC — what `Date.UTC` answers, except
+ * for the years 0–99, which `Date.UTC` reads as 1900–1999. iCalendar has
+ * such years (a yearly series may start in the year 50), and a wall time
+ * built with `Date.UTC` there landed 1900 years late: `instantAt` and
+ * `wallToInstantIn` did (fix pass of PR #232). Every wall time in src/ is
+ * turned into ms here, and nowhere by `Date.UTC`.
+ *
+ * `month` is 1–12. Fields past their range roll over, as with `Date.UTC`: day
+ * 32 is the first of the next month, hour 24 the next day — the round trip
+ * in `wallOfIso` relies on that to catch a clock time no calendar has.
+ */
+export function utcMs(year: number, month: number, day: number, hour = 0, minute = 0, second = 0): number {
+  return new Date(0).setUTCFullYear(year, month - 1, day) + ((hour * 60 + minute) * 60 + second) * 1000;
+}
+
 /** `wall` moved by `seconds` on the clock: plain field arithmetic, no zone involved. */
 export function addToWall(wall: ZonedWall, seconds: number): ZonedWall {
-  const d = new Date(Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second) + seconds * 1000);
+  const d = new Date(utcMs(wall.year, wall.month, wall.day, wall.hour, wall.minute, wall.second) + seconds * 1000);
   return {
     year: d.getUTCFullYear(),
     month: d.getUTCMonth() + 1,
@@ -164,8 +180,7 @@ function askedOffsetMs(ms: number, tz: string): number {
   const w = instantToZonedWall(ms, tz);
   // Whole seconds: Intl formats no milliseconds, so compare like with like.
   const whole = Math.floor(ms / 1000) * 1000;
-  // Not `Date.UTC`, which reads a year 0–99 as 1900–1999.
-  const wall = new Date(0).setUTCFullYear(w.year, w.month - 1, w.day) + ((w.hour * 60 + w.minute) * 60 + w.second) * 1000;
+  const wall = utcMs(w.year, w.month, w.day, w.hour, w.minute, w.second);
   return wall - whole;
 }
 
@@ -242,9 +257,9 @@ const offsetYears = new Map<string, Map<number, OffsetYear>>();
  */
 const DIRECT_ASKS_PER_YEAR = 64;
 
-/** 00:00Z on 1 January of `year`; `Date.UTC` would read 0–99 as 1900–1999. */
+/** 00:00Z on 1 January of `year`. */
 function startOfYear(year: number): number {
-  return new Date(0).setUTCFullYear(year, 0, 1);
+  return utcMs(year, 1, 1);
 }
 
 /**
@@ -323,7 +338,7 @@ export function zonedWallToInstant(
   minute: number,
   tz: string
 ): number {
-  return wallToInstantBy(Date.UTC(year, month - 1, day, hour, minute), (ms) => utcOffsetMs(ms, tz));
+  return wallToInstantBy(utcMs(year, month, day, hour, minute), (ms) => utcOffsetMs(ms, tz));
 }
 
 /**
@@ -382,8 +397,7 @@ function vtimezoneOffsetMs(zone: ICAL.Timezone, ms: number): number {
   zone._ensureCoverage(new Date(ms).getUTCFullYear() + 1);
   let offset = 0;
   for (const change of zone.changes as Array<ZonedWall & { utcOffset: number }>) {
-    const at = new Date(0).setUTCFullYear(change.year, change.month - 1, change.day) +
-      ((change.hour * 60 + change.minute) * 60 + change.second) * 1000;
+    const at = utcMs(change.year, change.month, change.day, change.hour, change.minute, change.second);
     if (at > ms) break;
     offset = change.utcOffset * 1000;
   }
@@ -454,7 +468,7 @@ export class IntlTimezone extends ICAL.Timezone {
   }
 
   override utcOffset(tt: ICAL.Time): number {
-    const wall = Date.UTC(tt.year, tt.month - 1, tt.day, tt.hour, tt.minute);
+    const wall = utcMs(tt.year, tt.month, tt.day, tt.hour, tt.minute);
     return (wall - zonedWallToInstant(tt.year, tt.month, tt.day, tt.hour, tt.minute, this.iana)) / 1000;
   }
 }
@@ -655,7 +669,7 @@ function wallOfIso(value: string): ZonedWall | null {
   const [year, month, day, hour, minute, second] = m.slice(1).map((part) => Number(part ?? 0));
   // The round trip catches a clock time that does not exist on any calendar:
   // `2026-13-45T25:00` would otherwise roll over into a later one.
-  const back = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  const back = new Date(utcMs(year, month, day, hour, minute, second));
   if (
     back.getUTCFullYear() !== year ||
     back.getUTCMonth() !== month - 1 ||
@@ -689,7 +703,7 @@ function utcWall(ms: number): ZonedWall {
  * added back, so a caller's `09:00:30` still comes back as `09:00:30`.
  */
 function wallToInstantIn(w: ZonedWall, zone: ICAL.Timezone): number {
-  const wall = Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute);
+  const wall = utcMs(w.year, w.month, w.day, w.hour, w.minute);
   return wallToInstantBy(wall, offsetsOf(zone)) + w.second * 1000;
 }
 
@@ -725,7 +739,7 @@ export function readDateTime(value: string, zone: WriteZone): number {
   const wall = wallOfIso(value);
   if (wall === null) return NaN;
   if (zone.kind === "zoned") return wallToInstantIn(wall, zone.zone);
-  return Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
+  return utcMs(wall.year, wall.month, wall.day, wall.hour, wall.minute, wall.second);
 }
 
 /**
@@ -747,7 +761,7 @@ export function wallAt(ms: number, zone: WriteZone): ZonedWall {
  */
 export function instantAt(wall: ZonedWall, zone: WriteZone): number {
   if (zone.kind === "zoned") return wallToInstantIn(wall, zone.zone);
-  return Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
+  return utcMs(wall.year, wall.month, wall.day, wall.hour, wall.minute, wall.second);
 }
 
 /**
@@ -760,7 +774,7 @@ export function instantAt(wall: ZonedWall, zone: WriteZone): number {
  */
 export function storedInstant(time: ICAL.Time, zone: WriteZone): number {
   const wall = { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
-  if (isFloating(time)) return Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
+  if (isFloating(time)) return utcMs(wall.year, wall.month, wall.day, wall.hour, wall.minute, wall.second);
   if (zone.kind === "zoned") return wallToInstantIn(wall, zone.zone);
   return time.toUnixTime() * 1000;
 }
