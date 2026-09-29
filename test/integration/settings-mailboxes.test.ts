@@ -1183,7 +1183,8 @@ test("Add mailbox opens on the address screen, not on eighteen empty boxes", asy
     const html = await res.text();
 
     assert.match(html, /name="mail\.defaultFrom"/);
-    assert.match(html, /name="password"/);
+    // #203: no password until the lookup has said whether one can work.
+    assert.equal(html.includes('name="password"'), false, html);
     // The whole of #141: the eighteen-field form is no longer what this URL is.
     assert.equal(html.includes('name="imap.host"'), false, html);
     // And it is still one press away.
@@ -1222,7 +1223,11 @@ test("?view= reaches the provider list and the full form at any time", async () 
       "/settings/mailboxes/new?view=nonsense",
       mint("GET", "/settings/mailboxes/new")
     );
-    assert.match(await mistyped.text(), /name="password"/);
+    // The address screen, recognised by its one button: since #203 it has no
+    // password box left to recognise it by.
+    const mistypedHtml = await mistyped.text();
+    assert.match(mistypedHtml, /name="_action" value="lookup"/);
+    assert.equal(mistypedHtml.includes('name="imap.host"'), false, mistypedHtml);
   } finally {
     await close();
   }
@@ -1265,6 +1270,70 @@ test("a lookup that finds nothing shows the provider list and calls it no failur
     assert.equal(/class="error"/.test(html), false, html);
     // #120: the password came in on this submission and goes on to the form.
     assert.match(html, /<input type="hidden" name="password" value="hunter2">/);
+  } finally {
+    await close();
+  }
+});
+
+/**
+ * What a browser would submit from a screen's form, read out of the page: every
+ * named input with its value, a checkbox or radio only when it is checked.
+ *
+ * Wider than {@link hiddenFields}, because the cases that use it are about what
+ * a *typed-in* box carries — a password that arrived with the lookup and has to
+ * be sitting in the boxes the save reads, not merely somewhere on the page.
+ */
+function formFields(html: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (const [input] of html.matchAll(/<input\b[^>]*>/g)) {
+    const name = /\bname="([^"]*)"/.exec(input)?.[1];
+    if (name === undefined) continue;
+    const type = /\btype="([^"]*)"/.exec(input)?.[1] ?? "text";
+    if ((type === "checkbox" || type === "radio") && !/\schecked\b/.test(input)) continue;
+    fields[name] = /\bvalue="([^"]*)"/.exec(input)?.[1] ?? "";
+  }
+  return fields;
+}
+
+test("a password the lookup still carries is kept through to the save (#120)", async () => {
+  // Since #203 the address screen asks for no password, so no browser sends one
+  // with the lookup. A submission that does — an older page still open in a
+  // tab, a back button onto one — must not lose it: the operator typed it, and
+  // asking again on a screen that said nothing about the first answer is the
+  // page forgetting what it was told. Followed across every hop to the file,
+  // each one submitting what the previous screen actually rendered.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const looked = await post(url, "/settings/mailboxes/new", {
+      _action: "lookup",
+      "mail.defaultFrom": UNRESOLVABLE,
+      password: "carried-from-an-old-form",
+    });
+    assert.equal(looked.status, 200);
+    const providers = await looked.text();
+    assert.match(providers, /value="mailbox-org"/, "a miss lands on the provider list");
+
+    const chosen = await post(url, "/settings/mailboxes/new", {
+      ...hiddenFields(providers),
+      "mail.defaultFrom": UNRESOLVABLE,
+      provider: "posteo",
+      _action: "provider",
+    });
+    assert.equal(chosen.status, 200);
+    const form = formFields(await chosen.text());
+    assert.equal(form["imap.pass"], "carried-from-an-old-form", "the IMAP box lost the password");
+    assert.equal(form["smtp.pass"], "carried-from-an-old-form", "the SMTP box lost the password");
+
+    const saved = await post(url, "/settings/mailboxes", await withStamp(accountsPath, { ...form, _action: "save" }));
+    assert.equal(saved.status, 303, "the save was refused");
+
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")) as {
+      accounts: Array<{ id: string; imap: { pass: string }; smtp: { pass: string } }>;
+    };
+    const account = stored.accounts.find((a) => a.id === form["id"]);
+    assert.ok(account, "the mailbox was not stored");
+    assert.equal(account.imap.pass, "carried-from-an-old-form");
+    assert.equal(account.smtp.pass, "carried-from-an-old-form");
   } finally {
     await close();
   }
@@ -2104,11 +2173,46 @@ test("an address at a provider that cannot be served is warned about at lookup",
     assert.equal(res.status, 200, "a warning is not a refusal");
     const html = await res.text();
     assert.match(html, /no password will connect/);
-    // Told before a password is asked for. The screen that carries the warning
-    // asks for none: the one the operator already typed travels as a hidden
-    // field, and there is no password box on it to fill in again.
+    // The carrying path (#120): a lookup that still arrives with a password —
+    // since #203 only an older page sends one — keeps it as a hidden field, so
+    // the screen with the warning has no password box to fill in again. The
+    // browser-shaped path is the next case.
     assert.equal(/type="password"/.test(html), false, html);
     assert.equal(/class="error"/.test(html), false, "a warning is not an error box");
+  } finally {
+    await close();
+  }
+});
+
+test("the outlook.com warning comes before any password is asked for (#203)", async () => {
+  // The connector's half of #197. `/settings/mailboxes/new` used to render a
+  // `required` password box beside the address, so an operator adding a second
+  // outlook.com mailbox typed a password before the lookup could tell them
+  // Microsoft accepts none over IMAP. Walked the way a browser walks it: the
+  // lookup is exactly what the address screen's form submits, and that has to
+  // carry no password — then the warning must sit above the one box, if any,
+  // that asks for it. The lookup runs for real, as in the case above, and the
+  // assertions hold whether the domain's settings were found or not.
+  const { url, close } = await startConnector();
+  try {
+    const opened = await get(url, "/settings/mailboxes/new", mint("GET", "/settings/mailboxes/new"));
+    assert.equal(opened.status, 200);
+    const submission = { ...formFields(await opened.text()), "mail.defaultFrom": "anna@outlook.com" };
+    assert.equal("password" in submission, false, "the address screen's form submits a password");
+    assert.deepEqual(
+      Object.keys(submission).filter((name) => /pass/i.test(name)),
+      [],
+      "the lookup carried a password field"
+    );
+
+    const res = await post(url, "/settings/mailboxes/new", { ...submission, _action: "lookup" });
+    assert.equal(res.status, 200, "a warning is not a refusal");
+    const html = await res.text();
+    const warningAt = html.indexOf("no password will connect");
+    assert.ok(warningAt >= 0, "the warning is missing");
+    const passwordAt = html.search(/type="password"/);
+    assert.ok(passwordAt === -1 || warningAt < passwordAt, "a password box comes before the warning");
+    assert.equal(/type="hidden" name="password"/.test(html), false, "a password was carried that nobody typed");
   } finally {
     await close();
   }
