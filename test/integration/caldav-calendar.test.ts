@@ -1480,3 +1480,214 @@ describe("ORGANIZER and attendees (#204, #205, spec 2026-09-29 §2.1)", SKIP, ()
     assert.equal(await etagOf(uid), etag);
   });
 });
+
+describe("find_free_slot (#213, R14, R15, spec 2026-09-29 §2.7)", SKIP, () => {
+  const MAILBOX = "me@mail.example";
+
+  /**
+   * `find_free_slot` as the model calls it: through the registered tool, on an
+   * account whose mailbox is {@link MAILBOX} and whose CalDAV is `caldavUrl`
+   * (Radicale, or a proxy in front of it), so the account's own address comes
+   * from ClientPool as it does in the connector.
+   */
+  async function findFreeSlot(caldavUrl: string, user: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const dir = await makeTmpDir();
+    try {
+      const file = await makeAccountsFile(dir, [
+        makeAccount({
+          id: "work",
+          default: true,
+          mail: { defaultFrom: MAILBOX, draftsFolder: "Drafts", sentFolder: "Sent" },
+          caldav: { url: caldavUrl, user, pass: RADICALE_PASSWORD },
+        }),
+      ]);
+      const store = new AccountsStore(file);
+      await store.reload();
+      type Handler = (args: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;
+      const handlers = new Map<string, Handler>();
+      const server = {
+        registerTool: (name: string, _config: unknown, handler: Handler) => handlers.set(name, handler),
+      } as unknown as McpServer;
+      registerCalendarTools(server, new ClientPool(store));
+      const handler = handlers.get("find_free_slot");
+      assert.ok(handler, "no find_free_slot");
+      return JSON.parse((await handler(args)).content[0].text) as Record<string, unknown>;
+    } finally {
+      await cleanupTmpDir(dir);
+    }
+  }
+
+  /** One timed event on Tuesday 2026-10-06, in UTC, `from` and `to` as HHMM, with `extra` lines. */
+  function tuesday(uid: string, from: string, to: string, ...extra: string[]): string {
+    return ics(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Other Client//EN",
+      "BEGIN:VEVENT",
+      `UID:${uid}`,
+      "DTSTAMP:20260901T080000Z",
+      `DTSTART:20261006T${from}00Z`,
+      `DTEND:20261006T${to}00Z`,
+      `SUMMARY:${uid}`,
+      ...extra,
+      "END:VEVENT",
+      "END:VCALENDAR"
+    );
+  }
+
+  const TUESDAY_9_TO_17 = { range_start: "2026-10-06T09:00:00Z", range_end: "2026-10-06T17:00:00Z", duration_minutes: 30 };
+
+  it("R14: an empty calendar, Monday to Wednesday, 9–17, has a slot on each day — and says it used UTC, Radicale's calendar naming no zone", async () => {
+    const own = await makeRadicaleCalendar();
+    const answer = await findFreeSlot(RADICALE_URL, own.user, {
+      calendar_urls: [own.calendarUrl],
+      range_start: "2026-10-05T00:00:00Z",
+      range_end: "2026-10-08T00:00:00Z",
+      duration_minutes: 60,
+      working_hours: { start_hour: 9, end_hour: 17 },
+    });
+    assert.deepEqual(
+      (answer.slots as Array<{ start: string }>).map((s) => s.start.slice(0, 10)),
+      ["2026-10-05", "2026-10-06", "2026-10-07"],
+      "one slot per day"
+    );
+    assert.deepEqual(answer.slots, [
+      { start: "2026-10-05T09:00:00Z", end: "2026-10-05T17:00:00Z" },
+      { start: "2026-10-06T09:00:00Z", end: "2026-10-06T17:00:00Z" },
+      { start: "2026-10-07T09:00:00Z", end: "2026-10-07T17:00:00Z" },
+    ]);
+    assert.equal(answer.timezone, "UTC");
+    assert.deepEqual(answer.skipped, []);
+  });
+
+  /** Give `own` a `calendar-timezone`, as Nextcloud's calendars carry one (Radicale's carry none until told). */
+  async function setCalendarZone(own: RadicaleCalendar, tzid: string): Promise<void> {
+    const body =
+      `<?xml version="1.0" encoding="utf-8"?>` +
+      `<d:propertyupdate xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:set><d:prop>` +
+      `<c:calendar-timezone>${tzid}</c:calendar-timezone>` +
+      `</d:prop></d:set></d:propertyupdate>`;
+    const res = await fetch(own.calendarUrl, {
+      method: "PROPPATCH",
+      headers: { authorization: own.authHeader, "content-type": "application/xml; charset=utf-8" },
+      body,
+    });
+    assert.equal(res.status, 207, `PROPPATCH calendar-timezone answered ${res.status}`);
+  }
+
+  it("the default zone: the calendars' own when they all name the same one, UTC when they disagree — and the answer names it", async () => {
+    const first = await makeRadicaleCalendar();
+    await setCalendarZone(first, "Europe/Berlin");
+    // A second calendar of the same user, with the same zone, then without one.
+    const second: RadicaleCalendar = { ...first, calendarUrl: first.calendarUrl.replace(/cal\/$/, "second/") };
+    const made = await fetch(second.calendarUrl, { method: "MKCALENDAR", headers: { authorization: first.authHeader } });
+    assert.equal(made.status, 201);
+    const args = {
+      range_start: "2026-10-23T00:00:00Z",
+      range_end: "2026-10-24T00:00:00Z",
+      duration_minutes: 60,
+      working_hours: { start_hour: 9, end_hour: 17 },
+    };
+
+    const disagree = await findFreeSlot(RADICALE_URL, first.user, { calendar_urls: [first.calendarUrl, second.calendarUrl], ...args });
+    assert.equal(disagree.timezone, "UTC");
+    assert.deepEqual(disagree.slots, [{ start: "2026-10-23T09:00:00Z", end: "2026-10-23T17:00:00Z" }]);
+
+    await setCalendarZone(second, "Europe/Berlin");
+    const agree = await findFreeSlot(RADICALE_URL, first.user, { calendar_urls: [first.calendarUrl, second.calendarUrl], ...args });
+    assert.equal(agree.timezone, "Europe/Berlin");
+    assert.deepEqual(agree.slots, [{ start: "2026-10-23T09:00:00+02:00", end: "2026-10-23T17:00:00+02:00" }]);
+
+    const given = await findFreeSlot(RADICALE_URL, first.user, {
+      calendar_urls: [first.calendarUrl, second.calendarUrl],
+      ...args,
+      timezone: "America/New_York",
+    });
+    assert.equal(given.timezone, "America/New_York");
+    assert.deepEqual(given.slots, [{ start: "2026-10-23T09:00:00-04:00", end: "2026-10-23T17:00:00-04:00" }]);
+  });
+
+  it("R15: a transparent and a cancelled event no longer block time, nor one the account declined; a tentative one does", async () => {
+    const own = await makeRadicaleCalendar();
+    await putRawEvent(own, "transparent.ics", tuesday("transparent@example.com", "1000", "1200", "TRANSP:TRANSPARENT"));
+    await putRawEvent(own, "cancelled.ics", tuesday("cancelled@example.com", "1300", "1400", "STATUS:CANCELLED"));
+    await putRawEvent(
+      own,
+      "declined.ics",
+      tuesday(
+        "declined@example.com",
+        "1430",
+        "1530",
+        "ORGANIZER:mailto:anna@example.com",
+        `ATTENDEE;PARTSTAT=DECLINED:mailto:${MAILBOX.toUpperCase()}`
+      )
+    );
+    await putRawEvent(own, "tentative.ics", tuesday("tentative@example.com", "1600", "1630", "STATUS:TENTATIVE"));
+    const answer = await findFreeSlot(RADICALE_URL, own.user, { calendar_urls: [own.calendarUrl], ...TUESDAY_9_TO_17 });
+    assert.deepEqual(answer.slots, [
+      { start: "2026-10-06T09:00:00Z", end: "2026-10-06T16:00:00Z" },
+      { start: "2026-10-06T16:30:00Z", end: "2026-10-06T17:00:00Z" },
+    ]);
+  });
+
+  it("an object it cannot read is named in skipped, with a warning that its time was not checked — never counted free in silence", async () => {
+    const own = await makeRadicaleCalendar();
+    await putRawEvent(own, "a-bad.ics", tuesday("bad@example.com", "1000", "1100"));
+    await putRawEvent(own, "b-good.ics", tuesday("good@example.com", "1300", "1400"));
+    const proxy = await startCalDavProxy({ corruptObject: "a-bad.ics" });
+    try {
+      const answer = await findFreeSlot(proxy.url, own.user, {
+        calendar_urls: [own.calendarUrl.replace(RADICALE_URL, proxy.url)],
+        ...TUESDAY_9_TO_17,
+      });
+      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the corrupt object");
+      const skipped = answer.skipped as Array<{ url: string; reason: string }> | undefined;
+      assert.ok(skipped, "the answer has no skipped");
+      assert.equal(skipped.length, 1);
+      assert.match(skipped[0].url, /\/a-bad\.ics$/);
+      assert.match(skipped[0].reason, /could not be read/);
+      assert.match(String(answer.warning), /could not be checked/);
+      assert.deepEqual(answer.slots, [
+        { start: "2026-10-06T09:00:00Z", end: "2026-10-06T13:00:00Z" },
+        { start: "2026-10-06T14:00:00Z", end: "2026-10-06T17:00:00Z" },
+      ]);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("an object whose rule never returns is skipped at its deadline, and its time is not reported free without the warning", { timeout: 60_000 }, async () => {
+    const own = await makeRadicaleCalendar();
+    await putRawEvent(own, "a-hangs.ics", tuesday("hangs-free@example.com", "1000", "1100"));
+    // As in "lookup robustness": no day of ISO week 1 is in June.
+    const hangs = ics(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Other Client//EN",
+      "BEGIN:VEVENT",
+      "UID:hangs-free@example.com",
+      "DTSTAMP:20200101T000000Z",
+      "DTSTART:20200101T100000Z",
+      "DURATION:PT1H",
+      "RRULE:FREQ=DAILY;BYWEEKNO=1;BYMONTH=6",
+      "END:VEVENT",
+      "END:VCALENDAR"
+    );
+    const proxy = await startCalDavProxy({ corruptObject: "a-hangs.ics", corruptWith: hangs });
+    try {
+      const answer = await findFreeSlot(proxy.url, own.user, {
+        calendar_urls: [own.calendarUrl.replace(RADICALE_URL, proxy.url)],
+        ...TUESDAY_9_TO_17,
+      });
+      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the object");
+      const skipped = answer.skipped as Array<{ url: string; reason: string }> | undefined;
+      assert.ok(skipped, "the answer has no skipped");
+      assert.equal(skipped.length, 1);
+      assert.match(skipped[0].url, /\/a-hangs\.ics$/);
+      assert.match(skipped[0].reason, /did not finish/);
+      assert.match(String(answer.warning), /could not be checked/);
+    } finally {
+      await proxy.close();
+    }
+  });
+});

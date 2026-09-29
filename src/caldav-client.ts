@@ -49,6 +49,7 @@ import {
   type OccurrenceLookup,
   type StoredObject,
 } from "./ical-expand.js";
+import { freeSlots, workingZone, type BusyInterval, type FreeSlot, type WorkingHours } from "./free-slots.js";
 import { parseCalendar, seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { expansionPool, reasonOf } from "./ical-worker-pool.js";
 import { calendarZone, canonicalZone } from "./ical-zones.js";
@@ -176,9 +177,25 @@ interface FoundObject extends StoredObject {
   parsed: ParsedCalendar;
 }
 
-export interface FreeSlot {
-  start: string;
-  end: string;
+/** What `find_free_slot` asks for (#213, spec 2026-09-29 §2.7). */
+export interface FreeSlotQuery {
+  calendarUrls: string[];
+  rangeStart: string;
+  rangeEnd: string;
+  durationMinutes: number;
+  /** Whole hours on the working zone's clock, applied to every day in the range. */
+  workingHours?: WorkingHours;
+  /** An IANA name; omitted, the calendars' own when they agree, else UTC. */
+  timezone?: string;
+}
+
+/** What `find_free_slot` answers: the zone it worked in, the slots in it, and what it could not check. */
+export interface FreeSlotAnswer {
+  /** The IANA zone, or `"UTC"`, the working hours were applied in and the slots are given in. */
+  timezone: string;
+  slots: FreeSlot[];
+  /** Objects whose busy time could not be read, as `list_events` names them. Empty when every one was read. */
+  skipped: SkippedObject[];
 }
 
 /** What a {@link CalDavClient} reports through, beside its answers (#210.4). */
@@ -662,85 +679,102 @@ export class CalDavClient {
     throw notFound(uid, calendar.url, nothingDone);
   }
 
-  async findFreeSlots(
-    calendarUrls: string[],
-    rangeStart: string,
-    rangeEnd: string,
-    durationMinutes: number,
-    workingHours?: { startHour: number; endHour: number }
-  ): Promise<FreeSlot[]> {
-    const busy: Array<{ start: number; end: number }> = [];
-    for (const url of calendarUrls) {
-      const { events } = await this.listEvents(url, rangeStart, rangeEnd);
-      for (const e of events) {
-        busy.push({
-          start: instantOfReported(e.start),
-          end: instantOfReported(e.end),
-        });
+  /**
+   * Free time across `calendarUrls` (#213, R14, spec 2026-09-29 §2.7): a thin
+   * wrapper — the busy filter is src/ical-busy.ts, run in the worker pool, and
+   * the slots are src/free-slots.ts.
+   *
+   * - **The zone:** `query.timezone`, else the calendars' own when they all
+   *   report the same one, else UTC ({@link workingZone}). The answer names it.
+   * - **The account's own addresses** come from {@link ownAddresses} and go
+   *   into the worker as data, to know whose `PARTSTAT=DECLINED` frees time. A
+   *   lookup that fails leaves them empty rather than failing the search: a
+   *   declined event then blocks time as anyone else's does — the safe side for
+   *   "is this free?" — and one `info` line says why.
+   * - **What could not be read is said,** in `skipped`, the way `list_events`
+   *   says it: an object with no data, one ical.js cannot read, one cut short,
+   *   one that timed out in its worker. Its time is unknown, and never
+   *   reported as free in silence.
+   *
+   * The objects are asked for, and walked, a day either side of the range: a
+   * floating or all-day time is placed on the working zone's clock, up to 14
+   * hours from where the server's UTC filter put it. Busy time outside the
+   * range is then ignored by `freeSlots`.
+   *
+   * Refused before any request, with `ToolRefusal`: a `timezone` that is no
+   * IANA name, working hours that end at or before they start, and a range
+   * that is not two date-times, the first before the second.
+   */
+  async findFreeSlots(query: FreeSlotQuery): Promise<FreeSlotAnswer> {
+    const nothingDone = "No calendar was read.";
+    let zone: string | null = null;
+    if (query.timezone !== undefined) {
+      zone = canonicalZone(query.timezone);
+      if (zone === null) {
+        throw new ToolRefusal(
+          `"${query.timezone}" is not an IANA time zone. Pass a name like Europe/Berlin or America/New_York, or omit timezone to use the calendars' own. ${nothingDone}`
+        );
       }
     }
-    busy.sort((a, b) => a.start - b.start);
-    const merged: Array<{ start: number; end: number }> = [];
-    for (const slot of busy) {
-      const last = merged[merged.length - 1];
-      if (last && slot.start <= last.end) {
-        last.end = Math.max(last.end, slot.end);
-      } else {
-        merged.push({ ...slot });
-      }
+    const hours = query.workingHours;
+    if (hours !== undefined && hours.endHour <= hours.startHour) {
+      throw new ToolRefusal(
+        `working_hours.end_hour (${hours.endHour}) must be after start_hour (${hours.startHour}): working hours are one span within each day. ${nothingDone}`
+      );
+    }
+    const range = { start: Date.parse(query.rangeStart), end: Date.parse(query.rangeEnd) };
+    if (!Number.isFinite(range.start) || !Number.isFinite(range.end) || range.end <= range.start) {
+      throw new ToolRefusal(
+        `range_start and range_end must be ISO 8601 date-times with an offset, range_start the earlier. ${nothingDone}`
+      );
     }
 
-    const rangeStartMs = new Date(rangeStart).getTime();
-    const rangeEndMs = new Date(rangeEnd).getTime();
-    const durationMs = durationMinutes * 60 * 1000;
-    const free: FreeSlot[] = [];
-    let cursor = rangeStartMs;
+    const calendars: DAVCalendar[] = [];
+    for (const url of query.calendarUrls) calendars.push(await this.findCalendar(url));
+    const timezone = zone ?? workingZone(calendars.map((c) => c.timezone));
+    let own: readonly string[];
+    try {
+      own = await this.ownAddresses();
+    } catch (err) {
+      this.log("info", "caldav: find_free_slot counts every declined event as busy; the account's addresses could not be looked up", {
+        account: this.accountId,
+        reason: classifyFailure(err).reason,
+      });
+      own = [];
+    }
 
-    const clampToWork = (start: number, end: number): { s: number; e: number } | null => {
-      if (!workingHours) return { s: start, e: end };
-      // Anchor to the day of `start` in UTC; users pass ISO with offset, so
-      // working hours are interpreted in UTC. v0.2 will accept a timezone.
-      const d = new Date(start);
-      const dayStart = Date.UTC(
-        d.getUTCFullYear(),
-        d.getUTCMonth(),
-        d.getUTCDate(),
-        workingHours.startHour
-      );
-      const dayEnd = Date.UTC(
-        d.getUTCFullYear(),
-        d.getUTCMonth(),
-        d.getUTCDate(),
-        workingHours.endHour
-      );
-      const s = Math.max(start, dayStart);
-      const e = Math.min(end, dayEnd);
-      if (e - s < durationMs) return null;
-      return { s, e };
-    };
-
-    for (const slot of merged) {
-      if (cursor + durationMs <= slot.start) {
-        const clamped = clampToWork(cursor, slot.start);
-        if (clamped) {
-          free.push({
-            start: new Date(clamped.s).toISOString(),
-            end: new Date(clamped.e).toISOString(),
-          });
+    const margin = 86_400_000;
+    const window = { start: range.start - margin, end: range.end + margin };
+    const client = await this.ensureClient();
+    const busy: BusyInterval[] = [];
+    const skipped: SkippedObject[] = [];
+    for (const calendar of calendars) {
+      const objects: DAVCalendarObject[] = await client.fetchCalendarObjects({
+        calendar,
+        timeRange: { start: new Date(window.start).toISOString(), end: new Date(window.end).toISOString() },
+        urlFilter: everyObjectIn(calendar),
+      });
+      const stored: StoredObject[] = [];
+      for (const obj of objects) {
+        if (typeof obj.data !== "string" || obj.data === "") {
+          skipped.push({ url: obj.url, reason: "The server sent no calendar data for it." });
+          continue;
         }
+        stored.push({ url: obj.url, etag: obj.etag ?? null, data: obj.data });
       }
-      cursor = Math.max(cursor, slot.end);
+      // Off this thread, each object under a deadline, all of them one request.
+      const results = await expansionPool.runOnEach(stored, "busyTimes", (o) => [o.data, window, own, timezone]);
+      results.forEach((result, i) => {
+        if (result.status === "rejected") {
+          skipped.push({ url: stored[i].url, reason: reasonOf(result.reason) });
+          return;
+        }
+        busy.push(...result.value.busy);
+        if (result.value.skipped !== undefined) skipped.push({ url: stored[i].url, reason: result.value.skipped });
+      });
     }
-    if (cursor + durationMs <= rangeEndMs) {
-      const clamped = clampToWork(cursor, rangeEndMs);
-      if (clamped) {
-        free.push({
-          start: new Date(clamped.s).toISOString(),
-          end: new Date(clamped.e).toISOString(),
-        });
-      }
-    }
-    return free;
+    const slots = freeSlots(busy, range, query.durationMinutes, { workingHours: hours, timezone });
+    return { timezone, slots, skipped };
   }
 
   /**
