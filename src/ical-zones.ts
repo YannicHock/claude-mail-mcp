@@ -85,6 +85,39 @@ export interface ZonedWall {
   second: number;
 }
 
+/**
+ * The clock fields of a stored time, exactly as stored: no zone is applied.
+ * One reading for the reader (src/ical-expand.ts) and the writer that moves
+ * a series, which each had their own copy until the code-health review of
+ * PR #229.
+ */
+export function wallOf(time: ICAL.Time): ZonedWall {
+  return { year: time.year, month: time.month, day: time.day, hour: time.hour, minute: time.minute, second: time.second };
+}
+
+/** `wall` moved by `seconds` on the clock: plain field arithmetic, no zone involved. */
+export function addToWall(wall: ZonedWall, seconds: number): ZonedWall {
+  const d = new Date(Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second) + seconds * 1000);
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+    second: d.getUTCSeconds(),
+  };
+}
+
+/** Seconds since midnight of a wall time. */
+export function clockSeconds(wall: ZonedWall): number {
+  return (wall.hour * 60 + wall.minute) * 60 + wall.second;
+}
+
+/** `YYYY-MM-DD` of a wall time. */
+export function dayOf(wall: ZonedWall): string {
+  return `${String(wall.year).padStart(4, "0")}-${String(wall.month).padStart(2, "0")}-${String(wall.day).padStart(2, "0")}`;
+}
+
 const formatters = new Map<string, Intl.DateTimeFormat>();
 
 /** One formatter per zone: constructing them is what costs, not using them. */
@@ -551,6 +584,18 @@ export type WriteZone =
 export const UTC_ZONE: WriteZone = { kind: "utc" };
 
 /**
+ * The zone a new event is written in for the IANA name `iana` (as
+ * {@link canonicalZone} spells it): UTC for a name that means UTC, written as
+ * `…Z`, and otherwise `TZID=iana` local time whose arithmetic is `Intl`'s.
+ * The one place a {@link WriteZone} is made from a name rather than read off
+ * a stored property, so no caller assembles an {@link IntlTimezone} by hand
+ * (code-health review of PR 3).
+ */
+export function zonedWriteZone(iana: string): WriteZone {
+  return isUtcName(iana) ? UTC_ZONE : { kind: "zoned", tzid: iana, zone: new IntlTimezone(iana, iana) };
+}
+
+/**
  * The property {@link vtimezoneFromIntl} marks its block with. The block is
  * this connector's to regenerate only while it carries the mark; one without
  * it — any other client's, bounded or not — is how that client reads the
@@ -673,6 +718,28 @@ export function readDateTime(value: string, zone: WriteZone): number {
   if (hasOffset(value)) return Date.parse(value);
   const wall = wallOfIso(value);
   if (wall === null) return NaN;
+  if (zone.kind === "zoned") return wallToInstantIn(wall, zone.zone);
+  return Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
+}
+
+/**
+ * The wall-clock fields the instant `ms` shows in `zone` — for a floating
+ * zone, the clock time `ms` stands for (it is read as UTC, see
+ * {@link readDateTime}). Unlike {@link writtenTime} it never falls back to
+ * UTC: on the second pass through an autumn overlap it is the wall time the
+ * zone's clocks show, which is what a series' "same clock time" (#207) is
+ * measured in.
+ */
+export function wallAt(ms: number, zone: WriteZone): ZonedWall {
+  return zone.kind === "zoned" ? utcWall(ms + offsetsOf(zone.zone)(ms)) : utcWall(ms);
+}
+
+/**
+ * The instant a wall time names in `zone`, by RFC 5545 §3.3.5's rule for a
+ * zoned one ({@link wallToInstantBy}); a UTC or floating wall time read as
+ * UTC. The inverse of {@link wallAt} everywhere but in a gap.
+ */
+export function instantAt(wall: ZonedWall, zone: WriteZone): number {
   if (zone.kind === "zoned") return wallToInstantIn(wall, zone.zone);
   return Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
 }
@@ -838,6 +905,31 @@ export function generatedVtimezone(tz: string, instants: number[]): ICAL.Compone
 }
 
 /**
+ * How far past the latest time an object holds a generated VTIMEZONE reaches
+ * for a series in its zone whose rule has no UNTIL (see
+ * {@link coverGeneratedVtimezone}): ten years, about 20 observances for a
+ * zone with DST.
+ */
+const SERIES_REACH_MS = 10 * 366 * 86_400_000;
+
+/**
+ * The instants a series in `tzid` runs to beyond the times `vcal` holds, the
+ * latest of which is `latest`: each such VEVENT's UNTIL, or `latest` plus
+ * {@link SERIES_REACH_MS} for a rule with COUNT or no end.
+ */
+function seriesReach(vcal: ICAL.Component, tzid: string, latest: number): number[] {
+  const reach: number[] = [];
+  for (const vevent of vcal.getAllSubcomponents("vevent")) {
+    if (String(vevent.getFirstProperty("dtstart")?.getParameter("tzid")) !== tzid) continue;
+    for (const prop of vevent.getAllProperties("rrule")) {
+      const until = (prop.getFirstValue() as ICAL.Recur).until;
+      reach.push(until ? until.toUnixTime() * 1000 : latest + SERIES_REACH_MS);
+    }
+  }
+  return reach;
+}
+
+/**
  * Regenerate the VTIMEZONE this connector generated for `tzid`, if the
  * object holds one, so that it covers every time in the object written in
  * that zone (review of #224). In place, and in the block's own position.
@@ -852,10 +944,19 @@ export function generatedVtimezone(tz: string, instants: number[]): ICAL.Compone
  * that TZID, a year either side.
  *
  * A block without the mark is someone else's and is left exactly as it is;
- * so is an object whose times in the zone are all gone. An RRULE is not
- * followed: `create_event` writes no series, and `update_event` changes no
- * series' time, so no series holds a generated block today. The change that
- * lets one (v0.7.4 PR 4) has to decide how far such a block reaches.
+ * so is an object whose times in the zone are all gone.
+ *
+ * **A series' reach** (v0.7.4 PR 4, #207). The times an object holds are
+ * only where a series starts: its occurrences run on by its rule. So for a
+ * VEVENT in that zone with an RRULE, the block also covers the rule's end —
+ * its UNTIL — and, for a rule with COUNT or no end at all, the ten years
+ * after the latest time the object holds ({@link SERIES_REACH_MS}). The
+ * rule is not walked for it (that is a worker's job, src/ical-worker-ops.ts,
+ * and a COUNT's last occurrence would need one): ten years is a bound, not
+ * the series' end, and past it the block reads the zone as its last
+ * observance says, as any other client's bounded block would. `create_event`
+ * writes no series, so this is a series another client made of an event
+ * this connector created, whose time `update_event` then moved.
  */
 export function coverGeneratedVtimezone(vcal: ICAL.Component, tzid: string): void {
   // A copy: ical.js hands out its own array, which the removal below empties.
@@ -875,6 +976,7 @@ export function coverGeneratedVtimezone(vcal: ICAL.Component, tzid: string): voi
     });
   }
   if (instants.length === 0) return;
+  instants.push(...seriesReach(vcal, tzid, Math.max(...instants)));
   subcomponents[index] = generatedVtimezone(tzid, instants);
   vcal.removeAllSubcomponents();
   for (const c of subcomponents) vcal.addSubcomponent(c);

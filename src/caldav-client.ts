@@ -27,30 +27,30 @@ import {
   DAVCalendar,
   DAVCalendarObject,
 } from "tsdav";
-import ICAL from "ical.js";
 import { randomUUID } from "node:crypto";
+import { buildIcs, builtZoneName, type NewEventFields } from "./ical-build.js";
 import {
   applyEventPatch,
-  calendarDate,
   changesSomething,
-  describeStoredEvent,
-  mainSequence,
-  timedBound,
+  describeSeries,
   touchesTime,
+  writtenBy,
+  type EditResult,
   type EventPatch,
+  type WriteMark,
 } from "./ical-edit.js";
-import { instantOfReported, type CalendarEvent, type StoredObject } from "./ical-expand.js";
-import { expansionPool } from "./ical-worker-pool.js";
+import { applyOccurrencePatch, excludeOccurrence } from "./ical-occurrence-edit.js";
+import { shiftSeries } from "./ical-series-shift.js";
 import {
-  calendarZone,
-  canonicalZone,
-  generatedVtimezone,
-  IntlTimezone,
-  isUtcName,
-  UTC_ZONE,
-  writtenTime,
-  type WriteZone,
-} from "./ical-zones.js";
+  instantOfReported,
+  type CalendarEvent,
+  type FoundOccurrence,
+  type OccurrenceLookup,
+  type StoredObject,
+} from "./ical-expand.js";
+import { parseCalendar, seriesFor, type ParsedCalendar } from "./ical-parse.js";
+import { expansionPool, reasonOf } from "./ical-worker-pool.js";
+import { calendarZone, canonicalZone } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 import { classifyFailure } from "../shared/credential-failure.js";
 import type { Logger } from "../shared/log.js";
@@ -86,16 +86,8 @@ export interface EventListing {
   skipped: SkippedObject[];
 }
 
-export interface NewEventInput {
+export interface NewEventInput extends NewEventFields {
   calendarUrl: string;
-  summary: string;
-  description?: string;
-  location?: string;
-  /** ISO 8601; with no offset, clock time in the zone the event is written in. */
-  start: string;
-  end: string;
-  allDay?: boolean;
-  attendees?: string[];
   /**
    * The IANA zone to write the event in (spec 2026-09-29 §2.5). Omitted, it is
    * the calendar's own zone when the server reports one, and UTC otherwise.
@@ -117,13 +109,51 @@ export interface EventTarget {
   uid: string;
   /** From `list_events`. Sent as If-Match; see spec §4.1 for when it may be omitted. */
   etag?: string;
-  /** Present only to be refused: single occurrences are out of scope (spec §4.3). */
+  /**
+   * One occurrence of a series, as `list_events` reported its `recurrenceId`
+   * (spec 2026-09-29 §2.3, #206). With `applyToSeries`, only the occurrence a
+   * series' new start or end describes (§2.4, #207).
+   */
   recurrenceId?: string;
-  /** Required to touch a recurring event at all. */
+  /** Required to touch a recurring event at all, unless `recurrenceId` names one occurrence. */
   applyToSeries?: boolean;
 }
 
 export interface EventUpdate extends EventTarget, EventPatch {}
+
+/** What `delete_event` answers. */
+export interface DeletedEvent {
+  uid: string;
+  url: string;
+  /**
+   * The object's new ETag, for a deletion of one occurrence that wrote the
+   * rest of the series back (#206); absent when the object was deleted, and
+   * null when the server gave none.
+   */
+  etag?: string | null;
+  /** Said when deleting one occurrence left the series with none. */
+  note?: string;
+}
+
+/**
+ * Where a guarded write goes, and what its refusals end with: the one
+ * argument {@link CalDavClient}'s `guardedWrite` takes about the event, in
+ * place of the five it took one by one (code-health review of PR 3).
+ * `move_event` (#212) passes the source's.
+ */
+export interface WriteTarget {
+  calendar: DAVCalendar;
+  uid: string;
+  /** The object's URL, as the lookup found it. */
+  url: string;
+  /** "Nothing was changed." and the like: what a refusal says was not done. */
+  nothingDone: string;
+}
+
+/** A stored object the UID lookup found, with the one parse of it every write reuses. */
+interface FoundObject extends StoredObject {
+  parsed: ParsedCalendar;
+}
 
 export interface FreeSlot {
   start: string;
@@ -247,12 +277,13 @@ export class CalDavClient {
    * before v0.7.4. The answer says which zone it was.
    */
   async createEvent(input: NewEventInput): Promise<CreatedEvent> {
+    const nothingDone = "Nothing was created.";
     let zone: string | null = null;
     if (input.timezone !== undefined) {
       zone = canonicalZone(input.timezone);
       if (zone === null) {
         throw new ToolRefusal(
-          `"${input.timezone}" is not an IANA time zone. Pass a name like Europe/Berlin or America/New_York, or omit timezone to use the calendar's own. Nothing was created.`
+          `"${input.timezone}" is not an IANA time zone. Pass a name like Europe/Berlin or America/New_York, or omit timezone to use the calendar's own. ${nothingDone}`
         );
       }
     }
@@ -260,7 +291,7 @@ export class CalDavClient {
     zone ??= calendarZone(calendar.timezone) ?? "UTC";
     const client = await this.ensureClient();
     const uid = `${randomUUID()}@claude-mail-mcp`;
-    const ics = buildIcs({ ...input, uid }, zone);
+    const ics = buildIcs({ ...input, uid }, zone, nothingDone);
     const filename = `${uid}.ics`;
     const res = await client.createCalendarObject({
       calendar,
@@ -269,58 +300,120 @@ export class CalDavClient {
     });
     assertWritten(res, "PUT");
     const base = calendar.url.endsWith("/") ? calendar.url : `${calendar.url}/`;
-    const timezone = input.allDay === true ? "floating" : isUtcName(zone) ? "UTC" : zone;
-    return { url: `${base}${filename}`, uid, timezone };
+    return { url: `${base}${filename}`, uid, timezone: builtZoneName(ics) };
   }
 
   /**
    * Change an existing event in place (#152). Spec §4: the caller's ETag guards
    * the write, a series needs `applyToSeries`, and everything the patch does
    * not name survives — see src/ical-edit.ts.
+   *
+   * v0.7.4 (spec 2026-09-29 §2.3, #206): with `recurrenceId` the patch goes
+   * to that one occurrence — its override, made from the master if it has
+   * none — and `applyToSeries` is not needed. The occurrence is found by
+   * {@link occurrence}, off this thread. An object holding only an override
+   * (an invitation to one instance, #211.3) is that occurrence, changed with
+   * or without `recurrenceId`.
+   *
+   * v0.7.4 (§2.4, #207): a series' `start` and `end`, with `applyToSeries`,
+   * give every occurrence a new clock time and/or length, each keeping its
+   * date — `shiftSeries` in src/ical-series-shift.ts, which carries EXDATE, RDATE,
+   * the overrides' RECURRENCE-IDs and UNTIL along. The times describe the
+   * series' first occurrence, or the one `recurrenceId` names: that is the
+   * one meaning `recurrenceId` has beside `applyToSeries: true`. For a change
+   * that moves no time the two contradict each other, and the call is refused
+   * before the server is contacted.
    */
   async updateEvent(update: EventUpdate): Promise<{ uid: string; url: string; etag: string | null }> {
     const nothingDone = "Nothing was changed, and no event was created.";
-    if (update.recurrenceId !== undefined) {
-      throw new ToolRefusal(
-        "Changing a single occurrence of a recurring event is not supported yet: it needs an override (RECURRENCE-ID) this connector does not write. Nothing was changed. To change every occurrence, omit recurrence_id and pass apply_to_series: true."
-      );
-    }
     if (!changesSomething(update)) {
       throw new ToolRefusal(
         "Nothing to change: pass at least one of summary, description, location, start, end or all_day."
       );
     }
-    const calendar = await this.findCalendar(update.calendarUrl);
-    const stored = await this.findStoredEvent(calendar, update.uid, nothingDone);
-    const shape = describeStoredEvent(stored.data, update.uid);
-    if (shape.overrideOnly) {
-      // #211.3: there is no master to patch, so without this the patch threw a
-      // plain Error — logged as a server failure — or, without
-      // apply_to_series, the call was told this is a series it can change.
+    const recurrenceId = update.recurrenceId;
+    if (recurrenceId !== undefined && update.applyToSeries === true && !touchesTime(update)) {
       throw new ToolRefusal(
-        `"${update.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example), and changing such an occurrence is not supported yet. Nothing was changed.`
+        `recurrence_id and apply_to_series: true contradict each other for a change that moves no time: recurrence_id changes that one occurrence, and apply_to_series every occurrence. Together they only say which occurrence a series' new start or end describes. Omit one of them. ${nothingDone}`
       );
     }
-    if (shape.recurring) {
-      if (update.applyToSeries !== true) throw seriesRefusal(update.uid, "change");
-      if (touchesTime(update)) {
-        throw new ToolRefusal(
-          `"${update.uid}" is a recurring series, and changing the time of a whole series is not supported yet. Nothing was changed. Its summary, description and location can be changed with apply_to_series: true.`
-        );
-      }
+    const calendar = await this.findCalendar(update.calendarUrl);
+    const stored = await this.findStoredEvent(calendar, update.uid, nothingDone);
+    const shape = describeSeries(seriesFor(stored.parsed.vcal, update.uid));
+    const target: WriteTarget = { calendar, uid: update.uid, url: stored.url, nothingDone };
+    let edit: EditResult;
+    // #211.3: an object with no master has no series here to change; the one
+    // occurrence it holds is changed like any other, with or without its
+    // recurrence_id.
+    if (shape.overrideOnly && update.applyToSeries === true && touchesTime(update)) {
+      throw new ToolRefusal(
+        `"${update.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example), so the series' time cannot be changed here. To move this one occurrence, omit apply_to_series. ${nothingDone}`
+      );
     }
+    if (shape.overrideOnly || (recurrenceId !== undefined && update.applyToSeries !== true)) {
+      const ifMatch = requireEtag(update, stored, nothingDone);
+      const found = await this.occurrence(stored, update.uid, recurrenceId ?? null, nothingDone);
+      edit = applyOccurrencePatch(stored.parsed, update.uid, found, update, nothingDone);
+      return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
+    }
+    if (shape.recurring && update.applyToSeries !== true) throw seriesRefusal(update.uid, "change");
     const ifMatch = requireEtag(update, stored, nothingDone);
-    const data = applyEventPatch(stored.data, update.uid, update);
+    // With apply_to_series, recurrence_id names the occurrence a series' new
+    // time describes (§2.4); on an event that does not recur the lookup
+    // refuses it, saying so.
+    const anchor = recurrenceId === undefined ? null : await this.occurrence(stored, update.uid, recurrenceId, nothingDone);
+    edit =
+      shape.recurring && touchesTime(update)
+        ? shiftSeries(stored.parsed, update.uid, anchor, update, nothingDone)
+        : applyEventPatch(stored.parsed, update.uid, update, nothingDone);
+    return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
+  }
+
+  /**
+   * The occurrence of `uid`'s series that `recurrenceId` names — or, for an
+   * object holding only an override, with `null`, its one occurrence — found
+   * by src/ical-expand.ts's `findOccurrence` in a worker (spec §2.3: matched
+   * against the expanded series, never built), since it walks the recurrence
+   * rule. A worker that times out or fails, and a `recurrence_id` that names
+   * no occurrence, are refusals ending in `nothingDone`.
+   */
+  private async occurrence(
+    stored: FoundObject,
+    uid: string,
+    recurrenceId: string | null,
+    nothingDone: string
+  ): Promise<FoundOccurrence> {
+    let found: OccurrenceLookup;
+    try {
+      found = await expansionPool.runOn(
+        { url: stored.url, etag: stored.etag, data: stored.data },
+        "findOccurrence",
+        stored.data,
+        uid,
+        recurrenceId
+      );
+    } catch (err) {
+      throw new ToolRefusal(`The occurrences of "${uid}" could not be looked up. ${reasonOf(err)} ${nothingDone}`);
+    }
+    if (!found.found) throw new ToolRefusal(`${found.reason} ${nothingDone}`);
+    return found;
+  }
+
+  /**
+   * PUT an edit of a stored object through {@link guardedWrite}, and return
+   * the new ETag: the server's answer's, or read back through
+   * {@link etagAfterWrite} when it gave none.
+   */
+  private async putEdit(target: WriteTarget, ifMatch: string | undefined, edit: EditResult): Promise<string | null> {
     const client = await this.ensureClient();
-    const res = await this.guardedWrite("PUT", calendar, update.uid, stored.url, ifMatch, nothingDone, (etag) =>
+    const res = await this.guardedWrite("PUT", target, ifMatch, (etag) =>
       client.updateCalendarObject({
-        calendarObject: { url: stored.url, data, ...(etag === undefined ? {} : { etag }) },
+        calendarObject: { url: target.url, data: edit.ics, ...(etag === undefined ? {} : { etag }) },
       })
     );
-    const etag =
-      res.headers.get("etag") ??
-      (await this.etagAfterWrite(calendar, update.uid, stored.url, mainSequence(data, update.uid)));
-    return { uid: update.uid, url: stored.url, etag };
+    const answered = res.headers.get("etag");
+    if (answered !== null || edit.mark === null) return answered;
+    return this.etagAfterWrite(target.calendar, target.url, edit.mark);
   }
 
   /**
@@ -336,7 +429,8 @@ export class CalDavClient {
    * read the event again in that case.
    *
    * An ETag is handed back only for what is recognisably this write: the same
-   * object URL, and the SEQUENCE this update just wrote. Otherwise someone
+   * object URL, and the SEQUENCE this update just wrote on the VEVENT it
+   * changed (`mark`, see `writtenBy` in src/ical-edit.ts). Otherwise someone
    * else's version landed in between (a phone syncing, a server applying an
    * attendee's reply that bumps it), and giving the caller *that* etag would
    * let its next update overwrite the other change unseen — `null` sends it to
@@ -349,15 +443,10 @@ export class CalDavClient {
    * `classifyFailure`'s bounded reading of the message, never the error
    * object, which can carry the connection's credentials.
    */
-  private async etagAfterWrite(
-    calendar: DAVCalendar,
-    uid: string,
-    url: string,
-    sequence: number | null
-  ): Promise<string | null> {
+  private async etagAfterWrite(calendar: DAVCalendar, url: string, mark: WriteMark): Promise<string | null> {
     try {
-      const now = await this.findStoredEvent(calendar, uid, "");
-      if (now.url !== url || sequence === null || mainSequence(now.data, uid) !== sequence) return null;
+      const now = await this.findStoredEvent(calendar, mark.uid, "");
+      if (now.url !== url || !writtenBy(now.data, mark)) return null;
       return now.etag;
     } catch (err) {
       this.log("info", "caldav: the etag of a write could not be read back", {
@@ -371,34 +460,66 @@ export class CalDavClient {
   /**
    * Delete an event, permanently (#153). The same guards as
    * {@link updateEvent}; a series is deleted whole, and only when asked to be.
+   *
+   * v0.7.4 (spec 2026-09-29 §2.3, #206): with `recurrenceId`, one occurrence
+   * — an `EXDATE` on the series, its override removed, the rest of the
+   * object written back with a PUT, so the answer carries the new `etag`. If
+   * that was the series' last occurrence the object is kept and the answer's
+   * `note` says the series has none left. An object holding only overrides
+   * (#211.3) has no series to exclude from: the occurrence is removed, and
+   * the object deleted when it held nothing else. `recurrenceId` with
+   * `applyToSeries: true` is contradictory and refused before the server is
+   * contacted.
    */
-  async deleteEvent(target: EventTarget): Promise<{ uid: string; url: string }> {
+  async deleteEvent(target: EventTarget): Promise<DeletedEvent> {
     const nothingDone = "Nothing was deleted.";
-    if (target.recurrenceId !== undefined) {
+    const recurrenceId = target.recurrenceId;
+    if (recurrenceId !== undefined && target.applyToSeries === true) {
       throw new ToolRefusal(
-        "Deleting a single occurrence of a recurring event is not supported yet: that is an EXDATE on the series, not a deletion. Nothing was deleted. To delete every occurrence, omit recurrence_id and pass apply_to_series: true."
+        `recurrence_id and apply_to_series: true contradict each other: recurrence_id deletes that one occurrence, and apply_to_series the whole series. Omit one of them. ${nothingDone}`
       );
     }
     const calendar = await this.findCalendar(target.calendarUrl);
     const stored = await this.findStoredEvent(calendar, target.uid, nothingDone);
-    const shape = describeStoredEvent(stored.data, target.uid);
+    const shape = describeSeries(seriesFor(stored.parsed.vcal, target.uid));
+    const writeTarget: WriteTarget = { calendar, uid: target.uid, url: stored.url, nothingDone };
+    if (recurrenceId !== undefined) {
+      const ifMatch = requireEtag(target, stored, nothingDone);
+      const found = await this.occurrence(stored, target.uid, recurrenceId, nothingDone);
+      const edit = excludeOccurrence(stored.parsed, target.uid, found, nothingDone);
+      if (!(shape.overrideOnly && edit.seriesEmpty)) {
+        const etag = await this.putEdit(writeTarget, ifMatch, edit);
+        const note =
+          edit.seriesEmpty
+            ? "That was the series' last occurrence: it has no occurrences left, but the event itself was kept. Delete it with apply_to_series: true to remove it."
+            : undefined;
+        return { uid: target.uid, url: stored.url, etag, ...(note === undefined ? {} : { note }) };
+      }
+      // The only occurrence of an object with no master: nothing would be left.
+      await this.deleteObject(writeTarget, ifMatch);
+      return { uid: target.uid, url: stored.url };
+    }
     if (shape.overrideOnly && target.applyToSeries !== true) {
       // #211.3: not "every occurrence" — the object holds only this one.
       throw new ToolRefusal(
-        `"${target.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example). Deleting it removes the whole stored object. Nothing was deleted. Pass apply_to_series: true if that is what you intend.`
+        `"${target.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example). Deleting it removes the whole stored object: pass its recurrence_id, or apply_to_series: true, if that is what you intend. ${nothingDone}`
       );
     }
     if (shape.recurring && target.applyToSeries !== true) {
       throw seriesRefusal(target.uid, "delete");
     }
-    const ifMatch = requireEtag(target, stored, nothingDone);
+    await this.deleteObject(writeTarget, requireEtag(target, stored, nothingDone));
+    return { uid: target.uid, url: stored.url };
+  }
+
+  /** DELETE the stored object `target` names, guarded by `ifMatch` through {@link guardedWrite}. */
+  private async deleteObject(target: WriteTarget, ifMatch: string | undefined): Promise<void> {
     const client = await this.ensureClient();
-    await this.guardedWrite("DELETE", calendar, target.uid, stored.url, ifMatch, nothingDone, (etag) =>
+    await this.guardedWrite("DELETE", target, ifMatch, (etag) =>
       client.deleteCalendarObject({
-        calendarObject: { url: stored.url, ...(etag === undefined ? {} : { etag }) },
+        calendarObject: { url: target.url, ...(etag === undefined ? {} : { etag }) },
       })
     );
-    return { uid: target.uid, url: stored.url };
   }
 
   /**
@@ -433,13 +554,11 @@ export class CalDavClient {
    */
   private async guardedWrite(
     method: "PUT" | "DELETE",
-    calendar: DAVCalendar,
-    uid: string,
-    url: string,
+    target: WriteTarget,
     ifMatch: string | undefined,
-    nothingDone: string,
     write: (ifMatch: string | undefined) => Promise<Response>
   ): Promise<Response> {
+    const { calendar, uid, url, nothingDone } = target;
     let res = await write(ifMatch);
     if (ifMatch === "*" && res.status === 412) {
       const again = await this.findStoredEvent(calendar, uid, nothingDone);
@@ -460,12 +579,11 @@ export class CalDavClient {
    * called (#211.1), and one that cannot be parsed is passed over rather than
    * ending the search (#211.2): the query matched it on a substring, so the
    * exact match may well be a later one.
+   *
+   * The match comes back with its parse, which the write that asked for it
+   * reuses rather than parsing the same text again.
    */
-  private async findStoredEvent(
-    calendar: DAVCalendar,
-    uid: string,
-    nothingDone: string
-  ): Promise<{ url: string; etag: string | null; data: string }> {
+  private async findStoredEvent(calendar: DAVCalendar, uid: string, nothingDone: string): Promise<FoundObject> {
     const client = await this.ensureClient();
     const objects: DAVCalendarObject[] = await client.fetchCalendarObjects({
       calendar,
@@ -474,13 +592,15 @@ export class CalDavClient {
     });
     for (const obj of objects) {
       if (typeof obj.data !== "string") continue;
-      let found: boolean;
+      let parsed: ParsedCalendar;
       try {
-        found = describeStoredEvent(obj.data, uid).found;
+        parsed = parseCalendar(obj.data);
       } catch {
         continue;
       }
-      if (found) return { url: obj.url, etag: obj.etag ?? null, data: obj.data };
+      if (describeSeries(seriesFor(parsed.vcal, uid)).found) {
+        return { url: obj.url, etag: obj.etag ?? null, data: obj.data, parsed };
+      }
     }
     throw notFound(uid, calendar.url, nothingDone);
   }
@@ -697,76 +817,4 @@ export function assertWritten(res: Response, method: string): void {
   if (!res.ok) {
     throw new Error(`CalDAV server answered ${res.status} ${res.statusText}`.trim() + ` to ${method}`);
   }
-}
-
-/**
- * The object `create_event` writes, in the IANA zone `zone` (spec 2026-09-29
- * §2.5): UTC (`…Z`, and no VTIMEZONE, as before v0.7.4) when `zone` is UTC,
- * and otherwise `TZID=zone` local time with a VTIMEZONE {@link
- * generatedVtimezone} makes for the event's span and a year either side —
- * marked as this connector's, so `update_event` regenerates it when the event
- * moves outside that span (review of #224). A time given without an offset is
- * clock time in `zone`. An all-day event is dates whatever the zone.
- *
- * A bound on the second pass through an autumn overlap is written in UTC:
- * as a wall time it would mean the first pass, an hour earlier, and could
- * land before the start (see `writtenTime` in src/ical-zones.ts).
- *
- * Throws {@link ToolRefusal} for a start or end it cannot read, and for an end
- * at or before the start — which until the review of #224 was written as it
- * was given, an event every client shows with no length or backwards.
- */
-export function buildIcs(input: NewEventInput & { uid: string }, zone: string, now: Date = new Date()): string {
-  const nothingDone = "Nothing was created.";
-  const cal = new ICAL.Component(["vcalendar", [], []]);
-  cal.updatePropertyWithValue("prodid", "-//claude-mail-mcp//EN");
-  cal.updatePropertyWithValue("version", "2.0");
-
-  const vevent = new ICAL.Component("vevent");
-  vevent.updatePropertyWithValue("uid", input.uid);
-  vevent.updatePropertyWithValue("dtstamp", ICAL.Time.fromJSDate(now, true));
-  if (input.allDay === true) {
-    const start = calendarDate("start", input.start, nothingDone);
-    const end = calendarDate("end", input.end, nothingDone);
-    if (end <= start) {
-      throw new ToolRefusal(
-        `The event would end (${end}) on or before it starts (${start}). For an all-day event the end date is exclusive: a one-day event on ${start} ends the day after. ${nothingDone}`
-      );
-    }
-    vevent.updatePropertyWithValue("dtstart", ICAL.Time.fromDateString(start));
-    vevent.updatePropertyWithValue("dtend", ICAL.Time.fromDateString(end));
-  } else {
-    const target: WriteZone = isUtcName(zone)
-      ? UTC_ZONE
-      : { kind: "zoned", tzid: zone, zone: new IntlTimezone(zone, zone) };
-    const startMs = timedBound("start", input.start, target, nothingDone);
-    const endMs = timedBound("end", input.end, target, nothingDone);
-    if (endMs <= startMs) {
-      throw new ToolRefusal(
-        `The event would end (${new Date(endMs).toISOString()}) at or before it starts (${new Date(startMs).toISOString()}). ${nothingDone}`
-      );
-    }
-    for (const [name, ms] of [["dtstart", startMs], ["dtend", endMs]] as const) {
-      const written = writtenTime(ms, target);
-      const prop = new ICAL.Property(name);
-      prop.setValue(written.time);
-      if (written.zone.kind === "zoned") prop.setParameter("tzid", written.zone.tzid);
-      vevent.addProperty(prop);
-    }
-    if (target.kind === "zoned") cal.addSubcomponent(generatedVtimezone(zone, [startMs, endMs]));
-  }
-  vevent.updatePropertyWithValue("summary", input.summary);
-  if (input.description) {
-    vevent.updatePropertyWithValue("description", input.description);
-  }
-  if (input.location) {
-    vevent.updatePropertyWithValue("location", input.location);
-  }
-  for (const a of input.attendees ?? []) {
-    const prop = new ICAL.Property("attendee");
-    prop.setValue(a.startsWith("mailto:") ? a : `mailto:${a}`);
-    vevent.addProperty(prop);
-  }
-  cal.addSubcomponent(vevent);
-  return cal.toString();
 }

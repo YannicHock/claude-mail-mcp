@@ -30,6 +30,7 @@ import {
   getRawEvent,
   makeRadicaleCalendar,
   putRawEvent,
+  serverExpands,
   serverFindsIn,
   waitForRadicaleReady,
   type CalDavProxy,
@@ -387,26 +388,40 @@ describe("lookup robustness (#211)", SKIP, () => {
     }
   });
 
-  it("#211.3: an override with no master is refused as the one occurrence it is, not as a series", async () => {
+  it("#211.3: an override with no master is changed as the one occurrence it is, with or without its recurrence_id (spec §2.3)", async () => {
     const { cal: own, client: mine } = await freshCalendar();
     const uid = "invited-once@example.com";
-    const etag = await putRawEvent(own, "invited-once.ics", overrideOnly(uid));
-    for (const applyToSeries of [undefined, true]) {
-      const message = await refusal(
-        mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, summary: "x", applyToSeries })
-      );
-      assert.match(message, /single occurrence of a series/, `apply_to_series: ${String(applyToSeries)}`);
-      assert.match(message, /Nothing was changed/);
-      assert.doesNotMatch(message, /pass apply_to_series/);
+    let etag: string | null = await putRawEvent(own, "invited-once.ics", overrideOnly(uid));
+    for (const recurrenceId of [undefined, "2026-10-08T09:00:00.000Z"]) {
+      const result = await mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag: etag ?? undefined, recurrenceId, summary: `Changed ${String(recurrenceId)}` });
+      etag = result.etag;
+      assert.match((await getRawEvent(own, "invited-once.ics")) ?? "", new RegExp(`SUMMARY:Changed ${String(recurrenceId)}`));
     }
-    assert.match((await getRawEvent(own, "invited-once.ics")) ?? "", /SUMMARY:The one I was invited to/);
+    const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(events.map((e) => [e.recurrenceId, e.summary]), [["2026-10-08T09:00:00.000Z", "Changed 2026-10-08T09:00:00.000Z"]]);
 
+    // Its time too, but not "the series'": that series lives elsewhere.
+    const series = await refusal(
+      mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag: etag ?? undefined, applyToSeries: true, start: "2026-10-08T11:00:00Z" })
+    );
+    assert.match(series, /series whose other occurrences are not in this calendar/);
+    assert.match(series, /Nothing was changed/);
+  });
+
+  it("#211.3: an override with no master is deleted whole, by its recurrence_id or with apply_to_series", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "invited-delete@example.com";
+    const etag = await putRawEvent(own, "invited.ics", overrideOnly(uid));
     const deleting = await refusal(mine.deleteEvent({ calendarUrl: own.calendarUrl, uid, etag }));
     assert.match(deleting, /single occurrence of a series/);
     assert.doesNotMatch(deleting, /every occurrence/);
     assert.match(deleting, /Nothing was deleted/);
-    await mine.deleteEvent({ calendarUrl: own.calendarUrl, uid, etag, applyToSeries: true });
-    assert.equal(await getRawEvent(own, "invited-once.ics"), null);
+    await mine.deleteEvent({ calendarUrl: own.calendarUrl, uid, etag, recurrenceId: "2026-10-08T09:00:00.000Z" });
+    assert.equal(await getRawEvent(own, "invited.ics"), null);
+
+    const again = await putRawEvent(own, "invited.ics", overrideOnly(uid));
+    await mine.deleteEvent({ calendarUrl: own.calendarUrl, uid, etag: again, applyToSeries: true });
+    assert.equal(await getRawEvent(own, "invited.ics"), null);
   });
 });
 
@@ -488,7 +503,7 @@ describe("update_event", SKIP, () => {
     assert.match((await getRawEvent(cal, "sub-10.ics")) ?? "", /SUMMARY:Ten/);
   });
 
-  it("refuses a series without apply_to_series, and its time even with it", async () => {
+  it("refuses a series without apply_to_series, and renames it with it", async () => {
     const uid = "series-update@example.com";
     await putRawEvent(cal, "series-update.ics", seriesEvent(uid));
     const etag = await etagOf(uid);
@@ -498,31 +513,288 @@ describe("update_event", SKIP, () => {
       /recurring series.*every occurrence/
     );
     assert.match(
-      await refusal(
-        client.updateEvent({
-          calendarUrl: cal.calendarUrl,
-          uid,
-          etag,
-          applyToSeries: true,
-          start: "2026-10-01T10:00:00Z",
-        })
-      ),
-      /time of a whole series is not supported/
+      await refusal(client.updateEvent({ calendarUrl: cal.calendarUrl, uid, etag, start: "2026-10-01T10:00:00Z" })),
+      /recurring series.*every occurrence/
     );
     await client.updateEvent({ calendarUrl: cal.calendarUrl, uid, etag, applyToSeries: true, summary: "Daily" });
     assert.match((await getRawEvent(cal, "series-update.ics")) ?? "", /SUMMARY:Daily[\s\S]*RRULE:FREQ=WEEKLY;COUNT=5|RRULE:FREQ=WEEKLY;COUNT=5[\s\S]*SUMMARY:Daily/);
   });
 
-  it("refuses a single occurrence, naming the limitation", async () => {
+  it("refuses a recurrence_id that names no occurrence, and changes nothing", async () => {
+    const uid = "series-between@example.com";
+    await putRawEvent(cal, "series-between.ics", seriesEvent(uid));
+    const etag = await etagOf(uid);
     const message = await refusal(
-      client.updateEvent({
-        calendarUrl: cal.calendarUrl,
-        uid: "series-update@example.com",
-        recurrenceId: "2026-10-08T09:00:00.000Z",
-        summary: "x",
-      })
+      client.updateEvent({ calendarUrl: cal.calendarUrl, uid, etag, recurrenceId: "2026-10-09T09:00:00.000Z", summary: "x" })
     );
-    assert.match(message, /single occurrence.*not supported yet/);
+    assert.match(message, /is not an occurrence of "series-between@example.com"/);
+    assert.match(message, /Nothing was changed/);
+    assert.equal(await etagOf(uid), etag, "the event was written");
+  });
+
+  it("refuses a recurrence_id on an event that does not recur", async () => {
+    const uid = "single-with-rid@example.com";
+    await putRawEvent(cal, "single-with-rid.ics", richEvent(uid));
+    const message = await refusal(
+      client.updateEvent({ calendarUrl: cal.calendarUrl, uid, etag: await etagOf(uid), recurrenceId: "2026-10-01T09:00:00.000Z", summary: "x" })
+    );
+    assert.match(message, /does not recur/);
+    assert.match(message, /Nothing was changed/);
+  });
+});
+
+/**
+ * A Berlin series, 09:00–10:00 every Thursday from 2026-10-01, five times,
+ * across the change to CET on 2026-10-25, with an alarm and an attendee.
+ */
+function berlinWeekly(uid: string, extra: string[] = []): string {
+  return ics(
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Other Client//EN",
+    ...BERLIN_VTIMEZONE,
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    "DTSTAMP:20260901T080000Z",
+    "DTSTART;TZID=Europe/Berlin:20261001T090000",
+    "DTEND;TZID=Europe/Berlin:20261001T100000",
+    "RRULE:FREQ=WEEKLY;COUNT=5",
+    ...extra,
+    "SUMMARY:Weekly",
+    "ATTENDEE;CN=Ben;PARTSTAT=ACCEPTED:mailto:ben@example.com",
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    "TRIGGER:-PT15M",
+    "DESCRIPTION:Reminder",
+    "END:VALARM",
+    "END:VEVENT",
+    "END:VCALENDAR"
+  );
+}
+
+/**
+ * A Berlin series at 09:00–10:00 every Thursday from 2026-10-01, UNTIL its
+ * last start on 2026-10-29 (after the change to CET), with the 15th taken out
+ * by an EXDATE, the 8th rescheduled to 11:00, and the 22nd changed only in
+ * its summary: every shape a series' time change has to carry along (§2.4).
+ */
+function movableSeries(uid: string): string {
+  return ics(
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Other Client//EN",
+    ...BERLIN_VTIMEZONE,
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    "DTSTAMP:20260901T080000Z",
+    "DTSTART;TZID=Europe/Berlin:20261001T090000",
+    "DTEND;TZID=Europe/Berlin:20261001T100000",
+    "RRULE:FREQ=WEEKLY;UNTIL=20261029T080000Z",
+    "EXDATE;TZID=Europe/Berlin:20261015T090000",
+    "SUMMARY:Weekly",
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    "TRIGGER:-PT15M",
+    "DESCRIPTION:Reminder",
+    "END:VALARM",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    "DTSTAMP:20260901T080000Z",
+    "RECURRENCE-ID;TZID=Europe/Berlin:20261008T090000",
+    "DTSTART;TZID=Europe/Berlin:20261008T110000",
+    "DTEND;TZID=Europe/Berlin:20261008T120000",
+    "SUMMARY:Weekly (rescheduled)",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    "DTSTAMP:20260901T080000Z",
+    "RECURRENCE-ID;TZID=Europe/Berlin:20261022T090000",
+    "DTSTART;TZID=Europe/Berlin:20261022T090000",
+    "DTEND;TZID=Europe/Berlin:20261022T100000",
+    "SUMMARY:Weekly (agenda)",
+    "END:VEVENT",
+    "END:VCALENDAR"
+  );
+}
+
+describe("a series' time (#207)", SKIP, () => {
+  it("moves a series with an EXDATE, an override and UNTIL to 15:00; list_events and Radicale's own expansion agree on every occurrence", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "movable@example.com";
+    const etag = await putRawEvent(own, "movable.ics", movableSeries(uid));
+    const result = await mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, applyToSeries: true, start: "2026-10-01T15:00:00" });
+    assert.ok(result.etag);
+
+    const { events, skipped } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(skipped, []);
+    assert.deepEqual(
+      events.map((e) => [e.recurrenceId, e.start, e.summary]),
+      [
+        // 15:00 CEST; the rescheduled one keeps its 11:00; the 15th stays out;
+        // the renamed one moves; the last, 15:00 CET, survives its UNTIL.
+        ["2026-10-08T13:00:00.000Z", "2026-10-08T09:00:00.000Z", "Weekly (rescheduled)"],
+        ["2026-10-01T13:00:00.000Z", "2026-10-01T13:00:00.000Z", "Weekly"],
+        ["2026-10-22T13:00:00.000Z", "2026-10-22T13:00:00.000Z", "Weekly (agenda)"],
+        ["2026-10-29T14:00:00.000Z", "2026-10-29T14:00:00.000Z", "Weekly"],
+      ].sort((a, b) => String(a[1]).localeCompare(String(b[1])))
+    );
+    assert.deepEqual(
+      await serverExpands(own, WINDOW.start, WINDOW.end),
+      events.map((e) => [e.recurrenceId, e.start])
+    );
+    assert.match((await getRawEvent(own, "movable.ics")) ?? "", /BEGIN:VALARM/);
+  });
+
+  it("measures the change against the occurrence recurrence_id names, after the DST change as before it", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "anchored@example.com";
+    const etag = await putRawEvent(own, "anchored.ics", berlinWeekly(uid));
+    await mine.updateEvent({
+      calendarUrl: own.calendarUrl,
+      uid,
+      etag,
+      applyToSeries: true,
+      recurrenceId: "2026-10-29T08:00:00.000Z",
+      start: "2026-10-29T16:00:00+01:00",
+      end: "2026-10-29T16:30:00+01:00",
+    });
+    const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(
+      events.map((e) => [e.start, e.end]),
+      [
+        ["2026-10-01T14:00:00.000Z", "2026-10-01T14:30:00.000Z"],
+        ["2026-10-08T14:00:00.000Z", "2026-10-08T14:30:00.000Z"],
+        ["2026-10-15T14:00:00.000Z", "2026-10-15T14:30:00.000Z"],
+        ["2026-10-22T14:00:00.000Z", "2026-10-22T14:30:00.000Z"],
+        ["2026-10-29T15:00:00.000Z", "2026-10-29T15:30:00.000Z"],
+      ]
+    );
+    assert.deepEqual((await serverExpands(own, WINDOW.start, WINDOW.end)).map(([, s]) => s), events.map((e) => e.start));
+  });
+
+  it("refuses a new day for the series, and writes nothing", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "same-day@example.com";
+    const etag = await putRawEvent(own, "same-day.ics", berlinWeekly(uid));
+    const message = await refusal(
+      mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, applyToSeries: true, start: "2026-10-02T09:00:00" })
+    );
+    assert.match(message, /day of a series cannot be changed/);
+    assert.match(message, /Nothing was changed/);
+    assert.match((await getRawEvent(own, "same-day.ics")) ?? "", /DTSTART;TZID=Europe\/Berlin:20261001T090000/);
+  });
+});
+
+describe("one occurrence of a series (#206)", SKIP, () => {
+  it("moves one Thursday and cancels another in a Berlin weekly series; list_events shows the rest unchanged", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "one-thursday@example.com";
+    await putRawEvent(own, "weekly.ics", berlinWeekly(uid));
+    const before = (await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end)).events;
+    assert.equal(before.length, 5);
+
+    // The second Thursday, from 09:00 to 14:00 Berlin time.
+    const moved = await mine.updateEvent({
+      calendarUrl: own.calendarUrl,
+      uid,
+      etag: before[1].etag ?? undefined,
+      recurrenceId: before[1].recurrenceId ?? undefined,
+      start: "2026-10-08T14:00:00",
+      summary: "Weekly (later)",
+    });
+    assert.ok(moved.etag, "the update handed back no etag");
+    // The fourth, with the etag the update handed back.
+    const cancelled = await mine.deleteEvent({
+      calendarUrl: own.calendarUrl,
+      uid,
+      etag: moved.etag,
+      recurrenceId: before[3].recurrenceId ?? undefined,
+    });
+    assert.equal(cancelled.url, moved.url);
+
+    const after = (await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end)).events;
+    assert.deepEqual(
+      after.map((e) => [e.recurrenceId, e.start, e.end, e.summary]),
+      [
+        ["2026-10-01T07:00:00.000Z", "2026-10-01T07:00:00.000Z", "2026-10-01T08:00:00.000Z", "Weekly"],
+        ["2026-10-08T07:00:00.000Z", "2026-10-08T12:00:00.000Z", "2026-10-08T13:00:00.000Z", "Weekly (later)"],
+        ["2026-10-15T07:00:00.000Z", "2026-10-15T07:00:00.000Z", "2026-10-15T08:00:00.000Z", "Weekly"],
+        ["2026-10-29T08:00:00.000Z", "2026-10-29T08:00:00.000Z", "2026-10-29T09:00:00.000Z", "Weekly"],
+      ]
+    );
+    const stored = (await getRawEvent(own, "weekly.ics")) ?? "";
+    assert.match(stored, /RECURRENCE-ID;TZID=Europe\/Berlin:20261008T090000/);
+    assert.match(stored, /EXDATE;TZID=Europe\/Berlin:20261022T090000/);
+    // Radicale's own reading of what was stored agrees: nothing at 07:00Z on the 22nd, the moved one at 12:00Z.
+    assert.deepEqual(await serverFindsIn(own, "2026-10-22T06:00:00Z", "2026-10-22T09:00:00Z"), []);
+    assert.deepEqual(await serverFindsIn(own, "2026-10-08T12:00:00Z", "2026-10-08T12:30:00Z"), ["weekly.ics"]);
+  });
+
+  it("does the same for an all-day series, whose recurrence_id is a date", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "one-day@example.com";
+    const etag = await putRawEvent(
+      own,
+      "bins.ics",
+      ics(
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Other Client//EN",
+        "BEGIN:VEVENT",
+        `UID:${uid}`,
+        "DTSTAMP:20260901T080000Z",
+        "DTSTART;VALUE=DATE:20261001",
+        "DTEND;VALUE=DATE:20261002",
+        "RRULE:FREQ=WEEKLY;COUNT=4",
+        "SUMMARY:Bins out",
+        "END:VEVENT",
+        "END:VCALENDAR"
+      )
+    );
+    const moved = await mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, recurrenceId: "2026-10-08", start: "2026-10-09" });
+    assert.ok(moved.etag);
+    await mine.deleteEvent({ calendarUrl: own.calendarUrl, uid, etag: moved.etag, recurrenceId: "2026-10-15" });
+    const { events, skipped } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(skipped, []);
+    assert.deepEqual(
+      events.map((e) => [e.recurrenceId, e.start, e.end]),
+      [
+        ["2026-10-01", "2026-10-01", "2026-10-02"],
+        ["2026-10-08", "2026-10-09", "2026-10-10"],
+        ["2026-10-22", "2026-10-22", "2026-10-23"],
+      ]
+    );
+    const stored = (await getRawEvent(own, "bins.ics")) ?? "";
+    assert.match(stored, /RECURRENCE-ID;VALUE=DATE:20261008/);
+    assert.match(stored, /EXDATE;VALUE=DATE:20261015/);
+  });
+
+  it("says so when the occurrence deleted was the series' last, and keeps the event", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "last-one@example.com";
+    const etag = await putRawEvent(own, "last.ics", seriesEvent(uid).replace("COUNT=5", "COUNT=1"));
+    const result = await mine.deleteEvent({ calendarUrl: own.calendarUrl, uid, etag, recurrenceId: "2026-10-01T09:00:00.000Z" });
+    assert.match(result.note ?? "", /no occurrences left/);
+    assert.notEqual(await getRawEvent(own, "last.ics"), null);
+  });
+
+  it("hands back the etag of an occurrence update on a server that answers the PUT without one (the read-back finds its override)", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "etagless-occurrence@example.com";
+    const etag = await putRawEvent(own, "weekly.ics", berlinWeekly(uid));
+    const proxy = await startCalDavProxy({ etaglessPuts: true });
+    try {
+      const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+      const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
+      const first = await viaProxy.updateEvent({ calendarUrl, uid, etag, recurrenceId: "2026-10-08T07:00:00.000Z", summary: "One" });
+      assert.equal(proxy.strippedPuts(), 1, "the proxy never took the ETag away");
+      assert.ok(first.etag, "the read-back did not recognise its own override");
+      await viaProxy.updateEvent({ calendarUrl, uid, etag: first.etag, recurrenceId: "2026-10-08T07:00:00.000Z", summary: "Two" });
+      assert.match((await getRawEvent(own, "weekly.ics")) ?? "", /SUMMARY:Two/);
+    } finally {
+      await proxy.close();
+    }
   });
 });
 
@@ -963,16 +1235,15 @@ describe("delete_event", SKIP, () => {
     assert.equal(await getRawEvent(cal, "series-delete.ics"), null);
   });
 
-  it("refuses a single occurrence, naming EXDATE", async () => {
-    assert.match(
-      await refusal(
-        client.deleteEvent({
-          calendarUrl: cal.calendarUrl,
-          uid: "whatever@example.com",
-          recurrenceId: "2026-10-08T09:00:00.000Z",
-        })
-      ),
-      /EXDATE/
+  it("refuses a recurrence_id that names no occurrence, and deletes nothing", async () => {
+    const uid = "delete-between@example.com";
+    await putRawEvent(cal, "delete-between.ics", seriesEvent(uid));
+    const etag = await etagOf(uid);
+    const message = await refusal(
+      client.deleteEvent({ calendarUrl: cal.calendarUrl, uid, etag, recurrenceId: "2026-10-08T10:00:00.000Z" })
     );
+    assert.match(message, /is not an occurrence/);
+    assert.match(message, /Nothing was deleted/);
+    assert.equal(await etagOf(uid), etag);
   });
 });

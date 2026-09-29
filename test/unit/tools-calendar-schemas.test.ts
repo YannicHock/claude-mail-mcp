@@ -20,7 +20,7 @@ import { makeTmpDir, cleanupTmpDir, makeAccount, makeAccountsFile } from "../hel
 
 type Handler = (args: Record<string, unknown>) => Promise<unknown>;
 interface Registered {
-  config: { inputSchema: Record<string, z.ZodType> };
+  config: { description?: string; inputSchema: Record<string, z.ZodType> };
   handler: Handler;
 }
 
@@ -84,6 +84,32 @@ describe("the calendar tools' shared fields (#214)", () => {
           assert.match(description, /all.day/, `${tool}.${field}: ${description}`);
         }
       }
+    });
+  });
+});
+
+describe("occurrences and a series' time on the calendar tools (spec 2026-09-29 §2.3, §2.4)", () => {
+  it("recurrence_id is supported, says what it takes, and that it comes from list_events", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const description = schemaOf(tools, "update_event").recurrence_id?.description ?? "";
+      assert.doesNotMatch(description, /not supported/i);
+      assert.match(description, /recurrenceId/);
+      assert.match(description, /list_events/);
+      assert.match(description, /YYYY-MM-DD/);
+    });
+  });
+
+  it("update_event and delete_event describe one occurrence, and update_event a series' new time, and neither says it cannot yet", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const update = tools.get("update_event")?.config.description ?? "";
+      const del = tools.get("delete_event")?.config.description ?? "";
+      for (const [tool, description] of [["update_event", update], ["delete_event", del]] as const) {
+        assert.doesNotMatch(description, /cannot be (changed|deleted) yet|not supported/i, tool);
+        assert.match(description, /recurrence_id/, tool);
+      }
+      assert.match(update, /keeping its date|keeps its date/);
+      assert.match(update, /day of a series cannot/);
+      assert.match(del, /EXDATE|that one occurrence/);
     });
   });
 });
