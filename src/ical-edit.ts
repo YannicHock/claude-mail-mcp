@@ -15,7 +15,7 @@
  */
 
 import ICAL from "ical.js";
-import { ToolRefusal } from "./tool-errors.js";
+import { ToolRefusal } from "./tool-refusal.js";
 
 /** The fields `update_event` can change. Everything else is left alone. */
 export interface EventPatch {

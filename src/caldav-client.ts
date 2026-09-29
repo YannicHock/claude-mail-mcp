@@ -25,7 +25,7 @@ import {
   touchesTime,
   type EventPatch,
 } from "./ical-edit.js";
-import { ToolRefusal } from "./tool-errors.js";
+import { ToolRefusal } from "./tool-refusal.js";
 
 // createDAVClient returns a logged-in client whose type omits the login
 // methods. Capture that shape for our field types.

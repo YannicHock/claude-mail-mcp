@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import { assertWritten, requireEtag } from "../../src/caldav-client.js";
 import type { ClientPool } from "../../src/client-pool.js";
 import { reportingFailures, ToolRefusal, TOOL_FAILURE_EVENT } from "../../src/tool-errors.js";
+import { ToolRefusal as ToolRefusalItself } from "../../src/tool-refusal.js";
 
 interface Line {
   level: string;
@@ -25,6 +26,22 @@ function recordingPool(): { pool: ClientPool; lines: Line[] } {
   const pool = { log: (level: string, message: string) => lines.push({ level, message }) } as unknown as ClientPool;
   return { pool, lines };
 }
+
+describe("ToolRefusal's own module (#214)", () => {
+  // src/ical-edit.ts and the other pure calendar modules throw refusals.
+  // Importing the class from tool-errors.ts pulled shared/credential-failure
+  // into every one of them; a file of its own keeps them dependency-free.
+  it("is the class tool-errors.ts re-exports, so every existing import still matches", () => {
+    assert.equal(ToolRefusal, ToolRefusalItself);
+    assert.ok(new ToolRefusalItself("x") instanceof ToolRefusal);
+  });
+
+  it("imports nothing", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const source = await readFile(new URL("../../src/tool-refusal.ts", import.meta.url), "utf8");
+    assert.doesNotMatch(source, /^import /m);
+  });
+});
 
 describe("reportingFailures", () => {
   it("passes a ToolRefusal through unchanged and logs nothing", async () => {
