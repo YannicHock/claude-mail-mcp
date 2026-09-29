@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import ICAL from "ical.js";
 
-import { CalDavClient, buildIcs } from "../../src/caldav-client.js";
+import { CalDavClient, buildIcs, requireEtag } from "../../src/caldav-client.js";
 import { utcOffsetMs } from "../../src/ical-zones.js";
 import { ToolRefusal } from "../../src/tool-refusal.js";
 
@@ -69,6 +69,60 @@ describe("buildIcs — the zone create_event writes (spec §2.5)", () => {
     const text = buildIcs({ ...BASE, start: "2026-10-01", end: "2026-10-02", allDay: true }, "Asia/Jerusalem", NOW);
     assert.match(text, /\r\nDTSTART;VALUE=DATE:20261001\r\n/);
     assert.doesNotMatch(text, /VTIMEZONE|TZID/);
+  });
+});
+
+describe("requireEtag — ETags the server hands out oddly (spec §2.8, #210)", () => {
+  const target = { calendarUrl: "https://dav.example/cal/", uid: "e@x" };
+
+  it("#210.2: a value passed without its quotes is sent in the stored form", () => {
+    assert.equal(requireEtag({ ...target, etag: "abc" }, { etag: '"abc"' }), '"abc"');
+  });
+
+  it("#210.3: a weak stored ETag that matches is a match, and the write goes with no If-Match", () => {
+    for (const passed of ['"abc"', 'W/"abc"', "abc"]) {
+      assert.equal(requireEtag({ ...target, etag: passed }, { etag: 'W/"abc"' }), undefined, passed);
+    }
+  });
+
+  it("#210.3: a weak stored ETag that does not match is refused as a change made since, before any write", () => {
+    assert.throws(
+      () => requireEtag({ ...target, etag: 'W/"old"' }, { etag: 'W/"new"' }, "Nothing was changed."),
+      (err: unknown) =>
+        err instanceof ToolRefusal &&
+        /changed after you read it/.test(err.message) &&
+        /Nothing was changed/.test(err.message)
+    );
+  });
+
+  it("a strong value that does not match is sent as it is, for the server to refuse", () => {
+    assert.equal(requireEtag({ ...target, etag: '"old"' }, { etag: '"new"' }), '"old"');
+  });
+});
+
+describe("CalDavClient — a failed ETag read-back (#210.4)", () => {
+  it("logs exactly one info line with the account and the reason, and no credential", async () => {
+    const lines: Array<{ level: string; message: string; extra?: Record<string, unknown> }> = [];
+    const client = new CalDavClient(
+      { url: "https://dav.example/", user: "alice", pass: "s3cret-app-password" },
+      { accountId: "work", log: (level, message, extra) => lines.push({ level, message, extra }) }
+    );
+    // The lookup the read-back runs, failing the way a flaky server does —
+    // with the credentials on the error object, as connection errors carry them.
+    const internals = client as unknown as {
+      findStoredEvent: () => Promise<never>;
+      etagAfterWrite: (calendar: unknown, uid: string, url: string, sequence: number | null) => Promise<string | null>;
+    };
+    internals.findStoredEvent = async () => {
+      throw Object.assign(new Error("socket hang up"), { options: { user: "alice", pass: "s3cret-app-password" } });
+    };
+    const etag = await internals.etagAfterWrite({ url: "https://dav.example/cal/" }, "e@x", "https://dav.example/cal/e.ics", 3);
+    assert.equal(etag, null);
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.equal(lines[0].level, "info");
+    assert.equal(lines[0].extra?.account, "work");
+    assert.match(String(lines[0].extra?.reason), /socket hang up/);
+    assert.doesNotMatch(JSON.stringify(lines), /s3cret-app-password/);
   });
 });
 

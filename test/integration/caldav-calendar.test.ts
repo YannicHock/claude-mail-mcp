@@ -702,6 +702,143 @@ describe("a change that lands between the lookup and the write (#214)", SKIP, ()
   });
 });
 
+describe("ETags the server hands out oddly (#210, spec §2.8)", SKIP, () => {
+  /** A client, and the calendar's URL, with every request going through `proxy`. */
+  function via(proxy: CalDavProxy, own: RadicaleCalendar): { client: CalDavClient; calendarUrl: string } {
+    return {
+      client: new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD }),
+      calendarUrl: own.calendarUrl.replace(RADICALE_URL, proxy.url),
+    };
+  }
+
+  /** The etag list_events hands out for `uid` through `client`, which may be null. */
+  async function listedEtag(mine: CalDavClient, calendarUrl: string, uid: string): Promise<string | null> {
+    const hit = (await mine.listEvents(calendarUrl, WINDOW.start, WINDOW.end)).events.find((e) => e.uid === uid);
+    assert.ok(hit, `list_events does not show ${uid}`);
+    return hit.etag;
+  }
+
+  const puts = (proxy: CalDavProxy) => proxy.requests().filter((r) => r.method === "PUT");
+
+  it("weak ETags: an update with the etag list_events gave succeeds, written with no If-Match", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "weak@example.com";
+    await putRawEvent(own, "weak.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({ weakEtags: true });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      const etag = await listedEtag(mine, calendarUrl, uid);
+      assert.match(etag ?? "", /^W\//, "the proxy did not make the ETag weak");
+      await mine.updateEvent({ calendarUrl, uid, etag: etag ?? undefined, summary: "Through gzip" });
+      assert.match((await getRawEvent(own, "weak.ics")) ?? "", /SUMMARY:Through gzip/);
+      assert.deepEqual(puts(proxy).map((r) => r.ifMatch), [null]);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("weak ETags: an update with a stale one is refused before any PUT", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "weak-stale@example.com";
+    await putRawEvent(own, "weak-stale.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({ weakEtags: true });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      const stale = await listedEtag(mine, calendarUrl, uid);
+      await editBehindTheBack(own, "weak-stale.ics", richEvent(uid, "Changed on the phone"));
+      const message = await refusal(mine.updateEvent({ calendarUrl, uid, etag: stale ?? undefined, summary: "x" }));
+      assert.match(message, /changed after you read it/);
+      assert.match(message, /Nothing was changed/);
+      assert.equal(puts(proxy).length, 0, "a PUT was sent");
+      assert.match((await getRawEvent(own, "weak-stale.ics")) ?? "", /SUMMARY:Changed on the phone/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("no ETags: an update of an event deleted between the lookup and the PUT is refused as not found, and creates nothing", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "no-etags-gone@example.com";
+    await putRawEvent(own, "gone.ics", richEvent(uid));
+    let deleted = false;
+    const proxy = await startCalDavProxy({
+      noEtags: true,
+      before: async ({ method }) => {
+        if (method === "PUT" && !deleted) {
+          deleted = true;
+          await deleteBehindTheBack(own, "gone.ics");
+        }
+      },
+    });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      assert.equal(await listedEtag(mine, calendarUrl, uid), null, "the proxy let an ETag through");
+      const message = await refusal(mine.updateEvent({ calendarUrl, uid, summary: "x" }));
+      assert.match(message, /No event with UID "no-etags-gone@example.com"/);
+      assert.match(message, /no event was created/);
+      assert.equal(await getRawEvent(own, "gone.ics"), null, "the update recreated the event");
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("If-Match: * mishandled: an update of an existing event succeeds after the retry", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "star-broken@example.com";
+    await putRawEvent(own, "star.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({ noEtags: true, starIfMatchBroken: true });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      await mine.updateEvent({ calendarUrl, uid, summary: "After the retry" });
+      assert.equal(proxy.starRefusals(), 1, "If-Match: * was never sent, so the retry never ran");
+      assert.deepEqual(puts(proxy).map((r) => r.ifMatch), ["*", null]);
+      assert.match((await getRawEvent(own, "star.ics")) ?? "", /SUMMARY:After the retry/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("If-Match: * mishandled, and the event gone by the retry: what the retry created is taken back", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "star-gone@example.com";
+    await putRawEvent(own, "star-gone.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({
+      noEtags: true,
+      starIfMatchBroken: true,
+      before: async ({ method, ifMatch }) => {
+        if (method === "PUT" && ifMatch === null) await deleteBehindTheBack(own, "star-gone.ics");
+      },
+    });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      const message = await refusal(mine.updateEvent({ calendarUrl, uid, summary: "x" }));
+      assert.match(message, /No event with UID "star-gone@example.com"/);
+      assert.match(message, /no event was created/);
+      assert.equal(await getRawEvent(own, "star-gone.ics"), null, "the retry left a created event behind");
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("no ETags: a delete goes with If-Match: *, and removes the event", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "no-etags-delete@example.com";
+    await putRawEvent(own, "delete.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({ noEtags: true });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      await mine.deleteEvent({ calendarUrl, uid });
+      assert.deepEqual(
+        proxy.requests().filter((r) => r.method === "DELETE").map((r) => r.ifMatch),
+        ["*"]
+      );
+      assert.equal(await getRawEvent(own, "delete.ics"), null);
+    } finally {
+      await proxy.close();
+    }
+  });
+});
+
 describe("delete_event", SKIP, () => {
   it("removes an event", async () => {
     const uid = "delete-me@example.com";

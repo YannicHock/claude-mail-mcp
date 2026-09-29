@@ -120,6 +120,8 @@ export interface ProxiedRequest {
   method: string;
   /** The path on Radicale, e.g. `/u…/cal/event.ics`. */
   path: string;
+  /** The request's If-Match header, or null when it had none. */
+  ifMatch: string | null;
 }
 
 /**
@@ -128,10 +130,8 @@ export interface ProxiedRequest {
  * was found somewhere specific; everything not named is passed through
  * untouched.
  *
- * The plan (v0.7.4 Task 2) names five behaviours in all. The ones the read
- * path needs are here; `weakEtags`, `noEtags` and `starIfMatchBroken` (#210,
- * Task 4b) and `refuseMove` (#212, Task 7) join them with the changes that
- * test them, as further answer rewrites beside `etaglessPuts`.
+ * The plan (v0.7.4) names five behaviours in all. Four are here; `refuseMove`
+ * (#212, Task 7) joins them with the change that tests it.
  */
 export interface CalDavProxyOptions {
   /**
@@ -150,6 +150,27 @@ export interface CalDavProxyOptions {
    */
   corruptObject?: string;
   /**
+   * Hand out every ETag weak, `W/"…"`, in headers and in `getetag` — what a
+   * proxy that compresses the answer does to a strong one (nginx with gzip
+   * does). Requests are passed on untouched, so an `If-Match` naming a weak
+   * ETag meets Radicale's strong comparison and 412s (R9), as it would behind
+   * such a proxy (#210.3).
+   */
+  weakEtags?: boolean;
+  /**
+   * Hand out no ETag at all, neither as a header nor as `getetag` (#210.1),
+   * and give `If-Match: *` its RFC 7232 meaning, which Radicale does not on
+   * PUT (R10): the proxy answers 412 itself when the object is missing, and
+   * passes the request on without the header when it exists.
+   */
+  noEtags?: boolean;
+  /**
+   * Answer 412 to every PUT carrying `If-Match: *`, existing object or not —
+   * the literal comparison Radicale itself makes (R10), made explicit so the
+   * test does not depend on a Radicale version keeping it.
+   */
+  starIfMatchBroken?: boolean;
+  /**
    * Run before a request is forwarded, e.g. to delete an event between the
    * connector's lookup and its write.
    */
@@ -167,6 +188,10 @@ export interface CalDavProxy {
   strippedPuts: () => number;
   /** REPORT answers the corrupt object was planted in — proof the reader met it. */
   corruptedReports: () => number;
+  /** Every request the proxy was sent, in order. */
+  requests: () => ProxiedRequest[];
+  /** PUTs refused for their `If-Match: *` under `starIfMatchBroken`. */
+  starRefusals: () => number;
   close: () => Promise<void>;
 }
 
@@ -192,6 +217,21 @@ function plantCorruptObject(xml: string, name: string): { xml: string; planted: 
   return { xml: xml.slice(0, first) + reordered.join("") + xml.slice(last), planted: true };
 }
 
+/** An ETag made weak: `"abc"` becomes `W/"abc"`, and one already weak is left alone. */
+function weakened(etag: string): string {
+  return /^W\//i.test(etag) ? etag : `W/${etag}`;
+}
+
+/** Rewrite, or with `null` remove, every `getetag` element in a multistatus body. */
+function rewriteGetetags(xml: string, change: ((etag: string) => string) | null): string {
+  return xml.replace(/<((?:\w+:)?getetag)>([^<]*)<\/\1>/g, (_m, tag: string, value: string) => {
+    if (change === null) return "";
+    // Radicale sends the quotes as `&quot;`; the rewrite is on the unescaped value.
+    const plain = value.replaceAll("&quot;", '"');
+    return `<${tag}>${change(plain).replaceAll('"', "&quot;")}</${tag}>`;
+  });
+}
+
 /**
  * A proxy in front of Radicale that behaves the way {@link CalDavProxyOptions}
  * says: what Radicale itself cannot be made to do, faked at the HTTP layer
@@ -201,6 +241,8 @@ function plantCorruptObject(xml: string, name: string): { xml: string; planted: 
 export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promise<CalDavProxy> {
   let stripped = 0;
   let corrupted = 0;
+  let starRefused = 0;
+  const log: ProxiedRequest[] = [];
   const { createServer } = await import("node:http");
   const upstream = new URL(RADICALE_URL);
   // Hop-by-hop, or no longer true once fetch has decoded the body.
@@ -215,9 +257,34 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
         headers.set(k, Array.isArray(v) ? v.join(", ") : v);
       }
       const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
-      const seen: ProxiedRequest = { method: req.method ?? "GET", path: new URL(req.url ?? "/", upstream).pathname };
+      const ifMatch = headers.get("if-match");
+      const seen: ProxiedRequest = {
+        method: req.method ?? "GET",
+        path: new URL(req.url ?? "/", upstream).pathname,
+        ifMatch,
+      };
+      log.push(seen);
+      const refuse = (): void => {
+        res.writeHead(412, "Precondition Failed", { "content-length": "0" });
+        res.end();
+      };
       (async () => {
         await options.before?.(seen);
+        if (ifMatch?.trim() === "*" && (req.method === "PUT" || req.method === "DELETE")) {
+          if (options.starIfMatchBroken && req.method === "PUT") {
+            starRefused += 1;
+            return refuse();
+          }
+          if (options.noEtags) {
+            const exists = await fetch(new URL(req.url ?? "/", upstream), {
+              method: "GET",
+              headers: { authorization: headers.get("authorization") ?? "" },
+            });
+            await exists.arrayBuffer();
+            if (exists.status === 404) return refuse();
+            headers.delete("if-match");
+          }
+        }
         const answer = await fetch(new URL(req.url ?? "/", upstream), {
           method: req.method,
           headers,
@@ -231,9 +298,14 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
             stripped += 1;
             return;
           }
-          out[k] = v;
+          if (k === "etag" && options.noEtags) return;
+          out[k] = k === "etag" && options.weakEtags ? weakened(v) : v;
         });
         let payload = Buffer.from(await answer.arrayBuffer());
+        if ((options.weakEtags || options.noEtags) && (req.method === "REPORT" || req.method === "PROPFIND")) {
+          const xml = rewriteGetetags(payload.toString("utf8"), options.noEtags ? null : weakened);
+          payload = Buffer.from(xml, "utf8");
+        }
         if (options.corruptObject !== undefined && req.method === "REPORT") {
           const { xml, planted } = plantCorruptObject(payload.toString("utf8"), options.corruptObject);
           if (planted) {
@@ -257,6 +329,8 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
     url: `http://127.0.0.1:${address.port}/`,
     strippedPuts: () => stripped,
     corruptedReports: () => corrupted,
+    requests: () => [...log],
+    starRefusals: () => starRefused,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
