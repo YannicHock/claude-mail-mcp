@@ -14,7 +14,7 @@ Self-hosted **IMAP / SMTP / CalDAV connector for Claude** with multi-account sup
 
 ## What it does
 
-Exposes 14 MCP tools to Claude:
+Exposes 16 MCP tools to Claude:
 
 **Accounts (1)**
 
@@ -36,13 +36,15 @@ Exposes 14 MCP tools to Claude:
 | `move_message` | Move between folders |
 | `delete_message` | Delete (destructive — prefer move to Trash) |
 
-**Calendar (4)**
+**Calendar (6)**
 
 | Tool | Purpose |
 |------|---------|
 | `list_calendars` | Discover CalDAV calendars |
 | `list_events` | Events in a time window (recurrences expanded) |
 | `create_event` | Add new event (writes to CalDAV) |
+| `update_event` | Change an event's time, title, location or description (ETag-guarded) |
+| `delete_event` | Delete an event (permanent — CalDAV has no trash) |
 | `find_free_slot` | Compute free intervals across one or more calendars |
 
 Every tool accepts an optional `account: "<id>"` parameter to pick a mailbox; omit it to use the default account. So "list unread in INBOX of work account" vs "compare today's calendar across work and personal" both work in one connector.
@@ -157,7 +159,7 @@ A push to `main` publishes them tagged `sha-<short>` and nothing else; a `v*` ta
 gh attestation verify --owner YannicHock oci://ghcr.io/yannichock/claude-mail-mcp:latest
 ```
 
-`docker-compose.test.yml` has nothing to do with running any of this — it gives the integration suite a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) server to talk to. See [Development](#development).
+`docker-compose.test.yml` has nothing to do with running any of this — it gives the integration suite a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) server and a [Radicale](https://radicale.org/) CalDAV server to talk to. See [Development](#development).
 
 ---
 
@@ -236,7 +238,7 @@ Claude.ai (web) isn't in this diagram: it reaches the connector through the OAut
 - **`/mcp` is gated by one static Bearer token,** generated on first boot, which the OAuth layer substitutes into every request it proxies and never hands to a client.
 - **An unclaimed instance is claimable only from its own logs.** Until setup completes, `/mcp` answers 503 and everything but `/health` and the setup URL answers 404, so the window between `docker compose up` and the first sign-in is not an open form on the public internet. It reduces takeover to an attacker who can already read your container logs.
 - **The two services run unprivileged, as two different users,** sharing exactly one group: the one that owns `secrets/`, so each can read a secret the other wrote. The OAuth signing key and the operator's password hash are in the half of `secrets/` that is never mounted into the process parsing inbound MIME.
-- **Destructive tools** (`delete_message`) document their irreversibility, so Claude surfaces a confirmation step. Prefer `move_message` to a Trash folder.
+- **Destructive tools** (`delete_message`, `delete_event`) document their irreversibility, so Claude surfaces a confirmation step. Prefer `move_message` to a Trash folder; a deleted calendar event has no trash to recover it from.
 
 The Docker deployment is the one this project supports, and it takes its isolation from the container runtime: two unprivileged users, one shared group, and no path from the connector to the OAuth layer's secrets. [docs/HARDENING.md](docs/HARDENING.md) has the full threat model, the OAuth layer's own, and the operator checklist. Reporting issues: [SECURITY.md](SECURITY.md).
 
@@ -254,7 +256,7 @@ npm test            # alias for test:unit
 
 `npm run test:unit` runs offline — no network, no Docker required.
 
-`npm run test:integration` adds the cases a mocked client cannot reach: the IMAP/SMTP tools end-to-end against a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) container started from `docker-compose.test.yml`, the connection probe against a real server, and the MCP protocol surface (auth rejection, `initialize`, `tools/list`, `/health`). The suite manages the GreenMail container itself — no manual `docker compose up` needed — and skips cleanly instead of failing when the Docker daemon isn't reachable. It binds fixed host ports, so only one checkout at a time can run it.
+`npm run test:integration` adds the cases a mocked client cannot reach: the IMAP/SMTP tools end-to-end against a disposable [GreenMail](https://greenmail-mail-test.github.io/greenmail/) container started from `docker-compose.test.yml`, the calendar writes (ETags, `If-Match`, `412`) against a [Radicale](https://radicale.org/) container from the same file, the connection probe against a real server, and the MCP protocol surface (auth rejection, `initialize`, `tools/list`, `/health`). The suite manages both containers itself — no manual `docker compose up` needed — and skips cleanly instead of failing when the Docker daemon isn't reachable. It binds fixed host ports (3143/3025/3993 for GreenMail, 5232 for Radicale), so only one checkout at a time can run it.
 
 ```bash
 npm run test:integration

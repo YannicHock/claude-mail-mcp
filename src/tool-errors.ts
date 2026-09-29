@@ -39,6 +39,20 @@ import { classifyFailure } from "../shared/credential-failure.js";
 export const TOOL_FAILURE_EVENT = "mail tool call failed";
 
 /**
+ * An answer a tool gives on purpose, not a mailbox that failed.
+ *
+ * A calendar write refused because the event changed since it was read, or
+ * because it is one occurrence of a series, is the tool working as designed —
+ * a model retrying after a conflict is exactly the behaviour asked for. Logging
+ * it at `warn` beside real server failures would teach an operator to ignore
+ * the one line #146 exists to put in front of them. So {@link reportingFailures}
+ * rethrows this unchanged: no log line, and the message is not prefixed.
+ */
+export class ToolRefusal extends Error {
+  override readonly name = "ToolRefusal";
+}
+
+/**
  * Log one `warn` line for `err` and return the error to throw in its place.
  *
  * Split from {@link reportingFailures} for the one caller that must not
@@ -86,6 +100,7 @@ export async function reportingFailures<T>(
   try {
     return await run();
   } catch (err) {
+    if (err instanceof ToolRefusal) throw err;
     throw logToolFailure(pool, tool, account, err);
   }
 }
