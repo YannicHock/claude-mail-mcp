@@ -427,7 +427,7 @@ test("a hung tier does not block the ones after it", async () => {
   const deps = fakeDeps({ pages: { [T1]: hang, [T2]: ok(clientConfigXml()) } });
 
   const started = Date.now();
-  const found = await lookupMailboxSettings(EMAIL, { deps, perAttemptMs: 150, totalMs: 2000 });
+  const found = await lookupMailboxSettings(EMAIL, { deps, perAttemptMs: 150, discoveryMs: 2000 });
   const elapsed = Date.now() - started;
 
   assert.equal(found?.source, "autoconfig-well-known");
@@ -439,7 +439,7 @@ test("the whole cascade gives up at its overall deadline", async () => {
   const deps = fakeDeps({ pages: { [T1]: hang, [T2]: hang, [T3]: hang } });
 
   const started = Date.now();
-  const found = await lookupMailboxSettings(EMAIL, { deps, perAttemptMs: 400, totalMs: 500 });
+  const found = await lookupMailboxSettings(EMAIL, { deps, perAttemptMs: 400, discoveryMs: 500 });
   const elapsed = Date.now() - started;
 
   assert.equal(found, null);
@@ -681,7 +681,7 @@ test("CalDAV discovery cannot cost a lookup the mail settings it already found",
 
 // ------------------------------------------------- the §7 numbers, as shipped
 //
-// The budget tests above all pass `perAttemptMs` and `totalMs` explicitly, which
+// The budget tests above all pass `perAttemptMs` and `discoveryMs` explicitly, which
 // is what makes them fast and is also the hole in them: every one of those tests
 // stays green if `lookupMailboxSettings` stops using its own constants as the
 // defaults, and timeout.test.ts stays green too, because the constants would
@@ -735,7 +735,7 @@ test("an un-optioned lookup bounds every attempt by the cascade's total too", as
   await lookupMailboxSettings(EMAIL, { deps });
 
   for (const budget of budgets) {
-    assert.ok(budget <= AUTOCONFIG_TOTAL_TIMEOUT_MS, `an attempt got ${budget}ms`);
+    assert.ok(budget <= AUTOCONFIG_DISCOVERY_TIMEOUT_MS, `an attempt got ${budget}ms`);
   }
 });
 
@@ -948,4 +948,26 @@ test("the choice is reported per service with host:port pairs only, for the log"
     },
   ]);
   assert.equal(JSON.stringify(choices).includes("anna"), false, "never the address");
+});
+
+test("slow discovery and a check that never settles together stay inside both budgets", async () => {
+  // The worst case the spec promises a test for: discovery spends its whole
+  // budget (a hung subdomain tier, then a CalDAV probe that hangs as well) and
+  // the reach check never answers. The two run side by side, so the bound is
+  // discovery plus reach, never more.
+  const hang = () => new Promise<HttpResponse>(() => {});
+  const deps = reachDeps({
+    pages: { [GMAIL_ISPDB]: ok(GMAIL_XML), "https://gmail.com/.well-known/caldav": hang },
+    never: true,
+  });
+  const started = Date.now();
+  const found = await lookupMailboxSettings(GMAIL, {
+    deps,
+    perAttemptMs: 300,
+    discoveryMs: 600,
+    reachMs: 300,
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(found?.smtp.port, 465);
+  assert.ok(elapsed < 600 + 300 + 400, `took ${elapsed}ms`);
 });

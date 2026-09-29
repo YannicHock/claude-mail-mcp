@@ -1352,8 +1352,9 @@ const SETUP_SUBJECT = "setup-wizard";
  * itself, and `oauth/test/unit/setup-wizard.test.ts` pins that it is positive.
  *
  * The derivation holds for the connector's *default* budget, which is what the
- * routes this wizard calls actually run under. `probeAccount` and
- * `lookupMailboxSettings` both accept a `totalMs` override, and nothing but a
+ * routes this wizard calls actually run under. `probeAccount` accepts a
+ * `totalMs` override and `lookupMailboxSettings` a `discoveryMs` and a
+ * `reachMs` one, and nothing but a
  * test passes one today; a future caller that does owns this invariant itself,
  * because no arithmetic here can see its argument.
  *

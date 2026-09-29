@@ -109,8 +109,8 @@ export const CONNECTOR_AUTOCONFIG_REACH_MS = 3_000;
 /**
  * How long the connector gives the whole address lookup before it answers
  * `null`. Shared for the same reason, and used the same way: `src/autoconfig.ts`
- * takes it as `AUTOCONFIG_TOTAL_TIMEOUT_MS`, and the wizard's lookup timeout is
- * this plus slack.
+ * runs its two phases on the two numbers above, whose sum this is, and the
+ * wizard's lookup timeout is this plus slack.
  *
  * Discovery plus one reach slice. The budget grew rather than having the probes
  * squeezed into what discovery left over, because that would make the answer

@@ -59,7 +59,9 @@
  *     rebinding) — the check and the socket see the same answer.
  *   - At most one redirect, re-checked against exactly the same rules.
  *   - {@link AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS} per attempt (a redirect is another
- *     attempt), {@link AUTOCONFIG_TOTAL_TIMEOUT_MS} for the whole cascade.
+ *     attempt), {@link AUTOCONFIG_DISCOVERY_TIMEOUT_MS} for the whole cascade,
+ *     then {@link AUTOCONFIG_REACH_TIMEOUT_MS} to check the servers it found —
+ *     {@link AUTOCONFIG_TOTAL_TIMEOUT_MS} in all.
  *   - {@link MAX_RESPONSE_BYTES} of body, after which the socket is destroyed
  *     rather than the buffer grown.
  *
@@ -201,7 +203,7 @@ export type Verdict = "open" | "closed" | "unknown";
 
 export interface LookupOptions {
   /** The discovery phase's budget. Default {@link AUTOCONFIG_DISCOVERY_TIMEOUT_MS}. */
-  totalMs?: number;
+  discoveryMs?: number;
   perAttemptMs?: number;
   /** The reachability phase's budget. Default {@link AUTOCONFIG_REACH_TIMEOUT_MS}. */
   reachMs?: number;
@@ -969,8 +971,9 @@ async function choose(
  * Look up `email`'s mailbox settings. Resolves with a {@link MailboxSuggestion}
  * to show the operator for confirmation, or with `null` — which is not an
  * error and carries no reason, because the wizard's response to it is simply
- * the provider list. Never rejects, and never takes longer than `totalMs`
- * (default {@link AUTOCONFIG_TOTAL_TIMEOUT_MS}) plus the time to unwind.
+ * the provider list. Never rejects, and never takes longer than `discoveryMs`
+ * plus `reachMs` (by default {@link AUTOCONFIG_TOTAL_TIMEOUT_MS}) plus the time
+ * to unwind.
  */
 export async function lookupMailboxSettings(
   email: string,
@@ -978,7 +981,7 @@ export async function lookupMailboxSettings(
 ): Promise<MailboxSuggestion | null> {
   const deps = opts.deps ?? defaultDeps;
   const budget = new Budget(
-    opts.totalMs ?? AUTOCONFIG_DISCOVERY_TIMEOUT_MS,
+    opts.discoveryMs ?? AUTOCONFIG_DISCOVERY_TIMEOUT_MS,
     opts.perAttemptMs ?? AUTOCONFIG_PER_ATTEMPT_TIMEOUT_MS
   );
   const reachMs = opts.reachMs ?? AUTOCONFIG_REACH_TIMEOUT_MS;
