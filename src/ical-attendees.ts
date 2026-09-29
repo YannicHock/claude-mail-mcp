@@ -293,16 +293,29 @@ function clientScheduled(prop: ICAL.Property): boolean {
  * nothing was changed.
  */
 function checkOrganizer(vevents: readonly ICAL.Component[], own: readonly string[], nothingDone: string): void {
+  const foreign = foreignOrganizer(vevents, own);
+  if (foreign === undefined) return;
+  throw new ToolRefusal(
+    `This event is organized by ${addressKey(foreign)}, not by this account (${[...new Set(own.map(addressKey))].join(", ")}), and only its organizer changes who is invited. Its title, description, location and time can still be changed here. ${nothingDone}`
+  );
+}
+
+/**
+ * The first ORGANIZER on any of `vevents` — every VEVENT of one UID — that
+ * is none of the account's `own` addresses, as written (a `mailto:` URI), or
+ * undefined when every one named is the account's, or none is named: the
+ * one test of "someone else's meeting" that {@link checkOrganizer} and
+ * {@link mayNotifyOnMove} share (code-health review of PR #231).
+ */
+function foreignOrganizer(vevents: readonly ICAL.Component[], own: readonly string[]): string | undefined {
   const mine = new Set(own.map(addressKey));
   for (const vevent of vevents) {
     for (const organizer of vevent.getAllProperties("organizer")) {
-      const address = addressKey(String(organizer.getFirstValue()));
-      if (mine.has(address)) continue;
-      throw new ToolRefusal(
-        `This event is organized by ${address}, not by this account (${[...mine].join(", ")}), and only its organizer changes who is invited. Its title, description, location and time can still be changed here. ${nothingDone}`
-      );
+      const address = String(organizer.getFirstValue());
+      if (!mine.has(addressKey(address))) return address;
     }
   }
+  return undefined;
 }
 
 /**
@@ -429,13 +442,8 @@ export function schedulingObject(vevents: readonly ICAL.Component[]): boolean {
  */
 export function mayNotifyOnMove(vevents: readonly ICAL.Component[], own: readonly string[]): string[] | undefined {
   if (!schedulingObject(vevents)) return undefined;
-  const mine = new Set(own.map(addressKey));
-  for (const vevent of vevents) {
-    for (const organizer of vevent.getAllProperties("organizer")) {
-      const address = String(organizer.getFirstValue());
-      if (!mine.has(addressKey(address))) return [address.trim().replace(MAILTO, "")];
-    }
-  }
+  const foreign = foreignOrganizer(vevents, own);
+  if (foreign !== undefined) return [foreign.trim().replace(MAILTO, "")];
   return schedulable(vevents, [], own);
 }
 

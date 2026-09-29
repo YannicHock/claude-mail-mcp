@@ -1485,6 +1485,227 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
     }
   });
 
+  /**
+   * Two calendars of a fresh user, a proxy in front of them built from
+   * `options(source, target)`, and `move(uid, etag)` through it. The proxy is
+   * closed by `run`'s end, whatever the test did.
+   */
+  async function throughProxy(
+    options: (source: RadicaleCalendar, target: RadicaleCalendar) => Parameters<typeof startCalDavProxy>[0],
+    run: (ctx: {
+      source: RadicaleCalendar;
+      target: RadicaleCalendar;
+      proxy: CalDavProxy;
+      sourceUrl: string;
+      targetUrl: string;
+      move: (uid: string, etag?: string) => Promise<Awaited<ReturnType<CalDavClient["moveEvent"]>>>;
+    }) => Promise<void>
+  ): Promise<void> {
+    const source = await makeRadicaleCalendar();
+    const target = await addRadicaleCalendar(source, "other");
+    const proxy = await startCalDavProxy(options(source, target));
+    try {
+      const mover = new CalDavClient({ url: proxy.url, user: source.user, pass: RADICALE_PASSWORD });
+      const sourceUrl = source.calendarUrl.replace(RADICALE_URL, proxy.url);
+      const targetUrl = target.calendarUrl.replace(RADICALE_URL, proxy.url);
+      await run({
+        source,
+        target,
+        proxy,
+        sourceUrl,
+        targetUrl,
+        move: (uid, etag) => mover.moveEvent({ calendarUrl: sourceUrl, uid, etag, targetCalendarUrl: targetUrl }),
+      });
+    } finally {
+      await proxy.close();
+    }
+  }
+
+  it("a read-only source whose DELETE answers 403: the copy is removed again and the call refused, nothing moved (review of PR #231)", async () => {
+    await throughProxy(
+      (source) => ({ refuseMove: 405, failSourceDelete: pathOf(source), failSourceDeleteWith: 403 }),
+      async ({ source, target, move }) => {
+        const uid = "move-readonly@example.com";
+        const etag = await putRawEvent(source, "move-readonly.ics", richEvent(uid));
+        const message = await refusal(move(uid, etag));
+        assert.match(message, /403/);
+        assert.ok(message.endsWith("Nothing was moved."), message);
+        assert.equal(await getRawEvent(target, "move-readonly.ics"), null, "the copy in the target was left behind");
+        assert.notEqual(await getRawEvent(source, "move-readonly.ics"), null);
+      }
+    );
+  });
+
+  it("a source DELETE answering 503 leaves the copy, since the source may be gone, and names both URLs", async () => {
+    await throughProxy(
+      (source) => ({ refuseMove: 405, failSourceDelete: pathOf(source), failSourceDeleteWith: 503 }),
+      async ({ source, target, sourceUrl, targetUrl, move }) => {
+        const uid = "move-unsure@example.com";
+        const etag = await putRawEvent(source, "move-unsure.ics", richEvent(uid));
+        const message = await refusal(move(uid, etag));
+        assert.ok(message.includes(`${sourceUrl}move-unsure.ics`), message);
+        assert.ok(message.includes(`${targetUrl}move-unsure.ics`), message);
+        assert.doesNotMatch(message, /Nothing was moved/);
+        assert.notEqual(await getRawEvent(target, "move-unsure.ics"), null);
+      }
+    );
+  });
+
+  it("a target that already holds the UID is refused before anything is sent, on a server that answers it 400 as Nextcloud does (review of PR #231)", async () => {
+    await throughProxy(
+      () => ({ refuseMove: 405, uidConflictAs400: true }),
+      async ({ source, target, proxy, move }) => {
+        const uid = "move-twin-nc@example.com";
+        const etag = await putRawEvent(source, "move-twin-nc.ics", richEvent(uid));
+        await putRawEvent(target, "twin-nc-elsewhere.ics", richEvent(uid, "The twin"));
+        const message = await refusal(move(uid, etag));
+        assert.match(message, /already has an event with UID "move-twin-nc@example\.com"/);
+        assert.ok(message.endsWith("Nothing was moved."), message);
+        const writes = proxy.requests().filter((r) => ["MOVE", "PUT", "DELETE"].includes(r.method));
+        assert.deepEqual(writes, [], "something was sent before the UID was looked up in the target");
+        assert.notEqual(await getRawEvent(source, "move-twin-nc.ics"), null);
+      }
+    );
+  });
+
+  for (const [answer, performed] of [
+    [502, true],
+    [502, false],
+    [504, true],
+  ] as const) {
+    it(`a gateway answering ${answer} to a MOVE that ${performed ? "did" : "did not"} happen: the answer says where the event is (review of PR #231)`, async () => {
+      await throughProxy(
+        () => ({ garbleMove: { perform: performed, answer } }),
+        async ({ source, target, proxy, targetUrl, move }) => {
+          const uid = `move-gateway-${answer}-${String(performed)}@example.com`;
+          const name = `move-gateway-${answer}-${String(performed)}.ics`;
+          const etag = await putRawEvent(source, name, richEvent(uid));
+          if (performed) {
+            const moved = await move(uid, etag);
+            assert.equal(moved.via, "move");
+            assert.equal(moved.url, `${targetUrl}${name}`);
+            assert.equal(moved.etag, etag);
+            assert.equal(await getRawEvent(source, name), null);
+            assert.notEqual(await getRawEvent(target, name), null);
+          } else {
+            const message = await refusal(move(uid, etag));
+            assert.match(message, new RegExp(String(answer)));
+            assert.ok(message.endsWith("Nothing was moved."), message);
+            assert.notEqual(await getRawEvent(source, name), null);
+            assert.equal(await getRawEvent(target, name), null);
+          }
+          assert.equal(proxy.requests().filter((r) => r.method === "PUT").length, 0, "the fallback ran after an ambiguous answer");
+        }
+      );
+    });
+  }
+
+  it("Radicale's own 502 to a MOVE it will not do (\"Remote destination not supported\") still gets the fallback", async () => {
+    await throughProxy(
+      () => ({ refuseMove: 502, refuseMoveBody: "Remote destination not supported" }),
+      async ({ source, target, move }) => {
+        const uid = "move-remote@example.com";
+        const etag = await putRawEvent(source, "move-remote.ics", richEvent(uid));
+        const moved = await move(uid, etag);
+        assert.equal(moved.via, "copy-then-delete");
+        assert.equal(await getRawEvent(source, "move-remote.ics"), null);
+        assert.notEqual(await getRawEvent(target, "move-remote.ics"), null);
+      }
+    );
+  });
+
+  it("a connection lost mid-MOVE: the event is looked for, and found moved (review of PR #231)", async () => {
+    await throughProxy(
+      () => ({ garbleMove: { perform: true, answer: "drop" } }),
+      async ({ source, target, move }) => {
+        const uid = "move-dropped@example.com";
+        const etag = await putRawEvent(source, "move-dropped.ics", richEvent(uid));
+        const moved = await move(uid, etag);
+        assert.equal(moved.via, "move");
+        assert.equal(await getRawEvent(source, "move-dropped.ics"), null);
+        assert.notEqual(await getRawEvent(target, "move-dropped.ics"), null);
+      }
+    );
+  });
+
+  it("a connection lost mid-MOVE with the server gone after it: a refusal naming both URLs, saying it may have moved", async () => {
+    await throughProxy(
+      () => ({ garbleMove: { perform: true, answer: "drop", thenDown: true } }),
+      async ({ source, sourceUrl, targetUrl, move }) => {
+        const uid = "move-gone@example.com";
+        const etag = await putRawEvent(source, "move-gone.ics", richEvent(uid));
+        const message = await refusal(move(uid, etag));
+        assert.ok(message.includes(`${sourceUrl}move-gone.ics`), message);
+        assert.ok(message.includes(`${targetUrl}move-gone.ics`), message);
+        assert.match(message, /may have moved/);
+        assert.match(message, /check the target/);
+      }
+    );
+  });
+
+  for (const mode of ["weakEtags", "noEtags"] as const) {
+    it(`${mode}: an edit landing in the source between the copy and the DELETE is never lost; the copy is removed and nothing moved (review of PR #231)`, async () => {
+      await throughProxy(
+        (source, target) => ({
+          refuseMove: 405,
+          [mode]: true,
+          // Someone edits the source the moment the copy is written.
+          after: async ({ method, path }, status) => {
+            if (method === "PUT" && status < 300 && path.startsWith(pathOf(target))) {
+              await editBehindTheBack(source, "move-raced.ics", richEvent("move-raced@example.com", "Edited in the source"));
+            }
+          },
+        }),
+        async ({ source, target, move }) => {
+          const uid = "move-raced@example.com";
+          const etag = await putRawEvent(source, "move-raced.ics", richEvent(uid));
+          const message = await refusal(move(uid, mode === "noEtags" ? undefined : etag));
+          assert.match(message, /changed after you read it/);
+          assert.match(message, /Nothing was moved\./);
+          assert.match((await getRawEvent(source, "move-raced.ics")) ?? "", /Edited in the source/);
+          assert.equal(await getRawEvent(target, "move-raced.ics"), null, "the copy in the target was left behind");
+        }
+      );
+    });
+  }
+
+  it("a 403 whose body names no-uid-conflict is that refusal, not a reason for the fallback (review of PR #231)", async () => {
+    await throughProxy(
+      () => ({
+        refuseMove: 403,
+        refuseMoveBody:
+          '<?xml version="1.0"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><C:no-uid-conflict/></D:error>',
+      }),
+      async ({ source, target, proxy, move }) => {
+        const uid = "move-403-uid@example.com";
+        const etag = await putRawEvent(source, "move-403-uid.ics", richEvent(uid));
+        const message = await refusal(move(uid, etag));
+        assert.match(message, /already has an event with UID/);
+        assert.ok(message.endsWith("Nothing was moved."), message);
+        assert.equal(proxy.requests().filter((r) => r.method === "PUT").length, 0);
+        assert.notEqual(await getRawEvent(source, "move-403-uid.ics"), null);
+        assert.equal(await getRawEvent(target, "move-403-uid.ics"), null);
+      }
+    );
+  });
+
+  for (const status of [403, 507]) {
+    it(`a target that refuses the fallback's copy with ${status}: refused, the source untouched, nothing moved (review of PR #231)`, async () => {
+      await throughProxy(
+        (_source, target) => ({ refuseMove: 405, failTargetPut: pathOf(target), failTargetPutWith: status }),
+        async ({ source, proxy, move }) => {
+          const uid = `move-put-${status}@example.com`;
+          const etag = await putRawEvent(source, `move-put-${status}.ics`, richEvent(uid));
+          const message = await refusal(move(uid, etag));
+          assert.match(message, new RegExp(String(status)));
+          assert.ok(message.endsWith("Nothing was moved."), message);
+          assert.equal(proxy.requests().filter((r) => r.method === "DELETE").length, 0);
+          assert.notEqual(await getRawEvent(source, `move-put-${status}.ics`), null);
+        }
+      );
+    });
+  }
+
   it("move_event answers which way it moved, and may_notify for a meeting the account organizes", async () => {
     const MAILBOX = "me@mail.example";
     const own = await makeRadicaleCalendar();

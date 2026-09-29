@@ -9,7 +9,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import ICAL from "ical.js";
 
-import { CalDavClient, requireEtag } from "../../src/caldav-client.js";
+import { CalDavClient } from "../../src/caldav-client.js";
+import { requireEtag } from "../../src/caldav-etag.js";
 import { buildIcs, builtZoneName } from "../../src/ical-build.js";
 import { utcOffsetMs } from "../../src/ical-zones.js";
 import { ToolRefusal } from "../../src/tool-refusal.js";
