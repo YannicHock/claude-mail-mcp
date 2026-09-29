@@ -29,7 +29,7 @@ import {
 } from "tsdav";
 import { randomUUID } from "node:crypto";
 import { buildIcs, builtZoneName, type NewEventFields } from "./ical-build.js";
-import { calendarUserAddresses, notifyChoice, touchesAttendees } from "./ical-attendees.js";
+import { calendarUserAddresses, notifyChoice, schedulable, touchesAttendees } from "./ical-attendees.js";
 import {
   applyEventPatch,
   changesSomething,
@@ -102,6 +102,26 @@ export interface CreatedEvent {
   uid: string;
   /** The IANA zone, `"UTC"`, or `"floating"` for an all-day event — as `list_events` reports it. */
   timezone: string;
+  /**
+   * For an event with attendees: whom the calendar server may now email
+   * about it (review of PR #230) — every attendee with `notifyAttendees:
+   * true`, none with `false`. Absent for an event with none.
+   */
+  mayNotify?: string[];
+}
+
+/** What `update_event` answers: the event, its new ETag, and for a guest-list change whom the server may now email. */
+export interface UpdatedEvent {
+  uid: string;
+  url: string;
+  etag: string | null;
+  /**
+   * For a change to the guest list: everyone the calendar server may now
+   * email about the event — `mayNotify` in src/ical-attendees.ts, which
+   * names the attendees already listed, too, when this call made the
+   * account the event's organizer. Absent for any other change.
+   */
+  mayNotify?: string[];
 }
 
 /** Which event a write is aimed at, and the guards spec §4 puts on it. */
@@ -291,7 +311,8 @@ export class CalDavClient {
    * ORGANIZER — the first of {@link ownAddresses} — and `notifyAttendees`
    * decides whether the server may mail them (`buildIcs` in
    * src/ical-build.ts). Without it the call is refused before the server is
-   * contacted.
+   * contacted, and so is one whose address lookup fails ({@link ownFor}).
+   * The answer's `mayNotify` names whom the server may now email.
    */
   async createEvent(input: NewEventInput): Promise<CreatedEvent> {
     const nothingDone = "Nothing was created.";
@@ -311,7 +332,7 @@ export class CalDavClient {
     zone ??= calendarZone(calendar.timezone) ?? "UTC";
     const client = await this.ensureClient();
     const uid = `${randomUUID()}@claude-mail-mcp`;
-    const own = invites ? await this.ownAddresses() : [];
+    const own = invites ? await this.ownFor(nothingDone) : [];
     const ics = buildIcs({ ...input, uid, own }, zone, nothingDone);
     const filename = `${uid}.ics`;
     const res = await client.createCalendarObject({
@@ -321,7 +342,9 @@ export class CalDavClient {
     });
     assertWritten(res, "PUT");
     const base = calendar.url.endsWith("/") ? calendar.url : `${calendar.url}/`;
-    return { url: `${base}${filename}`, uid, timezone: builtZoneName(ics) };
+    const created: CreatedEvent = { url: `${base}${filename}`, uid, timezone: builtZoneName(ics) };
+    if (!invites) return created;
+    return { ...created, mayNotify: schedulable(parseCalendar(ics).vcal.getAllSubcomponents("vevent"), [], own) };
   }
 
   /**
@@ -350,9 +373,11 @@ export class CalDavClient {
    * the one occurrence `recurrenceId` names — through `applyAttendeePatch` in
    * src/ical-attendees.ts, with {@link ownAddresses} to tell the account's own
    * meeting from someone else's. Without `notifyAttendees` the call is refused
-   * before the server is contacted.
+   * before the server is contacted; a lookup of those addresses that fails is
+   * a refusal too, ending in "Nothing was changed" ({@link ownFor}). The
+   * answer's `mayNotify` names whom the server may now email.
    */
-  async updateEvent(update: EventUpdate): Promise<{ uid: string; url: string; etag: string | null }> {
+  async updateEvent(update: EventUpdate): Promise<UpdatedEvent> {
     const nothingDone = "Nothing was changed, and no event was created.";
     if (!changesSomething(update)) {
       throw new ToolRefusal(
@@ -369,7 +394,7 @@ export class CalDavClient {
     }
     const calendar = await this.findCalendar(update.calendarUrl);
     const stored = await this.findStoredEvent(calendar, update.uid, nothingDone);
-    const own = touchesAttendees(update) ? await this.ownAddresses() : [];
+    const own = touchesAttendees(update) ? await this.ownFor(nothingDone) : [];
     const shape = describeSeries(seriesFor(stored.parsed.vcal, update.uid));
     const target: WriteTarget = { calendar, uid: update.uid, url: stored.url, nothingDone };
     const ctx = { nothingDone, now: new Date(), own };
@@ -386,7 +411,7 @@ export class CalDavClient {
       const ifMatch = requireEtag(update, stored, nothingDone);
       const found = await this.occurrence(stored, update.uid, recurrenceId ?? null, nothingDone);
       edit = applyOccurrencePatch(stored.parsed, update.uid, found, update, ctx);
-      return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
+      return updated(update.uid, stored.url, await this.putEdit(target, ifMatch, edit), edit);
     }
     if (shape.recurring && update.applyToSeries !== true) throw seriesRefusal(update.uid, "change");
     const ifMatch = requireEtag(update, stored, nothingDone);
@@ -398,7 +423,7 @@ export class CalDavClient {
       shape.recurring && touchesTime(update)
         ? shiftSeries(stored.parsed, update.uid, anchor, update, ctx)
         : applyEventPatch(stored.parsed, update.uid, update, ctx);
-    return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
+    return updated(update.uid, stored.url, await this.putEdit(target, ifMatch, edit), edit);
   }
 
   /**
@@ -731,13 +756,12 @@ export class CalDavClient {
    * account is edited. A lookup that fails is not kept, so the next call asks
    * again.
    *
-   * A principal that does not list the property at all — tsdav's
-   * `fetchCalendarUserAddresses` then throws "cannot find
-   * calendarUserAddresses" — has no address of its own here, and the
-   * mailbox's is used. Any other failure (the server unreachable, a 5xx) is
-   * passed on: taking the mailbox's address on a transient error could make
-   * a Nextcloud with a different address read the account's own meeting as
-   * an invitation received, and mail people accordingly.
+   * A principal that answers and lists no `mailto:` has no address of its
+   * own here, and the mailbox's is used. Any other outcome (the server
+   * unreachable, a 401, a 5xx) is passed on, and not kept: taking the
+   * mailbox's address on a transient error could make a Nextcloud with a
+   * different address read the account's own meeting as an invitation
+   * received, and mail people accordingly. See {@link lookUpAddresses}.
    *
    * `find_free_slot` (#213) reads it too, to know which ATTENDEE is the
    * account's own declined one.
@@ -750,20 +774,70 @@ export class CalDavClient {
     return this.addresses;
   }
 
+  /**
+   * The PROPFIND behind {@link ownAddresses}, and what its answer means.
+   *
+   * tsdav's `fetchCalendarUserAddresses` does not throw on a failed request:
+   * its `davRequest` hands back `[{ ok: false }]` for any non-2xx, and the
+   * function then throws "cannot find calendarUserAddresses" — the very error
+   * it throws for a principal it cannot find in a good answer. Taking that
+   * error for "the principal lists no address" (as the first version of
+   * this did) turned a 503 or a 401 into the mailbox's address, cached for
+   * the client's lifetime: on Nextcloud, where the principal's address is a
+   * different one, an ORGANIZER the server does not recognise, and the
+   * account's own meeting read as someone else's (review of PR #230).
+   *
+   * So the answer is looked at itself, through a `fetch` that records its
+   * status. The mailbox's address stands in only for a `207 Multi-Status` in
+   * which the principal lists no `mailto:` — the property absent or `404`,
+   * which tsdav reads as no hrefs, or only non-`mailto:` hrefs, as Radicale's
+   * (R13). Anything else — another status, no answer, a 207 tsdav cannot
+   * find the principal in — throws, is not cached, and refuses the attendee
+   * call that asked ({@link ownFor}).
+   */
   private async lookUpAddresses(): Promise<readonly string[]> {
     const client = await this.ensureClient();
     // tsdav's declaration asks for the account, but the client createDAVClient
     // hands back fills in the one it discovered at login (its `defaultParam`
     // over `commonDefaultsWithAccount`); passing it would need that account,
-    // which the client does not expose.
-    const fetchAddresses = client.fetchCalendarUserAddresses as unknown as () => Promise<string[]>;
-    let hrefs: string[] = [];
+    // which the client does not expose. What is passed is merged over it.
+    const fetchAddresses = client.fetchCalendarUserAddresses as unknown as (params: {
+      fetch: typeof fetch;
+    }) => Promise<string[]>;
+    let status: number | undefined;
+    const recording: typeof fetch = async (input, init) => {
+      const res = await fetch(input, init);
+      status = res.status;
+      return res;
+    };
+    let hrefs: string[];
     try {
-      hrefs = await fetchAddresses();
+      hrefs = await fetchAddresses({ fetch: recording });
     } catch (err) {
-      if (!(err instanceof Error && err.message === "cannot find calendarUserAddresses")) throw err;
+      if (status === undefined || status === 207) throw err;
+      throw new Error(`the CalDAV server answered ${status} to the lookup of the account's addresses`);
+    }
+    if (status !== 207) {
+      throw new Error(`the CalDAV server answered ${status ?? "nothing"} to the lookup of the account's addresses`);
     }
     return Object.freeze(calendarUserAddresses(hrefs, this.address));
+  }
+
+  /**
+   * {@link ownAddresses} for a call that is about to write an attendee: a
+   * lookup that fails is a refusal ending in `nothingDone`, before anything
+   * is written, rather than a guess at the account's address — which is the
+   * ORGANIZER the server compares, and decides by whom it mails. The reason
+   * is `classifyFailure`'s bounded reading, never the error object.
+   */
+  private async ownFor(nothingDone: string): Promise<readonly string[]> {
+    try {
+      return await this.ownAddresses();
+    } catch (err) {
+      throw new ToolRefusal(
+        `The account's own calendar address could not be looked up (${classifyFailure(err).reason}), so this connector cannot tell whose meeting this is, or write the account as its organizer. Try again in a moment. ${nothingDone}`
+      );
+    }
   }
 
   private async findCalendar(url: string): Promise<DAVCalendar> {
@@ -808,6 +882,11 @@ function uidFilter(uid: string) {
       },
     },
   };
+}
+
+/** What `updateEvent` answers for a write of `edit`: its `mayNotify` only when it changed the guest list. */
+function updated(uid: string, url: string, etag: string | null, edit: EditResult): UpdatedEvent {
+  return { uid, url, etag, ...(edit.mayNotify === undefined ? {} : { mayNotify: edit.mayNotify }) };
 }
 
 function notFound(uid: string, calendarUrl: string, nothingDone: string): ToolRefusal {

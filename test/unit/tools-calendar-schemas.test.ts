@@ -233,6 +233,27 @@ describe("attendees on the calendar tools (#204, #205, spec 2026-09-29 §2.1)", 
     });
   });
 
+  it("notify_attendees and remove_attendees say removal with false is refused for now, and what to do instead: leave them listed first (spec §2.1, until acceptance A2)", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const notify = schemaOf(tools, "update_event").notify_attendees?.description ?? "";
+      assert.match(notify, /[Rr]emoving attendees with false is refused for now/);
+      assert.match(notify, /leave them listed.*true/);
+      assert.doesNotMatch(notify, /removing an attendee the server was free to notify is refused/);
+      const remove = schemaOf(tools, "update_event").remove_attendees?.description ?? "";
+      assert.match(remove, /notify_attendees: true/);
+      assert.match(remove, /false is refused/);
+    });
+  });
+
+  it("create_event and update_event say their answer names, in may_notify, whom the calendar server may now email", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      for (const tool of ["create_event", "update_event"]) {
+        assert.match(tools.get(tool)?.config.description ?? "", /may_notify/, tool);
+      }
+      assert.match(schemaOf(tools, "update_event").notify_attendees?.description ?? "", /may_notify/);
+    });
+  });
+
   it("create_event, update_event and delete_event say the server may mail attendees, and to confirm first", async () => {
     await withCalendarTools(CLOSED, async (tools) => {
       for (const tool of ["create_event", "update_event", "delete_event"]) {
