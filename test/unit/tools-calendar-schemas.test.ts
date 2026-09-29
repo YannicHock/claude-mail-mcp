@@ -88,6 +88,44 @@ describe("the calendar tools' shared fields (#214)", () => {
   });
 });
 
+describe("zones on the calendar tools (spec 2026-09-29 §2.5)", () => {
+  it("create_event takes an optional IANA timezone, and says what it defaults to", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const timezone = schemaOf(tools, "create_event").timezone;
+      assert.ok(timezone, "create_event has no timezone");
+      assert.equal(timezone.safeParse(undefined).success, true, "timezone is required");
+      assert.match(timezone.description ?? "", /IANA/);
+      assert.match(timezone.description ?? "", /calendar's own/);
+    });
+  });
+
+  it("update_event tells the model a floating event takes its times without an offset", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      for (const field of ["start", "end"]) {
+        assert.match(schemaOf(tools, "update_event")[field]?.description ?? "", /floating.*without an offset/, field);
+      }
+    });
+  });
+
+  it("create_event refuses a timezone that is no IANA name before any request, and leaves no warn line", async () => {
+    await withCalendarTools(CLOSED, async (tools, warnings) => {
+      const create = tools.get("create_event");
+      assert.ok(create);
+      await assert.rejects(
+        create.handler({
+          calendar_url: `${CLOSED}cal/`,
+          summary: "x",
+          start: "2026-10-01T09:00:00Z",
+          end: "2026-10-01T10:00:00Z",
+          timezone: "Mars/Olympus_Mons",
+        }),
+        (err: unknown) => err instanceof ToolRefusal && /Nothing was created/.test(err.message)
+      );
+      assert.equal(warnings(), 0);
+    });
+  });
+});
+
 describe("update_event with nothing to change", () => {
   it("is refused before any request, and leaves no warn line", async () => {
     // Had the call reached for the closed port, it would have failed as

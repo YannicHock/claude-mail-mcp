@@ -19,7 +19,10 @@ import assert from "node:assert/strict";
 import ICAL from "ical.js";
 
 import {
+  calendarZone,
+  canonicalZone,
   instantToZonedWall,
+  vtimezoneFromIntl,
   resolveUnknownTzid,
   utcOffsetMs,
   withResolvedZones,
@@ -215,5 +218,98 @@ describe("withResolvedZones and zoneOf", () => {
     assert.ok(ve);
     assert.deepEqual(zoneOf(ve.getFirstProperty("dtstart")!), { kind: "utc" });
     assert.deepEqual(zoneOf(ve.getFirstProperty("dtend")!), { kind: "floating" });
+  });
+});
+
+/** An ical.js zone read from the VTIMEZONE text `vtimezoneFromIntl` wrote. */
+function zoneFrom(vtimezone: string): ICAL.Timezone {
+  const vcal = new ICAL.Component(ICAL.parse(`BEGIN:VCALENDAR\r\nVERSION:2.0\r\n${vtimezone}END:VCALENDAR\r\n`));
+  const component = vcal.getFirstSubcomponent("vtimezone");
+  assert.ok(component, "no VTIMEZONE in the text");
+  return new ICAL.Timezone(component);
+}
+
+describe("vtimezoneFromIntl — the VTIMEZONE create_event writes (spec §2.5 A)", () => {
+  // Jerusalem and Casablanca are the two zones the rejected package got
+  // wrong; Kolkata has no transitions at all; Sydney changes in the other
+  // hemisphere.
+  for (const tz of ZONES.concat("Asia/Kolkata")) {
+    it(`${tz}: ical.js reading it agrees with Intl at every hour it can name`, () => {
+      const from = at("2026-01-01T00:00:00Z");
+      const to = at("2028-01-01T00:00:00Z");
+      const zone = zoneFrom(vtimezoneFromIntl(tz, from, to));
+      assert.equal(zone.tzid, tz);
+      let checked = 0;
+      for (let ms = from; ms < to; ms += 5 * 3600_000) {
+        const w = instantToZonedWall(ms, tz);
+        // A wall time in an autumn overlap names two instants. RFC 5545 says
+        // the first; ical.js reading a VTIMEZONE takes the second, whoever
+        // wrote the block. That is ical.js's reading, not this block, so
+        // those hours are left out and every other one is checked.
+        const ambiguous = [1800_000, 3600_000, 7200_000].some(
+          (d) =>
+            JSON.stringify(instantToZonedWall(ms - d, tz)) === JSON.stringify(w) ||
+            JSON.stringify(instantToZonedWall(ms + d, tz)) === JSON.stringify(w)
+        );
+        if (ambiguous) continue;
+        const t = ICAL.Time.fromData({ ...w, isDate: false }, zone);
+        assert.equal(t.toUnixTime() * 1000, ms, `${tz} ${new Date(ms).toISOString()}`);
+        checked += 1;
+      }
+      assert.ok(checked > 3000, `only ${checked} instants checked`);
+    });
+  }
+
+  it("emits one observance per transition, STANDARD or DAYLIGHT, and one alone for a zone with none", () => {
+    const from = at("2026-01-01T00:00:00Z");
+    const to = at("2027-01-01T00:00:00Z");
+    const berlin = vtimezoneFromIntl("Europe/Berlin", from, to);
+    // The one in effect at the start, then March and October.
+    assert.equal((berlin.match(/BEGIN:(STANDARD|DAYLIGHT)/g) ?? []).length, 3);
+    assert.match(berlin, /BEGIN:DAYLIGHT\r\nDTSTART:20260329T020000\r\nTZOFFSETFROM:\+0100\r\nTZOFFSETTO:\+0200\r\n/);
+    assert.match(berlin, /BEGIN:STANDARD\r\nDTSTART:20261025T030000\r\nTZOFFSETFROM:\+0200\r\nTZOFFSETTO:\+0100\r\n/);
+    const kolkata = vtimezoneFromIntl("Asia/Kolkata", from, to);
+    assert.equal((kolkata.match(/BEGIN:(STANDARD|DAYLIGHT)/g) ?? []).length, 1);
+    assert.match(kolkata, /TZOFFSETTO:\+0530/);
+  });
+});
+
+describe("the zone a new event is written in", () => {
+  it("canonicalZone takes an IANA name in its canonical spelling, and nothing else", () => {
+    assert.equal(canonicalZone("Asia/Jerusalem"), "Asia/Jerusalem");
+    assert.equal(canonicalZone("europe/berlin"), "Europe/Berlin");
+    assert.equal(canonicalZone("UTC"), "UTC");
+    assert.equal(canonicalZone("W. Europe Standard Time"), null);
+    assert.equal(canonicalZone("+02:00"), null);
+    assert.equal(canonicalZone(""), null);
+  });
+
+  it("calendarZone reads a calendar's calendar-timezone as VTIMEZONE text or as a bare id", () => {
+    const text = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Nextcloud//EN",
+      "BEGIN:VTIMEZONE",
+      "TZID:Europe/Berlin",
+      "BEGIN:STANDARD",
+      "DTSTART:19701025T030000",
+      "TZOFFSETFROM:+0200",
+      "TZOFFSETTO:+0100",
+      "END:STANDARD",
+      "END:VTIMEZONE",
+      "END:VCALENDAR",
+      "",
+    ].join("\r\n");
+    assert.equal(calendarZone(text), "Europe/Berlin");
+    assert.equal(calendarZone(text.replace("TZID:Europe/Berlin", "TZID:/mozilla.org/20050126_1/Europe/Berlin")), "Europe/Berlin");
+    assert.equal(calendarZone("Europe/Berlin"), "Europe/Berlin");
+    assert.equal(calendarZone("  Asia/Jerusalem\n"), "Asia/Jerusalem");
+  });
+
+  it("calendarZone gives up — so the event is written in UTC — on no zone, or one it cannot place", () => {
+    // Radicale sets no calendar-timezone (R13), and tsdav then reports "".
+    for (const value of ["", undefined, null, 42, { _cdata: "Europe/Berlin" }, "W. Europe Standard Time", "BEGIN:VCALENDAR\r\nnonsense"]) {
+      assert.equal(calendarZone(value), null, JSON.stringify(value));
+    }
   });
 });

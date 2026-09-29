@@ -232,7 +232,9 @@ describe("applyEventPatch — what it changes", () => {
     const ve = master(out, "rich-1@example.com");
     assert.equal(iso(ve.getFirstPropertyValue("dtstart")), "2026-10-01T13:00:00.000Z");
     assert.equal(iso(ve.getFirstPropertyValue("dtend")), "2026-10-01T14:00:00.000Z");
-    assert.equal(ve.getFirstProperty("dtstart")?.getParameter("tzid"), undefined, "a rewritten time is UTC (spec §2.4)");
+    // v0.7.4 (#208): a new time is written in the event's own zone, no longer as UTC.
+    assert.equal(ve.getFirstProperty("dtstart")?.getParameter("tzid"), "Europe/Berlin");
+    assert.match(out, /\r\nDTSTART;TZID=Europe\/Berlin:20261001T150000\r\n/);
   });
 
   it("replaces DURATION with DTEND when the time changes", () => {
@@ -291,8 +293,8 @@ describe("applyEventPatch — what it refuses", () => {
   });
 });
 
-/** A timed event whose TZID has no VTIMEZONE in the object: ical.js cannot place it. */
-const UNRESOLVED_TZID = ics(
+/** A timed event in Europe/Berlin whose object carries no VTIMEZONE, as Nextcloud and iCloud often store one (R6). */
+const BERLIN_NO_VTIMEZONE = ics(
   "BEGIN:VCALENDAR",
   "VERSION:2.0",
   "PRODID:-//Other Client//EN",
@@ -335,34 +337,122 @@ const NO_END = ics(
   "END:VCALENDAR"
 );
 
-describe("applyEventPatch — times it cannot place (final review)", () => {
-  it("refuses an end-only change on a TZID it has no VTIMEZONE for, rather than moving the start", () => {
-    for (const end of ["2026-10-01T12:00:00+02:00", "2026-10-01T11:00:00+02:00"]) {
+/** A TZID with no VTIMEZONE that is no IANA name either: nothing can place it. */
+const CUSTOM_ZONE = BERLIN_NO_VTIMEZONE.replaceAll("Europe/Berlin", "My Custom Zone");
+
+/** The VTIMEZONE blocks of an object, exactly as serialised. */
+function vtimezones(text: string): string[] {
+  return [...text.matchAll(/BEGIN:VTIMEZONE\r\n[\s\S]*?END:VTIMEZONE\r\n/g)].map((m) => m[0]);
+}
+
+describe("applyEventPatch — a new time keeps the event's zone (#208, #209)", () => {
+  it("writes a Berlin event moved by its start as Berlin time, keeps its VTIMEZONE byte for byte, and keeps its length across the DST change", () => {
+    // 09:00–10:00 CEST on 1 October, moved to 15:00 CET on 29 October: the
+    // clocks went back on the 25th in between.
+    const out = applyEventPatch(RICH, "rich-1@example.com", { start: "2026-10-29T15:00:00+01:00" }, NOW);
+    assert.match(out, /\r\nDTSTART;TZID=Europe\/Berlin:20261029T150000\r\n/);
+    assert.match(out, /\r\nDTEND;TZID=Europe\/Berlin:20261029T160000\r\n/);
+    assert.equal(vtimezones(RICH).length, 1);
+    assert.deepEqual(vtimezones(out), vtimezones(RICH));
+    const ve = master(out, "rich-1@example.com");
+    assert.equal(iso(ve.getFirstPropertyValue("dtstart")), "2026-10-29T14:00:00.000Z");
+    assert.equal(iso(ve.getFirstPropertyValue("dtend")), "2026-10-29T15:00:00.000Z");
+  });
+
+  it("moves a Berlin event with no VTIMEZONE by its start alone, with the same TZID and still no VTIMEZONE", () => {
+    // Refused until v0.7.4: ical.js read the TZID as floating.
+    const out = applyEventPatch(BERLIN_NO_VTIMEZONE, "nozone-1@example.com", { start: "2026-10-29T15:00:00+01:00" }, NOW);
+    assert.match(out, /\r\nDTSTART;TZID=Europe\/Berlin:20261029T150000\r\n/);
+    assert.match(out, /\r\nDTEND;TZID=Europe\/Berlin:20261029T160000\r\n/);
+    assert.equal(vtimezones(out).length, 0, "a VTIMEZONE was added");
+  });
+
+  it("changes only the end of such an event, keeping the start where it was", () => {
+    const out = applyEventPatch(BERLIN_NO_VTIMEZONE, "nozone-1@example.com", { end: "2026-10-01T12:00:00+02:00" }, NOW);
+    assert.match(out, /\r\nDTSTART;TZID=Europe\/Berlin:20261001T090000\r\n/);
+    assert.match(out, /\r\nDTEND;TZID=Europe\/Berlin:20261001T120000\r\n/);
+  });
+
+  it("writes a path-like TZID back exactly as it was stored", () => {
+    const mozilla = BERLIN_NO_VTIMEZONE.replaceAll("Europe/Berlin", "/mozilla.org/20050126_1/Europe/Berlin");
+    const out = applyEventPatch(mozilla, "nozone-1@example.com", { start: "2026-10-01T15:00:00+02:00" }, NOW);
+    assert.match(out, /\r\nDTSTART;TZID=\/mozilla\.org\/20050126_1\/Europe\/Berlin:20261001T150000\r\n/);
+  });
+
+  it("reads a time given without an offset as clock time in the event's own zone", () => {
+    const out = applyEventPatch(RICH, "rich-1@example.com", { start: "2026-10-29T15:00:00" }, NOW);
+    assert.match(out, /\r\nDTSTART;TZID=Europe\/Berlin:20261029T150000\r\n/);
+    assert.equal(iso(master(out, "rich-1@example.com").getFirstPropertyValue("dtstart")), "2026-10-29T14:00:00.000Z");
+  });
+
+  it("keeps a floating event floating, moved by its start alone", () => {
+    const out = applyEventPatch(FLOATING, "float-1@example.com", { start: "2026-10-01T15:00:00" }, NOW);
+    assert.match(out, /\r\nDTSTART:20261001T150000\r\n/);
+    assert.match(out, /\r\nDTEND:20261001T160000\r\n/);
+  });
+
+  it("refuses a time with an offset for a floating event, saying why", () => {
+    for (const patch of [
+      { start: "2026-10-01T15:00:00+02:00" },
+      { start: "2026-10-01T15:00:00Z" },
+      { start: "2026-10-01T15:00:00", end: "2026-10-01T16:00:00+02:00" },
+    ]) {
       assert.throws(
-        () => applyEventPatch(UNRESOLVED_TZID, "nozone-1@example.com", { end }, NOW),
+        () => applyEventPatch(FLOATING, "float-1@example.com", patch, NOW),
         (err: unknown) =>
-          err instanceof ToolRefusal && /time zone/.test(err.message) && /Nothing was changed/.test(err.message)
+          err instanceof ToolRefusal &&
+          /floating/.test(err.message) &&
+          /without an offset/.test(err.message) &&
+          /Nothing was changed/.test(err.message),
+        JSON.stringify(patch)
       );
     }
   });
 
-  it("refuses a start-only move of a floating event, which would need its old length", () => {
-    assert.throws(
-      () => applyEventPatch(FLOATING, "float-1@example.com", { start: "2026-10-02T09:00:00Z" }, NOW),
-      (err: unknown) => err instanceof ToolRefusal && /time zone/.test(err.message)
-    );
+  it("still refuses a one-sided change to a TZID nothing can place", () => {
+    for (const patch of [{ start: "2026-10-01T11:00:00+02:00" }, { end: "2026-10-01T12:00:00+02:00" }]) {
+      assert.throws(
+        () => applyEventPatch(CUSTOM_ZONE, "nozone-1@example.com", patch, NOW),
+        (err: unknown) =>
+          err instanceof ToolRefusal && /"My Custom Zone"/.test(err.message) && /Nothing was changed/.test(err.message),
+        JSON.stringify(patch)
+      );
+    }
   });
 
-  it("still moves such an event when given both bounds, since neither old time is needed", () => {
+  it("moves such an event when given both bounds, as UTC, since neither old time is needed", () => {
     const out = applyEventPatch(
-      UNRESOLVED_TZID,
+      CUSTOM_ZONE,
       "nozone-1@example.com",
       { start: "2026-10-01T11:00:00+02:00", end: "2026-10-01T12:00:00+02:00" },
       NOW
     );
-    const ve = master(out, "nozone-1@example.com");
-    assert.equal(iso(ve.getFirstPropertyValue("dtstart")), "2026-10-01T09:00:00.000Z");
-    assert.equal(iso(ve.getFirstPropertyValue("dtend")), "2026-10-01T10:00:00.000Z");
+    assert.match(out, /\r\nDTSTART:20261001T090000Z\r\n/);
+    assert.match(out, /\r\nDTEND:20261001T100000Z\r\n/);
+  });
+
+  it("keeps a UTC event in UTC", () => {
+    const out = applyEventPatch(WITH_DURATION, "dur-1@example.com", { start: "2026-10-02T11:00:00+02:00" }, NOW);
+    assert.match(out, /\r\nDTSTART:20261002T090000Z\r\n/);
+    assert.match(out, /\r\nDTEND:20261002T094500Z\r\n/);
+  });
+
+  it("keeps everything else an update keeps when it rewrites the time", () => {
+    const out = applyEventPatch(RICH, "rich-1@example.com", { start: "2026-10-29T15:00:00+01:00" }, NOW);
+    const ve = master(out, "rich-1@example.com");
+    assert.equal(ve.getAllSubcomponents("valarm").length, 1, "the alarm was dropped");
+    assert.equal(ve.getFirstProperty("attendee")?.getParameter("partstat"), "ACCEPTED");
+    assert.equal(ve.getFirstPropertyValue("x-keep-me"), "yes");
+  });
+
+  it("leaves the other overrides of a series alone", () => {
+    // The series' own time is refused one level up (CalDavClient); the patch
+    // itself must still not touch an override's zone when it renames.
+    const zoned = SERIES.replaceAll("DTSTART:2026", "DTSTART;TZID=Europe/Berlin:2026")
+      .replaceAll("DTEND:2026", "DTEND;TZID=Europe/Berlin:2026")
+      .replaceAll(/(DTSTART|DTEND)(;TZID=Europe\/Berlin:\d{8}T\d{6})Z/g, "$1$2");
+    const out = applyEventPatch(zoned, "series-1@example.com", { summary: "Renamed" }, NOW);
+    assert.match(out, /\r\nDTSTART;TZID=Europe\/Berlin:20261008T110000\r\n/);
   });
 });
 

@@ -30,6 +30,7 @@ import {
   getRawEvent,
   makeRadicaleCalendar,
   putRawEvent,
+  serverFindsIn,
   waitForRadicaleReady,
   type CalDavProxy,
   type RadicaleCalendar,
@@ -488,6 +489,117 @@ describe("update_event", SKIP, () => {
   });
 });
 
+/** A single Berlin event on 2026-10-22, 09:00–10:00 CEST, with or without its VTIMEZONE. */
+function berlinEvent(uid: string, withVtimezone: boolean): string {
+  return ics(
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Other Client//EN",
+    ...(withVtimezone ? BERLIN_VTIMEZONE : []),
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    "DTSTAMP:20260901T080000Z",
+    "DTSTART;TZID=Europe/Berlin:20261022T090000",
+    "DTEND;TZID=Europe/Berlin:20261022T100000",
+    "SUMMARY:Planning",
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    "TRIGGER:-PT15M",
+    "DESCRIPTION:Reminder",
+    "END:VALARM",
+    "END:VEVENT",
+    "END:VCALENDAR"
+  );
+}
+
+describe("zones on write (#208, #209)", SKIP, () => {
+  for (const withVtimezone of [true, false]) {
+    it(`a Berlin event ${withVtimezone ? "with" : "without"} a VTIMEZONE, moved by update_event across the DST change, stays Berlin and expands on Radicale to the right instants`, async () => {
+      const { cal: own, client: mine } = await freshCalendar();
+      const uid = `berlin-move-${String(withVtimezone)}@example.com`;
+      const etag = await putRawEvent(own, "berlin.ics", berlinEvent(uid, withVtimezone));
+      // 09:00 on the 29th, after the clocks went back: 08:00Z, not 07:00Z.
+      await mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, start: "2026-10-29T09:00:00+01:00" });
+
+      const stored = (await getRawEvent(own, "berlin.ics")) ?? "";
+      assert.match(stored, /DTSTART;TZID=Europe\/Berlin:20261029T090000/);
+      assert.match(stored, /DTEND;TZID=Europe\/Berlin:20261029T100000/);
+      // Radicale normalises what it stores (R16) and gives an object with an
+      // IANA TZID a VTIMEZONE of its own, so on this server both cases are
+      // stored with one; that the connector adds none is the unit test's.
+      assert.match(stored, /BEGIN:VTIMEZONE/);
+      assert.match(stored, /BEGIN:VALARM/);
+
+      // Radicale places it at 08:00Z itself; at CEST it would be 07:00Z.
+      assert.deepEqual(await serverFindsIn(own, "2026-10-29T08:00:00Z", "2026-10-29T08:30:00Z"), ["berlin.ics"]);
+      assert.deepEqual(await serverFindsIn(own, "2026-10-29T06:30:00Z", "2026-10-29T08:00:00Z"), []);
+      const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+      assert.deepEqual(
+        events.map((e) => [e.start, e.end, e.timezone]),
+        [["2026-10-29T08:00:00.000Z", "2026-10-29T09:00:00.000Z", "Europe/Berlin"]]
+      );
+    });
+  }
+
+  it("a floating event moved by update_event stays floating", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "floating-move@example.com";
+    const etag = await putRawEvent(
+      own,
+      "floating.ics",
+      berlinEvent(uid, false).replaceAll(";TZID=Europe/Berlin", "")
+    );
+    await mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, start: "2026-10-29T15:00:00" });
+    const stored = (await getRawEvent(own, "floating.ics")) ?? "";
+    assert.match(stored, /DTSTART:20261029T150000\r?\n/);
+    assert.match(stored, /DTEND:20261029T160000\r?\n/);
+    const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(
+      events.map((e) => [e.start, e.timezone]),
+      [["2026-10-29T15:00:00", "floating"]]
+    );
+  });
+
+  it("create_event on a calendar with no zone of its own writes UTC, as before, and says so", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    // What tsdav hands back for Radicale, which sets no calendar-timezone (R13).
+    assert.deepEqual(
+      (await mine.listCalendars()).map((c) => c.timezone),
+      [""]
+    );
+    const created = await mine.createEvent({
+      calendarUrl: own.calendarUrl,
+      summary: "No zone",
+      start: "2026-10-01T09:00:00+02:00",
+      end: "2026-10-01T10:00:00+02:00",
+    });
+    assert.equal(created.timezone, "UTC");
+    const stored = (await getRawEvent(own, `${created.uid}.ics`)) ?? "";
+    assert.match(stored, /DTSTART:20261001T070000Z/);
+    assert.doesNotMatch(stored, /VTIMEZONE/);
+  });
+
+  it("create_event with a timezone writes it with a VTIMEZONE Radicale reads to the right instant", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const created = await mine.createEvent({
+      calendarUrl: own.calendarUrl,
+      summary: "In Jerusalem",
+      // Jerusalem is at +03:00 from Friday 2026-03-27: 10:00 on the 28th is 07:00Z.
+      start: "2026-03-28T10:00:00",
+      end: "2026-03-28T11:00:00",
+      timezone: "Asia/Jerusalem",
+    });
+    assert.equal(created.timezone, "Asia/Jerusalem");
+    const stored = (await getRawEvent(own, `${created.uid}.ics`)) ?? "";
+    assert.match(stored, /DTSTART;TZID=Asia\/Jerusalem:20260328T100000/);
+    assert.match(stored, /BEGIN:VTIMEZONE/);
+    const file = `${created.uid}.ics`;
+    assert.deepEqual(await serverFindsIn(own, "2026-03-28T07:00:00Z", "2026-03-28T07:30:00Z"), [file]);
+    // At the winter +02:00 it would be 08:00–09:00Z.
+    assert.deepEqual(await serverFindsIn(own, "2026-03-28T08:00:00Z", "2026-03-28T09:00:00Z"), []);
+  });
+});
+
 describe("update_event on a server that answers a PUT without an ETag", SKIP, () => {
   // The v0.7.2 acceptance run on Nextcloud: update_event answered etag: null,
   // so a second change needed a list_events in between. The connector now
@@ -584,6 +696,143 @@ describe("a change that lands between the lookup and the write (#214)", SKIP, ()
       assert.equal(proxy.strippedPuts(), 1, "the PUT still carried an ETag, so no read-back happened");
       assert.equal(result.etag, null);
       assert.match((await getRawEvent(own, "overtaken.ics")) ?? "", /SUMMARY:Phone/);
+    } finally {
+      await proxy.close();
+    }
+  });
+});
+
+describe("ETags the server hands out oddly (#210, spec §2.8)", SKIP, () => {
+  /** A client, and the calendar's URL, with every request going through `proxy`. */
+  function via(proxy: CalDavProxy, own: RadicaleCalendar): { client: CalDavClient; calendarUrl: string } {
+    return {
+      client: new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD }),
+      calendarUrl: own.calendarUrl.replace(RADICALE_URL, proxy.url),
+    };
+  }
+
+  /** The etag list_events hands out for `uid` through `client`, which may be null. */
+  async function listedEtag(mine: CalDavClient, calendarUrl: string, uid: string): Promise<string | null> {
+    const hit = (await mine.listEvents(calendarUrl, WINDOW.start, WINDOW.end)).events.find((e) => e.uid === uid);
+    assert.ok(hit, `list_events does not show ${uid}`);
+    return hit.etag;
+  }
+
+  const puts = (proxy: CalDavProxy) => proxy.requests().filter((r) => r.method === "PUT");
+
+  it("weak ETags: an update with the etag list_events gave succeeds, written with no If-Match", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "weak@example.com";
+    await putRawEvent(own, "weak.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({ weakEtags: true });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      const etag = await listedEtag(mine, calendarUrl, uid);
+      assert.match(etag ?? "", /^W\//, "the proxy did not make the ETag weak");
+      await mine.updateEvent({ calendarUrl, uid, etag: etag ?? undefined, summary: "Through gzip" });
+      assert.match((await getRawEvent(own, "weak.ics")) ?? "", /SUMMARY:Through gzip/);
+      assert.deepEqual(puts(proxy).map((r) => r.ifMatch), [null]);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("weak ETags: an update with a stale one is refused before any PUT", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "weak-stale@example.com";
+    await putRawEvent(own, "weak-stale.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({ weakEtags: true });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      const stale = await listedEtag(mine, calendarUrl, uid);
+      await editBehindTheBack(own, "weak-stale.ics", richEvent(uid, "Changed on the phone"));
+      const message = await refusal(mine.updateEvent({ calendarUrl, uid, etag: stale ?? undefined, summary: "x" }));
+      assert.match(message, /changed after you read it/);
+      assert.match(message, /Nothing was changed/);
+      assert.equal(puts(proxy).length, 0, "a PUT was sent");
+      assert.match((await getRawEvent(own, "weak-stale.ics")) ?? "", /SUMMARY:Changed on the phone/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("no ETags: an update of an event deleted between the lookup and the PUT is refused as not found, and creates nothing", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "no-etags-gone@example.com";
+    await putRawEvent(own, "gone.ics", richEvent(uid));
+    let deleted = false;
+    const proxy = await startCalDavProxy({
+      noEtags: true,
+      before: async ({ method }) => {
+        if (method === "PUT" && !deleted) {
+          deleted = true;
+          await deleteBehindTheBack(own, "gone.ics");
+        }
+      },
+    });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      assert.equal(await listedEtag(mine, calendarUrl, uid), null, "the proxy let an ETag through");
+      const message = await refusal(mine.updateEvent({ calendarUrl, uid, summary: "x" }));
+      assert.match(message, /No event with UID "no-etags-gone@example.com"/);
+      assert.match(message, /no event was created/);
+      assert.equal(await getRawEvent(own, "gone.ics"), null, "the update recreated the event");
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("If-Match: * mishandled: an update of an existing event succeeds after the retry", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "star-broken@example.com";
+    await putRawEvent(own, "star.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({ noEtags: true, starIfMatchBroken: true });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      await mine.updateEvent({ calendarUrl, uid, summary: "After the retry" });
+      assert.equal(proxy.starRefusals(), 1, "If-Match: * was never sent, so the retry never ran");
+      assert.deepEqual(puts(proxy).map((r) => r.ifMatch), ["*", null]);
+      assert.match((await getRawEvent(own, "star.ics")) ?? "", /SUMMARY:After the retry/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("If-Match: * mishandled, and the event gone by the retry: what the retry created is taken back", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "star-gone@example.com";
+    await putRawEvent(own, "star-gone.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({
+      noEtags: true,
+      starIfMatchBroken: true,
+      before: async ({ method, ifMatch }) => {
+        if (method === "PUT" && ifMatch === null) await deleteBehindTheBack(own, "star-gone.ics");
+      },
+    });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      const message = await refusal(mine.updateEvent({ calendarUrl, uid, summary: "x" }));
+      assert.match(message, /No event with UID "star-gone@example.com"/);
+      assert.match(message, /no event was created/);
+      assert.equal(await getRawEvent(own, "star-gone.ics"), null, "the retry left a created event behind");
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("no ETags: a delete goes with If-Match: *, and removes the event", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "no-etags-delete@example.com";
+    await putRawEvent(own, "delete.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({ noEtags: true });
+    try {
+      const { client: mine, calendarUrl } = via(proxy, own);
+      await mine.deleteEvent({ calendarUrl, uid });
+      assert.deepEqual(
+        proxy.requests().filter((r) => r.method === "DELETE").map((r) => r.ifMatch),
+        ["*"]
+      );
+      assert.equal(await getRawEvent(own, "delete.ics"), null);
     } finally {
       await proxy.close();
     }

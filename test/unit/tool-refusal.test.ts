@@ -92,8 +92,8 @@ describe("requireEtag (spec §4.1)", () => {
     assert.equal(requireEtag({ ...target, etag: '"a"' }, { etag: '"b"' }), '"a"');
   });
 
-  it("writes without If-Match when the server keeps no etag", () => {
-    assert.equal(requireEtag(target, { etag: null }), undefined);
+  it("writes with If-Match: * when the server keeps no etag, so a vanished event is not recreated (#210.1)", () => {
+    assert.equal(requireEtag(target, { etag: null }), "*");
   });
 
   it("refuses to write blind over an object that has an etag", () => {

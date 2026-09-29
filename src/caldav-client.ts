@@ -25,17 +25,28 @@ import ICAL from "ical.js";
 import { randomUUID } from "node:crypto";
 import {
   applyEventPatch,
+  calendarDate,
   changesSomething,
   describeStoredEvent,
-  icalTimeFor,
   mainSequence,
+  timedBound,
   touchesTime,
   type EventPatch,
 } from "./ical-edit.js";
 import { expandObject, instantOfReported, type CalendarEvent } from "./ical-expand.js";
+import {
+  calendarZone,
+  canonicalZone,
+  IntlTimezone,
+  isUtcName,
+  timeIn,
+  UTC_ZONE,
+  vtimezoneFromIntl,
+  type WriteZone,
+} from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
-
-export type { CalendarEvent } from "./ical-expand.js";
+import { classifyFailure } from "../shared/credential-failure.js";
+import type { Logger } from "../shared/log.js";
 
 // createDAVClient returns a logged-in client whose type omits the login
 // methods. Capture that shape for our field types.
@@ -73,10 +84,24 @@ export interface NewEventInput {
   summary: string;
   description?: string;
   location?: string;
-  start: string; // ISO 8601, with timezone offset
+  /** ISO 8601; with no offset, clock time in the zone the event is written in. */
+  start: string;
   end: string;
   allDay?: boolean;
   attendees?: string[];
+  /**
+   * The IANA zone to write the event in (spec 2026-09-29 §2.5). Omitted, it is
+   * the calendar's own zone when the server reports one, and UTC otherwise.
+   */
+  timezone?: string;
+}
+
+/** What `create_event` answers: where the event went, and the zone it was written in. */
+export interface CreatedEvent {
+  url: string;
+  uid: string;
+  /** The IANA zone, `"UTC"`, or `"floating"` for an all-day event — as `list_events` reports it. */
+  timezone: string;
 }
 
 /** Which event a write is aimed at, and the guards spec §4 puts on it. */
@@ -98,13 +123,29 @@ export interface FreeSlot {
   end: string;
 }
 
+/** What a {@link CalDavClient} reports through, beside its answers (#210.4). */
+export interface CalDavClientOptions {
+  /**
+   * The tool layer's logger, from `ClientPool` (src/client-pool.ts). It is
+   * given the few things that go wrong without failing the call — today, an
+   * ETag the connector could not read back after a write. Defaults to a no-op.
+   */
+  log?: Logger;
+  /** The account these calls are for, named in every line logged. */
+  accountId?: string;
+}
+
 export class CalDavClient {
   private client: AuthedDAVClient | null = null;
   private connecting: Promise<AuthedDAVClient> | null = null;
   private readonly auth: CalDavAuth;
+  private readonly log: Logger;
+  private readonly accountId: string | undefined;
 
-  constructor(auth: CalDavAuth) {
+  constructor(auth: CalDavAuth, options: CalDavClientOptions = {}) {
     this.auth = auth;
+    this.log = options.log ?? (() => {});
+    this.accountId = options.accountId;
   }
 
   private async ensureClient(): Promise<AuthedDAVClient> {
@@ -181,11 +222,28 @@ export class CalDavClient {
     return { events, skipped };
   }
 
-  async createEvent(input: NewEventInput): Promise<{ url: string; uid: string }> {
+  /**
+   * Write a new event. Its zone (spec 2026-09-29 §2.5) is `input.timezone`
+   * when given — refused, before the server is contacted, unless it is an
+   * IANA name — else the calendar's own `calendar-timezone`, so an event
+   * Claude creates behaves like one made in the server's web UI, else UTC as
+   * before v0.7.4. The answer says which zone it was.
+   */
+  async createEvent(input: NewEventInput): Promise<CreatedEvent> {
+    let zone: string | null = null;
+    if (input.timezone !== undefined) {
+      zone = canonicalZone(input.timezone);
+      if (zone === null) {
+        throw new ToolRefusal(
+          `"${input.timezone}" is not an IANA time zone. Pass a name like Europe/Berlin or America/New_York, or omit timezone to use the calendar's own. Nothing was created.`
+        );
+      }
+    }
     const calendar = await this.findCalendar(input.calendarUrl);
+    zone ??= calendarZone(calendar.timezone) ?? "UTC";
     const client = await this.ensureClient();
     const uid = `${randomUUID()}@claude-mail-mcp`;
-    const ics = buildIcs({ ...input, uid });
+    const ics = buildIcs({ ...input, uid }, zone);
     const filename = `${uid}.ics`;
     const res = await client.createCalendarObject({
       calendar,
@@ -194,7 +252,8 @@ export class CalDavClient {
     });
     assertWritten(res, "PUT");
     const base = calendar.url.endsWith("/") ? calendar.url : `${calendar.url}/`;
-    return { url: `${base}${filename}`, uid };
+    const timezone = input.allDay === true ? "floating" : isUtcName(zone) ? "UTC" : zone;
+    return { url: `${base}${filename}`, uid, timezone };
   }
 
   /**
@@ -233,14 +292,14 @@ export class CalDavClient {
         );
       }
     }
-    const ifMatch = requireEtag(update, stored);
+    const ifMatch = requireEtag(update, stored, nothingDone);
     const data = applyEventPatch(stored.data, update.uid, update);
     const client = await this.ensureClient();
-    const res = await client.updateCalendarObject({
-      calendarObject: { url: stored.url, data, ...(ifMatch === undefined ? {} : { etag: ifMatch }) },
-    });
-    refuseLostRace(res, update.uid, calendar.url, nothingDone);
-    assertWritten(res, "PUT");
+    const res = await this.guardedWrite("PUT", calendar, update.uid, stored.url, ifMatch, nothingDone, (etag) =>
+      client.updateCalendarObject({
+        calendarObject: { url: stored.url, data, ...(etag === undefined ? {} : { etag }) },
+      })
+    );
     const etag =
       res.headers.get("etag") ??
       (await this.etagAfterWrite(calendar, update.uid, stored.url, mainSequence(data, update.uid)));
@@ -265,6 +324,13 @@ export class CalDavClient {
    * attendee's reply that bumps it), and giving the caller *that* etag would
    * let its next update overwrite the other change unseen — `null` sends it to
    * `list_events` instead.
+   *
+   * A read-back that fails outright leaves one `info` line with the account
+   * and the reason (#210.4) — not `warn`, since the call succeeded, but not
+   * nothing either: a server where it always fails would otherwise look like
+   * the old `etag: null` with no trace in the log. The reason is
+   * `classifyFailure`'s bounded reading of the message, never the error
+   * object, which can carry the connection's credentials.
    */
   private async etagAfterWrite(
     calendar: DAVCalendar,
@@ -276,7 +342,11 @@ export class CalDavClient {
       const now = await this.findStoredEvent(calendar, uid, "");
       if (now.url !== url || sequence === null || mainSequence(now.data, uid) !== sequence) return null;
       return now.etag;
-    } catch {
+    } catch (err) {
+      this.log("info", "caldav: the etag of a write could not be read back", {
+        account: this.accountId,
+        reason: classifyFailure(err).reason,
+      });
       return null;
     }
   }
@@ -304,14 +374,64 @@ export class CalDavClient {
     if (shape.recurring && target.applyToSeries !== true) {
       throw seriesRefusal(target.uid, "delete");
     }
-    const ifMatch = requireEtag(target, stored);
+    const ifMatch = requireEtag(target, stored, nothingDone);
     const client = await this.ensureClient();
-    const res = await client.deleteCalendarObject({
-      calendarObject: { url: stored.url, ...(ifMatch === undefined ? {} : { etag: ifMatch }) },
-    });
-    refuseLostRace(res, target.uid, calendar.url, nothingDone);
-    assertWritten(res, "DELETE");
+    await this.guardedWrite("DELETE", calendar, target.uid, stored.url, ifMatch, nothingDone, (etag) =>
+      client.deleteCalendarObject({
+        calendarObject: { url: stored.url, ...(etag === undefined ? {} : { etag }) },
+      })
+    );
     return { uid: target.uid, url: stored.url };
+  }
+
+  /**
+   * Run a write guarded by `ifMatch` (from {@link requireEtag}) and turn its
+   * answer into a result or a refusal. Returns the successful response.
+   *
+   * `If-Match: *` — sent only for an object the server keeps no ETag for — is
+   * RFC 7232's "only if it still exists", so that an update of an event
+   * deleted since the lookup cannot recreate it (#210.1). But a server can
+   * compare `*` literally, and Radicale does on PUT (R10): 412 for an object
+   * that is plainly there. So a 412 to `*` is not taken at its word (spec
+   * §2.8):
+   *
+   *   1. look the event up again; gone, and the answer is the not-found
+   *      refusal;
+   *   2. still there, and the server mishandles `*`: write once more with no
+   *      `If-Match`;
+   *   3. and if *that* PUT answers 201, the event went away in between and the
+   *      write just created it again — delete what was created, and refuse as
+   *      not found. An update never leaves a created event behind.
+   */
+  private async guardedWrite(
+    method: "PUT" | "DELETE",
+    calendar: DAVCalendar,
+    uid: string,
+    url: string,
+    ifMatch: string | undefined,
+    nothingDone: string,
+    write: (ifMatch: string | undefined) => Promise<Response>
+  ): Promise<Response> {
+    let res = await write(ifMatch);
+    if (ifMatch === "*" && res.status === 412) {
+      const again = await this.findStoredEvent(calendar, uid, nothingDone);
+      if (again.url !== url) throw notFound(uid, calendar.url, nothingDone);
+      res = await write(undefined);
+      if (method === "PUT" && res.status === 201) {
+        const client = await this.ensureClient();
+        const undo = await client.deleteCalendarObject({ calendarObject: { url } });
+        if (!undo.ok && undo.status !== 404) {
+          throw new Error(
+            `CalDAV server answered ${undo.status} ${undo.statusText}`.trim() +
+              ` to DELETE of ${url}, an event an update recreated after it had been deleted elsewhere`
+          );
+        }
+        throw notFound(uid, calendar.url, nothingDone);
+      }
+    }
+    refuseLostRace(res, uid, calendar.url, nothingDone);
+    assertWritten(res, method);
+    return res;
   }
 
   /**
@@ -483,17 +603,61 @@ function seriesRefusal(uid: string, verb: "change" | "delete"): ToolRefusal {
   );
 }
 
+/** An ETag's opaque part: without `W/` and without its quotes, so `abc`, `"abc"` and `W/"abc"` compare equal. */
+function opaqueTag(etag: string): string {
+  return etag.trim().replace(/^W\//i, "").replace(/^"(.*)"$/, "$1");
+}
+
+/** True for a weak ETag, `W/"…"`, which `If-Match`'s strong comparison can never match (RFC 7232 §3.1). */
+function isWeak(etag: string): boolean {
+  return /^W\//i.test(etag.trim());
+}
+
 /**
- * The If-Match value for a write, per spec §4.1: the caller's ETag when given;
- * none when the server keeps no ETag for the object; otherwise a refusal,
- * because writing blind over an object that *has* an ETag is the overwrite
- * #152 exists to prevent.
+ * The If-Match value for a write, per spec 2026-09-28 §4.1 and 2026-09-29
+ * §2.8 (#210), or undefined to send none. The lookup has just read the
+ * stored object and its ETag, so the caller's value is checked against that:
+ *
+ *   - **Quotes (#210.2).** A model that passes `abc` for `"abc"` means the
+ *     same ETag; the stored form is sent, instead of a 412 every time.
+ *   - **A weak stored ETag (#210.3)** can never satisfy `If-Match`, so every
+ *     write would loop on 412. The caller's value is compared with it here,
+ *     ignoring `W/` and quotes: a mismatch is refused as a change made since,
+ *     before anything is written; a match is written with no `If-Match`. That
+ *     keeps what #152 guards against — a change between `list_events` and the
+ *     write — and gives up only the moment between this lookup and the PUT.
+ *   - **No stored ETag (#210.1):** `*`, "only if it still exists", so a write
+ *     cannot recreate an event deleted since. {@link CalDavClient}'s
+ *     `guardedWrite` copes with a server that gets `*` wrong.
+ *   - **No caller ETag** for an object that has one is refused: writing blind
+ *     over it is the overwrite #152 exists to prevent.
+ *
+ * A strong value that does not match is sent as it is, and the server's 412
+ * says so.
  */
-export function requireEtag(target: EventTarget, stored: { etag: string | null }): string | undefined {
-  if (target.etag !== undefined) return target.etag;
-  if (stored.etag === null) return undefined;
-  throw new ToolRefusal(
-    `Pass the etag list_events returned for "${target.uid}", so a change made elsewhere since you read it is not overwritten. Nothing was written.`
+export function requireEtag(
+  target: EventTarget,
+  stored: { etag: string | null },
+  nothingDone = "Nothing was written."
+): string | undefined {
+  if (target.etag === undefined) {
+    if (stored.etag === null) return "*";
+    throw new ToolRefusal(
+      `Pass the etag list_events returned for "${target.uid}", so a change made elsewhere since you read it is not overwritten. ${nothingDone}`
+    );
+  }
+  if (stored.etag === null) return target.etag;
+  const same = opaqueTag(target.etag) === opaqueTag(stored.etag);
+  if (isWeak(stored.etag)) {
+    if (!same) throw changedSinceRead(target.uid, nothingDone);
+    return undefined;
+  }
+  return same ? stored.etag : target.etag;
+}
+
+function changedSinceRead(uid: string, nothingDone: string): ToolRefusal {
+  return new ToolRefusal(
+    `The event "${uid}" changed after you read it. ${nothingDone} Call list_events again for its current state and etag, then retry.`
   );
 }
 
@@ -502,11 +666,7 @@ export function requireEtag(target: EventTarget, stored: { etag: string | null }
  * failures: someone else changed it, or it went away, since it was read.
  */
 function refuseLostRace(res: Response, uid: string, calendarUrl: string, nothingDone: string): void {
-  if (res.status === 412) {
-    throw new ToolRefusal(
-      `The event "${uid}" changed after you read it. ${nothingDone} Call list_events again for its current state and etag, then retry.`
-    );
-  }
+  if (res.status === 412) throw changedSinceRead(uid, nothingDone);
   if (res.status === 404) throw notFound(uid, calendarUrl, nothingDone);
 }
 
@@ -521,19 +681,49 @@ export function assertWritten(res: Response, method: string): void {
   }
 }
 
-function buildIcs(input: NewEventInput & { uid: string }): string {
+/** How far either side of a new event its generated VTIMEZONE reaches (spec §2.5 A). */
+const VTIMEZONE_MARGIN_MS = 366 * 86_400_000;
+
+/**
+ * The object `create_event` writes, in the IANA zone `zone` (spec 2026-09-29
+ * §2.5): UTC (`…Z`, and no VTIMEZONE, as before v0.7.4) when `zone` is UTC,
+ * and otherwise `TZID=zone` local time with a VTIMEZONE {@link
+ * vtimezoneFromIntl} generates for the event's span and a year either side. A
+ * time given without an offset is clock time in `zone`. An all-day event is
+ * dates whatever the zone.
+ *
+ * Throws {@link ToolRefusal} for a start or end it cannot read.
+ */
+export function buildIcs(input: NewEventInput & { uid: string }, zone: string, now: Date = new Date()): string {
+  const nothingDone = "Nothing was created.";
   const cal = new ICAL.Component(["vcalendar", [], []]);
   cal.updatePropertyWithValue("prodid", "-//claude-mail-mcp//EN");
   cal.updatePropertyWithValue("version", "2.0");
 
   const vevent = new ICAL.Component("vevent");
   vevent.updatePropertyWithValue("uid", input.uid);
-  vevent.updatePropertyWithValue(
-    "dtstamp",
-    ICAL.Time.fromJSDate(new Date(), true)
-  );
-  vevent.updatePropertyWithValue("dtstart", icalTimeFor(input.start, input.allDay === true));
-  vevent.updatePropertyWithValue("dtend", icalTimeFor(input.end, input.allDay === true));
+  vevent.updatePropertyWithValue("dtstamp", ICAL.Time.fromJSDate(now, true));
+  if (input.allDay === true) {
+    vevent.updatePropertyWithValue("dtstart", ICAL.Time.fromDateString(calendarDate("start", input.start, nothingDone)));
+    vevent.updatePropertyWithValue("dtend", ICAL.Time.fromDateString(calendarDate("end", input.end, nothingDone)));
+  } else {
+    const target: WriteZone = isUtcName(zone)
+      ? UTC_ZONE
+      : { kind: "zoned", tzid: zone, zone: new IntlTimezone(zone, zone) };
+    const startMs = timedBound("start", input.start, target, nothingDone);
+    const endMs = timedBound("end", input.end, target, nothingDone);
+    for (const [name, ms] of [["dtstart", startMs], ["dtend", endMs]] as const) {
+      const prop = new ICAL.Property(name);
+      prop.setValue(timeIn(ms, target));
+      if (target.kind === "zoned") prop.setParameter("tzid", target.tzid);
+      vevent.addProperty(prop);
+    }
+    if (target.kind === "zoned") {
+      const from = Math.min(startMs, endMs) - VTIMEZONE_MARGIN_MS;
+      const to = Math.max(startMs, endMs) + VTIMEZONE_MARGIN_MS;
+      cal.addSubcomponent(new ICAL.Component(ICAL.parse(vtimezoneFromIntl(zone, from, to))));
+    }
+  }
   vevent.updatePropertyWithValue("summary", input.summary);
   if (input.description) {
     vevent.updatePropertyWithValue("description", input.description);

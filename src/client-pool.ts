@@ -99,12 +99,17 @@ export class ClientPool {
         fromName: account.mail.defaultFromName || undefined,
       }
     );
+    // The pool's logger, so a write that succeeded but could not read its new
+    // ETag back says so once in the log (#210.4).
     const caldav = account.caldav
-      ? new CalDavClient({
-          url: account.caldav.url,
-          user: account.caldav.user,
-          pass: account.caldav.pass,
-        })
+      ? new CalDavClient(
+          {
+            url: account.caldav.url,
+            user: account.caldav.user,
+            pass: account.caldav.pass,
+          },
+          { log: this.log, accountId: account.id }
+        )
       : null;
     return {
       id: account.id,
