@@ -558,6 +558,21 @@ describe("shiftSeries — a new clock time for every occurrence, each keeping it
     });
   }
 
+  it("a new length reaches an override whose DTSTART is stored in another zone than the series' — read in its own zone, not the series' (fix-pass review of PR #229)", () => {
+    // A Berlin 09:00–10:00 series; another client stored the second Thursday's
+    // text-only override in UTC. 07:00Z is 09:00 Berlin: it still sits at its
+    // occurrence, so it moves and lengthens with the series.
+    const text = series(SHAPES[0], "20261001", "FREQ=WEEKLY;COUNT=3", [], [
+      ["RECURRENCE-ID;TZID=Europe/Berlin:20261008T090000", "DTSTART:20261008T070000Z", "DTEND:20261008T080000Z", "SUMMARY:Text only, in UTC"],
+    ]);
+    const out = shifted(text, { start: "2026-10-01T15:00:00", end: "2026-10-01T16:30:00" });
+    const { instances } = expandObject(out, { start: Date.parse("2026-09-01T00:00:00Z"), end: Date.parse("2027-01-01T00:00:00Z") }, { url: "u", etag: null });
+    assert.deepEqual(
+      instances.map((e) => [berlinClock(e.start), minutes(e.start, e.end)]),
+      [["15:00", 90], ["15:00", 90], ["15:00", 90]]
+    );
+  });
+
   it("leaves a DATE UNTIL and a COUNT exactly as they were", () => {
     for (const rrule of ["FREQ=WEEKLY;UNTIL=20261105", "FREQ=WEEKLY;COUNT=4"]) {
       const out = unfold(shifted(series(SHAPES[0], "20261015", rrule), { start: "2026-10-15T15:00:00" }));

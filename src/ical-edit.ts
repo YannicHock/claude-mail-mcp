@@ -683,14 +683,22 @@ function shiftTimedSeries(
   const move = (prop: ICAL.Property | null): void => {
     if (prop !== null && delta !== 0) shiftProperty(prop, delta, zone);
   };
-  /** A new DTEND (or DURATION) `length` after `ve`'s own start. */
+  /**
+   * A new DTEND (or DURATION) `length` after `ve`'s own start. That start is
+   * read in the zone its own DTSTART is stored in, as {@link patchTimes}
+   * reads one — an override another client stored in UTC beside a Berlin
+   * series had its `…Z` fields read as Berlin clock time, and came out 30
+   * minutes long, or negative (fix-pass review of PR #229).
+   */
   const lengthen = (ve: ICAL.Component, ownEndZone: WriteZone): void => {
     if (length === undefined) return;
     if (ve.hasProperty("duration") && !ve.hasProperty("dtend")) {
       ve.updatePropertyWithValue("duration", ICAL.Duration.fromSeconds(Math.round(length / 1000)));
       return;
     }
-    const ownStart = storedInstant(ve.getFirstPropertyValue("dtstart") as ICAL.Time, zone);
+    const startProp = ve.getFirstProperty("dtstart") as ICAL.Property;
+    const ownZone = writeZoneOf(startProp);
+    const ownStart = storedInstant(startProp.getFirstValue() as ICAL.Time, ownZone.kind === "unresolved" ? zone : ownZone);
     const end = writtenTime(ownStart + length, ownEndZone);
     setTime(ve, "dtend", end.time, end.zone);
   };
