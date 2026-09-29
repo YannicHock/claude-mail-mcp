@@ -131,6 +131,24 @@ async function post(
   });
 }
 
+/**
+ * Where a save's 303 points, asserted to be the list with a notice token, and
+ * the page a browser gets there.
+ */
+async function followNotice(url: string, res: Response): Promise<string> {
+  const location = res.headers.get("location") ?? "";
+  assert.match(location, /^\/settings\/mailboxes\?notice=[A-Za-z0-9_-]{22}$/);
+  const page = await fetch(`${url}${location}`, {
+    headers: {
+      authorization: `Bearer ${AUTH_TOKEN}`,
+      [ASSERTION_HEADER]: mint("GET", "/settings/mailboxes"),
+    },
+    redirect: "manual",
+  });
+  assert.equal(page.status, 200);
+  return page.text();
+}
+
 async function stampOf(accountsPath: string): Promise<string> {
   const { readStamp } = await import("../../src/accounts-writer.js");
   return readStamp(accountsPath);
@@ -256,10 +274,11 @@ test("a CalDAV server that refuses does not stop the save, and the operator is t
       _stamp: await stampOf(accountsPath),
     });
 
-    // 200 and the mailbox list, not the 303 a clean save gets: a redirect
-    // carries nothing, and this is the one outcome that has something to say.
-    assert.equal(res.status, 200);
-    const page = await res.text();
+    // A 303 like every other save (#173): a 200 rendered out of the POST made
+    // a reload re-submit the form. The notice rides the redirect as a token
+    // the list route turns back into the sentence.
+    assert.equal(res.status, 303);
+    const page = await followNotice(url, res);
     assert.match(page, /The mailbox was saved/);
     assert.match(page, /calendar tools/i);
     assert.match(page, /rejected these credentials/);
@@ -267,6 +286,34 @@ test("a CalDAV server that refuses does not stop the save, and the operator is t
     const accounts = await storedAccounts(accountsPath);
     assert.equal(accounts.length, 1, "the mailbox is stored, CalDAV or no CalDAV");
     assert.equal(accounts[0]?.caldav?.url, caldav.url, "including the block that failed");
+  } finally {
+    await close();
+    await caldav?.close();
+  }
+});
+
+test("an edit whose CalDAV fails lands on the list by 303 too, not on the edit URL", SKIP, async () => {
+  let caldav: FakeCalDavServer | undefined;
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const created = await post(url, "/settings/mailboxes", {
+      ...form(),
+      _stamp: await stampOf(accountsPath),
+    });
+    assert.equal(created.status, 303);
+    caldav = await startFakeCalDavServer("reject-credentials");
+    const res = await post(url, "/settings/mailboxes/work", {
+      ...form({
+        "caldav.url": caldav.url,
+        "caldav.user": USER,
+        "caldav.pass": "not-the-password",
+      }),
+      _stamp: await stampOf(accountsPath),
+    });
+    assert.equal(res.status, 303);
+    const page = await followNotice(url, res);
+    assert.match(page, /The mailbox was saved/);
+    assert.equal((await storedAccounts(accountsPath))[0]?.caldav?.url, caldav.url);
   } finally {
     await close();
     await caldav?.close();

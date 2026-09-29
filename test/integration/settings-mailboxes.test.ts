@@ -316,6 +316,26 @@ test("an assertion bound to another path is refused", async () => {
  * comparison itself is untouched and still strict — it is the configured value
  * that is now canonicalised before it becomes the operand.
  */
+test("a notice token the connector never issued is no notice, and no error (#173)", async () => {
+  // The list route paints a notice only for a token a save handed out. Anything
+  // else in the query is ignored: a bookmarked URL is not a fault, and a query
+  // must never be able to put text of its choosing on this page.
+  const { url, close } = await startConnector();
+  try {
+    const res = await get(
+      url,
+      "/settings/mailboxes?notice=AAAAAAAAAAAAAAAAAAAAAA",
+      mint("GET", "/settings/mailboxes")
+    );
+    assert.equal(res.status, 200);
+    const page = await res.text();
+    assert.equal(page.includes('<div class="notice">'), false, page);
+    assert.equal(page.includes("AAAAAAAAAAAAAAAAAAAAAA"), false);
+  } finally {
+    await close();
+  }
+});
+
 test("a PUBLIC_URL whose host is spelled with capitals still verifies", async () => {
   const { url, close } = await startConnector([], "https://Mail-MCP.Example.invalid");
   try {

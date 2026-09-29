@@ -105,6 +105,7 @@ import {
   type CalDavCreds,
 } from "./accounts.js";
 import { StaleStampError } from "./accounts-writer.js";
+import { createNoticeFlash, type NoticeFlash } from "./notice-flash.js";
 import { probeAccount, type ProbeReport } from "./probe.js";
 import { credentialNoteFor, providerPresets, unsupportedNoticeFor } from "./providers.js";
 import {
@@ -155,6 +156,8 @@ export interface SettingsRouterDeps {
   issuer: string;
   settingsKey: string;
   log: Logger;
+  /** Where a save's notice waits for the redirect. A fresh one when absent. */
+  notices?: NoticeFlash;
 }
 
 // The three per-service passwords a draft has, plus the cascade's own single
@@ -909,6 +912,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   const jsonBody = express.json({ limit: "64kb" });
   const guardAssertion = requireSettingsAssertion({ key: settingsKey, issuer, log });
   const guardCsrf = requireFormCsrf();
+  const notices = deps.notices ?? createNoticeFlash();
 
   /**
    * What a new mailbox starts out as, before a lookup or a preset fills it in.
@@ -1049,45 +1053,31 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   }
 
   /**
-   * Where a browser lands after a save: the mailbox list.
+   * Where a browser lands after a save: the mailbox list, by 303, always — so a
+   * reload of the list cannot re-submit the form.
    *
-   * Still a 303 when there is nothing extra to say, so a reload of the list
-   * cannot re-submit the form. The one exception is the failure the save
-   * deliberately does not refuse on — a CalDAV block that did not work. That
-   * has to be *shown*, and a redirect carries nothing, so the list is rendered
-   * here instead with the notice on it. The operator is on the same page either
-   * way; they are simply told the one thing a 303 could not have told them.
+   * The failure the save deliberately does not refuse on, a CalDAV block that
+   * did not work, has to be *shown*. It used to be, on a 200 rendered out of
+   * the POST, which gave up exactly the property the 303 is for (#173). It now
+   * rides the redirect as a token; see `src/notice-flash.ts` for why the
+   * sentence itself never goes into the URL.
    */
-  async function sendSavedPage(
-    res: Response,
-    csrf: string,
-    report: MailboxProbeReport | undefined
-  ): Promise<void> {
+  function sendSavedPage(res: Response, report: MailboxProbeReport | undefined): void {
     const notice = report === undefined ? null : caldavFailureNotice(report);
-    if (notice === null) {
-      sendRedirect(res, 303, "/settings/mailboxes");
-      return;
-    }
-    const accounts = store.list();
-    sendHtml(
+    sendRedirect(
       res,
-      200,
-      renderMailboxList({
-        csrf,
-        stamp: await store.stamp(),
-        accounts,
-        notice,
-        rowNotices: Object.fromEntries(
-          reservedIdAccounts(accounts).map((a) => [a.id, reservedIdNotice(a.id)])
-        ),
-      })
+      303,
+      notice === null ? "/settings/mailboxes" : `/settings/mailboxes?notice=${notices.put(notice)}`
     );
   }
 
-  router.get("/settings/mailboxes", guardAssertion, async (_req, res) => {
+  router.get("/settings/mailboxes", guardAssertion, async (req, res) => {
     const assertion = assertionOf(res);
     const stamp = await store.stamp();
     const accounts = store.list();
+    // The one thing a save's 303 carries. An unknown or expired token is no
+    // notice, not an error: a bookmarked URL is not a fault.
+    const notice = notices.get(req.query.notice);
     sendHtml(
       res,
       200,
@@ -1095,6 +1085,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         csrf: assertion.csrf,
         stamp,
         accounts,
+        ...(notice === null ? {} : { notice }),
         // An account that predates the create-time check (or was hand-written
         // into accounts.json) keeps a broken in-place edit, and the list page is
         // the one place its operator is certain to look. See RESERVED_IDS in
@@ -1402,7 +1393,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         });
         return;
       }
-      await sendSavedPage(res, assertion.csrf, wireReport);
+      sendSavedPage(res, wireReport);
     }
   );
 
@@ -1633,7 +1624,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       }
       throw err;
     }
-    await sendSavedPage(res, assertion.csrf, gate.report);
+    sendSavedPage(res, gate.report);
   });
 
   router.post("/settings/mailboxes/:id/test", guardAssertion, formBody, guardCsrf, async (req, res) => {
