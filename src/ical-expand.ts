@@ -424,7 +424,7 @@ export interface FoundOccurrence {
    * when there is none, `"unknown"` when the walk stopped before finding out
    * or this occurrence is one the walk never met. What a write needs to
    * change the occurrence a `RANGE=THISANDFUTURE` override starts at alone:
-   * that override moves on to the next one (src/ical-edit.ts).
+   * that override moves on to the next one (src/ical-occurrence-edit.ts).
    */
   next: NextOccurrence | null | "unknown";
 }

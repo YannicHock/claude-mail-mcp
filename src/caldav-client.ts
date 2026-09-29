@@ -31,17 +31,16 @@ import { randomUUID } from "node:crypto";
 import { buildIcs, builtZoneName, type NewEventFields } from "./ical-build.js";
 import {
   applyEventPatch,
-  applyOccurrencePatch,
   changesSomething,
   describeSeries,
-  excludeOccurrence,
-  shiftSeries,
   touchesTime,
   writtenBy,
   type EditResult,
   type EventPatch,
   type WriteMark,
 } from "./ical-edit.js";
+import { applyOccurrencePatch, excludeOccurrence } from "./ical-occurrence-edit.js";
+import { shiftSeries } from "./ical-series-shift.js";
 import {
   instantOfReported,
   type CalendarEvent,
@@ -318,7 +317,7 @@ export class CalDavClient {
    *
    * v0.7.4 (§2.4, #207): a series' `start` and `end`, with `applyToSeries`,
    * give every occurrence a new clock time and/or length, each keeping its
-   * date — `shiftSeries` in src/ical-edit.ts, which carries EXDATE, RDATE,
+   * date — `shiftSeries` in src/ical-series-shift.ts, which carries EXDATE, RDATE,
    * the overrides' RECURRENCE-IDs and UNTIL along. The times describe the
    * series' first occurrence, or the one `recurrenceId` names: that is the
    * one meaning `recurrenceId` has beside `applyToSeries: true`. For a change

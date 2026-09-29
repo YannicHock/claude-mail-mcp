@@ -13,7 +13,7 @@
  */
 
 import ICAL from "ical.js";
-import { calendarDate, timedBound } from "./ical-edit.js";
+import { calendarDate, mailtoOf, timedBound } from "./ical-input.js";
 import { parseCalendar } from "./ical-parse.js";
 import { generatedVtimezone, writtenTime, zonedWriteZone, zoneNameOf } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
@@ -98,7 +98,7 @@ export function buildIcs(
   }
   for (const a of input.attendees ?? []) {
     const prop = new ICAL.Property("attendee");
-    prop.setValue(a.startsWith("mailto:") ? a : `mailto:${a}`);
+    prop.setValue(mailtoOf(a));
     vevent.addProperty(prop);
   }
   cal.addSubcomponent(vevent);

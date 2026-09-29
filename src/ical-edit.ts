@@ -25,28 +25,37 @@
  * this module picks for it. And an edit takes the caller's one parse of the
  * stored text (`ParsedCalendar`), changes it in place, and hands back the
  * text to write: a write parses the stored object once.
+ *
+ * What lives where since the code-health review of PR #229, which split this
+ * module before the attendee edits land in it:
+ *
+ *   - here: the patch and what it is checked for, the read-back's
+ *     {@link WriteMark}, and the edit of one VEVENT — {@link patchText},
+ *     {@link patchTimes}, {@link stampRevision} — that every writer below
+ *     uses for whichever VEVENT it changes, and {@link applyEventPatch}, the
+ *     edit of a main event;
+ *   - src/ical-occurrence-edit.ts: one occurrence of a series changed or
+ *     deleted (#206);
+ *   - src/ical-series-shift.ts: a whole series moved to a new time (#207);
+ *   - src/ical-input.ts: a caller's date, time or address read, shared with
+ *     `create_event`'s builder (src/ical-build.ts);
+ *   - src/ical-series.ts: which VEVENT is which occurrence and which counts,
+ *     shared with the reader (src/ical-expand.ts), which this module no
+ *     longer imports.
  */
 
 import ICAL from "ical.js";
-import type { FoundOccurrence } from "./ical-expand.js";
+import { calendarDate, dateMs, isoDate, timedBound } from "./ical-input.js";
 import { parseCalendar, seriesFor, type ParsedCalendar, type Series } from "./ical-parse.js";
-import { allDaySeries, currentOverrides, keyOf, modifiesFuture, sequenceOf } from "./ical-series.js";
+import { allDaySeries, currentOverrides, sequenceOf } from "./ical-series.js";
 import {
-  addToWall,
-  clockSeconds,
   coverGeneratedVtimezone,
-  dayOf,
   hasOffset,
-  instantAt,
-  readDateTime,
   storedInstant,
   UTC_ZONE,
-  wallAt,
-  wallOf,
   writeZoneOf,
   writtenTime,
   type WriteZone,
-  type ZonedWall,
 } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
@@ -114,7 +123,7 @@ export function describeSeries({ master, overrides }: Series): StoredEventShape 
  */
 export interface EditResult {
   ics: string;
-  /** Null when the write left no VEVENT it changed to know it by (see {@link excludeOccurrence}). */
+  /** Null when the write left no VEVENT it changed to know it by (see `excludeOccurrence` in src/ical-occurrence-edit.ts). */
   mark: WriteMark | null;
 }
 
@@ -165,58 +174,6 @@ export function stampRevision(vevent: ICAL.Component, now: Date): number {
   vevent.updatePropertyWithValue("last-modified", stamp);
   return sequence;
 }
-
-/** Midnight UTC of the date part, so all-day arithmetic counts whole days. */
-function dateMs(iso: string): number {
-  return Date.parse(`${iso.slice(0, 10)}T00:00:00Z`);
-}
-
-function isoDate(ms: number): string {
-  return new Date(ms).toISOString().slice(0, 10);
-}
-
-/**
- * A caller's all-day bound as `YYYY-MM-DD`, or a refusal ending in
- * `nothingDone`. The round trip catches a date that parses but does not
- * exist: `2026-13-45` would otherwise roll over and be written as a date in
- * 2027.
- */
-export function calendarDate(field: "start" | "end", value: string, nothingDone: string): string {
-  const day = value.slice(0, 10);
-  const ms = /^\d{4}-\d{2}-\d{2}$/.test(day) ? dateMs(day) : NaN;
-  if (Number.isNaN(ms) || isoDate(ms) !== day) {
-    throw new ToolRefusal(
-      `${field} "${value}" is not a calendar date (YYYY-MM-DD) for an all-day event. ${nothingDone}`
-    );
-  }
-  return day;
-}
-
-/**
- * A caller's timed bound, read for `zone` by {@link readDateTime}, or a
- * refusal ending in `nothingDone`. Unchecked, an unreadable value is NaN, and
- * the RangeError that follows reaches the operator's log as a server failure
- * — the noise spec §4.5 exists to keep out of it.
- *
- * A floating zone refuses a value with an offset (#209, spec §2.5): the event
- * has no zone to convert it into, and silently dropping the offset would move
- * it by that much.
- */
-export function timedBound(field: "start" | "end", value: string, zone: WriteZone, nothingDone: string): number {
-  if (zone.kind === "floating" && hasOffset(value)) {
-    throw new ToolRefusal(
-      `This event is floating: it is stored as clock time with no time zone, and shows at that clock time wherever it is read. So its ${field} must be given without an offset, like 2026-10-01T09:00:00, and "${value}" has one. ${nothingDone}`
-    );
-  }
-  const ms = readDateTime(value, zone);
-  if (Number.isNaN(ms)) {
-    throw new ToolRefusal(
-      `${field} "${value}" is not an ISO 8601 date-time, like 2026-10-01T09:00:00+02:00. ${nothingDone}`
-    );
-  }
-  return ms;
-}
-
 /**
  * Write `time` into the VEVENT's `name` property, in place when it has one —
  * so the property keeps its position and every parameter but the two this
@@ -225,7 +182,7 @@ export function timedBound(field: "start" | "end", value: string, zone: WriteZon
  * in (`WrittenTime` in src/ical-zones.ts), which for the second pass through
  * an autumn overlap is UTC whatever the event's zone.
  */
-function setTime(vevent: ICAL.Component, name: "dtstart" | "dtend", time: ICAL.Time, zone: WriteZone | null): void {
+export function setTime(vevent: ICAL.Component, name: "dtstart" | "dtend", time: ICAL.Time, zone: WriteZone | null): void {
   let prop = vevent.getFirstProperty(name);
   if (prop === null) {
     prop = new ICAL.Property(name);
@@ -237,13 +194,13 @@ function setTime(vevent: ICAL.Component, name: "dtstart" | "dtend", time: ICAL.T
 }
 
 /** How a timed bound is shown in a refusal: clock time for a floating one, an instant otherwise. */
-function shown(ms: number, zone: WriteZone): string {
+export function shown(ms: number, zone: WriteZone): string {
   const iso = new Date(ms).toISOString();
   return zone.kind === "floating" ? iso.slice(0, 19) : iso;
 }
 
 /** Set, or with `""` remove, the text fields the patch names on `vevent`. */
-function patchText(vevent: ICAL.Component, patch: EventPatch): void {
+export function patchText(vevent: ICAL.Component, patch: EventPatch): void {
   if (patch.summary !== undefined) vevent.updatePropertyWithValue("summary", patch.summary);
   for (const name of ["description", "location"] as const) {
     const value = patch[name];
@@ -282,646 +239,6 @@ export function applyEventPatch(
   const sequence = stampRevision(master, now);
   return { ics: vcal.toString(), mark: { uid, sequence } };
 }
-
-/**
- * The time `occurrence` started at, as a value for a RECURRENCE-ID or an
- * EXDATE beside `master`: its clock fields (as `findOccurrence` handed them
- * back) in the zone object of the master's own DTSTART, so it is written in
- * the master's value type and zone (spec 2026-09-29 §2.3) — a date for an
- * all-day series, `TZID=…` local time for a zoned one, `…Z` for a UTC one,
- * and clock time for a floating one. Nothing is converted: the fields are
- * the ones the recurrence rule produced.
- */
-function originalStart(
-  master: ICAL.Component,
-  occurrence: Pick<FoundOccurrence, "wall" | "isDate">
-): { time: ICAL.Time; tzid: string | null } {
-  const startProp = master.getFirstProperty("dtstart") as ICAL.Property;
-  const start = startProp.getFirstValue() as ICAL.Time;
-  const time = ICAL.Time.fromData({ ...occurrence.wall, isDate: occurrence.isDate }, start.zone);
-  const tzid = startProp.getParameter("tzid");
-  return { time, tzid: occurrence.isDate || tzid === undefined ? null : String(tzid) };
-}
-
-/**
- * A copy of the VEVENT `ve` to add beside it — every property, parameter and
- * VALARM — whose DTSTART, DTEND and RECURRENCE-ID keep the zones they were
- * read in. A copy through `toJSON` alone would not: a TZID with no VTIMEZONE
- * is placed through `Intl` by `parseCalendar` on the parsed times, not in the
- * text, and the copy's times read as a zone nothing can place.
- */
-function copyOf(ve: ICAL.Component): ICAL.Component {
-  const copy = new ICAL.Component(structuredClone(ve.toJSON()));
-  for (const name of ["dtstart", "dtend", "recurrence-id"]) {
-    const from = ve.getFirstProperty(name);
-    const to = copy.getFirstProperty(name);
-    const value = from?.getFirstValue();
-    if (to !== null && value instanceof ICAL.Time) to.setValue(value.clone());
-  }
-  return copy;
-}
-
-/** A property `name` holding `time`, with `tzid` when it has one. */
-function timeProperty(name: string, time: ICAL.Time, tzid: string | null): ICAL.Property {
-  const prop = new ICAL.Property(name);
-  prop.setValue(time);
-  if (tzid !== null) prop.setParameter("tzid", tzid);
-  return prop;
-}
-
-/**
- * A new override VEVENT for `occurrence`, made from `master` (spec §2.3): a
- * copy of it — so VALARM, ATTENDEE with its parameters, ORGANIZER and every
- * X- property come along, as another client's override would carry them —
- * with RRULE, RDATE, EXDATE and EXRULE removed, `RECURRENCE-ID` set to the
- * occurrence's original start in the master's type and zone, and the
- * occurrence's own start and end: the start that RECURRENCE-ID names, and
- * the end `list_events` showed for it (the master's length added to the
- * start's clock, as ical.js expands it), in the start's zone. A DURATION
- * stays a DURATION. Its SEQUENCE starts at the master's; the edit then
- * raises it, so the override has a revision of its own.
- */
-function overrideFrom(master: ICAL.Component, occurrence: FoundOccurrence): ICAL.Component {
-  const copy = copyOf(master);
-  for (const name of ["rrule", "rdate", "exdate", "exrule"]) copy.removeAllProperties(name);
-  const { time, tzid } = originalStart(master, occurrence);
-  const start = copy.getFirstProperty("dtstart") as ICAL.Property;
-  start.setValue(time.clone());
-  copy.addProperty(timeProperty("recurrence-id", time.clone(), tzid));
-  const end = copy.getFirstProperty("dtend");
-  if (end !== null) {
-    const until = time.clone();
-    until.addDuration(new ICAL.Event(master).duration);
-    end.setValue(until);
-    if (tzid === null) end.removeParameter("tzid");
-    else end.setParameter("tzid", tzid);
-  }
-  copy.updatePropertyWithValue("sequence", sequenceOf(master));
-  return copy;
-}
-
-/**
- * Where ical.js lists the occurrence whose rule start is `occurrenceStart`
- * when the `RANGE=THISANDFUTURE` override `range` reaches it, worked out
- * exactly as its `getOccurrenceDetails` does, so that what is written is what
- * `list_events` showed: the override's start minus its RECURRENCE-ID, read
- * in the override's start zone, added to the occurrence's clock fields in
- * that zone, and the override's length after that. Arithmetic on one
- * override — no recurrence rule is walked here (src/ical-worker-ops.ts).
- */
-function rangeShifted(range: ICAL.Component, occurrenceStart: ICAL.Time): { start: ICAL.Time; end: ICAL.Time } {
-  const event = new ICAL.Event(range);
-  const original = event.recurrenceId.clone();
-  const moved = event.startDate.clone();
-  original.zone = moved.zone;
-  const diff = moved.subtractDate(original);
-  const start = occurrenceStart.clone();
-  start.zone = event.startDate.zone;
-  start.addDuration(diff);
-  const end = start.clone();
-  end.addDuration(event.duration);
-  return { start, end };
-}
-
-/**
- * Put `ve` — an override — at `start`/`end`: DTSTART takes `start`, keeping
- * its TZID (the zone `start` is in), and DTEND, when it has one, `end` in the
- * same zone. A DURATION is left alone: the length is the override's own.
- */
-function placeOverride(ve: ICAL.Component, start: ICAL.Time, end: ICAL.Time): void {
-  const startProp = ve.getFirstProperty("dtstart") as ICAL.Property;
-  startProp.setValue(start.clone());
-  const endProp = ve.getFirstProperty("dtend");
-  if (endProp === null) return;
-  endProp.setValue(end.clone());
-  const tzid = startProp.getParameter("tzid");
-  if (tzid === undefined || start.isDate) endProp.removeParameter("tzid");
-  else endProp.setParameter("tzid", String(tzid));
-}
-
-/** `ve`'s RECURRENCE-ID replaced by one for `time` in `tzid`, with `RANGE=THISANDFUTURE` when `range` says so. */
-function setRecurrenceId(ve: ICAL.Component, time: ICAL.Time, tzid: string | null, range: boolean): void {
-  ve.removeAllProperties("recurrence-id");
-  const prop = timeProperty("recurrence-id", time.clone(), tzid);
-  if (range) prop.setParameter("range", "THISANDFUTURE");
-  ve.addProperty(prop);
-}
-
-/**
- * A new override for `occurrence`, which the `RANGE=THISANDFUTURE` override
- * `range` of an earlier occurrence reaches: made from the occurrence as
- * `list_events` listed it (fix-pass review of PR #229) — a copy of `range`,
- * whose properties it was listed with, at the start and end that override
- * gave it ({@link rangeShifted}), with its own RECURRENCE-ID in the master's
- * type and zone and no RANGE: it changes this occurrence, and only this one.
- * Copying the master instead put it back at the series' old time and title.
- */
-function overrideFromRange(master: ICAL.Component, range: ICAL.Component, occurrence: FoundOccurrence): ICAL.Component {
-  const copy = copyOf(range);
-  const { time, tzid } = originalStart(master, occurrence);
-  const { start, end } = rangeShifted(range, time);
-  setRecurrenceId(copy, time, tzid, false);
-  placeOverride(copy, start, end);
-  return copy;
-}
-
-/**
- * Take the occurrence a `RANGE=THISANDFUTURE` override `range` starts at out
- * of that override's reach, leaving every later occurrence as it was listed
- * (fix-pass review of PR #229) — for changing or deleting that one
- * occurrence alone. Returns a plain override for it, a copy of `range` with
- * no RANGE, already in `vcal`, for a change to be applied to; a deletion
- * removes it again.
- *
- * `range` itself moves on to the series' next occurrence: its RECURRENCE-ID
- * becomes that occurrence's original start (RANGE kept), and its DTSTART and
- * DTEND the times it gave that occurrence ({@link rangeShifted}) — so its
- * change still starts there and reaches every one after. Its revision is
- * stamped. When there is no next occurrence, nothing further is reached, and
- * `range` itself becomes the plain override.
- *
- * Refused, ending in `nothingDone`, when this cannot be done faithfully: the
- * next occurrence has an override of its own — which the moved RECURRENCE-ID
- * would collide with — or the walk that found the occurrence could not say
- * what the next one is.
- */
-function detachRangeAnchor(
-  vcal: ICAL.Component,
-  master: ICAL.Component,
-  range: ICAL.Component,
-  occurrence: FoundOccurrence,
-  nothingDone: string,
-  now: Date
-): ICAL.Component {
-  const { next } = occurrence;
-  if (next === null) {
-    range.getFirstProperty("recurrence-id")?.removeParameter("range");
-    return range;
-  }
-  if (next === "unknown" || next.overridden) {
-    const why =
-      next === "unknown"
-        ? "the occurrence after it could not be found"
-        : "the occurrence after it has changes of its own";
-    throw new ToolRefusal(
-      `The occurrence "${occurrence.recurrenceId}" is where another calendar app's change to "this and all following occurrences" begins (RANGE=THISANDFUTURE), and ${why}, so this connector cannot change that one occurrence without also changing every later one. To change only this occurrence, use the calendar app that made that change. ${nothingDone}`
-    );
-  }
-  const plain = copyOf(range);
-  plain.getFirstProperty("recurrence-id")?.removeParameter("range");
-  const { time, tzid } = originalStart(master, { wall: next.wall, isDate: occurrence.isDate });
-  const { start, end } = rangeShifted(range, time);
-  setRecurrenceId(range, time, tzid, true);
-  placeOverride(range, start, end);
-  stampRevision(range, now);
-  vcal.addSubcomponent(plain);
-  return plain;
-}
-
-/** The VEVENT at `index` in `vcal` (document order), which `findOccurrence` named as an override of `uid`. */
-function overrideAt(vcal: ICAL.Component, uid: string, index: number): ICAL.Component {
-  const ve = vcal.getAllSubcomponents("vevent")[index];
-  if (ve === undefined || String(ve.getFirstPropertyValue("uid")) !== uid || !ve.hasProperty("recurrence-id")) {
-    throw new Error(`VEVENT ${index} is not an override of ${uid}`);
-  }
-  return ve;
-}
-
-/**
- * Change one occurrence of `uid`'s series (#206, spec 2026-09-29 §2.3), the
- * one `findOccurrence` (src/ical-expand.ts) found in the same stored text
- * `parsed` was read from.
- *
- * The occurrence's override VEVENT is edited if it has one — the current
- * one, of several revisions — and otherwise one is made from the master
- * ({@link overrideFrom}) and added to the object. Either way the patch is
- * applied to the override alone, with the time logic the main event gets
- * ({@link patchTimes}), and its revision stamped; the master and every other
- * override are left exactly as they were. An object with no master (an
- * invitation to one instance, #211.3) is edited the same way.
- *
- * `RANGE=THISANDFUTURE` (fix-pass review of PR #229): a change another
- * client made to "this and all following occurrences" is an override whose
- * change reaches every later occurrence too, and this writes one occurrence
- * all the same. An occurrence it reaches gets its new override from the
- * occurrence as listed — that override's properties and times, never its
- * RANGE ({@link overrideFromRange}) — and the occurrence it starts at is
- * taken out of its reach before the patch is applied
- * ({@link detachRangeAnchor}), or the refusal that explains why it cannot be.
- *
- * Refused, ending in `nothingDone`: switching one occurrence between all-day
- * and timed — it keeps the form of its series, whose RECURRENCE-ID must
- * match the master's — and whatever {@link patchTimes} refuses.
- */
-export function applyOccurrencePatch(
-  parsed: ParsedCalendar,
-  uid: string,
-  occurrence: FoundOccurrence,
-  patch: EventPatch,
-  nothingDone: string,
-  now: Date = new Date()
-): EditResult {
-  const { vcal } = parsed;
-  if (patch.allDay !== undefined && patch.allDay !== occurrence.isDate) {
-    throw new ToolRefusal(
-      `One occurrence of a series cannot be switched between all-day and timed: it keeps the form of its series. ${nothingDone}`
-    );
-  }
-  const { master } = seriesFor(vcal, uid);
-  let target: ICAL.Component;
-  if (occurrence.current !== null) {
-    target = overrideAt(vcal, uid, occurrence.current);
-    // The override of the occurrence a THISANDFUTURE change starts at: its
-    // changes reach every later one, so this one is taken out of it first.
-    if (master !== undefined && modifiesFuture(target)) {
-      target = detachRangeAnchor(vcal, master, target, occurrence, nothingDone, now);
-    }
-  } else {
-    if (master === undefined) throw new Error(`applyOccurrencePatch: no main VEVENT for UID ${uid} to copy`);
-    target =
-      occurrence.range === null
-        ? overrideFrom(master, occurrence)
-        : overrideFromRange(master, overrideAt(vcal, uid, occurrence.range), occurrence);
-    vcal.addSubcomponent(target);
-  }
-  patchText(target, patch);
-  if (touchesTime(patch)) patchTimes(target, patch, nothingDone);
-  const sequence = stampRevision(target, now);
-  const override = keyOf(new ICAL.Event(target).recurrenceId, allDaySeries(master));
-  return { ics: vcal.toString(), mark: { uid, sequence, override } };
-}
-
-/**
- * Delete one occurrence of `uid`'s series (#206, spec §2.3), the one
- * `findOccurrence` found: an `EXDATE` for it on the master, in the master's
- * value type and zone ({@link originalStart}), every override of it removed,
- * and the master's revision stamped. The object itself is kept even when this
- * was the series' last occurrence; `seriesEmpty` says so, for the answer.
- *
- * An object with no master has no series to exclude from: the occurrence's
- * overrides are removed and nothing else. It is the caller's to delete the
- * object outright when that leaves it empty, and the result then has no
- * mark to read back by (`mark: null`), since no VEVENT left was written.
- *
- * `RANGE=THISANDFUTURE` (fix-pass review of PR #229): an occurrence such an
- * override of an earlier one reaches has no override of its own, and just
- * gets its EXDATE; the override is never removed for it. The occurrence the
- * override starts at is taken out of its reach first
- * ({@link detachRangeAnchor}), so the change still reaches every later
- * occurrence — it used to be removed as that occurrence's override, and every
- * later occurrence went back to the series' old time and title. That is the
- * one refusal here, ending in `nothingDone`.
- */
-export function excludeOccurrence(
-  parsed: ParsedCalendar,
-  uid: string,
-  occurrence: FoundOccurrence,
-  nothingDone: string,
-  now: Date = new Date()
-): EditResult & { seriesEmpty: boolean } {
-  const { vcal } = parsed;
-  const { master } = seriesFor(vcal, uid);
-  const vevents = vcal.getAllSubcomponents("vevent");
-  let removed = occurrence.overrides.map((index) => vevents[index]);
-  const current = occurrence.current === null ? undefined : overrideAt(vcal, uid, occurrence.current);
-  if (master !== undefined && current !== undefined && modifiesFuture(current)) {
-    // The occurrence a THISANDFUTURE change starts at: that change moves on
-    // to the next occurrence rather than going with this one, so every later
-    // occurrence stays as it was listed.
-    const detached = detachRangeAnchor(vcal, master, current, occurrence, nothingDone, now);
-    if (detached !== current) removed = [...removed.filter((ve) => ve !== current), detached];
-  }
-  for (const ve of removed) vcal.removeSubcomponent(ve);
-  const seriesEmpty = !occurrence.others;
-  if (master === undefined) return { ics: vcal.toString(), mark: null, seriesEmpty };
-  const { time, tzid } = originalStart(master, occurrence);
-  master.addProperty(timeProperty("exdate", time, tzid));
-  const sequence = stampRevision(master, now);
-  return { ics: vcal.toString(), mark: { uid, sequence }, seriesEmpty };
-}
-
-/** True when two zones are the same clock: both UTC, both floating, or one TZID. */
-function sameClock(a: WriteZone | { kind: "unresolved"; tzid: string }, b: WriteZone): boolean {
-  if (a.kind === "zoned" && b.kind === "zoned") return a.tzid === b.tzid;
-  return a.kind === b.kind;
-}
-
-/** The sub-daily frequencies whose occurrence times are the rule's, not DTSTART's (spec §2.4). */
-const SUB_DAILY = new Set(["HOURLY", "MINUTELY", "SECONDLY"]);
-
-/**
- * Move a series to a new clock time and/or length, every occurrence keeping
- * its date (#207, spec 2026-09-29 §2.4, option A).
- *
- * `patch.start` and `patch.end` describe the new time of one occurrence: the
- * one `anchor` names — found by `findOccurrence` from the caller's
- * `recurrence_id` — or, with none, the series' first, its DTSTART. What is
- * applied to the series is the **difference in wall-clock time** between that
- * occurrence's original start and its new one, read in the series' own zone:
- * so a Berlin series at 09:00 moved to 15:00 is at 15:00 on both sides of the
- * change to winter time, never at 14:00 or 16:00 (Review Focus 1). With
- * `patch.end`, every occurrence takes the new length (elapsed time); without
- * it, each keeps its own.
- *
- * Everything keyed to the old start times moves with them, or it would
- * orphan (§0.1):
- *
- *   - DTSTART and DTEND (or DURATION, kept as a DURATION);
- *   - every EXDATE and RDATE, so each keeps naming the same occurrence;
- *   - every override's RECURRENCE-ID, and the override's own DTSTART/DTEND
- *     when they still equal its original occurrence (it only changed its
- *     text); an override that was rescheduled keeps its explicit time;
- *   - a DATE-TIME `UNTIL`, so the last occurrence survives. A DATE `UNTIL`
- *     and `COUNT` are left exactly as they are.
- *
- * A value in the series' own zone is moved on its clock, field by field — the
- * value the rule produces for each occurrence moves the same way, so the two
- * keep matching whatever the offset. One stored in another zone (a UTC EXDATE
- * on a Berlin series, say) is read as an instant, moved on the series' clock,
- * and written back in its own zone.
- *
- * Text fields in `patch` go to the master, as `apply_to_series` says. The
- * master and every override that moved get a new revision. A VTIMEZONE this
- * connector generated is regenerated to cover the series, to its UNTIL or ten
- * years on (`coverGeneratedVtimezone` in src/ical-zones.ts).
- *
- * Refused, each ending in `nothingDone`: a start on another *date* than the
- * occurrence it describes (the day of a series is its rule's, not its time);
- * a rule whose times are its own — a sub-daily FREQ, or BYHOUR, BYMINUTE or
- * BYSECOND — when the start moves; a switch between all-day and timed; an
- * end at or before the start; an offset for a floating series; and a zone
- * nothing can place. "This and all following occurrences" is not this
- * function's: it would be a new series (§2.4 C, out of v0.7.4).
- */
-export function shiftSeries(
-  parsed: ParsedCalendar,
-  uid: string,
-  anchor: FoundOccurrence | null,
-  patch: EventPatch,
-  nothingDone: string,
-  now: Date = new Date()
-): EditResult {
-  const { vcal } = parsed;
-  const { master, overrides } = seriesFor(vcal, uid);
-  if (master === undefined) throw new Error(`shiftSeries: no main VEVENT for UID ${uid}`);
-  const startProp = master.getFirstProperty("dtstart") as ICAL.Property;
-  const start = startProp.getFirstValue() as ICAL.Time;
-  const allDay = start.isDate;
-  if (patch.allDay !== undefined && patch.allDay !== allDay) {
-    throw new ToolRefusal(
-      `A series cannot be switched between all-day and timed: every occurrence it has, and every RECURRENCE-ID and EXDATE naming one, would change its form. ${nothingDone}`
-    );
-  }
-  const anchorWall = anchor === null ? wallOf(start) : anchor.wall;
-  // The lengths an override is compared against, before anything moves.
-  const oldLength = new ICAL.Event(master).duration.toSeconds();
-
-  if (allDay) {
-    shiftAllDaySeries(master, overrides, anchorWall, patch, oldLength, nothingDone, now);
-  } else {
-    shiftTimedSeries(master, overrides, anchorWall, patch, oldLength, nothingDone, now);
-  }
-  patchText(master, patch);
-  const sequence = stampRevision(master, now);
-  return { ics: vcal.toString(), mark: { uid, sequence } };
-}
-
-/** The part of {@link shiftSeries} for an all-day series: no new day, and a new length in whole days. */
-function shiftAllDaySeries(
-  master: ICAL.Component,
-  overrides: ICAL.Component[],
-  anchorWall: ZonedWall,
-  patch: EventPatch,
-  oldLength: number,
-  nothingDone: string,
-  now: Date
-): void {
-  const anchorDay = dayOf(anchorWall);
-  if (patch.start !== undefined) {
-    const day = calendarDate("start", patch.start, nothingDone);
-    if (day !== anchorDay) throw dayChanged(patch.start, day, anchorDay, nothingDone);
-  }
-  if (patch.end === undefined) return;
-  const endDay = calendarDate("end", patch.end, nothingDone);
-  const days = Math.round((dateMs(endDay) - dateMs(anchorDay)) / 86_400_000);
-  if (days <= 0) {
-    throw new ToolRefusal(
-      `Every occurrence would end (${endDay}) on or before it starts (${anchorDay}). For an all-day event the end date is exclusive. ${nothingDone}`
-    );
-  }
-  const lengthen = (ve: ICAL.Component): void => {
-    if (ve.hasProperty("duration") && !ve.hasProperty("dtend")) {
-      ve.updatePropertyWithValue("duration", ICAL.Duration.fromData({ days }));
-      return;
-    }
-    const own = ve.getFirstPropertyValue("dtstart") as ICAL.Time;
-    setTime(ve, "dtend", ICAL.Time.fromDateString(isoDate(dateMs(own.toString().slice(0, 10)) + days * 86_400_000)), null);
-  };
-  lengthen(master);
-  for (const ve of overrides) {
-    if (!unrescheduled(ve, oldLength, true)) continue;
-    lengthen(ve);
-    stampRevision(ve, now);
-  }
-}
-
-/**
- * True for an override that still sits at its original occurrence with the
- * series' old length: it changed only its text, so it moves with the series
- * (spec §2.4). One that was rescheduled keeps its own time.
- */
-function unrescheduled(ve: ICAL.Component, oldLength: number, allDay: boolean): boolean {
-  const event = new ICAL.Event(ve);
-  return keyOf(event.startDate, allDay) === keyOf(event.recurrenceId, allDay) && event.duration.toSeconds() === oldLength;
-}
-
-function dayChanged(given: string, day: string, anchorDay: string, nothingDone: string): ToolRefusal {
-  return new ToolRefusal(
-    `The day of a series cannot be changed; only its time. start "${given}" falls on ${day} in the series' own time zone, and the occurrence it describes is on ${anchorDay}. To move one occurrence to another day, pass its recurrence_id without apply_to_series. ${nothingDone}`
-  );
-}
-
-/** The part of {@link shiftSeries} for a timed series. */
-function shiftTimedSeries(
-  master: ICAL.Component,
-  overrides: ICAL.Component[],
-  anchorWall: ZonedWall,
-  patch: EventPatch,
-  oldLength: number,
-  nothingDone: string,
-  now: Date
-): void {
-  const startProp = master.getFirstProperty("dtstart") as ICAL.Property;
-  const endProp = master.getFirstProperty("dtend");
-  const storedStart = writeZoneOf(startProp);
-  const storedEnd = endProp === null ? storedStart : writeZoneOf(endProp);
-  for (const stored of [storedStart, storedEnd]) {
-    if (stored.kind === "unresolved") {
-      throw new ToolRefusal(
-        `This series' time is stored in the time zone "${stored.tzid}", which has no VTIMEZONE in the event and is not an IANA time zone, so this connector cannot tell what clock time its occurrences are at. ${nothingDone}`
-      );
-    }
-  }
-  const zone = storedStart as WriteZone;
-  const endZone = storedEnd as WriteZone;
-
-  let delta = 0;
-  if (patch.start !== undefined) {
-    const wall = wallAt(timedBound("start", patch.start, zone, nothingDone), zone);
-    if (dayOf(wall) !== dayOf(anchorWall)) throw dayChanged(patch.start, dayOf(wall), dayOf(anchorWall), nothingDone);
-    delta = clockSeconds(wall) - clockSeconds(anchorWall);
-  }
-  if (delta !== 0) {
-    for (const prop of master.getAllProperties("rrule")) {
-      const recur = prop.getFirstValue() as ICAL.Recur;
-      if (SUB_DAILY.has(recur.freq)) {
-        throw new ToolRefusal(
-          `This series repeats FREQ=${recur.freq}: the times of its occurrences are its rule's, so moving its start would contradict the rule rather than move them. ${nothingDone}`
-        );
-      }
-      for (const part of ["BYHOUR", "BYMINUTE", "BYSECOND"] as const) {
-        const values = recur.parts[part];
-        if (values !== undefined && values.length > 0) {
-          throw new ToolRefusal(
-            `This series' rule fixes the times of its occurrences with ${part}=${values.join(",")}, so moving its start would contradict the rule rather than move them. ${nothingDone}`
-          );
-        }
-      }
-    }
-  }
-
-  // The new length, measured on the occurrence the times describe.
-  let length: number | undefined;
-  if (patch.end !== undefined) {
-    const startMs = instantAt(addToWall(anchorWall, delta), zone);
-    const endMs = timedBound("end", patch.end, endZone, nothingDone);
-    if (endMs <= startMs) {
-      throw new ToolRefusal(
-        `Every occurrence would end (${shown(endMs, endZone)}) at or before it starts (${shown(startMs, zone)}). ${nothingDone}`
-      );
-    }
-    length = endMs - startMs;
-  }
-
-  const move = (prop: ICAL.Property | null): void => {
-    if (prop !== null && delta !== 0) shiftProperty(prop, delta, zone);
-  };
-  /**
-   * A new DTEND (or DURATION) `length` after `ve`'s own start. That start is
-   * read in the zone its own DTSTART is stored in, as {@link patchTimes}
-   * reads one — an override another client stored in UTC beside a Berlin
-   * series had its `…Z` fields read as Berlin clock time, and came out 30
-   * minutes long, or negative (fix-pass review of PR #229).
-   */
-  const lengthen = (ve: ICAL.Component, ownEndZone: WriteZone): void => {
-    if (length === undefined) return;
-    if (ve.hasProperty("duration") && !ve.hasProperty("dtend")) {
-      ve.updatePropertyWithValue("duration", ICAL.Duration.fromSeconds(Math.round(length / 1000)));
-      return;
-    }
-    const startProp = ve.getFirstProperty("dtstart") as ICAL.Property;
-    const ownZone = writeZoneOf(startProp);
-    const ownStart = storedInstant(startProp.getFirstValue() as ICAL.Time, ownZone.kind === "unresolved" ? zone : ownZone);
-    const end = writtenTime(ownStart + length, ownEndZone);
-    setTime(ve, "dtend", end.time, end.zone);
-  };
-
-  move(startProp);
-  if (length !== undefined) lengthen(master, endZone);
-  else move(endProp);
-  for (const name of ["exdate", "rdate"]) {
-    for (const prop of master.getAllProperties(name)) move(prop);
-  }
-  if (delta !== 0) shiftUntil(master, delta, zone);
-
-  for (const ve of overrides) {
-    const moves = unrescheduled(ve, oldLength, false);
-    let changed = false;
-    if (delta !== 0) {
-      move(ve.getFirstProperty("recurrence-id"));
-      changed = true;
-    }
-    if (moves) {
-      move(ve.getFirstProperty("dtstart"));
-      const ownEnd = ve.getFirstProperty("dtend");
-      if (length !== undefined) {
-        const ownEndZone = ownEnd === null ? zone : writeZoneOf(ownEnd);
-        lengthen(ve, ownEndZone.kind === "unresolved" ? zone : ownEndZone);
-        changed = true;
-      } else {
-        move(ownEnd);
-      }
-      changed ||= delta !== 0;
-    }
-    if (changed) stampRevision(ve, now);
-  }
-
-  const vcal = master.parent;
-  for (const z of new Set([zone, endZone])) {
-    if (z.kind === "zoned" && z.generated === true && vcal) coverGeneratedVtimezone(vcal, z.tzid);
-  }
-}
-
-/**
- * Move every time in `prop` — a DTSTART, DTEND, RECURRENCE-ID, EXDATE or
- * RDATE, one value or several, a PERIOD's two ends — by `delta` seconds on
- * the clock of the series' zone `zone`, in place, its parameters kept. A
- * date is left alone. A value in the series' own zone moves field by field;
- * one in another zone (a UTC EXDATE on a Berlin series) is read as an
- * instant, moved on the series' clock, and written back in its own zone.
- */
-function shiftProperty(prop: ICAL.Property, delta: number, zone: WriteZone): void {
-  const own = writeZoneOf(prop);
-  const shiftTime = (time: ICAL.Time): ICAL.Time => {
-    if (time.isDate) return time;
-    if (own.kind === "unresolved" || sameClock(own, zone)) {
-      const moved = time.clone();
-      moved.adjust(0, 0, 0, delta);
-      return moved;
-    }
-    const at = instantAt(addToWall(wallAt(storedInstant(time, own), zone), delta), zone);
-    return ICAL.Time.fromData({ ...wallAt(at, own), isDate: false }, time.zone ?? undefined);
-  };
-  const values = prop.getValues().map((value: unknown) => {
-    if (value instanceof ICAL.Period) {
-      return ICAL.Period.fromData({
-        start: shiftTime(value.start),
-        ...(value.end ? { end: shiftTime(value.end) } : { duration: value.duration }),
-      });
-    }
-    return shiftTime(value as ICAL.Time);
-  });
-  if (values.length === 1) prop.setValue(values[0]);
-  else prop.setValues(values);
-}
-
-/**
- * Move a DATE-TIME `UNTIL` by `delta` seconds on the series' clock, so the
- * occurrence it ended on is still the last one (the UNTIL case, §0.1). A UTC
- * UNTIL (the RFC 5545 form for a zoned or UTC series) is read as an instant,
- * moved on the clock of `zone`, and written back in UTC; a floating one moves
- * on its own clock. A DATE UNTIL, and a rule with COUNT or no end, are left
- * exactly as they are.
- */
-function shiftUntil(master: ICAL.Component, delta: number, zone: WriteZone): void {
-  for (const prop of master.getAllProperties("rrule")) {
-    const recur = prop.getFirstValue() as ICAL.Recur;
-    const until = recur.until;
-    if (until === null || until === undefined || until.isDate) continue;
-    let moved: ICAL.Time;
-    if (until.zone === ICAL.Timezone.utcTimezone) {
-      const at = instantAt(addToWall(wallAt(until.toUnixTime() * 1000, zone), delta), zone);
-      moved = ICAL.Time.fromJSDate(new Date(at), true);
-    } else {
-      moved = until.clone();
-      moved.adjust(0, 0, 0, delta);
-    }
-    const next = recur.clone();
-    next.until = moved;
-    prop.setValue(next);
-  }
-}
-
 /**
  * Write the time `patch` asks for into `vevent` — a main VEVENT or an
  * override, the same rules for either — in the zone the event was stored in
