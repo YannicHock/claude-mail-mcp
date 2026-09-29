@@ -283,7 +283,8 @@ export class CalDavClient {
    * The expansion runs in src/ical-worker-pool.ts's workers, each object
    * under a deadline: one recurrence rule ical.js never returns from is a
    * `skipped` entry, not a connector that no longer answers anyone (review of
-   * #223). `find_free_slot` reads through here, so it is covered too.
+   * #223). `find_free_slot` reads its objects through the same pool, with
+   * its own operation ({@link findFreeSlots}).
    */
   async listEvents(calendarUrl: string, rangeStart: string, rangeEnd: string): Promise<EventListing> {
     const calendar = await this.findCalendar(calendarUrl);
