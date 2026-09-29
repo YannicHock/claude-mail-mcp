@@ -21,14 +21,24 @@
  * To add one — as PR 4 added the occurrence lookup by `recurrence_id` — add it to
  * {@link WORKER_OPS}, say what it does in {@link OP_ACTIONS}, and call it
  * with `ExpansionPool.runOn` (src/ical-worker-pool.ts), which also remembers
- * an object that timed out; turn a rejection into words with `reasonOf`.
+ * an object that timed out — or, for many objects in one call, as
+ * `find_free_slot` reads a calendar (#213), with `ExpansionPool.runOnEach`,
+ * which makes them one request; turn a rejection into words with `reasonOf`.
  */
 
+import { busyTimes } from "./ical-busy.js";
 import { expandObject, findOccurrence } from "./ical-expand.js";
 
 export const WORKER_OPS = {
   /** src/ical-expand.ts's {@link expandObject}: one stored object's instances in a window. */
   expand: expandObject,
+  /**
+   * src/ical-busy.ts's {@link busyTimes}: one stored object's busy time in a
+   * window, as epoch ms, for `find_free_slot` (#213) — transparent, cancelled
+   * and self-declined occurrences left out, and what could not be read said.
+   * The account's own addresses and the working zone come in as plain strings.
+   */
+  busyTimes,
   /**
    * src/ical-expand.ts's {@link findOccurrence}: the occurrence a caller's
    * `recurrence_id` names, matched against the expanded series (#206), for
@@ -48,6 +58,7 @@ export type WorkerOpName = keyof WorkerOps;
  */
 export const OP_ACTIONS: { readonly [K in WorkerOpName]: string } = {
   expand: "expanding",
+  busyTimes: "reading its busy times",
   findOccurrence: "looking for the occurrence",
 };
 

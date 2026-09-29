@@ -227,6 +227,30 @@ export class ExpansionPool {
   }
 
   /**
+   * {@link runOn} for each of `objects`, in order, as **one** request taking
+   * turns with every other — what `expand` is for `expandObject`, for any
+   * operation. `argsOf` gives each object's arguments. Never rejects: each
+   * object's outcome is settled on its own, an object that timed out (now or
+   * within {@link HANGING_REMEMBERED_MS}) or whose worker failed coming back
+   * `rejected` — turn its reason into words with {@link reasonOf}.
+   *
+   * Why not `runOn` per object: each call is a request of its own, so a
+   * `find_free_slot` over a calendar of fifty objects (#213) would be fifty
+   * requests, and another account's one-object `list_events` would wait
+   * behind every one of them — the stall the turns exist to prevent.
+   */
+  runOnEach<K extends WorkerOpName>(
+    objects: readonly StoredObject[],
+    op: K,
+    argsOf: (object: StoredObject) => Parameters<WorkerOps[K]>
+  ): Promise<PromiseSettledResult<ReturnType<WorkerOps[K]>>[]> {
+    const group = this.group();
+    return Promise.allSettled(
+      objects.map((o) => this.submit(group, objectKey(o), op, argsOf(o)) as Promise<ReturnType<WorkerOps[K]>>)
+    );
+  }
+
+  /**
    * `expandObject` for each of `objects`, in order, each under its own
    * deadline, as one request taking turns with every other. Never rejects:
    * an object that timed out — now or within {@link HANGING_REMEMBERED_MS} —
