@@ -110,12 +110,98 @@ export function instantToZonedWall(ms: number, tz: string): ZonedWall {
   };
 }
 
-/** The UTC offset in effect in `tz` at the instant `ms`, in milliseconds (east positive). */
-export function utcOffsetMs(ms: number, tz: string): number {
+/** {@link utcOffsetMs} as `Intl` answers it, asked afresh every time. */
+function askedOffsetMs(ms: number, tz: string): number {
   const w = instantToZonedWall(ms, tz);
   // Whole seconds: Intl formats no milliseconds, so compare like with like.
   const whole = Math.floor(ms / 1000) * 1000;
   return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) - whole;
+}
+
+const DAY_MS = 86_400_000;
+
+/** The offset in effect at a span's start, and every change in it: `at` is the first second of the new offset. */
+interface OffsetChanges {
+  first: number;
+  changes: Array<{ at: number; from: number; to: number }>;
+}
+
+/**
+ * Every change of `tz`'s UTC offset from `fromMs` to `toMs`, found by a daily
+ * scan and a bisection to the second — about 370 `Intl` calls a year. Two
+ * changes inside one day that cancel out would be missed; the zone database
+ * has none since offsets were standardised.
+ */
+function offsetChanges(tz: string, fromMs: number, toMs: number): OffsetChanges {
+  const start = Math.floor(fromMs / 1000) * 1000;
+  const first = askedOffsetMs(start, tz);
+  const changes: OffsetChanges["changes"] = [];
+  let before = first;
+  for (let lo = start; lo < toMs; lo += DAY_MS) {
+    const hi = Math.min(lo + DAY_MS, toMs);
+    const after = askedOffsetMs(hi, tz);
+    if (after === before) continue;
+    // The first second showing the new offset: lo still shows the old one.
+    let a = lo;
+    let b = hi;
+    while (b - a > 1000) {
+      const mid = a + Math.floor((b - a) / 2000) * 1000;
+      if (askedOffsetMs(mid, tz) === before) a = mid;
+      else b = mid;
+    }
+    const to = askedOffsetMs(b, tz);
+    changes.push({ at: b, from: before, to });
+    before = to;
+    // Resume the scan from the transition, in case the day holds a second one.
+    lo = b - DAY_MS;
+  }
+  return { first, changes };
+}
+
+/**
+ * Each zone's offsets, one calendar year (UTC) at a time, as
+ * {@link offsetChanges} found them. Bounded like the formatters: TZIDs come
+ * from whatever other clients stored.
+ */
+const offsetYears = new Map<string, Map<number, OffsetChanges>>();
+
+/** 00:00Z on 1 January of `year`; `Date.UTC` would read 0–99 as 1900–1999. */
+function startOfYear(year: number): number {
+  return new Date(0).setUTCFullYear(year, 0, 1);
+}
+
+/**
+ * The UTC offset in effect in `tz` at the instant `ms`, in milliseconds (east
+ * positive). Exactly `Intl`'s answer, to the second.
+ *
+ * Remembered per zone and year (review of #223). Asked afresh, it cost two
+ * `formatToParts` per call, and {@link IntlTimezone} asks eight or so per
+ * occurrence expanded, so a daily series since 2016 in a zone with no
+ * VTIMEZONE took 390 ms against 70 ms with one, and a daily series since 1990
+ * over a second and a half. A year's offsets are found once — a daily scan,
+ * a few milliseconds — and every later call is a lookup.
+ */
+export function utcOffsetMs(ms: number, tz: string): number {
+  if (!Number.isFinite(ms)) return askedOffsetMs(ms, tz);
+  const year = new Date(ms).getUTCFullYear();
+  let years = offsetYears.get(tz);
+  if (years === undefined) {
+    if (offsetYears.size >= 1000) offsetYears.clear();
+    years = new Map();
+    offsetYears.set(tz, years);
+  }
+  let known = years.get(year);
+  if (known === undefined) {
+    if (years.size >= 1000) years.clear();
+    known = offsetChanges(tz, startOfYear(year), startOfYear(year + 1));
+    years.set(year, known);
+  }
+  let offset = known.first;
+  for (const change of known.changes) {
+    if (change.at > ms) break;
+    offset = change.to;
+  }
+  return offset;
 }
 
 /**
@@ -546,8 +632,6 @@ function formatLocal(w: ZonedWall): string {
   return `${pad(w.year, 4)}${pad(w.month)}${pad(w.day)}T${pad(w.hour)}${pad(w.minute)}${pad(w.second)}`;
 }
 
-const DAY_MS = 86_400_000;
-
 /**
  * A VTIMEZONE for the IANA zone `tz` that is exact from `fromMs` to `toMs`,
  * as iCalendar text (spec §2.5 A). `create_event` writes it for its `timezone`
@@ -564,27 +648,7 @@ const DAY_MS = 86_400_000;
  */
 export function vtimezoneFromIntl(tz: string, fromMs: number, toMs: number): string {
   const start = Math.floor(fromMs / 1000) * 1000;
-  const changes: Array<{ at: number; from: number; to: number }> = [];
-  let before = utcOffsetMs(start, tz);
-  for (let lo = start; lo < toMs; lo += DAY_MS) {
-    const hi = Math.min(lo + DAY_MS, toMs);
-    const after = utcOffsetMs(hi, tz);
-    if (after === before) continue;
-    // The first second showing the new offset: lo still shows the old one.
-    let a = lo;
-    let b = hi;
-    while (b - a > 1000) {
-      const mid = a + Math.floor((b - a) / 2000) * 1000;
-      if (utcOffsetMs(mid, tz) === before) a = mid;
-      else b = mid;
-    }
-    changes.push({ at: b, from: before, to: utcOffsetMs(b, tz) });
-    before = utcOffsetMs(b, tz);
-    // Resume the scan from the transition, in case the day holds a second one.
-    lo = b - DAY_MS;
-  }
-
-  const first = utcOffsetMs(start, tz);
+  const { first, changes } = offsetChanges(tz, start, toMs);
   const lowest = Math.min(first, ...changes.map((c) => c.to));
   const observance = (at: number, from: number, to: number): string[] => {
     const kind = to > lowest ? "DAYLIGHT" : "STANDARD";
