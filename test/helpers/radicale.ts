@@ -382,6 +382,43 @@ export async function serverFindsIn(cal: RadicaleCalendar, start: string, end: s
   return [...text.matchAll(/<(?:\w+:)?href>[^<]*\/([^/<]+)<\/(?:\w+:)?href>/g)].map((m) => decodeURIComponent(m[1])).sort();
 }
 
+/**
+ * Every instance Radicale's own `<C:expand>` makes of the objects in
+ * `[start, end)`, as `[recurrenceId, start]` pairs of UTC ISO instants sorted
+ * by start: how the server — and any client that asks it to expand — reads
+ * a series the connector wrote. Radicale writes the expanded DTSTART and
+ * RECURRENCE-ID in UTC (spec 2026-09-29 §0.1, R5), which is what this reads.
+ * Only for timed series in a zone or UTC: Radicale's expansion fails on the
+ * all-day and floating shapes (R1, R2).
+ */
+export async function serverExpands(cal: RadicaleCalendar, start: string, end: string): Promise<Array<[string | null, string]>> {
+  const stamp = (iso: string): string => iso.replace(/[-:]/g, "").replace(/\.\d+/, "");
+  const body = `<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><C:calendar-data><C:expand start="${stamp(start)}" end="${stamp(end)}"/></C:calendar-data></D:prop>
+  <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
+    <C:time-range start="${stamp(start)}" end="${stamp(end)}"/>
+  </C:comp-filter></C:comp-filter></C:filter>
+</C:calendar-query>`;
+  const res = await fetch(cal.calendarUrl, {
+    method: "REPORT",
+    headers: { authorization: cal.authHeader, depth: "1", "content-type": "application/xml; charset=utf-8" },
+    body,
+  });
+  if (res.status !== 207) throw new Error(`REPORT with expand answered ${res.status}`);
+  const text = (await res.text()).replace(/&#13;/g, "").replace(/\r/g, "");
+  const iso = (value: string): string =>
+    `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}T${value.slice(9, 11)}:${value.slice(11, 13)}:${value.slice(13, 15)}.000Z`;
+  const instances: Array<[string | null, string]> = [];
+  for (const [vevent] of text.matchAll(/BEGIN:VEVENT\n[\s\S]*?END:VEVENT/g)) {
+    const dtstart = /\nDTSTART:(\d{8}T\d{6})Z/.exec(vevent);
+    if (dtstart === null) throw new Error(`an expanded instance has no UTC DTSTART:\n${vevent}`);
+    const rid = /\nRECURRENCE-ID:(\d{8}T\d{6})Z/.exec(vevent);
+    instances.push([rid === null ? null : iso(rid[1]), iso(dtstart[1])]);
+  }
+  return instances.sort((a, b) => a[1].localeCompare(b[1]));
+}
+
 /** Delete an object behind the connector's back, as a phone would. */
 export async function deleteBehindTheBack(cal: RadicaleCalendar, filename: string): Promise<void> {
   const res = await fetch(`${cal.calendarUrl}${filename}`, { method: "DELETE", headers: { authorization: cal.authHeader } });

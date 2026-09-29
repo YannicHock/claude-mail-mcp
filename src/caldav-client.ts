@@ -35,6 +35,7 @@ import {
   changesSomething,
   describeSeries,
   excludeOccurrence,
+  shiftSeries,
   touchesTime,
   writtenBy,
   type EditResult,
@@ -315,10 +316,14 @@ export class CalDavClient {
    * (an invitation to one instance, #211.3) is that occurrence, changed with
    * or without `recurrenceId`.
    *
-   * `recurrenceId` with `applyToSeries: true` has one meaning (§2.4): the
-   * occurrence a series' new start or end describes. For a change that moves
-   * no time the two contradict each other, and the call is refused before
-   * the server is contacted.
+   * v0.7.4 (§2.4, #207): a series' `start` and `end`, with `applyToSeries`,
+   * give every occurrence a new clock time and/or length, each keeping its
+   * date — `shiftSeries` in src/ical-edit.ts, which carries EXDATE, RDATE,
+   * the overrides' RECURRENCE-IDs and UNTIL along. The times describe the
+   * series' first occurrence, or the one `recurrenceId` names: that is the
+   * one meaning `recurrenceId` has beside `applyToSeries: true`. For a change
+   * that moves no time the two contradict each other, and the call is refused
+   * before the server is contacted.
    */
   async updateEvent(update: EventUpdate): Promise<{ uid: string; url: string; etag: string | null }> {
     const nothingDone = "Nothing was changed, and no event was created.";
@@ -357,21 +362,16 @@ export class CalDavClient {
       edit = applyOccurrencePatch(stored.parsed, update.uid, found, update, nothingDone);
       return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
     }
-    if (shape.recurring) {
-      if (update.applyToSeries !== true) throw seriesRefusal(update.uid, "change");
-      if (touchesTime(update)) {
-        throw new ToolRefusal(
-          `"${update.uid}" is a recurring series, and changing the time of a whole series is not supported yet. Nothing was changed. Its summary, description and location can be changed with apply_to_series: true.`
-        );
-      }
-    }
+    if (shape.recurring && update.applyToSeries !== true) throw seriesRefusal(update.uid, "change");
     const ifMatch = requireEtag(update, stored, nothingDone);
-    if (recurrenceId !== undefined) {
-      // With apply_to_series on an event that does not recur: the lookup
-      // refuses it, saying so.
-      await this.occurrence(stored, update.uid, recurrenceId, nothingDone);
-    }
-    edit = applyEventPatch(stored.parsed, update.uid, update, nothingDone);
+    // With apply_to_series, recurrence_id names the occurrence a series' new
+    // time describes (§2.4); on an event that does not recur the lookup
+    // refuses it, saying so.
+    const anchor = recurrenceId === undefined ? null : await this.occurrence(stored, update.uid, recurrenceId, nothingDone);
+    edit =
+      shape.recurring && touchesTime(update)
+        ? shiftSeries(stored.parsed, update.uid, anchor, update, nothingDone)
+        : applyEventPatch(stored.parsed, update.uid, update, nothingDone);
     return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
   }
 
@@ -508,7 +508,7 @@ export class CalDavClient {
     if (shape.overrideOnly && target.applyToSeries !== true) {
       // #211.3: not "every occurrence" — the object holds only this one.
       throw new ToolRefusal(
-        `"${target.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example). Deleting it removes the whole stored object. Nothing was deleted. Pass apply_to_series: true if that is what you intend.`
+        `"${target.uid}" is a single occurrence of a series whose other occurrences are not in this calendar (an invitation to one instance, for example). Deleting it removes the whole stored object: pass its recurrence_id, or apply_to_series: true, if that is what you intend. ${nothingDone}`
       );
     }
     if (shape.recurring && target.applyToSeries !== true) {

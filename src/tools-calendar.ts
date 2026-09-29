@@ -27,8 +27,11 @@
  * What the calendar can do: list calendars and events, create an event, find
  * free time, and since v0.7.2 change (`update_event`, #152) and delete
  * (`delete_event`, #153) an existing one. Both writes are guarded by the ETag
- * `list_events` returns, refuse a single occurrence of a series, and need
- * `apply_to_series` to touch a series at all (spec 2026-09-28 §4). An update
+ * `list_events` returns, and need `apply_to_series` to touch a series as a
+ * whole (spec 2026-09-28 §4). Since v0.7.4 they address one occurrence by the
+ * `recurrence_id` `list_events` reports (#206, spec 2026-09-29 §2.3), and
+ * `update_event` gives a series a new clock time or length, every occurrence
+ * keeping its date (#207, §2.4). An update
  * edits the stored object in place — see src/ical-edit.ts — so attendees,
  * alarms and anything else this connector does not model survive it.
  * Neither tool sends mail to attendees: there is no iMIP yet (#29). The
@@ -125,12 +128,17 @@ const etagSchema = z
 const applyToSeriesSchema = z
   .boolean()
   .optional()
-  .describe("Required to change or delete a recurring event; the call then applies to every occurrence");
+  .describe(
+    "Required to change or delete a recurring event as a whole; the call then applies to every occurrence. Not needed with recurrence_id, which addresses one occurrence"
+  );
 
 const recurrenceIdSchema = z
   .string()
+  .min(1)
   .optional()
-  .describe("Not supported yet: a single occurrence of a series cannot be changed or deleted. Passing it is refused.");
+  .describe(
+    "One occurrence of a recurring event: its recurrenceId exactly as list_events reported it — an ISO instant (2026-10-08T07:00:00.000Z), a clock time with no offset for a floating series, or a date (YYYY-MM-DD) for an all-day series. The call then changes or deletes that occurrence only. With apply_to_series=true (update_event only) it instead names the occurrence whose new start/end the whole series' time is measured against"
+  );
 
 /**
  * Resolve the account and hand back its CalDAV client together with the id
@@ -251,7 +259,7 @@ export function registerCalendarTools(
     "update_event",
     {
       description:
-        "Change an existing calendar event. WRITE OPERATION. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. `start` alone moves the event and keeps its length as elapsed time (whole days for an all-day event): one that spans a daylight-saving change keeps its hours, not its clock times. The answer carries the event's new `etag` for a further change; if it is null, call list_events before changing it again. This connector sends no invitation or update mail itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees when an event you organize is changed. Treat changing an event that has attendees as a message to real people, and confirm with the user first. A recurring event needs apply_to_series=true, and then only its summary, description and location can change; a single occurrence cannot be changed yet.",
+        "Change an existing calendar event. WRITE OPERATION. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. `start` alone moves the event and keeps its length as elapsed time (whole days for an all-day event): one that spans a daylight-saving change keeps its hours, not its clock times. The answer carries the event's new `etag` for a further change; if it is null, call list_events before changing it again. This connector sends no invitation or update mail itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees when an event you organize is changed. Treat changing an event that has attendees as a message to real people, and confirm with the user first. One occurrence of a recurring event: pass its recurrence_id from list_events, and only that occurrence changes. The whole series: pass apply_to_series=true. A series' start and end then give every occurrence a new clock time and/or length, each keeping its date — start and end describe the series' first occurrence, or the one recurrence_id names — and the day of a series cannot be changed, only its time. Cancelled and individually changed occurrences stay the ones they were. An invitation to a single occurrence of someone else's series is changed like one occurrence, with or without recurrence_id.",
       inputSchema: {
         calendar_url: calendarUrlSchema,
         uid: uidSchema,
@@ -299,7 +307,7 @@ export function registerCalendarTools(
     "delete_event",
     {
       description:
-        "Delete a calendar event. DESTRUCTIVE AND PERMANENT: CalDAV has no trash, so a deleted event cannot be recovered. This connector sends no cancellation itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees a cancellation when an event you organize is deleted, and that mail cannot be recalled. Confirm with the user first if the event has attendees. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is deleted. A recurring event needs apply_to_series=true and is then deleted with every occurrence; a single occurrence cannot be deleted yet.",
+        "Delete a calendar event. DESTRUCTIVE AND PERMANENT: CalDAV has no trash, so a deleted event cannot be recovered. This connector sends no cancellation itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees a cancellation when an event you organize is deleted, and that mail cannot be recalled. Confirm with the user first if the event has attendees. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is deleted. To cancel one occurrence of a recurring event, pass its recurrence_id from list_events: that one occurrence is removed from the series (an EXDATE), the rest stay, and the answer carries the series' new `etag`. A whole recurring event needs apply_to_series=true and is then deleted with every occurrence. Deleting an invitation to a single occurrence of someone else's series deletes the stored invitation; on some servers (e.g. Nextcloud) that may send the organizer a decline.",
       inputSchema: {
         calendar_url: calendarUrlSchema,
         uid: uidSchema,

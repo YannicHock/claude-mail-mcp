@@ -872,6 +872,31 @@ export function generatedVtimezone(tz: string, instants: number[]): ICAL.Compone
 }
 
 /**
+ * How far past the latest time an object holds a generated VTIMEZONE reaches
+ * for a series in its zone whose rule has no UNTIL (see
+ * {@link coverGeneratedVtimezone}): ten years, about 20 observances for a
+ * zone with DST.
+ */
+const SERIES_REACH_MS = 10 * 366 * 86_400_000;
+
+/**
+ * The instants a series in `tzid` runs to beyond the times `vcal` holds, the
+ * latest of which is `latest`: each such VEVENT's UNTIL, or `latest` plus
+ * {@link SERIES_REACH_MS} for a rule with COUNT or no end.
+ */
+function seriesReach(vcal: ICAL.Component, tzid: string, latest: number): number[] {
+  const reach: number[] = [];
+  for (const vevent of vcal.getAllSubcomponents("vevent")) {
+    if (String(vevent.getFirstProperty("dtstart")?.getParameter("tzid")) !== tzid) continue;
+    for (const prop of vevent.getAllProperties("rrule")) {
+      const until = (prop.getFirstValue() as ICAL.Recur).until;
+      reach.push(until ? until.toUnixTime() * 1000 : latest + SERIES_REACH_MS);
+    }
+  }
+  return reach;
+}
+
+/**
  * Regenerate the VTIMEZONE this connector generated for `tzid`, if the
  * object holds one, so that it covers every time in the object written in
  * that zone (review of #224). In place, and in the block's own position.
@@ -886,10 +911,19 @@ export function generatedVtimezone(tz: string, instants: number[]): ICAL.Compone
  * that TZID, a year either side.
  *
  * A block without the mark is someone else's and is left exactly as it is;
- * so is an object whose times in the zone are all gone. An RRULE is not
- * followed: `create_event` writes no series, and `update_event` changes no
- * series' time, so no series holds a generated block today. The change that
- * lets one (v0.7.4 PR 4) has to decide how far such a block reaches.
+ * so is an object whose times in the zone are all gone.
+ *
+ * **A series' reach** (v0.7.4 PR 4, #207). The times an object holds are
+ * only where a series starts: its occurrences run on by its rule. So for a
+ * VEVENT in that zone with an RRULE, the block also covers the rule's end —
+ * its UNTIL — and, for a rule with COUNT or no end at all, the ten years
+ * after the latest time the object holds ({@link SERIES_REACH_MS}). The
+ * rule is not walked for it (that is a worker's job, src/ical-worker-ops.ts,
+ * and a COUNT's last occurrence would need one): ten years is a bound, not
+ * the series' end, and past it the block reads the zone as its last
+ * observance says, as any other client's bounded block would. `create_event`
+ * writes no series, so this is a series another client made of an event
+ * this connector created, whose time `update_event` then moved.
  */
 export function coverGeneratedVtimezone(vcal: ICAL.Component, tzid: string): void {
   // A copy: ical.js hands out its own array, which the removal below empties.
@@ -909,6 +943,7 @@ export function coverGeneratedVtimezone(vcal: ICAL.Component, tzid: string): voi
     });
   }
   if (instants.length === 0) return;
+  instants.push(...seriesReach(vcal, tzid, Math.max(...instants)));
   subcomponents[index] = generatedVtimezone(tzid, instants);
   vcal.removeAllSubcomponents();
   for (const c of subcomponents) vcal.addSubcomponent(c);
