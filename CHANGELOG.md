@@ -2,7 +2,19 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.2] — 2026-09-29
+
+**The calendar can take back what it adds.** Until now Claude could put an appointment in a
+calendar, and fixing a wrong one meant opening a calendar client by hand. `update_event` and
+`delete_event` change and cancel what is there. Both are guarded by the ETag `list_events`
+hands out, so an event changed on a phone since Claude read it is never overwritten; a
+recurring series needs to be named as one before it is touched. An update edits the stored
+event in place, so attendees, reminders and everything else another client wrote survive it.
+
+**Know before using it with attendees:** this connector sends no mail itself, but the
+calendar server may. The acceptance run on Nextcloud found it mailing the attendees of an
+event you organize when it changes or is deleted, so both tools tell Claude to confirm with
+the user first. What the calendar still cannot do is listed, issue by issue, in v0.7.4.
 
 ### Added
 
@@ -14,7 +26,6 @@ All notable changes are documented here. This project follows [Semantic Versioni
 ### Fixed
 
 - **`create_event` no longer reports success when the server refuses the write.** The CalDAV library returns the raw response for every write and throws on none, so a `403` or a `507` came back as `{ success: true }`. Every calendar write now checks the status; a refusal about the event itself (changed since read, gone, a series) is an answer and leaves no `warn` line, and anything else is a server failure reported like any other.
-
 - **The setup wizard no longer asks for a mailbox password before it can say none will work.** The address screen asked for the address and the password together, so an operator with an `@outlook.com` address typed a password before the lookup could tell them Microsoft accepts no password over IMAP. It now asks for the address alone; the screen after the lookup shows the warning, then asks for the password once. (#197)
 
 ## [0.7.1] — 2026-09-11
