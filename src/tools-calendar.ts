@@ -87,6 +87,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ClientPool } from "./client-pool.js";
 import { CalDavClient } from "./caldav-client.js";
+import { MAX_FREE_SLOT_RANGE_DAYS, MAX_FREE_SLOTS } from "./free-slots.js";
 import { reportingFailures } from "./tool-errors.js";
 
 function asJson(value: unknown): { content: { type: "text"; text: string }[] } {
@@ -472,7 +473,7 @@ export function registerCalendarTools(
       // `skipped` are src/ical-busy.ts, src/free-slots.ts and
       // CalDavClient.findFreeSlots; this is only the shape the model sees.
       description:
-        "Find free time slots across one or more calendars in a window. Returns each continuous gap long enough to fit `duration_minutes`. An event blocks time unless it is transparent (\"show as free\"), cancelled, or one the account declined; a tentative one blocks it. Optional working hours restrict the search to the same hours on every day of the range, on the clock of `timezone`. The answer's `timezone` names the zone used, and each slot is given with that zone's offset. A stored event whose data could not be read is named in `skipped`, with a `warning`: its time was not checked, so a slot may overlap it.",
+        `Find free time slots across one or more calendars in a window of at most ${MAX_FREE_SLOT_RANGE_DAYS} days; a longer one is refused. Returns each continuous gap long enough to fit \`duration_minutes\`, the earliest first, at most ${MAX_FREE_SLOTS} of them, with \`truncated\` true when there were more. An event blocks time unless it is transparent ("show as free"), cancelled, or one the account declined under any of its addresses (its calendar addresses and its mailbox's); a tentative one blocks it. Optional working hours restrict the search to the same hours on every day of the range, on the clock of \`timezone\`. The answer's \`timezone\` names the zone used, and each slot is given with that zone's offset. A stored event whose data could not be read is named in \`skipped\`, with a \`warning\`: its time was not checked, so a slot may overlap it. The \`warning\` also says when the account's calendar addresses could not be looked up, so an invitation it declined may have counted as busy.`,
       inputSchema: {
         calendar_urls: z
           .array(z.string().url())
@@ -507,7 +508,7 @@ export function registerCalendarTools(
     },
     async (args) => {
       const { caldav, id } = requireCaldav(pool, args.account);
-      const { timezone, slots, skipped } = await reportingFailures(pool, "find_free_slot", id, () =>
+      const { timezone, slots, truncated, skipped, addressesKnown } = await reportingFailures(pool, "find_free_slot", id, () =>
         caldav.findFreeSlots({
           calendarUrls: args.calendar_urls,
           rangeStart: args.range_start,
@@ -520,12 +521,22 @@ export function registerCalendarTools(
         })
       );
       // An object whose busy time is unknown is never left to look free: the
-      // model is told, beside the slots, that they may overlap it.
-      const warning =
-        skipped.length === 0
-          ? undefined
-          : `The busy time of ${skipped.length === 1 ? "one stored event" : `${skipped.length} stored events`} named in skipped could not be checked, so a slot above may overlap ${skipped.length === 1 ? "it" : "them"}. Check with list_events or with the user before relying on it.`;
-      return asJson({ timezone, count: slots.length, slots, skipped, ...(warning === undefined ? {} : { warning }) });
+      // model is told, beside the slots, that they may overlap it. Nor is a
+      // declined invitation counted busy in silence when the account's
+      // addresses could not be looked up (review of PR #232).
+      const warnings: string[] = [];
+      if (skipped.length > 0) {
+        warnings.push(
+          `The busy time of ${skipped.length === 1 ? "one stored event" : `${skipped.length} stored events`} named in skipped could not be checked, so a slot above may overlap ${skipped.length === 1 ? "it" : "them"}. Check with list_events or with the user before relying on it.`
+        );
+      }
+      if (!addressesKnown) {
+        warnings.push(
+          "The account's calendar addresses could not be looked up, so only its mailbox's address counted as its own: an invitation it declined under another address was counted as busy, and a slot may be missing where it is in fact free."
+        );
+      }
+      const warning = warnings.length === 0 ? undefined : warnings.join(" ");
+      return asJson({ timezone, count: slots.length, truncated, slots, skipped, ...(warning === undefined ? {} : { warning }) });
     }
   );
 }

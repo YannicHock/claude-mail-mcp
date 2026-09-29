@@ -228,6 +228,39 @@ describe("find_free_slot's zone and what it could not check (#213, spec 2026-09-
   });
 });
 
+describe("find_free_slot's bounds, refused before any request (review of PR #232)", () => {
+  async function refused(args: Record<string, unknown>, pattern: RegExp): Promise<void> {
+    await withCalendarTools(CLOSED, async (tools, warnings) => {
+      const find = tools.get("find_free_slot");
+      assert.ok(find);
+      await assert.rejects(
+        find.handler({ calendar_urls: [`${CLOSED}cal/`], duration_minutes: 60, ...args }),
+        (err: unknown) => err instanceof ToolRefusal && pattern.test(err.message) && err.message.endsWith("No calendar was read.")
+      );
+      assert.equal(warnings(), 0);
+    });
+  }
+
+  it("refuses a range longer than 366 days — the years 0001–9999 blocked the event loop for 72 s", async () => {
+    await refused({ range_start: "0001-01-01T00:00:00Z", range_end: "9999-01-01T00:00:00Z" }, /366 days/);
+    await refused({ range_start: "2026-01-01T00:00:00Z", range_end: "2027-01-02T00:00:01Z" }, /366 days/);
+  });
+
+  it("says the range cap and the slot cap in its description", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const description = tools.get("find_free_slot")?.config.description ?? "";
+      assert.match(description, /366 days/);
+      assert.match(description, /200/);
+      assert.match(description, /`truncated`/);
+    });
+  });
+
+  it("refuses a range_start or range_end with no offset, which the process's own zone would otherwise read", async () => {
+    await refused({ range_start: "2026-10-05T09:00", range_end: "2026-10-06T00:00:00Z" }, /offset/);
+    await refused({ range_start: "2026-10-05T09:00:00Z", range_end: "2026-10-06T17:00:00" }, /offset/);
+  });
+});
+
 describe("update_event with nothing to change", () => {
   it("is refused before any request, and leaves no warn line", async () => {
     // Had the call reached for the closed port, it would have failed as

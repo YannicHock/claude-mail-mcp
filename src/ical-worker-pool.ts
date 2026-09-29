@@ -256,15 +256,15 @@ export class ExpansionPool {
    * an object that timed out — now or within {@link HANGING_REMEMBERED_MS} —
    * or whose worker failed comes back with no instances and
    * {@link reasonOf} in `skipped`.
+   *
+   * {@link runOnEach} underneath, so there is one batch path (code-health
+   * review of PR #232); `CalDavClient.listEvents` calls that directly, and
+   * this stays as the shorthand the pool's own tests use.
    */
-  expand(objects: StoredObject[], window: ExpandWindow): Promise<ExpandResult[]> {
-    const group = this.group();
-    return Promise.all(
-      objects.map((o) =>
-        (this.submit(group, objectKey(o), "expand", [o.data, window, { url: o.url, etag: o.etag }]) as Promise<ExpandResult>).catch(
-          (err: unknown): ExpandResult => ({ instances: [], skipped: reasonOf(err) })
-        )
-      )
+  async expand(objects: StoredObject[], window: ExpandWindow): Promise<ExpandResult[]> {
+    const settled = await this.runOnEach(objects, "expand", (o) => [o.data, window, { url: o.url, etag: o.etag }]);
+    return settled.map((result) =>
+      result.status === "fulfilled" ? result.value : { instances: [], skipped: reasonOf(result.reason) }
     );
   }
 

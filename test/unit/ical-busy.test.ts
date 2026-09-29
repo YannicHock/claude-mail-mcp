@@ -208,6 +208,44 @@ describe("busyTimes — what it cannot read is said, never counted free", () => 
   });
 });
 
+describe("busyTimes — an occurrence whose placed end is not after its start (review of PR #232)", () => {
+  function floating(start: string, end: string): string {
+    return ics(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Other Client//EN",
+      "BEGIN:VEVENT",
+      "UID:floating-gap@example.com",
+      "DTSTAMP:20260901T080000Z",
+      `DTSTART:${start}`,
+      `DTEND:${end}`,
+      "END:VEVENT",
+      "END:VCALENDAR"
+    );
+  }
+  const MARCH = { start: Date.parse("2026-03-01T00:00:00Z"), end: Date.parse("2026-04-01T00:00:00Z") };
+
+  it("a floating 02:30–03:30 on Berlin's spring-forward night keeps its own hour, from where 02:30 is read", () => {
+    // 02:30 does not exist that night; RFC 5545 reads it as 03:30 CEST, which
+    // is also where 03:30 is: placed as is, the hour collapses to nothing.
+    const result = busyTimes(floating("20260329T023000", "20260329T033000"), MARCH, OWN, "Europe/Berlin");
+    assert.equal(result.skipped, undefined);
+    assert.deepEqual(iso(result), [["2026-03-29T01:30:00.000Z", "2026-03-29T02:30:00.000Z"]]);
+  });
+
+  it("a DTEND before its DTSTART is named in skipped, not silently free", () => {
+    const result = busyTimes(event().replace("DTEND:20261006T110000Z", "DTEND:20261006T090000Z"), OCTOBER, OWN, "UTC");
+    assert.deepEqual(result.busy, []);
+    assert.match(result.skipped ?? "", /ends before it starts/);
+  });
+
+  it("an event with a DTSTART alone is zero-length, as RFC 5545 says: blocks nothing, and is not skipped", () => {
+    const result = busyTimes(event().replace("DTEND:20261006T110000Z\r\n", ""), OCTOBER, OWN, "UTC");
+    assert.equal(result.skipped, undefined);
+    assert.deepEqual(iso(result), [["2026-10-06T10:00:00.000Z", "2026-10-06T10:00:00.000Z"]]);
+  });
+});
+
 describe("busyTimes in a worker", () => {
   const pool = new ExpansionPool({});
   after(() => pool.close());

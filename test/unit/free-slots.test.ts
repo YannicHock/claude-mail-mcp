@@ -8,7 +8,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { freeSlots, workingZone, type BusyInterval } from "../../src/free-slots.js";
+import { freeSlots, MAX_FREE_SLOT_RANGE_DAYS, MAX_FREE_SLOTS, workingZone, type BusyInterval } from "../../src/free-slots.js";
 
 const at = (iso: string): number => Date.parse(iso);
 const span = (start: string, end: string): BusyInterval => ({ start: at(start), end: at(end) });
@@ -77,6 +77,41 @@ describe("freeSlots — working hours on every day (R14)", () => {
       { start: "2026-10-05T10:00:00Z", end: "2026-10-05T12:00:00Z" },
       { start: "2026-10-06T08:00:00Z", end: "2026-10-06T10:00:00Z" },
     ]);
+  });
+});
+
+describe("freeSlots — the review of PR #232", () => {
+  it("working hours 0–24 are one window through midnight: a free 23:00–00:30 fits 90 minutes", () => {
+    const busy = [span("2026-10-05T00:00:00Z", "2026-10-05T23:00:00Z"), span("2026-10-06T00:30:00Z", "2026-10-07T00:00:00Z")];
+    const slots = freeSlots(busy, span("2026-10-05T00:00:00Z", "2026-10-07T00:00:00Z"), 90, {
+      workingHours: { startHour: 0, endHour: 24 },
+      timezone: "Europe/Berlin",
+    });
+    assert.deepEqual(slots, [{ start: "2026-10-06T01:00:00+02:00", end: "2026-10-06T02:30:00+02:00" }]);
+  });
+
+  it("never reports a slot that starts before range_start, when range_start has milliseconds", () => {
+    const slots = freeSlots([], span("2026-10-05T09:00:00.500Z", "2026-10-05T10:00:00Z"), 30, { timezone: "UTC" });
+    assert.deepEqual(slots, [{ start: "2026-10-05T09:00:01Z", end: "2026-10-05T10:00:00Z" }]);
+    for (const s of slots) assert.ok(Date.parse(s.start) >= Date.parse("2026-10-05T09:00:00.500Z"), s.start);
+  });
+
+  it("stops at `limit` slots, the earliest, without walking the rest of the range", () => {
+    const started = performance.now();
+    const slots = freeSlots([], span("2026-01-01T00:00:00Z", "9999-01-01T00:00:00Z"), 60, {
+      workingHours: NINE_TO_FIVE,
+      timezone: "Europe/Berlin",
+      limit: 3,
+    });
+    const elapsed = performance.now() - started;
+    assert.equal(slots.length, 3);
+    assert.equal(slots[0].start, "2026-01-01T09:00:00+01:00");
+    assert.ok(elapsed < 1000, `took ${elapsed.toFixed(0)} ms`);
+  });
+
+  it("names its caps: a range of at most 366 days, at most 200 slots", () => {
+    assert.equal(MAX_FREE_SLOT_RANGE_DAYS, 366);
+    assert.equal(MAX_FREE_SLOTS, 200);
   });
 });
 

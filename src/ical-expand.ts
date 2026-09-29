@@ -180,8 +180,10 @@ export function reportedTime(time: ICAL.Time): string {
 
 /**
  * {@link instantOf} for a string {@link reportedTime} produced, so events from
- * different objects sort, and count as busy, by the same rule. `Date.parse`
- * alone would read a floating clock time in the process's own zone.
+ * different objects sort by the same rule: what `list_events` orders its
+ * answer by, and nothing else — `find_free_slot` reads busy time as numbers
+ * (src/ical-busy.ts), never back from these strings. `Date.parse` alone would
+ * read a floating clock time in the process's own zone.
  */
 export function instantOfReported(reported: string): number {
   if (/^\d{4}-\d{2}-\d{2}$/.test(reported)) return Date.parse(`${reported}T00:00:00Z`);

@@ -2157,6 +2157,67 @@ describe("find_free_slot (#213, R14, R15, spec 2026-09-29 §2.7)", SKIP, () => {
     }
   });
 
+  /** Tuesday's event `uid`, 10:00–11:00, an invitation from Anna that `declinedBy` declined. */
+  const declinedBy = (uid: string, address: string): string =>
+    tuesday(uid, "1000", "1100", "ORGANIZER:mailto:anna@example.com", `ATTENDEE;PARTSTAT=DECLINED:mailto:${address}`);
+
+  it("'own' is every address the principal lists and the mailbox's too: an invitation declined under the mailbox frees its time where the principal lists another (review of PR #232)", async () => {
+    const own = await makeRadicaleCalendar();
+    await putRawEvent(own, "declined.ics", declinedBy("declined-mailbox@example.com", MAILBOX));
+    const proxy = await startCalDavProxy({ principalAddresses: ["mailto:me@nextcloud.example"] });
+    try {
+      // The ORGANIZER rule is unchanged: the principal's address alone.
+      const direct = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD }, { address: MAILBOX });
+      assert.deepEqual(await direct.ownAddresses(), ["mailto:me@nextcloud.example"]);
+      const answer = await findFreeSlot(proxy.url, own.user, {
+        calendar_urls: [own.calendarUrl.replace(RADICALE_URL, proxy.url)],
+        ...TUESDAY_9_TO_17,
+      });
+      assert.deepEqual(answer.slots, [{ start: "2026-10-06T09:00:00Z", end: "2026-10-06T17:00:00Z" }]);
+      assert.equal(answer.warning, undefined);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("a failed lookup of the account's addresses is not a refusal, and the warning says declined invitations may have counted as busy (review of PR #232)", async () => {
+    const own = await makeRadicaleCalendar();
+    await putRawEvent(own, "declined.ics", declinedBy("declined-lookup@example.com", "someone-else@example.com"));
+    const proxy = await startCalDavProxy({ failAddressLookups: 100 });
+    try {
+      const answer = await findFreeSlot(proxy.url, own.user, {
+        calendar_urls: [own.calendarUrl.replace(RADICALE_URL, proxy.url)],
+        ...TUESDAY_9_TO_17,
+      });
+      assert.deepEqual(answer.slots, [
+        { start: "2026-10-06T09:00:00Z", end: "2026-10-06T10:00:00Z" },
+        { start: "2026-10-06T11:00:00Z", end: "2026-10-06T17:00:00Z" },
+      ]);
+      assert.deepEqual(answer.skipped, []);
+      assert.match(String(answer.warning), /declined/);
+      assert.match(String(answer.warning), /busy/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("a calendar named twice, with and without its trailing slash, is read once (review of PR #232)", async () => {
+    const own = await makeRadicaleCalendar();
+    await putRawEvent(own, "a-bad.ics", tuesday("bad-twice@example.com", "1000", "1100"));
+    const proxy = await startCalDavProxy({ corruptObject: "a-bad.ics" });
+    try {
+      const url = own.calendarUrl.replace(RADICALE_URL, proxy.url);
+      const answer = await findFreeSlot(proxy.url, own.user, {
+        calendar_urls: [url, url.replace(/\/$/, "")],
+        ...TUESDAY_9_TO_17,
+      });
+      // Read twice, its unreadable object was named twice.
+      assert.equal((answer.skipped as unknown[]).length, 1, "the calendar was read twice");
+    } finally {
+      await proxy.close();
+    }
+  });
+
   it("an object whose rule never returns is skipped at its deadline, and its time is not reported free without the warning", { timeout: 60_000 }, async () => {
     const own = await makeRadicaleCalendar();
     await putRawEvent(own, "a-hangs.ics", tuesday("hangs-free@example.com", "1000", "1100"));
