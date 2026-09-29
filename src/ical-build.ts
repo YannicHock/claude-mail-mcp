@@ -13,7 +13,7 @@
  */
 
 import ICAL from "ical.js";
-import { calendarDate, mailtoOf, timedBound } from "./ical-input.js";
+import { calendarDate, distinctAddresses, mailtoOf, notifyChoice, timedBound } from "./ical-input.js";
 import { parseCalendar } from "./ical-parse.js";
 import { generatedVtimezone, writtenTime, zonedWriteZone, zoneNameOf } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
@@ -28,6 +28,12 @@ export interface NewEventFields {
   end: string;
   allDay?: boolean;
   attendees?: string[];
+  /**
+   * Whether the calendar server may mail the attendees (spec 2026-09-29
+   * §2.1): `false` marks each `SCHEDULE-AGENT=CLIENT`. Required when
+   * `attendees` is non-empty.
+   */
+  notifyAttendees?: boolean;
 }
 
 /**
@@ -43,17 +49,34 @@ export interface NewEventFields {
  * as a wall time it would mean the first pass, an hour earlier, and could
  * land before the start (see `writtenTime` in src/ical-zones.ts).
  *
+ * Attendees (#204, spec 2026-09-29 §2.1): an event with any is written with
+ * `ORGANIZER:<organizer>` — the account's own address, the first of
+ * `ownAddresses` in src/caldav-client.ts — since RFC 5545 expects one
+ * wherever there are attendees, and without it a scheduling server such as
+ * Nextcloud does not treat the event as a meeting at all. Each attendee is a
+ * bare `mailto:`; with `notifyAttendees: false` each carries
+ * `SCHEDULE-AGENT=CLIENT` (RFC 6638 §7.1), which asks the server to send it
+ * nothing. With `true` the server is free to mail them an invitation. An
+ * event with no attendees gets no ORGANIZER, as before.
+ *
  * Throws {@link ToolRefusal} ending in `nothingDone` for a start or end it
- * cannot read, and for an end at or before the start — which until the
- * review of #224 was written as it was given, an event every client shows
- * with no length or backwards.
+ * cannot read, for an end at or before the start — which until the review
+ * of #224 was written as it was given, an event every client shows with no
+ * length or backwards — for attendees without `notifyAttendees`, and for one
+ * address listed twice.
  */
 export function buildIcs(
-  input: NewEventFields & { uid: string },
+  input: NewEventFields & { uid: string; organizer?: string },
   zone: string,
   nothingDone: string,
   now: Date = new Date()
 ): string {
+  const attendees = input.attendees ?? [];
+  const notify = attendees.length > 0 ? notifyChoice(input.notifyAttendees, nothingDone) : true;
+  distinctAddresses(attendees, nothingDone);
+  if (attendees.length > 0 && input.organizer === undefined) {
+    throw new Error("buildIcs: attendees need the account's address as ORGANIZER");
+  }
   const cal = new ICAL.Component(["vcalendar", [], []]);
   cal.updatePropertyWithValue("prodid", "-//claude-mail-mcp//EN");
   cal.updatePropertyWithValue("version", "2.0");
@@ -96,9 +119,15 @@ export function buildIcs(
   if (input.location) {
     vevent.updatePropertyWithValue("location", input.location);
   }
-  for (const a of input.attendees ?? []) {
+  if (attendees.length > 0 && input.organizer !== undefined) {
+    const organizer = new ICAL.Property("organizer");
+    organizer.setValue(mailtoOf(input.organizer));
+    vevent.addProperty(organizer);
+  }
+  for (const a of attendees) {
     const prop = new ICAL.Property("attendee");
     prop.setValue(mailtoOf(a));
+    if (!notify) prop.setParameter("schedule-agent", "CLIENT");
     vevent.addProperty(prop);
   }
   cal.addSubcomponent(vevent);

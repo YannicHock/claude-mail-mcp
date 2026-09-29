@@ -17,6 +17,7 @@
 import ICAL from "ical.js";
 import {
   coverGenerated,
+  patchSeriesAttendees,
   patchText,
   setTime,
   shown,
@@ -27,7 +28,7 @@ import {
 import type { FoundOccurrence } from "./ical-expand.js";
 import { calendarDate, dateMs, isoDate, timedBound } from "./ical-input.js";
 import { seriesFor, type ParsedCalendar } from "./ical-parse.js";
-import { keyOf } from "./ical-series.js";
+import { keyOf, sequenceOf } from "./ical-series.js";
 import {
   addToWall,
   clockSeconds,
@@ -83,8 +84,12 @@ const SUB_DAILY = new Set(["HOURLY", "MINUTELY", "SECONDLY"]);
  * on a Berlin series, say) is read as an instant, moved on the series' clock,
  * and written back in its own zone.
  *
- * Text fields in `patch` go to the master, as `apply_to_series` says. The
- * master and every override that moved get a new revision. A VTIMEZONE this
+ * Text fields in `patch` go to the master, as `apply_to_series` says, and
+ * its attendee changes (#205) to the whole series through
+ * `patchSeriesAttendees` (src/ical-edit.ts), checked before anything moves;
+ * `own` is the account's calendar user addresses, which only an attendee
+ * change needs. The master and every override that moved or whose guest list
+ * changed get a new revision — one, however many of the two reached it. A VTIMEZONE this
  * connector generated is regenerated to cover the series, to its UNTIL or ten
  * years on (`coverGenerated` in src/ical-edit.ts).
  *
@@ -102,7 +107,8 @@ export function shiftSeries(
   anchor: FoundOccurrence | null,
   patch: EventPatch,
   nothingDone: string,
-  now: Date = new Date()
+  now: Date = new Date(),
+  own: readonly string[] = []
 ): EditResult {
   const { vcal } = parsed;
   const { master, overrides } = seriesFor(vcal, uid);
@@ -115,6 +121,10 @@ export function shiftSeries(
       `A series cannot be switched between all-day and timed: every occurrence it has, and every RECURRENCE-ID and EXDATE naming one, would change its form. ${nothingDone}`
     );
   }
+  // The revisions before anything is written, so an override both moved and
+  // given a new guest list is stamped once, not twice.
+  const revisions = new Map(overrides.map((ve) => [ve, sequenceOf(ve)]));
+  const reached = patchSeriesAttendees(master, overrides, patch, own, nothingDone);
   const anchorWall = anchor === null ? wallOf(start) : anchor.wall;
   // The lengths an override is compared against, before anything moves.
   const oldLength = new ICAL.Event(master).duration.toSeconds();
@@ -126,6 +136,7 @@ export function shiftSeries(
   }
   patchText(master, patch);
   const sequence = stampRevision(master, now);
+  for (const ve of reached) if (sequenceOf(ve) === revisions.get(ve)) stampRevision(ve, now);
   return { ics: vcal.toString(), mark: { uid, sequence } };
 }
 

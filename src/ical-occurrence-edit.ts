@@ -8,9 +8,9 @@
  *
  * The rules of src/ical-edit.ts hold here too — the stored object is edited
  * in place, never rebuilt; every refusal ends in the caller's `nothingDone`;
- * a written VEVENT has its revision stamped — and its `patchText`,
- * `patchTimes` and `stampRevision` are what change an override, exactly as
- * they change a main event.
+ * a written VEVENT has its revision stamped — and its `applyAttendeePatch`,
+ * `patchText`, `patchTimes` and `stampRevision` are what change an override,
+ * exactly as they change a main event.
  *
  * Split out of src/ical-edit.ts in the code-health review of PR #229, which
  * also found the one-occurrence writes ignoring `RANGE=THISANDFUTURE`: the
@@ -20,6 +20,7 @@
 
 import ICAL from "ical.js";
 import {
+  applyAttendeePatch,
   patchText,
   patchTimes,
   stampRevision,
@@ -258,9 +259,16 @@ function overrideAt(vcal: ICAL.Component, uid: string, index: number): ICAL.Comp
  * taken out of its reach before the patch is applied
  * ({@link detachRangeAnchor}), or the refusal that explains why it cannot be.
  *
+ * Attendees (#205): `add_attendees` and `remove_attendees` change this
+ * occurrence's guest list alone — the override's ATTENDEEs, which it took
+ * from the master when it was made — through {@link applyAttendeePatch},
+ * with `own` the account's calendar user addresses. An invitation to one
+ * instance of someone else's series is refused there, as their meeting.
+ *
  * Refused, ending in `nothingDone`: switching one occurrence between all-day
  * and timed — it keeps the form of its series, whose RECURRENCE-ID must
- * match the master's — and whatever {@link patchTimes} refuses.
+ * match the master's — whatever {@link applyAttendeePatch} refuses, and
+ * whatever {@link patchTimes} refuses.
  */
 export function applyOccurrencePatch(
   parsed: ParsedCalendar,
@@ -268,7 +276,8 @@ export function applyOccurrencePatch(
   occurrence: FoundOccurrence,
   patch: EventPatch,
   nothingDone: string,
-  now: Date = new Date()
+  now: Date = new Date(),
+  own: readonly string[] = []
 ): EditResult {
   const { vcal } = parsed;
   if (patch.allDay !== undefined && patch.allDay !== occurrence.isDate) {
@@ -293,6 +302,7 @@ export function applyOccurrencePatch(
         : overrideFromRange(master, overrideAt(vcal, uid, occurrence.range), occurrence);
     vcal.addSubcomponent(target);
   }
+  applyAttendeePatch(target, patch, own, nothingDone);
   patchText(target, patch);
   if (touchesTime(patch)) patchTimes(target, patch, nothingDone);
   const sequence = stampRevision(target, now);

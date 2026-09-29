@@ -125,6 +125,41 @@ test("tools/list returns exactly the 16 registered tools", async () => {
   }
 });
 
+test("create_event and update_event list notify_attendees, and a call with attendees but without it is refused before the handler runs (spec 2026-09-29 §2.1)", async () => {
+  const { client, transport } = connectedClient();
+  try {
+    await client.connect(transport);
+    const { tools } = await client.listTools();
+    for (const name of ["create_event", "update_event"]) {
+      const properties = tools.find((t) => t.name === name)?.inputSchema.properties ?? {};
+      assert.ok("notify_attendees" in properties, `${name} does not list notify_attendees`);
+    }
+    // The account has no CalDAV: had the call reached the handler, it would
+    // have been refused for that instead.
+    let message: string;
+    try {
+      const result = await client.callTool({
+        name: "create_event",
+        arguments: {
+          calendar_url: "https://dav.example/cal/",
+          summary: "Planning",
+          start: "2026-10-01T09:00:00Z",
+          end: "2026-10-01T10:00:00Z",
+          attendees: ["ben@example.com"],
+        },
+      });
+      assert.equal(result.isError, true, "the call was accepted");
+      message = JSON.stringify(result.content);
+    } catch (err) {
+      message = String(err);
+    }
+    assert.match(message, /notify_attendees is required/);
+    assert.doesNotMatch(message, /no CalDAV configured/);
+  } finally {
+    await client.close();
+  }
+});
+
 test("GET /health reports the configured accounts without passwords", async () => {
   const res = await fetch(`${app.url}/health`);
   assert.equal(res.status, 200);
