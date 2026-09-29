@@ -107,21 +107,6 @@ export function describeSeries({ master, overrides }: Series): StoredEventShape 
   return { found: true, recurring, overrideOnly: master === undefined };
 }
 
-/** {@link describeSeries} for `uid` in the text `ics`, parsed here. */
-export function describeStoredEvent(ics: string, uid: string): StoredEventShape {
-  return describeSeries(seriesFor(parseCalendar(ics).vcal, uid));
-}
-
-/**
- * The SEQUENCE of the main VEVENT for `uid` (see {@link sequenceOf}), or null
- * when the object holds no main VEVENT for it. Lets a read-back after a write
- * tell its own version from one written since.
- */
-export function mainSequence(ics: string, uid: string): number | null {
-  const { master } = seriesFor(parseCalendar(ics).vcal, uid);
-  return master === undefined ? null : sequenceOf(master);
-}
-
 /**
  * What a write made, for the read-back that follows it: the new object's
  * text, and the {@link WriteMark} by which that version is told from one

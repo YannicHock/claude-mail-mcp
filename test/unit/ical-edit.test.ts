@@ -15,15 +15,15 @@ import ICAL from "ical.js";
 import {
   applyEventPatch,
   changesSomething,
-  describeStoredEvent,
-  mainSequence,
+  describeSeries,
   touchesTime,
+  writtenBy,
   type EventPatch,
 } from "../../src/ical-edit.js";
 import { ToolRefusal } from "../../src/tool-errors.js";
 import { buildIcs } from "../../src/ical-build.js";
-import { parseCalendar } from "../../src/ical-parse.js";
-import { sequenceOf } from "../../src/ical-series.js";
+import { parseCalendar, seriesFor } from "../../src/ical-parse.js";
+import { keyOf, sequenceOf } from "../../src/ical-series.js";
 
 const NOW = new Date("2026-09-28T12:00:00Z");
 
@@ -147,7 +147,17 @@ function iso(time: unknown): string {
   return (time as ICAL.Time).toJSDate().toISOString();
 }
 
-describe("describeStoredEvent", () => {
+/**
+ * `describeSeries` for `uid` in `text`, found the way `CalDavClient` finds it:
+ * one `parseCalendar`, then `seriesFor`. (A `describeStoredEvent` that did
+ * this inside src/ical-edit.ts existed for these tests alone, and was dropped
+ * in the code-health review of PR #229.)
+ */
+function describeStoredEvent(text: string, uid: string): ReturnType<typeof describeSeries> {
+  return describeSeries(seriesFor(parseCalendar(text).vcal, uid));
+}
+
+describe("describeSeries", () => {
   it("finds a plain event and calls it not recurring", () => {
     assert.deepEqual(describeStoredEvent(RICH, "rich-1@example.com"), {
       found: true,
@@ -510,28 +520,42 @@ describe("touchesTime / changesSomething", () => {
   });
 });
 
-describe("mainSequence (PR 3 review)", () => {
+describe("writtenBy — the read-back's test for its own write (PR 3 review, #214)", () => {
   it("reads the main VEVENT's SEQUENCE, treating an absent one as 0", () => {
-    assert.equal(mainSequence(RICH, "rich-1@example.com"), 2);
-    assert.equal(mainSequence(ALL_DAY, "allday-1@example.com"), 0);
+    assert.equal(writtenBy(RICH, { uid: "rich-1@example.com", sequence: 2 }), true);
+    assert.equal(writtenBy(RICH, { uid: "rich-1@example.com", sequence: 3 }), false);
+    assert.equal(writtenBy(ALL_DAY, { uid: "allday-1@example.com", sequence: 0 }), true);
   });
 
-  it("answers null for a UID the object does not hold", () => {
-    assert.equal(mainSequence(RICH, "someone-else@example.com"), null);
+  it("is false for a UID the object does not hold, and for text that is not iCalendar", () => {
+    assert.equal(writtenBy(RICH, { uid: "someone-else@example.com", sequence: 2 }), false);
+    assert.equal(writtenBy("not a calendar", { uid: "rich-1@example.com", sequence: 2 }), false);
+  });
+
+  it("knows an override's write by that override's SEQUENCE, not the master's", () => {
+    // The master at SEQUENCE 0 (absent), its one override at 7.
+    const text = SERIES.replace("RECURRENCE-ID:20261008T090000Z", "RECURRENCE-ID:20261008T090000Z\r\nSEQUENCE:7");
+    const [override] = seriesFor(parseCalendar(text).vcal, "series-1@example.com").overrides;
+    const key = keyOf(new ICAL.Event(override).recurrenceId, false);
+    assert.equal(writtenBy(text, { uid: "series-1@example.com", sequence: 7, override: key }), true);
+    assert.equal(writtenBy(text, { uid: "series-1@example.com", sequence: 0, override: key }), false);
+    assert.equal(writtenBy(text, { uid: "series-1@example.com", sequence: 0 }), true);
   });
 });
 
 describe("sequenceOf (#214)", () => {
-  it("is the reading both mainSequence and applyEventPatch use: absent or garbage is 0", () => {
+  it("is the reading both writtenBy and applyEventPatch use: absent or garbage is 0", () => {
     const withSequence = (value: string | null): ICAL.Component => {
       const text = value === null ? ALL_DAY : ALL_DAY.replace("SUMMARY:", `SEQUENCE:${value}\r\nSUMMARY:`);
       return master(text, "allday-1@example.com");
     };
     assert.equal(sequenceOf(withSequence(null)), 0);
     assert.equal(sequenceOf(withSequence("4")), 4);
-    // What applyEventPatch writes is what mainSequence then reads back.
-    const written = patched(RICH, "rich-1@example.com", { summary: "x" }, NOW);
-    assert.equal(mainSequence(written, "rich-1@example.com"), sequenceOf(master(RICH, "rich-1@example.com")) + 1);
+    assert.equal(sequenceOf(withSequence("garbage")), 0);
+    // What applyEventPatch writes is what writtenBy then reads back.
+    const edit = applyEventPatch(parseCalendar(RICH), "rich-1@example.com", { summary: "x" }, "Nothing was changed.", NOW);
+    assert.deepEqual(edit.mark, { uid: "rich-1@example.com", sequence: sequenceOf(master(RICH, "rich-1@example.com")) + 1 });
+    assert.equal(edit.mark !== null && writtenBy(edit.ics, edit.mark), true);
   });
 });
 
