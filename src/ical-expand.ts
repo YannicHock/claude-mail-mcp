@@ -32,12 +32,28 @@
  * walked before the window starts — a `FREQ=MINUTELY` rule from years ago is
  * millions of steps short of today. Hitting either is said in `skipped`.
  *
+ * Neither bound can stop ical.js inside one step, and it can stay there for
+ * ever: `RecurIterator.next` gives up on a rule that matches nothing only for
+ * MONTHLY and YEARLY (review of #223). {@link impossibleRule} refuses the
+ * common such rule before it is walked; the guarantee is that nothing here
+ * runs on the connector's own thread in production — `CalDavClient` calls
+ * {@link expandObject} through src/ical-worker-pool.ts, which stops a worker
+ * at its deadline. This module stays synchronous and pure, so the unit tests
+ * call it directly.
+ *
+ * Overrides are matched to occurrences here, by instant (by date for an
+ * all-day series), not by ical.js, which compares the text of a
+ * RECURRENCE-ID and so lost an override written in another zone or as a
+ * midnight DATE-TIME; one that matches nothing the walk met is listed at its
+ * own time (see {@link occurrencesIn}).
+ *
  * What a later change builds on: {@link occurrencesIn} is the expansion with
  * the ical.js values still attached, and {@link reportedTime} is the one place
  * a time becomes the string `list_events` hands out. Addressing one
  * occurrence (#206, spec §2.3) matches a caller's `recurrence_id` against
  * `reportedTime(occurrence.recurrenceId)` from the same expansion — matched,
- * never constructed.
+ * never constructed — and, since it walks the rule, runs as an operation of
+ * src/ical-worker-ops.ts, never on the calling thread.
  */
 
 import ICAL from "ical.js";
@@ -50,9 +66,12 @@ export const MAX_OCCURRENCES_PER_OBJECT = 1000;
 /**
  * Steps of a recurrence rule walked per object, inside the window or before
  * it, before giving up. ical.js walks a rule from its DTSTART, at roughly
- * 10 µs a step: a daily series begun in 1990 is about 13,000 steps from today,
- * an hourly one begun in 2021 about 50,000. A minutely one begun then is
- * millions, and is given up on after about half a second.
+ * 12 µs a step in UTC and 15–22 µs in a zone (a VTIMEZONE, or `Intl` since
+ * its offsets are remembered): a daily series begun in 1990 is about 13,000
+ * steps from today, an hourly one begun in 2021 about 50,000. A minutely one
+ * begun then is millions, and is given up on after 0.6–1.1 s. Counted between
+ * `next()` calls, so it cannot stop a rule stuck inside one; the worker's
+ * deadline does (src/ical-worker-pool.ts).
  */
 export const MAX_STEPS_PER_OBJECT = 50_000;
 
@@ -165,25 +184,106 @@ function inWindow(start: ICAL.Time, end: ICAL.Time, window: ExpandWindow): boole
   return s >= window.start && s < window.end;
 }
 
+/** The most days each month can have, February's in a leap year. */
+const LONGEST_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/**
+ * Why `recur` can never match a date, or null when it can — checked before a
+ * rule is walked, because ical.js cannot be trusted to find out by walking it.
+ *
+ * `RecurIterator.next` gives up on a rule that matches nothing only for
+ * MONTHLY and YEARLY. For DAILY, HOURLY, MINUTELY and SECONDLY it keeps
+ * stepping inside one `next()` call for ever, so {@link MAX_STEPS_PER_OBJECT},
+ * which counts `next()` calls, never gets a say: `FREQ=DAILY;BYMONTH=2;
+ * BYMONTHDAY=30` froze the whole connector (review of #223). An invitation
+ * a server files on its own is enough to plant one.
+ *
+ * This is the cheap answer to the common shape — a day of the month that none
+ * of the months given has — and nothing more. The guarantee is the deadline
+ * src/ical-worker-pool.ts runs every expansion under, which also catches the
+ * shapes this does not (`BYWEEKNO=1;BYMONTH=6`), and a rule that does match
+ * but so rarely that one `next()` walks for minutes.
+ */
+export function impossibleRule(recur: ICAL.Recur): string | null {
+  const months = recur.parts.BYMONTH;
+  const days = recur.parts.BYMONTHDAY;
+  if (months === undefined || months.length === 0 || days === undefined || days.length === 0) return null;
+  const longest = Math.max(...months.map((m) => LONGEST_MONTH[m - 1] ?? 0));
+  if (days.some((d) => d !== 0 && Math.abs(d) <= longest)) return null;
+  return `BYMONTHDAY=${days.join(",")} is a day none of BYMONTH=${months.join(",")} has`;
+}
+
+/**
+ * What an occurrence of a series is matched by: the date for an all-day
+ * series (or a DATE value), and the instant otherwise. ical.js matches an
+ * override to an occurrence by the text of its RECURRENCE-ID, wall clock or
+ * UTC, so one written in another zone, or as a midnight DATE-TIME for an
+ * all-day series, matched nothing — and the master's occurrence was listed at
+ * the old time while the override vanished (review of #223).
+ */
+function keyOf(time: ICAL.Time, allDay: boolean): string {
+  if (allDay || time.isDate) return `${time.year}-${time.month}-${time.day}`;
+  return String(instantOf(time));
+}
+
+/** True for an override that also moves every later occurrence (`RANGE=THISANDFUTURE`). */
+function modifiesFuture(ve: ICAL.Component): boolean {
+  const range = ve.getFirstProperty("recurrence-id")?.getParameter("range");
+  return typeof range === "string" && range.toUpperCase() === "THISANDFUTURE";
+}
+
+/**
+ * Take `RDATE;VALUE=PERIOD` apart before ical.js sees it: its iterator expects
+ * a time in every RDATE value and threw `time.toUnixTime is not a function` on
+ * a period, which skipped the whole object. Each period's start becomes a
+ * plain RDATE, in memory only, and the period is returned by the start's
+ * {@link keyOf} so its occurrence can be given the period's own end.
+ */
+function periodsOf(master: ICAL.Component, allDay: boolean): Map<string, ICAL.Period> {
+  const periods = new Map<string, ICAL.Period>();
+  for (const prop of master.getAllProperties("rdate")) {
+    const values = prop.getValues() as unknown[];
+    if (!values.some((v) => v instanceof ICAL.Period)) continue;
+    master.removeProperty(prop);
+    for (const value of values) {
+      const start = value instanceof ICAL.Period ? value.start : (value as ICAL.Time);
+      if (value instanceof ICAL.Period) periods.set(keyOf(start, allDay), value);
+      const plain = new ICAL.Property("rdate", master);
+      plain.setValue(start);
+      master.addProperty(plain);
+    }
+  }
+  return periods;
+}
+
 /**
  * Every occurrence in `vcal` that overlaps `window`, earliest first, with at
  * most `cap` of them. `vcal` must have come from `parseCalendar`
- * (src/ical-parse.ts), which resolves its zones.
+ * (src/ical-parse.ts), which resolves its zones. The master VEVENTs in it are
+ * changed in memory (an impossible RRULE dropped, a PERIOD RDATE split): it
+ * is for reading, never for writing back.
  *
- * Per UID: a master that does not recur is one occurrence; a master that does
- * is walked with its own overrides; overrides with no master (R3) are each an
- * occurrence of a series that lives elsewhere.
+ * Per UID: a master is walked with its own overrides (one that does not recur
+ * is one occurrence); overrides with no master (R3) are each an occurrence of
+ * a series that lives elsewhere.
  *
- * An override is found wherever it moved. One moved into the window from an
- * earlier occurrence is met on the walk; one moved in from an occurrence after
- * the window is picked up once the walk stops there; one moved out is left out.
+ * An override replaces the occurrence whose start it names, matched by
+ * {@link keyOf} here rather than by ical.js. One that replaces no occurrence
+ * the walk met — moved in from after the window, its occurrence also in
+ * EXDATE, or naming a start the series never had — is listed at its own
+ * DTSTART when that is in the window: it is an event the organizer sent, and
+ * dropping it was how overrides silently disappeared.
+ *
+ * `notes` says what was left out of the walk, for `skipped`: today, a rule
+ * {@link impossibleRule} refused.
  */
 export function occurrencesIn(
   vcal: ICAL.Component,
   window: ExpandWindow,
   cap: number = MAX_OCCURRENCES_PER_OBJECT
-): { occurrences: Occurrence[]; truncated: boolean; gaveUp: boolean } {
+): { occurrences: Occurrence[]; truncated: boolean; gaveUp: boolean; notes: string[] } {
   const found: Occurrence[] = [];
+  const notes: string[] = [];
   let truncated = false;
   let gaveUp = false;
   const add = (o: Occurrence): boolean => {
@@ -205,24 +305,37 @@ export function occurrencesIn(
       continue;
     }
 
-    // `exceptions` given explicitly: left to itself, ical.js relates every
-    // override in the object to the master, whatever its UID.
-    const event = new ICAL.Event(master, { exceptions: overrides });
-    if (!event.isRecurring()) {
-      add({ uid, recurrenceId: null, start: event.startDate, end: event.endDate, vevent: master });
-      continue;
+    const recurs = master.hasProperty("rrule") || master.hasProperty("rdate");
+    for (const prop of master.getAllProperties("rrule")) {
+      const why = impossibleRule(prop.getFirstValue() as ICAL.Recur);
+      if (why === null) continue;
+      master.removeProperty(prop);
+      notes.push(`Its recurrence rule can never match a date (${why}), so only its start and any RDATE are listed.`);
+    }
+    const allDay = (master.getFirstPropertyValue("dtstart") as ICAL.Time | null)?.isDate === true;
+    const periods = periodsOf(master, allDay);
+
+    // Only the RANGE=THISANDFUTURE overrides go to ical.js, for the shift they
+    // make to every later occurrence; every exact match is made here, by
+    // `keyOf`. Given none at all, ical.js relates every override in the
+    // object to the master, whatever its UID.
+    const event = new ICAL.Event(master, { exceptions: overrides.filter(modifiesFuture) });
+    const byKey = new Map<string, ICAL.Component>();
+    for (const ve of overrides) {
+      const key = keyOf(new ICAL.Event(ve).recurrenceId, allDay);
+      if (!byKey.has(key)) byKey.set(key, ve);
     }
 
     const iterator = event.iterator();
     const met = new Set<ICAL.Component>();
     // Walking up to the window is most of the work for an old series; an
-    // occurrence that ends well before it, with no override to move it, is
-    // passed over without asking ical.js for its details. A day of margin
-    // covers a length that a DST change stretches.
+    // occurrence that ends well before it, with no override or period to
+    // move or stretch it, is passed over without asking for its details. A
+    // day of margin covers a length that a DST change stretches.
     const lengthMs = event.duration.toSeconds() * 1000;
-    const passOver = overrides.length === 0 ? window.start - lengthMs - 86_400_000 : -Infinity;
+    const passOver =
+      overrides.length === 0 && periods.size === 0 ? window.start - lengthMs - 86_400_000 : -Infinity;
     let steps = 0;
-    let reachedWindowEnd = false;
     for (let next = iterator.next(); next; next = iterator.next()) {
       if (++steps > MAX_STEPS_PER_OBJECT) {
         gaveUp = true;
@@ -230,27 +343,41 @@ export function occurrencesIn(
       }
       const at = instantOf(next);
       if (at < passOver) continue;
-      if (at >= window.end) {
-        reachedWindowEnd = true;
-        break;
+      if (at >= window.end) break;
+      const recurrenceId = recurs ? next.clone() : null;
+      const key = keyOf(next, allDay);
+      const override = byKey.get(key);
+      let occurrence: Occurrence;
+      if (override !== undefined) {
+        met.add(override);
+        const moved = new ICAL.Event(override);
+        occurrence = { uid, recurrenceId, start: moved.startDate, end: moved.endDate, vevent: override };
+      } else {
+        const details = event.getOccurrenceDetails(next);
+        const period = periods.get(key);
+        let end = details.endDate;
+        if (period !== undefined && details.item.component === master) {
+          if (period.end) {
+            end = period.end;
+          } else {
+            end = next.clone();
+            end.addDuration(period.duration);
+          }
+        }
+        occurrence = { uid, recurrenceId, start: details.startDate, end, vevent: details.item.component };
       }
-      const details = event.getOccurrenceDetails(next);
-      const vevent = details.item.component;
-      met.add(vevent);
-      if (!add({ uid, recurrenceId: next.clone(), start: details.startDate, end: details.endDate, vevent })) break;
+      if (!add(occurrence)) break;
     }
-    if (reachedWindowEnd && !truncated) {
-      for (const ve of overrides) {
-        if (met.has(ve)) continue;
-        const moved = new ICAL.Event(ve);
-        if (instantOf(moved.recurrenceId) < window.end) continue;
-        if (!add({ uid, recurrenceId: moved.recurrenceId, start: moved.startDate, end: moved.endDate, vevent: ve })) break;
-      }
+    if (truncated) continue;
+    for (const ve of overrides) {
+      if (met.has(ve)) continue;
+      const own = new ICAL.Event(ve);
+      if (!add({ uid, recurrenceId: own.recurrenceId, start: own.startDate, end: own.endDate, vevent: ve })) break;
     }
   }
 
   found.sort((a, b) => instantOf(a.start) - instantOf(b.start));
-  return { occurrences: found, truncated, gaveUp };
+  return { occurrences: found, truncated, gaveUp, notes };
 }
 
 /** An error's message, on one line and bounded, for `skipped`. */
@@ -306,21 +433,20 @@ export function expandObject(ics: string, window: ExpandWindow, opts: ExpandOpti
       };
     }
     const cap = opts.cap ?? MAX_OCCURRENCES_PER_OBJECT;
-    const { occurrences, truncated, gaveUp } = occurrencesIn(vcal, window, cap);
+    const { occurrences, truncated, gaveUp, notes } = occurrencesIn(vcal, window, cap);
     const instances = occurrences.map((o) => toInstance(o, opts));
+    const reasons = [...notes];
     if (truncated) {
-      return {
-        instances,
-        skipped: `It recurs more than ${cap} occurrences in this window; only the first ${cap} are listed. Ask for a shorter window to see the rest.`,
-      };
+      reasons.push(
+        `It recurs more than ${cap} occurrences in this window; only the first ${cap} are listed. Ask for a shorter window to see the rest.`
+      );
     }
     if (gaveUp) {
-      return {
-        instances,
-        skipped: `Its recurrence rule was walked ${MAX_STEPS_PER_OBJECT} steps from its start and still had not reached the end of this window, so the connector gave up on it. Occurrences after that point are not listed.`,
-      };
+      reasons.push(
+        `Its recurrence rule was walked ${MAX_STEPS_PER_OBJECT} steps from its start and still had not reached the end of this window, so the connector gave up on it. Occurrences after that point are not listed.`
+      );
     }
-    return { instances };
+    return reasons.length === 0 ? { instances } : { instances, skipped: reasons.join(" ") };
   } catch (err) {
     return { instances: [], skipped: `The stored object could not be read as a calendar event: ${reasonFrom(err)}` };
   }

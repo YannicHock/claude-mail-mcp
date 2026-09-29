@@ -150,6 +150,13 @@ export interface CalDavProxyOptions {
    */
   corruptObject?: string;
   /**
+   * What `corruptObject` is replaced by, instead of the unparseable text: an
+   * object Radicale itself could not be trusted to store or to answer a
+   * time-range query for, such as a recurrence rule ical.js never returns
+   * from (review of #223).
+   */
+  corruptWith?: string;
+  /**
    * Hand out every ETag weak, `W/"…"`, in headers and in `getetag` — what a
    * proxy that compresses the answer does to a strong one (nginx with gzip
    * does). Requests are passed on untouched, so an `If-Match` naming a weak
@@ -203,13 +210,13 @@ const UNPARSEABLE = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nX-FOO;BAR:val\nEND:VEVENT\nE
  * `<response>` to the front. Radicale answers with an unprefixed DAV
  * namespace and `C:` for CalDAV, but the match allows any prefix.
  */
-function plantCorruptObject(xml: string, name: string): { xml: string; planted: boolean } {
+function plantCorruptObject(xml: string, name: string, data: string = UNPARSEABLE): { xml: string; planted: boolean } {
   const responses = [...xml.matchAll(/<(?:\w+:)?response>[\s\S]*?<\/(?:\w+:)?response>/g)].map((m) => m[0]);
   const index = responses.findIndex((r) => new RegExp(`<(?:\\w+:)?href>[^<]*/${name.replace(/\./g, "\\.")}</`).test(r));
   if (index === -1) return { xml, planted: false };
   const corrupt = responses[index].replace(
     /(<(\w+:)?calendar-data[^>]*>)[\s\S]*?(<\/(\w+:)?calendar-data>)/,
-    (_m, open: string, _p: string, close: string) => `${open}${UNPARSEABLE}${close}`
+    (_m, open: string, _p: string, close: string) => `${open}${data.replaceAll("&", "&amp;").replaceAll("<", "&lt;")}${close}`
   );
   const reordered = [corrupt, ...responses.filter((_, i) => i !== index)];
   const first = xml.indexOf(responses[0]);
@@ -307,7 +314,7 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
           payload = Buffer.from(xml, "utf8");
         }
         if (options.corruptObject !== undefined && req.method === "REPORT") {
-          const { xml, planted } = plantCorruptObject(payload.toString("utf8"), options.corruptObject);
+          const { xml, planted } = plantCorruptObject(payload.toString("utf8"), options.corruptObject, options.corruptWith);
           if (planted) {
             corrupted += 1;
             payload = Buffer.from(xml, "utf8");

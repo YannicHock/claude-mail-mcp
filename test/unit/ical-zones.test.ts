@@ -92,6 +92,42 @@ describe("Intl round trips, 2026–2030", () => {
   });
 });
 
+describe("utcOffsetMs — remembered per zone and year, still Intl's answer (review of #223)", () => {
+  /** Intl's own answer, asked every time: what utcOffsetMs said before it remembered. */
+  function asked(ms: number, tz: string): number {
+    const w = instantToZonedWall(ms, tz);
+    return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) - Math.floor(ms / 1000) * 1000;
+  }
+
+  // Lord Howe moves by 30 minutes; Kathmandu is +05:45 and changed once, in
+  // 1986; Casablanca suspends DST for Ramadan; 1916 is Berlin's first DST.
+  const cases: Array<[string, number[]]> = [
+    ["Europe/Berlin", [1916, 1990, 2026]],
+    ["Australia/Lord_Howe", [2026]],
+    ["Asia/Kathmandu", [1986]],
+    ["Africa/Casablanca", [2026]],
+    ["America/Sao_Paulo", [2018]],
+  ];
+  for (const [tz, years] of cases) {
+    it(`${tz} in ${years.join(", ")}: the same offset as asking Intl, every 37 minutes of the year`, () => {
+      for (const year of years) {
+        for (let ms = Date.UTC(year, 0, 1); ms < Date.UTC(year + 1, 0, 1); ms += 37 * 60_000) {
+          assert.equal(utcOffsetMs(ms, tz), asked(ms, tz), `${tz} ${new Date(ms).toISOString()}`);
+        }
+      }
+    });
+  }
+
+  it("changes on the exact second of a transition", () => {
+    const change = at("2026-03-29T01:00:00Z");
+    assert.equal(utcOffsetMs(change - 1000, "Europe/Berlin"), 3600_000);
+    assert.equal(utcOffsetMs(change, "Europe/Berlin"), 7200_000);
+    const lordHowe = at("2026-04-04T15:00:00Z");
+    assert.equal(utcOffsetMs(lordHowe - 1000, "Australia/Lord_Howe"), 11 * 3600_000);
+    assert.equal(utcOffsetMs(lordHowe, "Australia/Lord_Howe"), 10.5 * 3600_000);
+  });
+});
+
 describe("resolveUnknownTzid", () => {
   it("accepts an IANA name as it is", () => {
     assert.equal(resolveUnknownTzid("Europe/Berlin"), "Europe/Berlin");
