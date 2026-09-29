@@ -15,12 +15,15 @@
  */
 
 import ICAL from "ical.js";
+import { patchSeriesAttendees } from "./ical-attendees.js";
 import {
   coverGenerated,
+  mayNotifyOf,
   patchText,
   setTime,
   shown,
   stampRevision,
+  type EditContext,
   type EditResult,
   type EventPatch,
 } from "./ical-edit.js";
@@ -83,8 +86,12 @@ const SUB_DAILY = new Set(["HOURLY", "MINUTELY", "SECONDLY"]);
  * on a Berlin series, say) is read as an instant, moved on the series' clock,
  * and written back in its own zone.
  *
- * Text fields in `patch` go to the master, as `apply_to_series` says. The
- * master and every override that moved get a new revision. A VTIMEZONE this
+ * Text fields in `patch` go to the master, as `apply_to_series` says, and
+ * its attendee changes (#205) to the whole series through
+ * `patchSeriesAttendees` (src/ical-attendees.ts), checked before anything
+ * moves; `ctx.own` is the account's calendar user addresses, which only an
+ * attendee change needs. The master and every override that moved or whose guest list
+ * changed get a new revision — one, however many of the two reached it. A VTIMEZONE this
  * connector generated is regenerated to cover the series, to its UNTIL or ten
  * years on (`coverGenerated` in src/ical-edit.ts).
  *
@@ -101,9 +108,9 @@ export function shiftSeries(
   uid: string,
   anchor: FoundOccurrence | null,
   patch: EventPatch,
-  nothingDone: string,
-  now: Date = new Date()
+  ctx: EditContext
 ): EditResult {
+  const { nothingDone, now, own } = ctx;
   const { vcal } = parsed;
   const { master, overrides } = seriesFor(vcal, uid);
   if (master === undefined) throw new Error(`shiftSeries: no main VEVENT for UID ${uid}`);
@@ -115,21 +122,32 @@ export function shiftSeries(
       `A series cannot be switched between all-day and timed: every occurrence it has, and every RECURRENCE-ID and EXDATE naming one, would change its form. ${nothingDone}`
     );
   }
+  // Every override this write changes, for any reason, collected here and
+  // stamped once at the end: one moved and given a new guest list gets one
+  // new revision, not two.
+  const guests = patchSeriesAttendees(master, overrides, patch, own, nothingDone);
+  const touched = new Set<ICAL.Component>(guests?.changed ?? []);
   const anchorWall = anchor === null ? wallOf(start) : anchor.wall;
   // The lengths an override is compared against, before anything moves.
   const oldLength = new ICAL.Event(master).duration.toSeconds();
 
   if (allDay) {
-    shiftAllDaySeries(master, overrides, anchorWall, patch, oldLength, nothingDone, now);
+    shiftAllDaySeries(master, overrides, anchorWall, patch, oldLength, nothingDone, touched);
   } else {
-    shiftTimedSeries(master, overrides, anchorWall, patch, oldLength, nothingDone, now);
+    shiftTimedSeries(master, overrides, anchorWall, patch, oldLength, nothingDone, touched);
   }
   patchText(master, patch);
   const sequence = stampRevision(master, now);
-  return { ics: vcal.toString(), mark: { uid, sequence } };
+  touched.delete(master);
+  for (const ve of touched) stampRevision(ve, now);
+  return { ics: vcal.toString(), mark: { uid, sequence }, ...mayNotifyOf(guests) };
 }
 
-/** The part of {@link shiftSeries} for an all-day series: no new day, and a new length in whole days. */
+/**
+ * The part of {@link shiftSeries} for an all-day series: no new day, and a
+ * new length in whole days. Every override it changes is added to `touched`,
+ * whose revisions the caller stamps.
+ */
 function shiftAllDaySeries(
   master: ICAL.Component,
   overrides: ICAL.Component[],
@@ -137,7 +155,7 @@ function shiftAllDaySeries(
   patch: EventPatch,
   oldLength: number,
   nothingDone: string,
-  now: Date
+  touched: Set<ICAL.Component>
 ): void {
   const anchorDay = dayOf(anchorWall);
   if (patch.start !== undefined) {
@@ -164,7 +182,7 @@ function shiftAllDaySeries(
   for (const ve of overrides) {
     if (!unrescheduled(ve, oldLength, true)) continue;
     lengthen(ve);
-    stampRevision(ve, now);
+    touched.add(ve);
   }
 }
 
@@ -184,7 +202,7 @@ function dayChanged(given: string, day: string, anchorDay: string, nothingDone: 
   );
 }
 
-/** The part of {@link shiftSeries} for a timed series. */
+/** The part of {@link shiftSeries} for a timed series; every override it changes is added to `touched`. */
 function shiftTimedSeries(
   master: ICAL.Component,
   overrides: ICAL.Component[],
@@ -192,7 +210,7 @@ function shiftTimedSeries(
   patch: EventPatch,
   oldLength: number,
   nothingDone: string,
-  now: Date
+  touched: Set<ICAL.Component>
 ): void {
   const startProp = master.getFirstProperty("dtstart") as ICAL.Property;
   const endProp = master.getFirstProperty("dtend");
@@ -296,7 +314,7 @@ function shiftTimedSeries(
       }
       changed ||= delta !== 0;
     }
-    if (changed) stampRevision(ve, now);
+    if (changed) touched.add(ve);
   }
 
   coverGenerated(master.parent, [zone, endZone]);

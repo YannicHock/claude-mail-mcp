@@ -100,7 +100,9 @@ export class ClientPool {
       }
     );
     // The pool's logger, so a write that succeeded but could not read its new
-    // ETag back says so once in the log (#210.4).
+    // ETag back says so once in the log (#210.4). And the mailbox's address,
+    // which is the account's own calendar address wherever the server lists
+    // none (#204, spec 2026-09-29 §2.1, R13).
     const caldav = account.caldav
       ? new CalDavClient(
           {
@@ -108,7 +110,7 @@ export class ClientPool {
             user: account.caldav.user,
             pass: account.caldav.pass,
           },
-          { log: this.log, accountId: account.id }
+          { log: this.log, accountId: account.id, address: account.mail.defaultFrom }
         )
       : null;
     return {

@@ -187,6 +187,15 @@ export interface CalDavProxyOptions {
    */
   createdOnOverwrite?: boolean;
   /**
+   * Answer `503 Service Unavailable` to the first this many PROPFINDs asking
+   * for `calendar-user-address-set` — the account's own addresses — and pass
+   * the rest on: a server that fails for a moment and then answers (review
+   * of PR #230). tsdav turns such a 503 into the same error as a principal
+   * that lists no address, which the connector once took for "no address"
+   * and cached for the client's lifetime.
+   */
+  failAddressLookups?: number;
+  /**
    * Run before a request is forwarded, e.g. to delete an event between the
    * connector's lookup and its write.
    */
@@ -258,6 +267,7 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
   let stripped = 0;
   let corrupted = 0;
   let starRefused = 0;
+  let failedLookups = 0;
   const log: ProxiedRequest[] = [];
   const { createServer } = await import("node:http");
   const upstream = new URL(RADICALE_URL);
@@ -286,6 +296,16 @@ export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promis
       };
       (async () => {
         await options.before?.(seen);
+        if (
+          req.method === "PROPFIND" &&
+          failedLookups < (options.failAddressLookups ?? 0) &&
+          body?.toString("utf8").includes("calendar-user-address-set")
+        ) {
+          failedLookups += 1;
+          res.writeHead(503, "Service Unavailable", { "content-type": "text/plain", "content-length": "11" });
+          res.end("unavailable");
+          return;
+        }
         if (ifMatch?.trim() === "*" && (req.method === "PUT" || req.method === "DELETE")) {
           if (options.starIfMatchBroken && req.method === "PUT") {
             starRefused += 1;

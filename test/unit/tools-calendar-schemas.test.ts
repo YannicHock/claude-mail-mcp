@@ -20,7 +20,8 @@ import { makeTmpDir, cleanupTmpDir, makeAccount, makeAccountsFile } from "../hel
 
 type Handler = (args: Record<string, unknown>) => Promise<unknown>;
 interface Registered {
-  config: { description?: string; inputSchema: Record<string, z.ZodType> };
+  /** A raw shape, or — for a tool whose fields depend on each other — an object schema with a refinement. */
+  config: { description?: string; inputSchema: Record<string, z.ZodType> | z.ZodObject };
   handler: Handler;
 }
 
@@ -59,7 +60,21 @@ async function withCalendarTools<T>(
 function schemaOf(tools: Map<string, Registered>, tool: string): Record<string, z.ZodType> {
   const found = tools.get(tool);
   assert.ok(found, `${tool} is not registered`);
-  return found.config.inputSchema;
+  const schema = found.config.inputSchema;
+  return isObjectSchema(schema) ? (schema.shape as Record<string, z.ZodType>) : schema;
+}
+
+function isObjectSchema(schema: Registered["config"]["inputSchema"]): schema is z.ZodObject {
+  return typeof (schema as { safeParse?: unknown }).safeParse === "function";
+}
+
+/** What the SDK checks a call's arguments against: the tool's whole input schema, refinements included. */
+function inputOf(tools: Map<string, Registered>, tool: string): z.ZodObject {
+  const found = tools.get(tool);
+  assert.ok(found, `${tool} is not registered`);
+  const schema = found.config.inputSchema;
+  assert.ok(isObjectSchema(schema), `${tool} declares no refinement over its fields`);
+  return schema;
 }
 
 describe("the calendar tools' shared fields (#214)", () => {
@@ -162,6 +177,112 @@ describe("update_event with nothing to change", () => {
       await assert.rejects(
         update.handler({ calendar_url: `${CLOSED}cal/`, uid: "e@example.com", etag: '"a"' }),
         (err: unknown) => err instanceof ToolRefusal && /^Nothing to change/.test(err.message)
+      );
+      assert.equal(warnings(), 0);
+    });
+  });
+});
+
+describe("attendees on the calendar tools (#204, #205, spec 2026-09-29 §2.1)", () => {
+  const CAL = "https://dav.example/cal/";
+  const NEW = { calendar_url: CAL, summary: "Planning", start: "2026-10-01T09:00:00Z", end: "2026-10-01T10:00:00Z" };
+  const CHANGE = { calendar_url: CAL, uid: "e@example.com", etag: '"a"' };
+
+  /** The message a refused parse gives, which the model is shown. */
+  function rejection(schema: z.ZodObject, args: Record<string, unknown>): string {
+    const result = schema.safeParse(args);
+    assert.equal(result.success, false, `accepted: ${JSON.stringify(args)}`);
+    return result.error?.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") ?? "";
+  }
+
+  it("create_event requires notify_attendees when it has attendees, and says why", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const create = inputOf(tools, "create_event");
+      const message = rejection(create, { ...NEW, attendees: ["ben@example.com"] });
+      assert.match(message, /notify_attendees/);
+      assert.match(message, /confirm/i);
+      assert.equal(create.safeParse({ ...NEW, attendees: ["ben@example.com"], notify_attendees: false }).success, true);
+      assert.equal(create.safeParse({ ...NEW, attendees: [] }).success, true);
+      assert.equal(create.safeParse(NEW).success, true);
+    });
+  });
+
+  it("update_event requires notify_attendees when either attendee list is non-empty", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const update = inputOf(tools, "update_event");
+      assert.match(rejection(update, { ...CHANGE, add_attendees: ["dan@example.com"] }), /notify_attendees/);
+      assert.match(rejection(update, { ...CHANGE, remove_attendees: ["ben@example.com"] }), /notify_attendees/);
+      assert.equal(update.safeParse({ ...CHANGE, add_attendees: ["dan@example.com"], notify_attendees: true }).success, true);
+      assert.equal(update.safeParse({ ...CHANGE, summary: "x" }).success, true);
+      assert.equal(update.safeParse({ ...CHANGE, add_attendees: ["not an address"], notify_attendees: true }).success, false);
+    });
+  });
+
+  it("notify_attendees is one definition, and says what the server may send, that it cannot be recalled, and to confirm first — without promising what a server does", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const create = schemaOf(tools, "create_event").notify_attendees;
+      const update = schemaOf(tools, "update_event").notify_attendees;
+      assert.ok(create, "create_event has no notify_attendees");
+      assert.equal(create, update, "notify_attendees is defined twice");
+      const text = create.description ?? "";
+      assert.match(text, /server may/);
+      assert.match(text, /SCHEDULE-AGENT=CLIENT/);
+      assert.match(text, /cannot be recalled/);
+      assert.match(text, /[Cc]onfirm with the user/);
+      assert.doesNotMatch(text, /\bwill (e?mail|send)|nobody is told|no one is told|guarantee/i);
+    });
+  });
+
+  it("notify_attendees and remove_attendees say removal with false is refused for now, and what to do instead: leave them listed first (spec §2.1, until acceptance A2)", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const notify = schemaOf(tools, "update_event").notify_attendees?.description ?? "";
+      assert.match(notify, /[Rr]emoving attendees with false is refused for now/);
+      assert.match(notify, /leave them listed.*true/);
+      assert.doesNotMatch(notify, /removing an attendee the server was free to notify is refused/);
+      const remove = schemaOf(tools, "update_event").remove_attendees?.description ?? "";
+      assert.match(remove, /notify_attendees: true/);
+      assert.match(remove, /false is refused/);
+    });
+  });
+
+  it("create_event and update_event say their answer names, in may_notify, whom the calendar server may now email", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      for (const tool of ["create_event", "update_event"]) {
+        assert.match(tools.get(tool)?.config.description ?? "", /may_notify/, tool);
+      }
+      assert.match(schemaOf(tools, "update_event").notify_attendees?.description ?? "", /may_notify/);
+    });
+  });
+
+  it("create_event, update_event and delete_event say the server may mail attendees, and to confirm first", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      for (const tool of ["create_event", "update_event", "delete_event"]) {
+        const text = tools.get(tool)?.config.description ?? "";
+        assert.match(text, /sends no mail itself/, tool);
+        assert.match(text, /calendar server may/, tool);
+        assert.match(text, /cannot be recalled/, tool);
+        assert.match(text, /[Cc]onfirm with the user/, tool);
+      }
+      assert.match(tools.get("create_event")?.config.description ?? "", /ORGANIZER/);
+      assert.match(tools.get("update_event")?.config.description ?? "", /only its organizer/);
+      const add = schemaOf(tools, "update_event").add_attendees?.description ?? "";
+      assert.match(add, /notify_attendees/);
+    });
+  });
+
+  it("update_event with only attendee changes is not 'nothing to change', and without notify_attendees is refused before any request", async () => {
+    await withCalendarTools(CLOSED, async (tools, warnings) => {
+      const update = tools.get("update_event");
+      assert.ok(update);
+      await assert.rejects(
+        update.handler({ ...CHANGE, calendar_url: `${CLOSED}cal/`, add_attendees: ["dan@example.com"] }),
+        (err: unknown) => err instanceof ToolRefusal && /notify_attendees/.test(err.message) && /Nothing was changed/.test(err.message)
+      );
+      const create = tools.get("create_event");
+      assert.ok(create);
+      await assert.rejects(
+        create.handler({ ...NEW, calendar_url: `${CLOSED}cal/`, attendees: ["ben@example.com"] }),
+        (err: unknown) => err instanceof ToolRefusal && /notify_attendees/.test(err.message) && /Nothing was created/.test(err.message)
       );
       assert.equal(warnings(), 0);
     });

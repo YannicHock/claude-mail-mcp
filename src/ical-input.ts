@@ -10,6 +10,10 @@
  * from the editor until the code-health review of PR #229, which would have
  * tied `create_event` to every module the editor grew; they live here now,
  * with nothing to import but the zone arithmetic.
+ *
+ * A calendar user address is read, normalised and compared in
+ * src/ical-attendees.ts, beside the ORGANIZER and ATTENDEE lines it is
+ * written into (code-health review of PR #230).
  */
 
 import { hasOffset, readDateTime, type WriteZone } from "./ical-zones.js";
@@ -66,15 +70,4 @@ export function timedBound(field: "start" | "end", value: string, zone: WriteZon
     );
   }
   return ms;
-}
-
-/**
- * An attendee as the caller gave it — `ben@example.com`, or already
- * `mailto:ben@example.com` — as the calendar user address an ATTENDEE (or
- * ORGANIZER) holds: a `mailto:` URI, never prefixed twice. The one
- * normalisation `create_event` applies, here so an attendee edit applies the
- * same one.
- */
-export function mailtoOf(address: string): string {
-  return address.startsWith("mailto:") ? address : `mailto:${address}`;
 }

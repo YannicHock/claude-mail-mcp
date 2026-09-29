@@ -34,10 +34,15 @@
  *     {@link patchTimes}, {@link stampRevision} — that every writer below
  *     uses for whichever VEVENT it changes, and {@link applyEventPatch}, the
  *     edit of a main event;
+ *   - src/ical-attendees.ts (#204, #205, spec 2026-09-29 §2.1): a guest list
+ *     changed, which every writer here calls the way it calls
+ *     {@link patchText}. Those are the edits that decide whether a calendar
+ *     server mails real people, and they live on their own so that the
+ *     worker can read a guest list without importing an editor;
  *   - src/ical-occurrence-edit.ts: one occurrence of a series changed or
  *     deleted (#206);
  *   - src/ical-series-shift.ts: a whole series moved to a new time (#207);
- *   - src/ical-input.ts: a caller's date, time or address read, shared with
+ *   - src/ical-input.ts: a caller's date or time read, shared with
  *     `create_event`'s builder (src/ical-build.ts);
  *   - src/ical-series.ts: which VEVENT is which occurrence and which counts,
  *     shared with the reader (src/ical-expand.ts), which this module no
@@ -45,6 +50,7 @@
  */
 
 import ICAL from "ical.js";
+import { patchSeriesAttendees, touchesAttendees, type AttendeePatch, type AttendeeResult } from "./ical-attendees.js";
 import { calendarDate, dateMs, isoDate, timedBound } from "./ical-input.js";
 import { parseCalendar, seriesFor, type ParsedCalendar, type Series } from "./ical-parse.js";
 import { allDaySeries, currentOverrides, sequenceOf } from "./ical-series.js";
@@ -59,8 +65,11 @@ import {
 } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
-/** The fields `update_event` can change. Everything else is left alone. */
-export interface EventPatch {
+/**
+ * The fields `update_event` can change. Everything else is left alone. The
+ * guest list (#205) is {@link AttendeePatch}'s, in src/ical-attendees.ts.
+ */
+export interface EventPatch extends AttendeePatch {
   summary?: string;
   /** `""` removes the property. */
   description?: string;
@@ -70,6 +79,27 @@ export interface EventPatch {
   start?: string;
   end?: string;
   allDay?: boolean;
+}
+
+/**
+ * What every writer of a stored object is handed besides the patch (the
+ * code-health review of PR #230 replaced the positional parameters that kept
+ * growing): the sentence its refusals end with, the time its revision is
+ * stamped with, and the account's own calendar user addresses.
+ */
+export interface EditContext {
+  /** "Nothing was changed." and the like: what a refusal says was not done. */
+  nothingDone: string;
+  /** DTSTAMP and LAST-MODIFIED of every VEVENT the write changes. */
+  now: Date;
+  /**
+   * The account's calendar user addresses (`ownAddresses` in
+   * src/caldav-client.ts), which an attendee change needs to tell the
+   * account's own meeting from someone else's and to write its ORGANIZER.
+   * No default: a writer handed none has been told the account has none,
+   * and an attendee change is then refused.
+   */
+  own: readonly string[];
 }
 
 export interface StoredEventShape {
@@ -96,7 +126,8 @@ export function changesSomething(patch: EventPatch): boolean {
     patch.summary !== undefined ||
     patch.description !== undefined ||
     patch.location !== undefined ||
-    touchesTime(patch)
+    touchesTime(patch) ||
+    touchesAttendees(patch)
   );
 }
 
@@ -125,6 +156,13 @@ export interface EditResult {
   ics: string;
   /** Null when the write left no VEVENT it changed to know it by (see `excludeOccurrence` in src/ical-occurrence-edit.ts). */
   mark: WriteMark | null;
+  /**
+   * For a write that changed the guest list (#205): whom the calendar server
+   * may now email about the event — `AttendeeResult.mayNotify` in
+   * src/ical-attendees.ts, which `update_event` answers as `may_notify`.
+   * Absent for any other write.
+   */
+  mayNotify?: string[];
 }
 
 /**
@@ -234,26 +272,41 @@ export function patchText(vevent: ICAL.Component, patch: EventPatch): void {
  * parse of the stored text, for this one write (code-health review of PR 3:
  * a write parsed the same text three times).
  *
- * The text fields are set as given, the time by {@link patchTimes}, and the
- * VEVENT's revision is stamped. Throws {@link ToolRefusal} ending in
- * `nothingDone` for a patch that cannot be applied as asked.
+ * The attendees first, by `patchSeriesAttendees` (src/ical-attendees.ts) —
+ * so its refusals come before anything is changed — then the text fields as
+ * given and the time by {@link patchTimes}; the VEVENT's revision is
+ * stamped, and that of every other VEVENT the attendee change wrote. Throws
+ * {@link ToolRefusal} ending in `ctx.nothingDone` for a patch that cannot be
+ * applied as asked.
  */
-export function applyEventPatch(
-  parsed: ParsedCalendar,
-  uid: string,
-  patch: EventPatch,
-  nothingDone: string,
-  now: Date = new Date()
-): EditResult {
+export function applyEventPatch(parsed: ParsedCalendar, uid: string, patch: EventPatch, ctx: EditContext): EditResult {
+  const { nothingDone, now, own } = ctx;
   const { vcal } = parsed;
-  const { master } = seriesFor(vcal, uid);
+  const { master, overrides } = seriesFor(vcal, uid);
   if (master === undefined) {
     throw new Error(`applyEventPatch: no main VEVENT for UID ${uid}`);
   }
+  const guests = patchSeriesAttendees(master, overrides, patch, own, nothingDone);
   patchText(master, patch);
   if (touchesTime(patch)) patchTimes(master, patch, nothingDone);
   const sequence = stampRevision(master, now);
-  return { ics: vcal.toString(), mark: { uid, sequence } };
+  stampOthers(guests, master, now);
+  return { ics: vcal.toString(), mark: { uid, sequence }, ...mayNotifyOf(guests) };
+}
+
+/**
+ * Stamp the revision of every VEVENT an attendee change wrote besides
+ * `stamped`, which the writer stamps itself — each once, however many of
+ * the change's steps reached it (the ORGANIZER, a SCHEDULE-AGENT, the guest
+ * list).
+ */
+export function stampOthers(guests: AttendeeResult | null, stamped: ICAL.Component, now: Date): void {
+  for (const vevent of guests?.changed ?? []) if (vevent !== stamped) stampRevision(vevent, now);
+}
+
+/** The {@link EditResult.mayNotify} of a write whose attendee change answered `guests`; nothing for a write that made none. */
+export function mayNotifyOf(guests: AttendeeResult | null): Pick<EditResult, "mayNotify"> {
+  return guests === null ? {} : { mayNotify: guests.mayNotify };
 }
 /**
  * Write the time `patch` asks for into `vevent` — a main VEVENT or an

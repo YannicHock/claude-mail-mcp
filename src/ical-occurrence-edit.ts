@@ -9,8 +9,9 @@
  * The rules of src/ical-edit.ts hold here too — the stored object is edited
  * in place, never rebuilt; every refusal ends in the caller's `nothingDone`;
  * a written VEVENT has its revision stamped — and its `patchText`,
- * `patchTimes` and `stampRevision` are what change an override, exactly as
- * they change a main event.
+ * `patchTimes` and `stampRevision`, with `applyAttendeePatch` from
+ * src/ical-attendees.ts, are what change an override, exactly as they change
+ * a main event.
  *
  * Split out of src/ical-edit.ts in the code-health review of PR #229, which
  * also found the one-occurrence writes ignoring `RANGE=THISANDFUTURE`: the
@@ -19,11 +20,15 @@
  */
 
 import ICAL from "ical.js";
+import { applyAttendeePatch } from "./ical-attendees.js";
 import {
+  mayNotifyOf,
   patchText,
   patchTimes,
+  stampOthers,
   stampRevision,
   touchesTime,
+  type EditContext,
   type EditResult,
   type EventPatch,
 } from "./ical-edit.js";
@@ -258,18 +263,29 @@ function overrideAt(vcal: ICAL.Component, uid: string, index: number): ICAL.Comp
  * taken out of its reach before the patch is applied
  * ({@link detachRangeAnchor}), or the refusal that explains why it cannot be.
  *
+ * Attendees (#205): `add_attendees` and `remove_attendees` change this
+ * occurrence's guest list alone — the override's ATTENDEEs, which it took
+ * from the master when it was made — through {@link applyAttendeePatch},
+ * with `ctx.own` the account's calendar user addresses. What decides mail
+ * reaches further (review of PR #230): an ORGANIZER the change supplies goes
+ * on every VEVENT of the UID, and with `false` every plain attendee on each
+ * is marked `SCHEDULE-AGENT=CLIENT`, since the server schedules the whole
+ * object; every VEVENT that wrote is stamped once. An invitation to one
+ * instance of someone else's series is refused there, as their meeting.
+ *
  * Refused, ending in `nothingDone`: switching one occurrence between all-day
  * and timed — it keeps the form of its series, whose RECURRENCE-ID must
- * match the master's — and whatever {@link patchTimes} refuses.
+ * match the master's — whatever {@link applyAttendeePatch} refuses, and
+ * whatever {@link patchTimes} refuses.
  */
 export function applyOccurrencePatch(
   parsed: ParsedCalendar,
   uid: string,
   occurrence: FoundOccurrence,
   patch: EventPatch,
-  nothingDone: string,
-  now: Date = new Date()
+  ctx: EditContext
 ): EditResult {
+  const { nothingDone, now, own } = ctx;
   const { vcal } = parsed;
   if (patch.allDay !== undefined && patch.allDay !== occurrence.isDate) {
     throw new ToolRefusal(
@@ -293,11 +309,13 @@ export function applyOccurrencePatch(
         : overrideFromRange(master, overrideAt(vcal, uid, occurrence.range), occurrence);
     vcal.addSubcomponent(target);
   }
+  const guests = applyAttendeePatch(target, patch, own, nothingDone);
   patchText(target, patch);
   if (touchesTime(patch)) patchTimes(target, patch, nothingDone);
   const sequence = stampRevision(target, now);
+  stampOthers(guests, target, now);
   const override = keyOf(new ICAL.Event(target).recurrenceId, allDaySeries(master));
-  return { ics: vcal.toString(), mark: { uid, sequence, override } };
+  return { ics: vcal.toString(), mark: { uid, sequence, override }, ...mayNotifyOf(guests) };
 }
 
 /**

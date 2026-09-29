@@ -18,8 +18,13 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+import { AccountsStore } from "../../src/accounts.js";
 import { CalDavClient } from "../../src/caldav-client.js";
+import { ClientPool } from "../../src/client-pool.js";
+import { registerCalendarTools } from "../../src/tools-calendar.js";
 import { ToolRefusal } from "../../src/tool-errors.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { cleanupTmpDir, makeAccount, makeAccountsFile, makeTmpDir } from "../helpers/fixtures.js";
 import { composeDown, composeUp, isDockerAvailable } from "../helpers/docker.js";
 import {
   RADICALE_PASSWORD,
@@ -1244,6 +1249,234 @@ describe("delete_event", SKIP, () => {
     );
     assert.match(message, /is not an occurrence/);
     assert.match(message, /Nothing was deleted/);
+    assert.equal(await etagOf(uid), etag);
+  });
+});
+
+describe("ORGANIZER and attendees (#204, #205, spec 2026-09-29 §2.1)", SKIP, () => {
+  // Radicale has no schedule outbox (R13): it mails no one, so these show what
+  // is stored, never whether anyone would be mailed. That is acceptance A1/A2,
+  // on Nextcloud.
+  const MAILBOX = "me@mail.example";
+
+  /** A client for the shared calendar that knows the mailbox's address, as ClientPool builds it. */
+  function withAddress(): CalDavClient {
+    return new CalDavClient({ url: RADICALE_URL, user: cal.user, pass: RADICALE_PASSWORD }, { address: MAILBOX });
+  }
+
+  /** The stored object, unfolded. */
+  async function storedAs(filename: string): Promise<string> {
+    const text = await getRawEvent(cal, filename);
+    assert.ok(text, `${filename} is not stored`);
+    return text.replaceAll("\r\n ", "");
+  }
+
+  it("R13: ownAddresses on Radicale is the mailbox's defaultFrom alone, passed in by ClientPool, and asked for once", async () => {
+    const dir = await makeTmpDir();
+    try {
+      const file = await makeAccountsFile(dir, [
+        makeAccount({
+          id: "work",
+          default: true,
+          mail: { defaultFrom: MAILBOX, draftsFolder: "Drafts", sentFolder: "Sent" },
+          caldav: { url: RADICALE_URL, user: cal.user, pass: RADICALE_PASSWORD },
+        }),
+      ]);
+      const store = new AccountsStore(file);
+      await store.reload();
+      const caldav = new ClientPool(store).for("work").caldav;
+      assert.ok(caldav);
+      const first = await caldav.ownAddresses();
+      assert.deepEqual(first, [`mailto:${MAILBOX}`]);
+      assert.equal(await caldav.ownAddresses(), first, "the addresses were looked up again");
+    } finally {
+      await cleanupTmpDir(dir);
+    }
+  });
+
+  it("create_event with attendees stores ORGANIZER as the account and, with notify_attendees: false, SCHEDULE-AGENT=CLIENT on each", async () => {
+    const created = await withAddress().createEvent({
+      calendarUrl: cal.calendarUrl,
+      summary: "Invite nobody yet",
+      start: "2026-10-05T09:00:00Z",
+      end: "2026-10-05T10:00:00Z",
+      attendees: ["ben@example.com"],
+      notifyAttendees: false,
+    });
+    const stored = await storedAs(created.url.slice(cal.calendarUrl.length));
+    assert.match(stored, /\r\nORGANIZER:mailto:me@mail\.example\r\n/);
+    assert.match(stored, /\r\nATTENDEE;SCHEDULE-AGENT=CLIENT:mailto:ben@example\.com\r\n/);
+  });
+
+  it("add and remove on an event with an attendee and no ORGANIZER: it gets one, the other attendee keeps PARTSTAT, the alarm survives", async () => {
+    const uid = "attendees-add@example.com";
+    await putRawEvent(cal, "attendees-add.ics", richEvent(uid));
+    const client = withAddress();
+    await client.updateEvent({
+      calendarUrl: cal.calendarUrl,
+      uid,
+      etag: await etagOf(uid),
+      addAttendees: ["dan@example.com"],
+      notifyAttendees: false,
+    });
+    let stored = await storedAs("attendees-add.ics");
+    assert.match(stored, /\r\nORGANIZER:mailto:me@mail\.example\r\n/);
+    assert.match(stored, /\r\nATTENDEE;CN=Ben;PARTSTAT=ACCEPTED;SCHEDULE-AGENT=CLIENT:mailto:ben@example\.com\r\n/);
+    assert.match(stored, /\r\nATTENDEE;SCHEDULE-AGENT=CLIENT:mailto:dan@example\.com\r\n/);
+    assert.match(stored, /BEGIN:VALARM/);
+    assert.match(stored, /X-KEEP-ME:yes/);
+
+    // Removal with false is refused until acceptance A2 is in (spec §2.1),
+    // even for an attendee carrying SCHEDULE-AGENT=CLIENT; nothing is written.
+    const etag = await etagOf(uid);
+    const message = await refusal(
+      client.updateEvent({ calendarUrl: cal.calendarUrl, uid, etag, removeAttendees: ["DAN@example.com"], notifyAttendees: false })
+    );
+    assert.match(message, /Leave them listed/);
+    assert.ok(message.endsWith("Nothing was changed, and no event was created."), message);
+    assert.equal(await etagOf(uid), etag);
+
+    const removed = await client.updateEvent({
+      calendarUrl: cal.calendarUrl,
+      uid,
+      etag,
+      removeAttendees: ["DAN@example.com"],
+      notifyAttendees: true,
+    });
+    // Ben is marked CLIENT, and Dan was: no one left for the server to mail, and Dan was never scheduled.
+    assert.deepEqual(removed.mayNotify, []);
+    stored = await storedAs("attendees-add.ics");
+    assert.doesNotMatch(stored, /dan@example\.com/);
+    assert.match(stored, /PARTSTAT=ACCEPTED/);
+  });
+
+  it("a failed lookup of the account's addresses is not taken for 'none': the attendee call is refused with nothing written, and the next one asks again (review of PR #230)", async () => {
+    // Two 503s, then Radicale's own 207. tsdav answers a 503 with the same
+    // error as a principal listing no address; taken for that, the mailbox's
+    // address was cached for the client's lifetime, and on Nextcloud an
+    // ORGANIZER the server does not recognise makes the meeting someone else's.
+    const proxy = await startCalDavProxy({ failAddressLookups: 2 });
+    try {
+      const viaProxy = new CalDavClient({ url: proxy.url, user: cal.user, pass: RADICALE_PASSWORD }, { address: MAILBOX });
+      const calendarUrl = cal.calendarUrl.replace(RADICALE_URL, proxy.url);
+      const invite = {
+        calendarUrl,
+        summary: "Lookup failed",
+        start: "2026-10-06T09:00:00Z",
+        end: "2026-10-06T10:00:00Z",
+        attendees: ["ben@example.com"],
+        notifyAttendees: false,
+      };
+      const notCreated = await refusal(viaProxy.createEvent(invite));
+      assert.match(notCreated, /could not be looked up/);
+      assert.ok(notCreated.endsWith("Nothing was created."), notCreated);
+      assert.ok(!proxy.requests().some((r) => r.method === "PUT"), "something was written");
+
+      // #8: the same for update_event, whose refusal ends in its own sentence.
+      const uid = "attendees-lookup@example.com";
+      await putRawEvent(cal, "attendees-lookup.ics", richEvent(uid));
+      const etag = await etagOf(uid);
+      const notChanged = await refusal(
+        viaProxy.updateEvent({ calendarUrl, uid, etag, addAttendees: ["dan@example.com"], notifyAttendees: false })
+      );
+      assert.match(notChanged, /could not be looked up/);
+      assert.ok(notChanged.endsWith("Nothing was changed, and no event was created."), notChanged);
+      assert.equal(await etagOf(uid), etag);
+
+      // The server answers now: asked again, not remembered as failed.
+      const created = await viaProxy.createEvent(invite);
+      const stored = await storedAs(created.url.slice(calendarUrl.length));
+      assert.match(stored, /\r\nORGANIZER:mailto:me@mail\.example\r\n/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("create_event and update_event answer may_notify: everyone the calendar server may now email, the attendees an ORGANIZER added makes schedulable too (review of PR #230)", async () => {
+    const dir = await makeTmpDir();
+    try {
+      const file = await makeAccountsFile(dir, [
+        makeAccount({
+          id: "work",
+          default: true,
+          mail: { defaultFrom: MAILBOX, draftsFolder: "Drafts", sentFolder: "Sent" },
+          caldav: { url: RADICALE_URL, user: cal.user, pass: RADICALE_PASSWORD },
+        }),
+      ]);
+      const store = new AccountsStore(file);
+      await store.reload();
+      type Handler = (args: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;
+      const handlers = new Map<string, Handler>();
+      const server = {
+        registerTool: (name: string, _config: unknown, handler: Handler) => handlers.set(name, handler),
+      } as unknown as McpServer;
+      registerCalendarTools(server, new ClientPool(store));
+      const call = async (tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+        const handler = handlers.get(tool);
+        assert.ok(handler, `no ${tool}`);
+        return JSON.parse((await handler(args)).content[0].text) as Record<string, unknown>;
+      };
+
+      const created = await call("create_event", {
+        calendar_url: cal.calendarUrl,
+        summary: "Told",
+        start: "2026-10-07T09:00:00Z",
+        end: "2026-10-07T10:00:00Z",
+        attendees: ["ben@example.com"],
+        notify_attendees: true,
+      });
+      assert.deepEqual(created.may_notify, ["ben@example.com"]);
+
+      // Ben is on it plainly and it has no ORGANIZER: adding Dan with true
+      // makes the account organizer, and the server may now mail Ben too.
+      const uid = "attendees-may-notify@example.com";
+      await putRawEvent(cal, "attendees-may-notify.ics", richEvent(uid));
+      const updated = await call("update_event", {
+        calendar_url: cal.calendarUrl,
+        uid,
+        etag: await etagOf(uid),
+        add_attendees: ["dan@example.com"],
+        notify_attendees: true,
+      });
+      assert.deepEqual(updated.may_notify, ["ben@example.com", "dan@example.com"]);
+
+      const renamed = await call("update_event", { calendar_url: cal.calendarUrl, uid, etag: updated.etag, summary: "Renamed" });
+      assert.equal("may_notify" in renamed, false, "a change that leaves the guest list alone says nothing about it");
+    } finally {
+      await cleanupTmpDir(dir);
+    }
+  });
+
+  it("someone else's meeting: a change to its guest list is refused with nothing written, a new title is written", async () => {
+    const uid = "attendees-theirs@example.com";
+    await putRawEvent(
+      cal,
+      "attendees-theirs.ics",
+      richEvent(uid).replace("SUMMARY:Planning\r\n", "SUMMARY:Planning\r\nORGANIZER;CN=Anna:mailto:anna@example.com\r\n")
+    );
+    const client = withAddress();
+    const etag = await etagOf(uid);
+    const message = await refusal(
+      client.updateEvent({ calendarUrl: cal.calendarUrl, uid, etag, addAttendees: ["dan@example.com"], notifyAttendees: false })
+    );
+    assert.match(message, /anna@example\.com/);
+    assert.match(message, /Nothing was changed/);
+    assert.equal(await etagOf(uid), etag);
+
+    await client.updateEvent({ calendarUrl: cal.calendarUrl, uid, etag, summary: "Planning (my note)" });
+    const stored = await storedAs("attendees-theirs.ics");
+    assert.match(stored, /SUMMARY:Planning \(my note\)/);
+    assert.doesNotMatch(stored, /dan@example\.com/);
+  });
+
+  it("adding an attendee who already is one is refused, and nothing is written", async () => {
+    const uid = "attendees-twice@example.com";
+    await putRawEvent(cal, "attendees-twice.ics", richEvent(uid));
+    const etag = await etagOf(uid);
+    const message = await refusal(
+      withAddress().updateEvent({ calendarUrl: cal.calendarUrl, uid, etag, addAttendees: ["Ben@Example.com"], notifyAttendees: true })
+    );
+    assert.match(message, /already an attendee/);
     assert.equal(await etagOf(uid), etag);
   });
 });
