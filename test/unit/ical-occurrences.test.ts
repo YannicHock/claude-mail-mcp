@@ -36,7 +36,7 @@ import {
 } from "../helpers/ical-series-fixtures.js";
 
 function updateOne(text: string, rid: string | null, patch: EventPatch, uid = UID): string {
-  return applyOccurrencePatch(parseCalendar(text), uid, occurrence(text, rid, uid), patch, CHANGED, NOW).ics;
+  return applyOccurrencePatch(parseCalendar(text), uid, occurrence(text, rid, uid), patch, { nothingDone: CHANGED, now: NOW, own: [] }).ics;
 }
 
 function deleteOne(text: string, rid: string, uid = UID): string {
@@ -309,7 +309,7 @@ describe("RANGE=THISANDFUTURE — a one-occurrence write changes exactly one occ
         const text = ranged(shape);
         const rid = shape.reported("2026-10-15");
         const found = occurrence(text, rid);
-        const edit = applyOccurrencePatch(parseCalendar(text), UID, found, { start: "2026-10-15T13:00:00" }, CHANGED, NOW);
+        const edit = applyOccurrencePatch(parseCalendar(text), UID, found, { start: "2026-10-15T13:00:00" }, { nothingDone: CHANGED, now: NOW, own: [] });
         assert.deepEqual(
           rows(edit.ics),
           onlyChanged(rows(text), rid, { start: at(shape, "2026-10-15", 13), end: at(shape, "2026-10-15", 14) })

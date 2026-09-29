@@ -35,7 +35,7 @@ import {
 /** {@link shiftSeries} on `text`, the times described for the occurrence `anchor` names, or for the first. */
 function shifted(text: string, patch: EventPatch, anchor: string | null = null): string {
   const found = anchor === null ? null : occurrence(text, anchor);
-  return shiftSeries(parseCalendar(text), UID, found, patch, CHANGED, NOW).ics;
+  return shiftSeries(parseCalendar(text), UID, found, patch, { nothingDone: CHANGED, now: NOW, own: [] }).ics;
 }
 
 function refusedWith(call: () => unknown, pattern: RegExp): void {

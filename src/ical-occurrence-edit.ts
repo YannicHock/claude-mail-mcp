@@ -8,9 +8,10 @@
  *
  * The rules of src/ical-edit.ts hold here too — the stored object is edited
  * in place, never rebuilt; every refusal ends in the caller's `nothingDone`;
- * a written VEVENT has its revision stamped — and its `applyAttendeePatch`,
- * `patchText`, `patchTimes` and `stampRevision` are what change an override,
- * exactly as they change a main event.
+ * a written VEVENT has its revision stamped — and its `patchText`,
+ * `patchTimes` and `stampRevision`, with `applyAttendeePatch` from
+ * src/ical-attendees.ts, are what change an override, exactly as they change
+ * a main event.
  *
  * Split out of src/ical-edit.ts in the code-health review of PR #229, which
  * also found the one-occurrence writes ignoring `RANGE=THISANDFUTURE`: the
@@ -19,12 +20,13 @@
  */
 
 import ICAL from "ical.js";
+import { applyAttendeePatch } from "./ical-attendees.js";
 import {
-  applyAttendeePatch,
   patchText,
   patchTimes,
   stampRevision,
   touchesTime,
+  type EditContext,
   type EditResult,
   type EventPatch,
 } from "./ical-edit.js";
@@ -262,7 +264,7 @@ function overrideAt(vcal: ICAL.Component, uid: string, index: number): ICAL.Comp
  * Attendees (#205): `add_attendees` and `remove_attendees` change this
  * occurrence's guest list alone — the override's ATTENDEEs, which it took
  * from the master when it was made — through {@link applyAttendeePatch},
- * with `own` the account's calendar user addresses. An invitation to one
+ * with `ctx.own` the account's calendar user addresses. An invitation to one
  * instance of someone else's series is refused there, as their meeting.
  *
  * Refused, ending in `nothingDone`: switching one occurrence between all-day
@@ -275,10 +277,9 @@ export function applyOccurrencePatch(
   uid: string,
   occurrence: FoundOccurrence,
   patch: EventPatch,
-  nothingDone: string,
-  now: Date = new Date(),
-  own: readonly string[] = []
+  ctx: EditContext
 ): EditResult {
+  const { nothingDone, now, own } = ctx;
   const { vcal } = parsed;
   if (patch.allDay !== undefined && patch.allDay !== occurrence.isDate) {
     throw new ToolRefusal(

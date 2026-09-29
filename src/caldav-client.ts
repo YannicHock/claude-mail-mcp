@@ -29,11 +29,11 @@ import {
 } from "tsdav";
 import { randomUUID } from "node:crypto";
 import { buildIcs, builtZoneName, type NewEventFields } from "./ical-build.js";
+import { calendarUserAddresses, notifyChoice, touchesAttendees } from "./ical-attendees.js";
 import {
   applyEventPatch,
   changesSomething,
   describeSeries,
-  touchesAttendees,
   touchesTime,
   writtenBy,
   type EditResult,
@@ -49,7 +49,6 @@ import {
   type OccurrenceLookup,
   type StoredObject,
 } from "./ical-expand.js";
-import { calendarUserAddresses, notifyChoice } from "./ical-input.js";
 import { parseCalendar, seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { expansionPool, reasonOf } from "./ical-worker-pool.js";
 import { calendarZone, canonicalZone } from "./ical-zones.js";
@@ -297,6 +296,7 @@ export class CalDavClient {
   async createEvent(input: NewEventInput): Promise<CreatedEvent> {
     const nothingDone = "Nothing was created.";
     const invites = (input.attendees ?? []).length > 0;
+    // Before the server is contacted; see `notifyChoice` for the three guards.
     if (invites) notifyChoice(input.notifyAttendees, nothingDone);
     let zone: string | null = null;
     if (input.timezone !== undefined) {
@@ -311,8 +311,8 @@ export class CalDavClient {
     zone ??= calendarZone(calendar.timezone) ?? "UTC";
     const client = await this.ensureClient();
     const uid = `${randomUUID()}@claude-mail-mcp`;
-    const organizer = invites ? await this.organizerAddress(nothingDone) : undefined;
-    const ics = buildIcs({ ...input, uid, organizer }, zone, nothingDone);
+    const own = invites ? await this.ownAddresses() : [];
+    const ics = buildIcs({ ...input, uid, own }, zone, nothingDone);
     const filename = `${uid}.ics`;
     const res = await client.createCalendarObject({
       calendar,
@@ -348,7 +348,7 @@ export class CalDavClient {
    * v0.7.4 (§2.1, #205): `addAttendees` and `removeAttendees` change the
    * guest list — of the event, of the whole series with `applyToSeries`, or of
    * the one occurrence `recurrenceId` names — through `applyAttendeePatch` in
-   * src/ical-edit.ts, with {@link ownAddresses} to tell the account's own
+   * src/ical-attendees.ts, with {@link ownAddresses} to tell the account's own
    * meeting from someone else's. Without `notifyAttendees` the call is refused
    * before the server is contacted.
    */
@@ -359,6 +359,7 @@ export class CalDavClient {
         "Nothing to change: pass at least one of summary, description, location, start, end, all_day, add_attendees or remove_attendees."
       );
     }
+    // Before the server is contacted; see `notifyChoice` for the three guards.
     if (touchesAttendees(update)) notifyChoice(update.notifyAttendees, nothingDone);
     const recurrenceId = update.recurrenceId;
     if (recurrenceId !== undefined && update.applyToSeries === true && !touchesTime(update)) {
@@ -371,6 +372,7 @@ export class CalDavClient {
     const own = touchesAttendees(update) ? await this.ownAddresses() : [];
     const shape = describeSeries(seriesFor(stored.parsed.vcal, update.uid));
     const target: WriteTarget = { calendar, uid: update.uid, url: stored.url, nothingDone };
+    const ctx = { nothingDone, now: new Date(), own };
     let edit: EditResult;
     // #211.3: an object with no master has no series here to change; the one
     // occurrence it holds is changed like any other, with or without its
@@ -383,7 +385,7 @@ export class CalDavClient {
     if (shape.overrideOnly || (recurrenceId !== undefined && update.applyToSeries !== true)) {
       const ifMatch = requireEtag(update, stored, nothingDone);
       const found = await this.occurrence(stored, update.uid, recurrenceId ?? null, nothingDone);
-      edit = applyOccurrencePatch(stored.parsed, update.uid, found, update, nothingDone, new Date(), own);
+      edit = applyOccurrencePatch(stored.parsed, update.uid, found, update, ctx);
       return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
     }
     if (shape.recurring && update.applyToSeries !== true) throw seriesRefusal(update.uid, "change");
@@ -394,8 +396,8 @@ export class CalDavClient {
     const anchor = recurrenceId === undefined ? null : await this.occurrence(stored, update.uid, recurrenceId, nothingDone);
     edit =
       shape.recurring && touchesTime(update)
-        ? shiftSeries(stored.parsed, update.uid, anchor, update, nothingDone, new Date(), own)
-        : applyEventPatch(stored.parsed, update.uid, update, nothingDone, new Date(), own);
+        ? shiftSeries(stored.parsed, update.uid, anchor, update, ctx)
+        : applyEventPatch(stored.parsed, update.uid, update, ctx);
     return { uid: update.uid, url: stored.url, etag: await this.putEdit(target, ifMatch, edit) };
   }
 
@@ -720,7 +722,7 @@ export class CalDavClient {
    * The account's own calendar user addresses (spec 2026-09-29 §2.1), as
    * `mailto:` URIs: every `mailto:` in the principal's
    * `calendar-user-address-set` (RFC 6638 §2.4.1), then the mailbox's
-   * `mail.defaultFrom` — `calendarUserAddresses` in src/ical-input.ts, which
+   * `mail.defaultFrom` — `calendarUserAddresses` in src/ical-attendees.ts, which
    * also says why in that order. The first is the one an ORGANIZER is written
    * with; any of them makes an event "the account's own meeting".
    *
@@ -762,17 +764,6 @@ export class CalDavClient {
       if (!(err instanceof Error && err.message === "cannot find calendarUserAddresses")) throw err;
     }
     return Object.freeze(calendarUserAddresses(hrefs, this.address));
-  }
-
-  /** The address an ORGANIZER is written with: the first of {@link ownAddresses}, or a refusal ending in `nothingDone` when there is none. */
-  private async organizerAddress(nothingDone: string): Promise<string> {
-    const [first] = await this.ownAddresses();
-    if (first === undefined) {
-      throw new ToolRefusal(
-        `This account has no email address to organize the event with: its calendar lists none and its mailbox has no sender address. ${nothingDone}`
-      );
-    }
-    return first;
   }
 
   private async findCalendar(url: string): Promise<DAVCalendar> {

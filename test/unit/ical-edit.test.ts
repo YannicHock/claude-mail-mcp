@@ -29,7 +29,7 @@ const NOW = new Date("2026-09-28T12:00:00Z");
 
 /** {@link applyEventPatch} on the text `text`, parsed here, answering the new text. */
 function patched(text: string, uid: string, patch: EventPatch, now: Date = NOW): string {
-  return applyEventPatch(parseCalendar(text), uid, patch, "Nothing was changed.", now).ics;
+  return applyEventPatch(parseCalendar(text), uid, patch, { nothingDone: "Nothing was changed.", now, own: [] }).ics;
 }
 
 /** Join lines with CRLF, as RFC 5545 and every CalDAV server do. */
@@ -553,7 +553,7 @@ describe("sequenceOf (#214)", () => {
     assert.equal(sequenceOf(withSequence("4")), 4);
     assert.equal(sequenceOf(withSequence("garbage")), 0);
     // What applyEventPatch writes is what writtenBy then reads back.
-    const edit = applyEventPatch(parseCalendar(RICH), "rich-1@example.com", { summary: "x" }, "Nothing was changed.", NOW);
+    const edit = applyEventPatch(parseCalendar(RICH), "rich-1@example.com", { summary: "x" }, { nothingDone: "Nothing was changed.", now: NOW, own: [] });
     assert.deepEqual(edit.mark, { uid: "rich-1@example.com", sequence: sequenceOf(master(RICH, "rich-1@example.com")) + 1 });
     assert.equal(edit.mark !== null && writtenBy(edit.ics, edit.mark), true);
   });

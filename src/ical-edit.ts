@@ -34,17 +34,15 @@
  *     {@link patchTimes}, {@link stampRevision} — that every writer below
  *     uses for whichever VEVENT it changes, and {@link applyEventPatch}, the
  *     edit of a main event;
- *   - here too, since v0.7.4 (#204, #205, spec 2026-09-29 §2.1): a guest list
- *     changed — {@link applyAttendeePatch} for one VEVENT, and
- *     {@link patchSeriesAttendees} for a series — which every writer calls
- *     the way it calls {@link patchText}. These are the edits that decide
- *     whether a calendar server mails real people, so each one writes
- *     `SCHEDULE-AGENT=CLIENT` exactly where the caller's `notifyAttendees:
- *     false` reaches, and nowhere else;
+ *   - src/ical-attendees.ts (#204, #205, spec 2026-09-29 §2.1): a guest list
+ *     changed, which every writer here calls the way it calls
+ *     {@link patchText}. Those are the edits that decide whether a calendar
+ *     server mails real people, and they live on their own so that the
+ *     worker can read a guest list without importing an editor;
  *   - src/ical-occurrence-edit.ts: one occurrence of a series changed or
  *     deleted (#206);
  *   - src/ical-series-shift.ts: a whole series moved to a new time (#207);
- *   - src/ical-input.ts: a caller's date, time or address read, shared with
+ *   - src/ical-input.ts: a caller's date or time read, shared with
  *     `create_event`'s builder (src/ical-build.ts);
  *   - src/ical-series.ts: which VEVENT is which occurrence and which counts,
  *     shared with the reader (src/ical-expand.ts), which this module no
@@ -52,16 +50,8 @@
  */
 
 import ICAL from "ical.js";
-import {
-  addressKey,
-  calendarDate,
-  dateMs,
-  distinctAddresses,
-  isoDate,
-  mailtoOf,
-  notifyChoice,
-  timedBound,
-} from "./ical-input.js";
+import { patchSeriesAttendees, touchesAttendees, type AttendeePatch } from "./ical-attendees.js";
+import { calendarDate, dateMs, isoDate, timedBound } from "./ical-input.js";
 import { parseCalendar, seriesFor, type ParsedCalendar, type Series } from "./ical-parse.js";
 import { allDaySeries, currentOverrides, sequenceOf } from "./ical-series.js";
 import {
@@ -75,8 +65,11 @@ import {
 } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
-/** The fields `update_event` can change. Everything else is left alone. */
-export interface EventPatch {
+/**
+ * The fields `update_event` can change. Everything else is left alone. The
+ * guest list (#205) is {@link AttendeePatch}'s, in src/ical-attendees.ts.
+ */
+export interface EventPatch extends AttendeePatch {
   summary?: string;
   /** `""` removes the property. */
   description?: string;
@@ -86,17 +79,27 @@ export interface EventPatch {
   start?: string;
   end?: string;
   allDay?: boolean;
-  /** Email addresses to invite (#205). Non-empty needs {@link EventPatch.notifyAttendees}. */
-  addAttendees?: string[];
-  /** Email addresses to take off the guest list (#205). Non-empty needs {@link EventPatch.notifyAttendees}. */
-  removeAttendees?: string[];
+}
+
+/**
+ * What every writer of a stored object is handed besides the patch (the
+ * code-health review of PR #230 replaced the positional parameters that kept
+ * growing): the sentence its refusals end with, the time its revision is
+ * stamped with, and the account's own calendar user addresses.
+ */
+export interface EditContext {
+  /** "Nothing was changed." and the like: what a refusal says was not done. */
+  nothingDone: string;
+  /** DTSTAMP and LAST-MODIFIED of every VEVENT the write changes. */
+  now: Date;
   /**
-   * The caller's answer to "may the calendar server mail them?" (spec
-   * 2026-09-29 §2.1): `true` writes the attendees plainly, `false` marks the
-   * ones this call adds `SCHEDULE-AGENT=CLIENT`. Required whenever either list
-   * above is non-empty; see {@link applyAttendeePatch}.
+   * The account's calendar user addresses (`ownAddresses` in
+   * src/caldav-client.ts), which an attendee change needs to tell the
+   * account's own meeting from someone else's and to write its ORGANIZER.
+   * No default: a writer handed none has been told the account has none,
+   * and an attendee change is then refused.
    */
-  notifyAttendees?: boolean;
+  own: readonly string[];
 }
 
 export interface StoredEventShape {
@@ -115,11 +118,6 @@ export interface StoredEventShape {
 /** True when the patch touches the event's time, which a series refuses (§4.3). */
 export function touchesTime(patch: EventPatch): boolean {
   return patch.start !== undefined || patch.end !== undefined || patch.allDay !== undefined;
-}
-
-/** True when the patch adds or removes an attendee (#205): the change that may make a server mail people. */
-export function touchesAttendees(patch: EventPatch): boolean {
-  return (patch.addAttendees?.length ?? 0) > 0 || (patch.removeAttendees?.length ?? 0) > 0;
 }
 
 /** True when the patch changes anything at all. */
@@ -260,211 +258,6 @@ export function patchText(vevent: ICAL.Component, patch: EventPatch): void {
 }
 
 /**
- * The attendee half of a patch, checked: who is added, who is removed, and
- * whether the server may mail them. See {@link applyAttendeePatch}.
- */
-interface AttendeeCall {
-  add: readonly string[];
-  remove: readonly string[];
-  notify: boolean;
-}
-
-/** The attendee half of `patch`, or null when it has none; refused, ending in `nothingDone`, without `notifyAttendees` or with one address named twice. */
-function attendeeCall(patch: EventPatch, nothingDone: string): AttendeeCall | null {
-  if (!touchesAttendees(patch)) return null;
-  const notify = notifyChoice(patch.notifyAttendees, nothingDone);
-  const add = patch.addAttendees ?? [];
-  const remove = patch.removeAttendees ?? [];
-  distinctAddresses([...add, ...remove], nothingDone);
-  return { add, remove, notify };
-}
-
-/** The VEVENT's ATTENDEE properties by {@link addressKey}: one person may be listed more than once. */
-function attendeesOf(vevent: ICAL.Component): Map<string, ICAL.Property[]> {
-  const byKey = new Map<string, ICAL.Property[]>();
-  for (const prop of vevent.getAllProperties("attendee")) {
-    const key = addressKey(String(prop.getFirstValue()));
-    byKey.set(key, [...(byKey.get(key) ?? []), prop]);
-  }
-  return byKey;
-}
-
-/**
- * True when the server was never asked to schedule this ATTENDEE of `vevent`,
- * so removing it gives the server no one to send a cancellation to: it
- * carries `SCHEDULE-AGENT=CLIENT` or `NONE` (RFC 6638 §7.1), or the VEVENT
- * has no ORGANIZER, without which RFC 6638 §3.1 makes it no scheduling object
- * at all.
- */
-function unscheduled(vevent: ICAL.Component, prop: ICAL.Property): boolean {
-  if (!vevent.hasProperty("organizer")) return true;
-  const agent = prop.getParameter("schedule-agent");
-  return typeof agent === "string" && ["CLIENT", "NONE"].includes(agent.toUpperCase());
-}
-
-/**
- * Refuse an attendee change on `vevent` that this connector cannot make as
- * asked, ending in `nothingDone`, before anything is written:
- *
- *   - **Someone else's meeting** (spec §2.1): its ORGANIZER is none of the
- *     account's `own` addresses. Only the organizer changes who is invited;
- *     the event's text and time stay changeable, as the refusal says.
- *   - **Removing, with `notify: false`, an attendee the server may already
- *     have told** — one it was free to schedule ({@link unscheduled} is
- *     false). Taking them off may make it send a cancellation whatever this
- *     call says, and nothing written here can stop that; with `true` the
- *     caller has accepted it. The spec's condition on removal with `false`
- *     (§2.1: honoured only if acceptance A2 shows Nextcloud sends no
- *     cancellation for an attendee who carried SCHEDULE-AGENT=CLIENT) is
- *     about the other attendees, the ones it does not refuse here.
- */
-function checkAttendeeChange(vevent: ICAL.Component, call: AttendeeCall, own: readonly string[], nothingDone: string): void {
-  const organizer = vevent.getFirstProperty("organizer");
-  if (organizer !== null) {
-    const address = addressKey(String(organizer.getFirstValue()));
-    if (!own.some((mine) => addressKey(mine) === address)) {
-      throw new ToolRefusal(
-        `This event is organized by ${address}, not by this account (${own.map(addressKey).join(", ")}), and only its organizer changes who is invited. ${nothingDone} Its title, description, location and time can still be changed here.`
-      );
-    }
-  }
-  if (call.notify) return;
-  const listed = attendeesOf(vevent);
-  for (const address of call.remove) {
-    if ((listed.get(addressKey(address)) ?? []).some((prop) => !unscheduled(vevent, prop))) {
-      throw new ToolRefusal(
-        `${address} is on this event without SCHEDULE-AGENT=CLIENT, so the calendar server may already have told them about it, and removing them may make it email them a cancellation whatever notify_attendees says; this connector cannot prevent that. ${nothingDone} To remove them anyway, confirm with the user and pass notify_attendees: true.`
-      );
-    }
-  }
-}
-
-/** Refuse, ending in `nothingDone`, adding someone `vevent` already lists or removing someone it does not (spec §3.3). */
-function checkGuestList(vevent: ICAL.Component, call: AttendeeCall, nothingDone: string): void {
-  const listed = attendeesOf(vevent);
-  for (const address of call.add) {
-    if (listed.has(addressKey(address))) {
-      throw new ToolRefusal(`${address} is already an attendee of this event. ${nothingDone}`);
-    }
-  }
-  for (const address of call.remove) {
-    if (!listed.has(addressKey(address))) {
-      throw new ToolRefusal(`${address} is not an attendee of this event. ${nothingDone}`);
-    }
-  }
-}
-
-/**
- * Write `call` into `vevent`, in place, and say whether anything changed.
- * `lenient` (an override of a series whose master was checked) adds only
- * whom it does not list and removes only whom it does; otherwise the caller
- * has run {@link checkGuestList}.
- *
- *   - Every ATTENDEE this call does not name keeps its line exactly: its
- *     PARTSTAT, CN, ROLE, RSVP and every X- parameter.
- *   - An ATTENDEE added is a bare `mailto:` (as `create_event` writes one),
- *     with `SCHEDULE-AGENT=CLIENT` when `notify` is false.
- *   - A VEVENT with no ORGANIZER (one `create_event` wrote before v0.7.4,
- *     #204) gets the account's first address as one. That makes the
- *     attendees it already lists ones the server would now schedule too, so
- *     with `notify: false` each of them that carries no SCHEDULE-AGENT of its
- *     own is marked `CLIENT` as well: they are affected by this call just as
- *     the ones it adds are.
- */
-function writeAttendees(vevent: ICAL.Component, call: AttendeeCall, own: readonly string[], lenient: boolean): boolean {
-  const listed = attendeesOf(vevent);
-  const adding = call.add.filter((address) => !lenient || !listed.has(addressKey(address)));
-  const removing = call.remove.filter((address) => listed.has(addressKey(address)));
-  if (adding.length === 0 && removing.length === 0) return false;
-  if (!vevent.hasProperty("organizer")) {
-    const organizer = new ICAL.Property("organizer");
-    organizer.setValue(mailtoOf(own[0]));
-    vevent.addProperty(organizer);
-    if (!call.notify) {
-      for (const prop of vevent.getAllProperties("attendee")) {
-        if (prop.getParameter("schedule-agent") === undefined) prop.setParameter("schedule-agent", "CLIENT");
-      }
-    }
-  }
-  for (const address of removing) {
-    for (const prop of listed.get(addressKey(address)) ?? []) vevent.removeProperty(prop);
-  }
-  for (const address of adding) {
-    const prop = new ICAL.Property("attendee");
-    prop.setValue(mailtoOf(address));
-    if (!call.notify) prop.setParameter("schedule-agent", "CLIENT");
-    vevent.addProperty(prop);
-  }
-  return true;
-}
-
-/** The account's addresses, which an attendee change cannot go without: its ORGANIZER is the first. */
-function requireOwn(own: readonly string[], nothingDone: string): void {
-  if (own.length === 0) {
-    throw new ToolRefusal(
-      `This account has no email address to organize the event with: its calendar lists none and its mailbox has no sender address. ${nothingDone}`
-    );
-  }
-}
-
-/**
- * Add and remove the attendees `patch` names on one VEVENT — a main event,
- * or the override of the one occurrence a `recurrence_id` names — in place
- * (#205, spec 2026-09-29 §2.1), and say whether it changed. Nothing when the
- * patch names no attendee. `own` is the account's calendar user addresses,
- * the first of them the one an ORGANIZER is written with (`ownAddresses` in
- * src/caldav-client.ts). The caller stamps the VEVENT's revision.
- *
- * Every check comes before any write, so a refusal — ending in `nothingDone`
- * — leaves `vevent` as it was: `notifyAttendees` missing, one address named
- * twice, someone else's meeting, a quiet removal the server may not keep
- * quiet ({@link checkAttendeeChange}), an attendee added who already is one
- * or removed who is not. What is written is {@link writeAttendees}'s.
- *
- * On one occurrence this changes that occurrence's guest list alone, which
- * RFC 5545 allows an override to have; a server that schedules then invites
- * or cancels for that one instance.
- */
-export function applyAttendeePatch(
-  vevent: ICAL.Component,
-  patch: EventPatch,
-  own: readonly string[],
-  nothingDone: string
-): boolean {
-  const call = attendeeCall(patch, nothingDone);
-  if (call === null) return false;
-  requireOwn(own, nothingDone);
-  checkAttendeeChange(vevent, call, own, nothingDone);
-  checkGuestList(vevent, call, nothingDone);
-  return writeAttendees(vevent, call, own, false);
-}
-
-/**
- * {@link applyAttendeePatch} for a whole series (`apply_to_series`): the
- * master is changed as a single event is, and every override the same way
- * where it applies — an attendee added to the series is added to each
- * occurrence changed on its own too, and one removed is taken off every
- * occurrence that lists them — so the guest list is the series' and not
- * only the unchanged occurrences'. Returns the overrides it changed, whose
- * revisions the caller stamps. Every VEVENT is checked before any is written.
- */
-export function patchSeriesAttendees(
-  master: ICAL.Component,
-  overrides: readonly ICAL.Component[],
-  patch: EventPatch,
-  own: readonly string[],
-  nothingDone: string
-): ICAL.Component[] {
-  const call = attendeeCall(patch, nothingDone);
-  if (call === null) return [];
-  requireOwn(own, nothingDone);
-  for (const vevent of [master, ...overrides]) checkAttendeeChange(vevent, call, own, nothingDone);
-  checkGuestList(master, call, nothingDone);
-  writeAttendees(master, call, own, false);
-  return overrides.filter((vevent) => writeAttendees(vevent, call, own, true));
-}
-
-/**
  * Apply `patch` to the main VEVENT of `uid` in `parsed` — an object read by
  * `parseCalendar` (src/ical-parse.ts), which the caller has already used to
  * establish that the UID is there — and return the new object with its
@@ -472,22 +265,15 @@ export function patchSeriesAttendees(
  * parse of the stored text, for this one write (code-health review of PR 3:
  * a write parsed the same text three times).
  *
- * The attendees first, by {@link patchSeriesAttendees} — so its refusals
- * come before anything is changed — then the text fields as given and the
- * time by {@link patchTimes}; the VEVENT's revision is stamped, and that of
- * every override an attendee change reached. `own` is the account's calendar
- * user addresses, needed only for an attendee change (#205). Throws
- * {@link ToolRefusal} ending in `nothingDone` for a patch that cannot be
+ * The attendees first, by `patchSeriesAttendees` (src/ical-attendees.ts) —
+ * so its refusals come before anything is changed — then the text fields as
+ * given and the time by {@link patchTimes}; the VEVENT's revision is
+ * stamped, and that of every override an attendee change reached. Throws
+ * {@link ToolRefusal} ending in `ctx.nothingDone` for a patch that cannot be
  * applied as asked.
  */
-export function applyEventPatch(
-  parsed: ParsedCalendar,
-  uid: string,
-  patch: EventPatch,
-  nothingDone: string,
-  now: Date = new Date(),
-  own: readonly string[] = []
-): EditResult {
+export function applyEventPatch(parsed: ParsedCalendar, uid: string, patch: EventPatch, ctx: EditContext): EditResult {
+  const { nothingDone, now, own } = ctx;
   const { vcal } = parsed;
   const { master, overrides } = seriesFor(vcal, uid);
   if (master === undefined) {
