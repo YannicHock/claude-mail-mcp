@@ -115,20 +115,92 @@ export async function editBehindTheBack(
   return res.headers.get("etag") ?? "";
 }
 
+/** One request as the proxy saw it, for a hook to decide whether it cares. */
+export interface ProxiedRequest {
+  method: string;
+  /** The path on Radicale, e.g. `/u…/cal/event.ics`. */
+  path: string;
+}
+
 /**
- * A proxy in front of Radicale that drops the ETag header from every PUT
- * answer — what Nextcloud does when it rewrites the object it stores (its
- * scheduling plugin adds SCHEDULE-STATUS), and what RFC 4791 §5.3.4 allows.
- * Found on the v0.7.2 acceptance run: `update_event` then answered
- * `etag: null`. Everything else is passed through untouched.
+ * What {@link startCalDavProxy} does to the traffic it passes. Each option is
+ * one way a real server or a real deployment differs from Radicale, and each
+ * was found somewhere specific; everything not named is passed through
+ * untouched.
+ *
+ * The plan (v0.7.4 Task 2) names five behaviours in all. The ones the read
+ * path needs are here; `weakEtags`, `noEtags` and `starIfMatchBroken` (#210,
+ * Task 4b) and `refuseMove` (#212, Task 7) join them with the changes that
+ * test them, as further answer rewrites beside `etaglessPuts`.
  */
-export async function startEtaglessPutProxy(): Promise<{
+export interface CalDavProxyOptions {
+  /**
+   * Drop the ETag header from every PUT answer — what Nextcloud does when it
+   * rewrites the object it stores (its scheduling plugin adds
+   * SCHEDULE-STATUS), and what RFC 4791 §5.3.4 allows. Found on the v0.7.2
+   * acceptance run: `update_event` then answered `etag: null`.
+   */
+  etaglessPuts?: boolean;
+  /**
+   * Replace the calendar data of the object with this file name, in every
+   * REPORT answer, by something ical.js cannot parse (`X-FOO;BAR:val`, a
+   * parameter with no value), and put it first. Radicale normalises what it
+   * stores, so a corrupt object cannot be planted in it by content (R16);
+   * this is the one bad object among many of #211.2, ahead of the rest.
+   */
+  corruptObject?: string;
+  /**
+   * Run before a request is forwarded, e.g. to delete an event between the
+   * connector's lookup and its write.
+   */
+  before?: (req: ProxiedRequest) => Promise<void>;
+  /**
+   * Run after Radicale has answered and before the answer is passed on, e.g.
+   * to land another version between a PUT and the connector's read-back.
+   */
+  after?: (req: ProxiedRequest, status: number) => Promise<void>;
+}
+
+export interface CalDavProxy {
   url: string;
   /** PUT answers an ETag was actually removed from — proof the fallback path ran. */
   strippedPuts: () => number;
+  /** REPORT answers the corrupt object was planted in — proof the reader met it. */
+  corruptedReports: () => number;
   close: () => Promise<void>;
-}> {
+}
+
+/** The calendar-data a reader has to survive: a parameter with no value. */
+const UNPARSEABLE = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nX-FOO;BAR:val\nEND:VEVENT\nEND:VCALENDAR\n";
+
+/**
+ * In a multistatus body, replace the named object's calendar data and move its
+ * `<response>` to the front. Radicale answers with an unprefixed DAV
+ * namespace and `C:` for CalDAV, but the match allows any prefix.
+ */
+function plantCorruptObject(xml: string, name: string): { xml: string; planted: boolean } {
+  const responses = [...xml.matchAll(/<(?:\w+:)?response>[\s\S]*?<\/(?:\w+:)?response>/g)].map((m) => m[0]);
+  const index = responses.findIndex((r) => new RegExp(`<(?:\\w+:)?href>[^<]*/${name.replace(/\./g, "\\.")}</`).test(r));
+  if (index === -1) return { xml, planted: false };
+  const corrupt = responses[index].replace(
+    /(<(\w+:)?calendar-data[^>]*>)[\s\S]*?(<\/(\w+:)?calendar-data>)/,
+    (_m, open: string, _p: string, close: string) => `${open}${UNPARSEABLE}${close}`
+  );
+  const reordered = [corrupt, ...responses.filter((_, i) => i !== index)];
+  const first = xml.indexOf(responses[0]);
+  const last = xml.lastIndexOf(responses[responses.length - 1]) + responses[responses.length - 1].length;
+  return { xml: xml.slice(0, first) + reordered.join("") + xml.slice(last), planted: true };
+}
+
+/**
+ * A proxy in front of Radicale that behaves the way {@link CalDavProxyOptions}
+ * says: what Radicale itself cannot be made to do, faked at the HTTP layer
+ * (spec 2026-09-29 §6). Point a CalDavClient at `url` instead of
+ * {@link RADICALE_URL}; the paths are the same.
+ */
+export async function startCalDavProxy(options: CalDavProxyOptions = {}): Promise<CalDavProxy> {
   let stripped = 0;
+  let corrupted = 0;
   const { createServer } = await import("node:http");
   const upstream = new URL(RADICALE_URL);
   // Hop-by-hop, or no longer true once fetch has decoded the body.
@@ -143,25 +215,39 @@ export async function startEtaglessPutProxy(): Promise<{
         headers.set(k, Array.isArray(v) ? v.join(", ") : v);
       }
       const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
-      fetch(new URL(req.url ?? "/", upstream), { method: req.method, headers, body, redirect: "manual" })
-        .then(async (answer) => {
-          const out: Record<string, string> = {};
-          answer.headers.forEach((v, k) => {
-            if (dropped.has(k)) return;
-            if (req.method === "PUT" && k === "etag") {
-              stripped += 1;
-              return;
-            }
-            out[k] = v;
-          });
-          const payload = Buffer.from(await answer.arrayBuffer());
-          res.writeHead(answer.status, answer.statusText, { ...out, "content-length": String(payload.length) });
-          res.end(payload);
-        })
-        .catch((err: unknown) => {
-          res.writeHead(502);
-          res.end(String(err));
+      const seen: ProxiedRequest = { method: req.method ?? "GET", path: new URL(req.url ?? "/", upstream).pathname };
+      (async () => {
+        await options.before?.(seen);
+        const answer = await fetch(new URL(req.url ?? "/", upstream), {
+          method: req.method,
+          headers,
+          body,
+          redirect: "manual",
         });
+        const out: Record<string, string> = {};
+        answer.headers.forEach((v, k) => {
+          if (dropped.has(k)) return;
+          if (options.etaglessPuts && req.method === "PUT" && k === "etag") {
+            stripped += 1;
+            return;
+          }
+          out[k] = v;
+        });
+        let payload = Buffer.from(await answer.arrayBuffer());
+        if (options.corruptObject !== undefined && req.method === "REPORT") {
+          const { xml, planted } = plantCorruptObject(payload.toString("utf8"), options.corruptObject);
+          if (planted) {
+            corrupted += 1;
+            payload = Buffer.from(xml, "utf8");
+          }
+        }
+        await options.after?.(seen, answer.status);
+        res.writeHead(answer.status, answer.statusText, { ...out, "content-length": String(payload.length) });
+        res.end(payload);
+      })().catch((err: unknown) => {
+        res.writeHead(502);
+        res.end(String(err));
+      });
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -170,6 +256,13 @@ export async function startEtaglessPutProxy(): Promise<{
   return {
     url: `http://127.0.0.1:${address.port}/`,
     strippedPuts: () => stripped,
+    corruptedReports: () => corrupted,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
+}
+
+/** Delete an object behind the connector's back, as a phone would. */
+export async function deleteBehindTheBack(cal: RadicaleCalendar, filename: string): Promise<void> {
+  const res = await fetch(`${cal.calendarUrl}${filename}`, { method: "DELETE", headers: { authorization: cal.authHeader } });
+  if (!res.ok) throw new Error(`DELETE ${filename} answered ${res.status}`);
 }

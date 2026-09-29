@@ -24,12 +24,14 @@ import { composeDown, composeUp, isDockerAvailable } from "../helpers/docker.js"
 import {
   RADICALE_PASSWORD,
   RADICALE_URL,
-  startEtaglessPutProxy,
+  startCalDavProxy,
+  deleteBehindTheBack,
   editBehindTheBack,
   getRawEvent,
   makeRadicaleCalendar,
   putRawEvent,
   waitForRadicaleReady,
+  type CalDavProxy,
   type RadicaleCalendar,
 } from "../helpers/radicale.js";
 
@@ -112,7 +114,7 @@ after(() => {
 });
 
 async function etagOf(uid: string): Promise<string> {
-  const events = await client.listEvents(cal.calendarUrl, WINDOW.start, WINDOW.end);
+  const { events } = await client.listEvents(cal.calendarUrl, WINDOW.start, WINDOW.end);
   const hit = events.find((e) => e.uid === uid);
   assert.ok(hit, `list_events does not show ${uid}`);
   assert.ok(hit.etag, `list_events gave ${uid} no etag`);
@@ -128,6 +130,245 @@ describe("list_events", SKIP, () => {
       end: "2026-10-02T10:00:00Z",
     });
     assert.match(await etagOf(created.uid), /^"?.+"?$/);
+  });
+});
+
+/** A calendar of its own, so a shape that used to fail a whole calendar fails no other test. */
+async function freshCalendar(): Promise<{ cal: RadicaleCalendar; client: CalDavClient }> {
+  const own = await makeRadicaleCalendar();
+  return { cal: own, client: new CalDavClient({ url: RADICALE_URL, user: own.user, pass: RADICALE_PASSWORD }) };
+}
+
+const BERLIN_VTIMEZONE = [
+  "BEGIN:VTIMEZONE",
+  "TZID:Europe/Berlin",
+  "BEGIN:STANDARD",
+  "DTSTART:19701025T030000",
+  "TZOFFSETFROM:+0200",
+  "TZOFFSETTO:+0100",
+  "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19700329T020000",
+  "TZOFFSETFROM:+0100",
+  "TZOFFSETTO:+0200",
+  "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU",
+  "END:DAYLIGHT",
+  "END:VTIMEZONE",
+];
+
+describe("list_events — the shapes the server's expansion failed on (spec 2026-09-29 §0.1)", SKIP, () => {
+  it("R1: lists an all-day weekly series, each occurrence by its date, and the calendar around it", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    await putRawEvent(own, "plain.ics", richEvent("r1-plain@example.com"));
+    await putRawEvent(
+      own,
+      "allday-series.ics",
+      ics(
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Other Client//EN",
+        "BEGIN:VEVENT",
+        "UID:r1-allday@example.com",
+        "DTSTAMP:20260901T080000Z",
+        "DTSTART;VALUE=DATE:20261001",
+        "DTEND;VALUE=DATE:20261002",
+        "RRULE:FREQ=WEEKLY;COUNT=3",
+        "SUMMARY:Bins out",
+        "END:VEVENT",
+        "END:VCALENDAR"
+      )
+    );
+    const { events, skipped } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(skipped, []);
+    assert.deepEqual(
+      events.filter((e) => e.uid === "r1-allday@example.com").map((e) => [e.recurrenceId, e.start, e.allDay]),
+      [
+        ["2026-10-01", "2026-10-01", true],
+        ["2026-10-08", "2026-10-08", true],
+        ["2026-10-15", "2026-10-15", true],
+      ]
+    );
+    assert.ok(events.some((e) => e.uid === "r1-plain@example.com"), "the rest of the calendar is missing");
+  });
+
+  it("R2: lists a floating weekly series as clock time with no offset", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    await putRawEvent(
+      own,
+      "floating-series.ics",
+      ics(
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Other Client//EN",
+        "BEGIN:VEVENT",
+        "UID:r2-floating@example.com",
+        "DTSTAMP:20260901T080000Z",
+        "DTSTART:20261001T090000",
+        "DTEND:20261001T100000",
+        "RRULE:FREQ=WEEKLY;COUNT=2",
+        "SUMMARY:Gym",
+        "END:VEVENT",
+        "END:VCALENDAR"
+      )
+    );
+    const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(
+      events.map((e) => [e.start, e.end, e.timezone]),
+      [
+        ["2026-10-01T09:00:00", "2026-10-01T10:00:00", "floating"],
+        ["2026-10-08T09:00:00", "2026-10-08T10:00:00", "floating"],
+      ]
+    );
+  });
+
+  it("R3: lists an override with no master as its one instance", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    await putRawEvent(own, "override-only.ics", overrideOnly("r3-once@example.com"));
+    const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(
+      events.map((e) => [e.uid, e.recurrenceId, e.start]),
+      [["r3-once@example.com", "2026-10-08T09:00:00.000Z", "2026-10-08T10:00:00.000Z"]]
+    );
+  });
+
+  it("R5, kept: a zoned series with EXDATE and an override expands as Radicale's own expansion did", async () => {
+    // The values are what Radicale's <C:expand> answered for this object
+    // before the expansion moved into the connector: UTC instants, the EXDATE
+    // left out, the override used, and the change to CET on 2026-10-25 applied.
+    const { cal: own, client: mine } = await freshCalendar();
+    await putRawEvent(
+      own,
+      "berlin-series.ics",
+      ics(
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Other Client//EN",
+        ...BERLIN_VTIMEZONE,
+        "BEGIN:VEVENT",
+        "UID:r5-berlin@example.com",
+        "DTSTAMP:20260901T080000Z",
+        "DTSTART;TZID=Europe/Berlin:20261015T090000",
+        "DTEND;TZID=Europe/Berlin:20261015T100000",
+        "RRULE:FREQ=WEEKLY;COUNT=4",
+        "EXDATE;TZID=Europe/Berlin:20261022T090000",
+        "SUMMARY:Weekly",
+        "END:VEVENT",
+        "BEGIN:VEVENT",
+        "UID:r5-berlin@example.com",
+        "DTSTAMP:20260901T080000Z",
+        "RECURRENCE-ID;TZID=Europe/Berlin:20261029T090000",
+        "DTSTART;TZID=Europe/Berlin:20261029T110000",
+        "DTEND;TZID=Europe/Berlin:20261029T120000",
+        "SUMMARY:Weekly (later)",
+        "END:VEVENT",
+        "END:VCALENDAR"
+      )
+    );
+    const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(
+      events.map((e) => [e.recurrenceId, e.start, e.end, e.summary]),
+      [
+        ["2026-10-15T07:00:00.000Z", "2026-10-15T07:00:00.000Z", "2026-10-15T08:00:00.000Z", "Weekly"],
+        ["2026-10-29T08:00:00.000Z", "2026-10-29T10:00:00.000Z", "2026-10-29T11:00:00.000Z", "Weekly (later)"],
+        ["2026-11-05T08:00:00.000Z", "2026-11-05T08:00:00.000Z", "2026-11-05T09:00:00.000Z", "Weekly"],
+      ]
+    );
+  });
+});
+
+/** One VEVENT with a RECURRENCE-ID and no master: an invitation to a single instance. */
+function overrideOnly(uid: string): string {
+  return ics(
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Other Client//EN",
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    "DTSTAMP:20260901T080000Z",
+    "RECURRENCE-ID:20261008T090000Z",
+    "DTSTART:20261008T100000Z",
+    "DTEND:20261008T110000Z",
+    "SUMMARY:The one I was invited to",
+    "END:VEVENT",
+    "END:VCALENDAR"
+  );
+}
+
+describe("lookup robustness (#211)", SKIP, () => {
+  it("#211.1: lists an object whose href has no .ics, and updates it by UID", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "no-extension@example.com";
+    const etag = await putRawEvent(own, "no-extension", richEvent(uid));
+    const { events } = await mine.listEvents(own.calendarUrl, WINDOW.start, WINDOW.end);
+    assert.deepEqual(
+      events.map((e) => e.uid),
+      [uid]
+    );
+    await mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, summary: "Found it" });
+    assert.match((await getRawEvent(own, "no-extension")) ?? "", /SUMMARY:Found it/);
+  });
+
+  it("#211.2: lists the other events past one it cannot read, and names that one in skipped", async () => {
+    const own = await makeRadicaleCalendar();
+    await putRawEvent(own, "a-bad.ics", richEvent("bad@example.com", "Unreadable"));
+    await putRawEvent(own, "b-good.ics", richEvent("good@example.com", "Readable"));
+    const proxy = await startCalDavProxy({ corruptObject: "a-bad.ics" });
+    try {
+      const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+      const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
+      const { events, skipped } = await viaProxy.listEvents(calendarUrl, WINDOW.start, WINDOW.end);
+      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the corrupt object");
+      assert.deepEqual(
+        events.map((e) => e.summary),
+        ["Readable"]
+      );
+      assert.equal(skipped.length, 1);
+      assert.match(skipped[0].url, /\/a-bad\.ics$/);
+      assert.match(skipped[0].reason, /could not be read/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("#211.2: update_event finds the exact UID past an earlier object it cannot read", async () => {
+    const own = await makeRadicaleCalendar();
+    // Both match the UID query's substring text-match; the proxy puts the
+    // unreadable one first.
+    await putRawEvent(own, "a-bad.ics", richEvent("late@example.com-old", "Unreadable"));
+    const etag = await putRawEvent(own, "z-exact.ics", richEvent("late@example.com", "Before"));
+    const proxy = await startCalDavProxy({ corruptObject: "a-bad.ics" });
+    try {
+      const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+      const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
+      await viaProxy.updateEvent({ calendarUrl, uid: "late@example.com", etag, summary: "After" });
+      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the corrupt object");
+      assert.match((await getRawEvent(own, "z-exact.ics")) ?? "", /SUMMARY:After/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("#211.3: an override with no master is refused as the one occurrence it is, not as a series", async () => {
+    const { cal: own, client: mine } = await freshCalendar();
+    const uid = "invited-once@example.com";
+    const etag = await putRawEvent(own, "invited-once.ics", overrideOnly(uid));
+    for (const applyToSeries of [undefined, true]) {
+      const message = await refusal(
+        mine.updateEvent({ calendarUrl: own.calendarUrl, uid, etag, summary: "x", applyToSeries })
+      );
+      assert.match(message, /single occurrence of a series/, `apply_to_series: ${String(applyToSeries)}`);
+      assert.match(message, /Nothing was changed/);
+      assert.doesNotMatch(message, /pass apply_to_series/);
+    }
+    assert.match((await getRawEvent(own, "invited-once.ics")) ?? "", /SUMMARY:The one I was invited to/);
+
+    const deleting = await refusal(mine.deleteEvent({ calendarUrl: own.calendarUrl, uid, etag }));
+    assert.match(deleting, /single occurrence of a series/);
+    assert.doesNotMatch(deleting, /every occurrence/);
+    assert.match(deleting, /Nothing was deleted/);
+    await mine.deleteEvent({ calendarUrl: own.calendarUrl, uid, etag, applyToSeries: true });
+    assert.equal(await getRawEvent(own, "invited-once.ics"), null);
   });
 });
 
@@ -163,7 +404,7 @@ describe("update_event", SKIP, () => {
       etag: await etagOf(uid),
       start: "2026-10-01T13:00:00Z",
     });
-    const moved = (await client.listEvents(cal.calendarUrl, WINDOW.start, WINDOW.end)).find((e) => e.uid === uid);
+    const moved = (await client.listEvents(cal.calendarUrl, WINDOW.start, WINDOW.end)).events.find((e) => e.uid === uid);
     assert.equal(moved?.start, "2026-10-01T13:00:00.000Z");
     assert.equal(moved?.end, "2026-10-01T14:00:00.000Z");
   });
@@ -190,13 +431,13 @@ describe("update_event", SKIP, () => {
   });
 
   it("reports a UID that does not exist, and creates nothing", async () => {
-    const before = await client.listEvents(cal.calendarUrl, WINDOW.start, WINDOW.end);
+    const { events: before } = await client.listEvents(cal.calendarUrl, WINDOW.start, WINDOW.end);
     const message = await refusal(
       client.updateEvent({ calendarUrl: cal.calendarUrl, uid: "nobody@example.com", etag: '"x"', summary: "x" })
     );
     assert.match(message, /No event with UID "nobody@example.com"/);
     assert.match(message, /no event was created/);
-    const after = await client.listEvents(cal.calendarUrl, WINDOW.start, WINDOW.end);
+    const { events: after } = await client.listEvents(cal.calendarUrl, WINDOW.start, WINDOW.end);
     assert.equal(after.length, before.length);
   });
 
@@ -252,7 +493,7 @@ describe("update_event on a server that answers a PUT without an ETag", SKIP, ()
   // so a second change needed a list_events in between. The connector now
   // reads the new ETag back itself when the PUT did not carry one.
   it("returns the new etag anyway, and it carries a second update straight away", async () => {
-    const proxy = await startEtaglessPutProxy();
+    const proxy = await startCalDavProxy({ etaglessPuts: true });
     try {
       const viaProxy = new CalDavClient({ url: proxy.url, user: cal.user, pass: RADICALE_PASSWORD });
       const calendarUrl = cal.calendarUrl.replace(RADICALE_URL, proxy.url);
@@ -267,6 +508,82 @@ describe("update_event on a server that answers a PUT without an ETag", SKIP, ()
       assert.ok(second.etag);
       assert.match((await getRawEvent(cal, "etagless.ics")) ?? "", /SUMMARY:Two/);
       assert.equal(proxy.strippedPuts(), 2, "the proxy never took an ETag away, so the fallback was not exercised");
+    } finally {
+      await proxy.close();
+    }
+  });
+});
+
+describe("a change that lands between the lookup and the write (#214)", SKIP, () => {
+  /** A client whose every request goes through `proxy`, for the calendar `own`. */
+  function through(proxy: CalDavProxy, own: RadicaleCalendar): { client: CalDavClient; calendarUrl: string } {
+    return {
+      client: new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD }),
+      calendarUrl: own.calendarUrl.replace(RADICALE_URL, proxy.url),
+    };
+  }
+
+  it("refuses a delete whose event went away after the lookup as not found (refuseLostRace's 404)", async () => {
+    // Radicale answers a DELETE with If-Match on a missing object 404, and a
+    // PUT with If-Match on one 412, so the 404 branch is reached by a delete.
+    const own = await makeRadicaleCalendar();
+    const uid = "vanishes-before-delete@example.com";
+    const etag = await putRawEvent(own, "vanishes.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({
+      before: async ({ method }) => {
+        if (method === "DELETE") await deleteBehindTheBack(own, "vanishes.ics");
+      },
+    });
+    try {
+      const { client: viaProxy, calendarUrl } = through(proxy, own);
+      const message = await refusal(viaProxy.deleteEvent({ calendarUrl, uid, etag }));
+      assert.match(message, /No event with UID "vanishes-before-delete@example.com"/);
+      assert.match(message, /Nothing was deleted/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("refuses an update whose event went away after the lookup, and creates nothing", async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "vanishes-before-put@example.com";
+    const etag = await putRawEvent(own, "vanishes.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({
+      before: async ({ method }) => {
+        if (method === "PUT") await deleteBehindTheBack(own, "vanishes.ics");
+      },
+    });
+    try {
+      const { client: viaProxy, calendarUrl } = through(proxy, own);
+      const message = await refusal(viaProxy.updateEvent({ calendarUrl, uid, etag, summary: "x" }));
+      assert.match(message, /Nothing was changed, and no event was created/);
+      assert.equal(await getRawEvent(own, "vanishes.ics"), null);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("hands back no etag when another version landed between the PUT and the read-back", async () => {
+    // The PUT answers with no ETag (Nextcloud), so the connector reads it back
+    // — and by then a phone has written SEQUENCE:7 over it. That etag is the
+    // phone's version; handing it back would let the next update overwrite it.
+    const own = await makeRadicaleCalendar();
+    const uid = "overtaken@example.com";
+    const etag = await putRawEvent(own, "overtaken.ics", richEvent(uid));
+    const proxy = await startCalDavProxy({
+      etaglessPuts: true,
+      after: async ({ method }, status) => {
+        if (method === "PUT" && status < 300) {
+          await editBehindTheBack(own, "overtaken.ics", richEvent(uid, "Phone").replace("SUMMARY:", "SEQUENCE:7\r\nSUMMARY:"));
+        }
+      },
+    });
+    try {
+      const { client: viaProxy, calendarUrl } = through(proxy, own);
+      const result = await viaProxy.updateEvent({ calendarUrl, uid, etag, summary: "Claude" });
+      assert.equal(proxy.strippedPuts(), 1, "the PUT still carried an ETag, so no read-back happened");
+      assert.equal(result.etag, null);
+      assert.match((await getRawEvent(own, "overtaken.ics")) ?? "", /SUMMARY:Phone/);
     } finally {
       await proxy.close();
     }

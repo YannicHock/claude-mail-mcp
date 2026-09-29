@@ -30,6 +30,7 @@
 
 import type { ClientPool } from "./client-pool.js";
 import { classifyFailure } from "../shared/credential-failure.js";
+import { ToolRefusal } from "./tool-refusal.js";
 
 /**
  * The message every tool failure is logged under. One fixed string, so an
@@ -39,18 +40,12 @@ import { classifyFailure } from "../shared/credential-failure.js";
 export const TOOL_FAILURE_EVENT = "mail tool call failed";
 
 /**
- * An answer a tool gives on purpose, not a mailbox that failed.
- *
- * A calendar write refused because the event changed since it was read, or
- * because it is one occurrence of a series, is the tool working as designed —
- * a model retrying after a conflict is exactly the behaviour asked for. Logging
- * it at `warn` beside real server failures would teach an operator to ignore
- * the one line #146 exists to put in front of them. So {@link reportingFailures}
- * rethrows this unchanged: no log line, and the message is not prefixed.
+ * An answer a tool gives on purpose, not a mailbox that failed; see
+ * src/tool-refusal.ts. {@link reportingFailures} rethrows it unchanged, with no
+ * log line. Re-exported here so every import that predates the move (#214)
+ * still names the same class.
  */
-export class ToolRefusal extends Error {
-  override readonly name = "ToolRefusal";
-}
+export { ToolRefusal };
 
 /**
  * Log one `warn` line for `err` and return the error to throw in its place.

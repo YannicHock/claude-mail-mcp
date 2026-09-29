@@ -6,7 +6,16 @@
  * calendar to act on. If the resolved account has no CalDAV, the tool
  * surfaces a clear error rather than silently failing.
  *
- * All times are ISO 8601 with timezone offset (e.g. 2026-05-22T09:00:00+02:00).
+ * Times given to a tool are ISO 8601 with timezone offset (e.g.
+ * 2026-05-22T09:00:00+02:00), or `YYYY-MM-DD` for an all-day event. Times
+ * `list_events` reports are UTC instants, `YYYY-MM-DD` for an all-day event,
+ * and clock time with no offset for a floating one, beside the event's
+ * `timezone` (v0.7.4, spec 2026-09-29 §2.5).
+ *
+ * v0.7.4 (spec 2026-09-29 §2.2): `list_events` expands recurrence in the
+ * connector, so an all-day series, a floating series or an invitation to one
+ * instance no longer fails the whole calendar (R1–R3), and an object that
+ * cannot be read is named in the answer's `skipped` instead (#211).
  *
  * What the calendar can do: list calendars and events, create an event, find
  * free time, and since v0.7.2 change (`update_event`, #152) and delete
@@ -64,12 +73,49 @@ const isoDateTime = z
     "ISO 8601 datetime with timezone offset, e.g. 2026-05-22T09:00:00+02:00"
   );
 
+/**
+ * A start or end an event is given (#214): `isoDateTime` said "with timezone
+ * offset" even where an all-day event takes a bare date, so the schema told
+ * the model one thing and the tool description another.
+ */
+const DATE_OR_DATE_TIME =
+  "an ISO 8601 date-time with offset, e.g. 2026-05-22T09:00:00+02:00, or YYYY-MM-DD when all_day";
+
+const dateOrDateTime = z.string().describe(`Start: ${DATE_OR_DATE_TIME}`);
+
 const accountSchema = z
   .string()
   .optional()
   .describe(
     "Account ID (from list_accounts) to act on. Omit to use the default account."
   );
+
+// The fields every tool that names one stored event shares (#214). One
+// definition each, so update_event, delete_event and the writes still to come
+// cannot describe the same argument two ways.
+
+const calendarUrlSchema = z
+  .string()
+  .url()
+  .describe("Calendar URL as returned by list_calendars");
+
+const uidSchema = z.string().min(1).describe("Event UID as returned by list_events");
+
+const etagSchema = z
+  .string()
+  .min(1)
+  .optional()
+  .describe("The event's etag as returned by list_events. Required unless list_events returned null for it.");
+
+const applyToSeriesSchema = z
+  .boolean()
+  .optional()
+  .describe("Required to change or delete a recurring event; the call then applies to every occurrence");
+
+const recurrenceIdSchema = z
+  .string()
+  .optional()
+  .describe("Not supported yet: a single occurrence of a series cannot be changed or deleted. Passing it is refused.");
 
 /**
  * Resolve the account and hand back its CalDAV client together with the id
@@ -121,12 +167,9 @@ export function registerCalendarTools(
     "list_events",
     {
       description:
-        "List events in a calendar between two timestamps. Recurring events are expanded into individual instances.",
+        "List events in a calendar between two timestamps. Recurring events are expanded into individual instances, each with the `recurrenceId` of the occurrence it is (a date, YYYY-MM-DD, for an all-day series). Each event carries `timezone`: its IANA zone, \"UTC\", or \"floating\" — a clock time with no zone, whose `start` and `end` are given without an offset. `transparent: true` means it does not block time. An event whose stored data cannot be read is left out and named in `skipped` with the reason, rather than failing the whole calendar.",
       inputSchema: {
-        calendar_url: z
-          .string()
-          .url()
-          .describe("Calendar URL as returned by list_calendars"),
+        calendar_url: calendarUrlSchema,
         start: isoDateTime.describe("Window start (inclusive)"),
         end: isoDateTime.describe("Window end (exclusive)"),
         account: accountSchema,
@@ -134,10 +177,10 @@ export function registerCalendarTools(
     },
     async ({ calendar_url, start, end, account }) => {
       const { caldav, id } = requireCaldav(pool, account);
-      const events = await reportingFailures(pool, "list_events", id, () =>
+      const { events, skipped } = await reportingFailures(pool, "list_events", id, () =>
         caldav.listEvents(calendar_url, start, end)
       );
-      return asJson({ count: events.length, events });
+      return asJson({ count: events.length, events, skipped });
     }
   );
 
@@ -147,13 +190,10 @@ export function registerCalendarTools(
       description:
         "Create a new calendar event. WRITE OPERATION. Use all_day=true for date-only events (start/end should then be YYYY-MM-DD; end is exclusive — for a one-day event set end to the day after).",
       inputSchema: {
-        calendar_url: z
-          .string()
-          .url()
-          .describe("Calendar URL as returned by list_calendars"),
+        calendar_url: calendarUrlSchema,
         summary: z.string().min(1).describe("Event title"),
-        start: isoDateTime,
-        end: isoDateTime,
+        start: dateOrDateTime,
+        end: dateOrDateTime.describe(`End: ${DATE_OR_DATE_TIME}; exclusive for an all-day event`),
         all_day: z.boolean().optional(),
         description: z.string().optional(),
         location: z.string().optional(),
@@ -190,33 +230,22 @@ export function registerCalendarTools(
       description:
         "Change an existing calendar event. WRITE OPERATION. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. `start` alone moves the event and keeps its length. The answer carries the event's new `etag` for a further change; if it is null, call list_events before changing it again. This connector sends no invitation or update mail itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees when an event you organize is changed. Treat changing an event that has attendees as a message to real people, and confirm with the user first. A recurring event needs apply_to_series=true, and then only its summary, description and location can change; a single occurrence cannot be changed yet.",
       inputSchema: {
-        calendar_url: z
-          .string()
-          .url()
-          .describe("Calendar URL as returned by list_calendars"),
-        uid: z.string().min(1).describe("Event UID as returned by list_events"),
-        etag: z
-          .string()
-          .min(1)
-          .optional()
-          .describe("The event's etag as returned by list_events. Required unless list_events returned null for it."),
+        calendar_url: calendarUrlSchema,
+        uid: uidSchema,
+        etag: etagSchema,
         summary: z.string().min(1).optional().describe("New title"),
         description: z.string().optional().describe("New description; an empty string removes it"),
         location: z.string().optional().describe("New location; an empty string removes it"),
-        start: isoDateTime.optional().describe("New start. Alone, it moves the event and keeps its length."),
-        end: isoDateTime.optional().describe("New end"),
+        start: dateOrDateTime
+          .optional()
+          .describe(`New start: ${DATE_OR_DATE_TIME}. Alone, it moves the event and keeps its length.`),
+        end: dateOrDateTime.optional().describe(`New end: ${DATE_OR_DATE_TIME}; exclusive for an all-day event`),
         all_day: z
           .boolean()
           .optional()
           .describe("Switch between all-day and timed; needs both start and end (YYYY-MM-DD, end exclusive, when all-day)"),
-        recurrence_id: z
-          .string()
-          .optional()
-          .describe("Not supported yet: a single occurrence of a series cannot be changed. Passing it is refused."),
-        apply_to_series: z
-          .boolean()
-          .optional()
-          .describe("Required to change a recurring event; the change then applies to every occurrence"),
+        recurrence_id: recurrenceIdSchema,
+        apply_to_series: applyToSeriesSchema,
         account: accountSchema,
       },
     },
@@ -247,24 +276,11 @@ export function registerCalendarTools(
       description:
         "Delete a calendar event. DESTRUCTIVE AND PERMANENT: CalDAV has no trash, so a deleted event cannot be recovered. This connector sends no cancellation itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees a cancellation when an event you organize is deleted, and that mail cannot be recalled. Confirm with the user first if the event has attendees. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is deleted. A recurring event needs apply_to_series=true and is then deleted with every occurrence; a single occurrence cannot be deleted yet.",
       inputSchema: {
-        calendar_url: z
-          .string()
-          .url()
-          .describe("Calendar URL as returned by list_calendars"),
-        uid: z.string().min(1).describe("Event UID as returned by list_events"),
-        etag: z
-          .string()
-          .min(1)
-          .optional()
-          .describe("The event's etag as returned by list_events. Required unless list_events returned null for it."),
-        recurrence_id: z
-          .string()
-          .optional()
-          .describe("Not supported yet: a single occurrence of a series cannot be deleted. Passing it is refused."),
-        apply_to_series: z
-          .boolean()
-          .optional()
-          .describe("Required to delete a recurring event; every occurrence is deleted"),
+        calendar_url: calendarUrlSchema,
+        uid: uidSchema,
+        etag: etagSchema,
+        recurrence_id: recurrenceIdSchema,
+        apply_to_series: applyToSeriesSchema,
         account: accountSchema,
       },
     },
