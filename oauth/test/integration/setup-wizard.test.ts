@@ -1622,7 +1622,8 @@ test("step 2 opens on the address, not on eighteen boxes", async () => {
 
     assert.match(html, /Step 2 of 3 · Add your first mailbox/);
     assert.match(html, new RegExp(`name="${ADDRESS_FIELD}"`));
-    assert.match(html, new RegExp(`name="${SHARED_PASSWORD_FIELD}"`));
+    // #197: no password until the lookup has said whether one can work.
+    assert.equal(html.includes(`name="${SHARED_PASSWORD_FIELD}"`), false);
     // The full form is the fallback now, not the front door.
     assert.equal(html.includes(`name="${MAILBOX_FIELDS.imapHost}"`), false);
     // And nothing was contacted merely by looking at the screen.
@@ -1881,9 +1882,10 @@ test("Continue on the confirmation screen probes and stores what was shown", asy
 
     // Submit exactly what the confirmation screen carries and nothing else —
     // the hidden fields, read straight back out of the page. The password is
-    // among them, which is the whole of #120: the operator typed it on the
-    // address screen and this submission is the one they made by pressing
-    // Continue, not a second round of typing.
+    // among them, which is the whole of #120: the lookup carried it (the
+    // browser-shaped flow since #197 is the test further down) and this
+    // submission is the one made by pressing Continue, not a second round of
+    // typing.
     const hidden = hiddenFields(html);
     assert.ok(Object.keys(hidden).length > 0, "the confirmation screen carried nothing");
 
@@ -1948,10 +1950,63 @@ test("a found CalDAV endpoint is stored with the same password, and only then", 
   }
 });
 
-test("the password typed on the address screen is not asked for a second time", async () => {
-  // #120, end to end. One password, typed once on the screen that asks for it,
-  // carried through the lookup in the form the operator is already looking at —
-  // and still nowhere near the wizard's state file.
+test("the password typed on the confirmation screen reaches the save, and is not asked for again on Edit these", async () => {
+  // #120 end to end, the way a browser walks it since #197: the lookup goes out
+  // with no password, the confirmation screen asks for it once, and from there
+  // it travels — to the save, or through Edit these into the full form — without
+  // a second box and without touching the wizard's state file.
+  const dir = dataDir();
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { suggestion: suggestionFor() });
+
+    const found = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      _action: "lookup",
+    });
+    assert.equal(found.status, 200);
+    const confirmation = await found.text();
+    assert.match(
+      confirmation,
+      new RegExp(`name="${SHARED_PASSWORD_FIELD}"[^>]*type="password"`),
+      "the confirmation screen has nowhere to type the password"
+    );
+    assert.equal(/carried/i.test(confirmation), false, "nothing was carried, so nothing may claim it was");
+
+    // What the browser sends: the hidden fields plus the box the operator typed in.
+    const typed = { ...hiddenFields(confirmation), [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD };
+
+    const edited = await postSetupForm(harness, "/mailbox", { ...typed, _action: "edit" });
+    assert.equal(edited.status, 200);
+    const form = await edited.text();
+    for (const name of [MAILBOX_FIELDS.imapPass, MAILBOX_FIELDS.smtpPass]) {
+      assert.ok(
+        form.includes(`name="${name}" type="password" value="${MAILBOX_PASSWORD}"`),
+        `Edit these asks for ${name} again`
+      );
+    }
+
+    const saved = await postSetupForm(harness, "/mailbox", { ...typed, _action: "save" });
+    assert.equal(saved.status, 303);
+    const create = harness.upstream.requests.find((r) => r.method === "POST" && r.url === "/settings/mailboxes");
+    assert.ok(create, "the save never reached the connector");
+    const body = JSON.parse(create.body) as MailboxRequestBody;
+    assert.equal(body.mailbox.imap.pass, MAILBOX_PASSWORD);
+    assert.equal(body.mailbox.smtp.pass, MAILBOX_PASSWORD);
+
+    const state = readFileSync(join(dir, "setup-wizard.json"), "utf8");
+    assert.equal(state.includes(MAILBOX_PASSWORD), false);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a password the lookup carried is not asked for a second time", async () => {
+  // #120, the carrying path. Since #197 no browser sends a password with the
+  // lookup, but the route still keeps one that arrives (an older page, a
+  // hand-made POST): one password, carried through the lookup in the form the
+  // operator is already looking at — and still nowhere near the state file.
   const dir = dataDir();
   const harness = await startHarness({ unbootstrapped: true, dataDir: dir });
   try {
@@ -2375,6 +2430,37 @@ test("an outlook.com address is called out at the lookup, on the screen it leads
       harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
       ["POST /settings/autoconfig"]
     );
+  } finally {
+    await harness.close();
+  }
+});
+
+test("the outlook.com warning comes before any password is asked for", async () => {
+  // #197, the order the v0.7.1 spec's §5.3 asked for: "rendered at address
+  // lookup — before any password is typed." The acceptance run on 2026-09-28
+  // found the address screen demanding a password first. Now the lookup goes
+  // out with none, and the screen it leads to says no password will work
+  // *above* the one box that asks for it.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      suggestion: suggestionFor({ email: "anna@outlook.com", domain: "outlook.com" }),
+      unsupported: MICROSOFT_WARNING,
+    });
+
+    const res = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@outlook.com",
+      _action: "lookup",
+    });
+
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    const warningAt = html.indexOf("no password will connect");
+    const passwordAt = html.search(new RegExp(`name="${SHARED_PASSWORD_FIELD}"[^>]*type="password"`));
+    assert.ok(warningAt >= 0, "the warning is missing");
+    assert.ok(passwordAt >= 0, "the confirmation screen has nowhere to type the password");
+    assert.ok(warningAt < passwordAt, "the password box comes before the warning");
   } finally {
     await harness.close();
   }

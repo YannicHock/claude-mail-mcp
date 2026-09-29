@@ -843,17 +843,21 @@ export interface MailboxAddressPageData extends StepTwoLinks {
 }
 
 /**
- * Tier 1 — an address and a password, and nothing else on the screen.
+ * Tier 1 — an address, and nothing else on the screen.
  *
  * On Continue the connector looks the domain up (autoconfig, then the ISPDB,
  * then RFC 6186 SRV records) and what it finds is shown for confirmation. A
  * lookup that finds nothing is not a failure and is never reported as one: the
  * next screen is simply the provider list.
  *
- * The password is asked for here rather than after the lookup because it is the
- * other half of the same thought — "this is my mailbox" — and because a screen
- * that asks for an address, goes away for up to ten seconds and then asks for a
- * password reads as two steps rather than one.
+ * No password here, on purpose (#197). This screen used to ask for one beside
+ * the address, as the other half of "this is my mailbox" — and so an operator
+ * with an outlook.com address typed a password before the lookup could tell
+ * them no password will ever connect. The v0.7.1 spec's §5.3 put that warning
+ * "before any password is typed". Every screen after the lookup asks for a
+ * missing password itself (see {@link suggestionPassword}; the form's own boxes
+ * are `required`), so it is asked exactly once either way and #120 holds.
+ * A `lookup` that still carries a password is carried on as before.
  */
 export function renderMailboxAddressStep(data: MailboxAddressPageData): string {
   const emailError = data.errors[ADDRESS_FIELD] ?? "";
@@ -869,13 +873,6 @@ export function renderMailboxAddressStep(data: MailboxAddressPageData): string {
            value="${escapeHtml(data.email)}" required autofocus
            autocapitalize="none" autocorrect="off" spellcheck="false"${invalid(emailError)}>
     ${fieldError(emailError)}
-    <label for="mailbox_password">Password</label>
-    <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
-           value="" autocomplete="new-password" required>
-    <p class="muted">
-      The password for the mailbox itself. Some providers want an app password
-      here rather than the one you sign in to their website with.
-    </p>
     <div class="actions">
       <button type="submit" name="_action" value="lookup">Continue</button>
       ${skipButton()}
@@ -900,8 +897,8 @@ export interface MailboxSuggestionPageData extends StepTwoLinks {
    */
   values: Record<string, string>;
   /**
-   * The password the operator typed on the address screen, or "" when the
-   * submission that triggered the lookup did not carry one.
+   * The password the lookup's submission carried, or "" — the ordinary case
+   * since #197, when the address screen stopped asking for one.
    *
    * Not part of {@link values}: those are the connector's field names and the
    * rows on the screen are rendered from them, which is the last place a
@@ -916,12 +913,14 @@ export interface MailboxSuggestionPageData extends StepTwoLinks {
 }
 
 /**
- * The password, carried rather than asked for a second time.
+ * The password: asked for here, or carried rather than asked for a second time.
  *
- * #120: the operator typed it on the address screen, that submission is what
- * produced this one, and asking again — on a screen that until now said nothing
- * about the first answer — is the wizard forgetting something the operator can
- * plainly see it was told.
+ * Since #197 the address screen asks for no password, so the empty case below
+ * is the ordinary one and this is where the password is first typed. The
+ * carried case remains for a lookup that still arrives with one (an older page,
+ * a hand-made POST). #120: asking again for a password that submission carried
+ * — on a screen that said nothing about the first answer — is the wizard
+ * forgetting something the operator can plainly see it was told.
  *
  * A hidden input is the shape, because that is how the rest of this screen
  * already travels: the settings it is confirming are hidden inputs too, the
@@ -935,9 +934,8 @@ export interface MailboxSuggestionPageData extends StepTwoLinks {
  * whether Continue is about to use the password they typed or an empty one, and
  * if they press `Edit these` they meet a form that is mysteriously filled in.
  *
- * The empty case is not hypothetical. `required` on the address screen is the
- * browser's promise, not this package's, and a POST that skipped it still has
- * to produce a screen the operator can finish on.
+ * The empty case renders its own `required` box, with the app-password hint the
+ * address screen used to carry, and the operator finishes here.
  */
 function suggestionPassword(password: string): string {
   if (password === "") {
@@ -945,9 +943,10 @@ function suggestionPassword(password: string): string {
     <input id="mailbox_password" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" type="password"
            value="" autocomplete="new-password" required autofocus>
     <p class="muted">
-      Passwords are never written back into this page, so it has to be typed
-      here. It is used to log in to the servers above, and stored only once they
-      both answer.
+      The password for the mailbox itself. Some providers want an app password
+      here rather than the one you sign in to their website with. It is used to
+      log in to the servers above, stored only once they both answer, and
+      never written back into this page.
     </p>`;
   }
   return `<input type="hidden" name="${escapeHtml(SHARED_PASSWORD_FIELD)}" value="${escapeHtml(
@@ -1063,8 +1062,9 @@ export interface MailboxProviderPageData extends StepTwoLinks {
   /** Which radio is on, when a submission is being re-rendered. */
   selected: string;
   /**
-   * The password the operator typed on the address screen, or "" when this
-   * screen was reached from its own link and nobody has typed one yet.
+   * The password the lookup's submission carried, or "" — when this screen was
+   * reached from its own link, and ordinarily since #197, when the address
+   * screen stopped asking for one. The form asks for it then.
    */
   password: string;
   errors: Record<string, string>;
@@ -1077,9 +1077,9 @@ export interface MailboxProviderPageData extends StepTwoLinks {
  * The password on the way through tier 2, on the one route that has one.
  *
  * This screen is reached two ways, and #120 is only about one of them. From a
- * lookup that found nothing, the operator typed a password on the address
- * screen a moment ago and this screen is on the way to the form that will use
- * it. From the `Choose provider manually` link, nobody has typed anything, so
+ * lookup that found nothing and carried a password (no longer typed on the
+ * address screen since #197, but a lookup that brings one keeps it), this
+ * screen is on the way to the form that will use it. From the `Choose provider manually` link, nobody has typed anything, so
  * there is nothing to carry and nothing to say about it — and a note claiming
  * otherwise would be the worse half of the bug.
  */

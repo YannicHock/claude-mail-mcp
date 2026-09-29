@@ -2,6 +2,12 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The setup wizard no longer asks for a mailbox password before it can say none will work.** The address screen asked for the address and the password together, so an operator with an `@outlook.com` address typed a password before the lookup could tell them Microsoft accepts no password over IMAP. It now asks for the address alone; the screen after the lookup shows the warning, then asks for the password once. (#197)
+
 ## [0.7.1] — 2026-09-11
 
 **A wrong password says so.** The release that opened this milestone failed on a Gmail
