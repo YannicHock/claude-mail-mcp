@@ -714,24 +714,48 @@ function toInstance(o: Occurrence, opts: ExpandOptions): CalendarEvent {
  * and the reason in `skipped`.
  */
 export function expandObject(ics: string, window: ExpandWindow, opts: ExpandOptions): ExpandResult {
+  const { items, skipped } = readObject(ics, window, opts.cap ?? MAX_OCCURRENCES_PER_OBJECT, (o) => toInstance(o, opts));
+  return skipped === undefined ? { instances: items } : { instances: items, skipped };
+}
+
+/**
+ * What one stored object holds in `window`, each occurrence turned into a `T`
+ * by `map`, with why anything was left out: the one reading both worker
+ * operations that report on a window share — {@link expandObject} for
+ * `list_events`, and `busyTimes` (src/ical-busy.ts) for `find_free_slot` — so
+ * the two cannot disagree about which objects, and which occurrences, they
+ * could read (#213: the free-slot search used to drop `skipped`, and count an
+ * unreadable object's time as free).
+ *
+ * Never throws for anything in `ics`, nor for anything `map` throws: an
+ * object that cannot be read, or whose occurrences cannot be, comes back with
+ * no items and the reason in `skipped`. One cut short — more than `cap`
+ * occurrences, or {@link MAX_STEPS_PER_OBJECT} steps walked — comes back with
+ * what was read, and says so.
+ */
+export function readObject<T>(
+  ics: string,
+  window: ExpandWindow,
+  cap: number,
+  map: (occurrence: Occurrence) => T
+): { items: T[]; skipped?: string } {
   let parsed: ParsedCalendar;
   try {
     parsed = parseCalendar(ics);
   } catch (err) {
-    return { instances: [], skipped: `The stored object could not be read as iCalendar: ${reasonFrom(err)}` };
+    return { items: [], skipped: `The stored object could not be read as iCalendar: ${reasonFrom(err)}` };
   }
   try {
     const { vcal, unresolved } = parsed;
     if (unresolved.length > 0) {
       const names = unresolved.map((tzid) => `"${tzid}"`).join(", ");
       return {
-        instances: [],
+        items: [],
         skipped: `Its time zone ${names} has no VTIMEZONE in the object and is not an IANA time zone, so its times cannot be placed.`,
       };
     }
-    const cap = opts.cap ?? MAX_OCCURRENCES_PER_OBJECT;
     const { occurrences, truncated, gaveUp, notes } = occurrencesIn(vcal, window, cap);
-    const instances = occurrences.map((o) => toInstance(o, opts));
+    const items = occurrences.map(map);
     const reasons = [...notes];
     if (truncated) {
       reasons.push(
@@ -743,8 +767,8 @@ export function expandObject(ics: string, window: ExpandWindow, opts: ExpandOpti
         `Its recurrence rule was walked ${MAX_STEPS_PER_OBJECT} steps from its start and still had not reached the end of this window, so the connector gave up on it. Occurrences after that point are not listed.`
       );
     }
-    return reasons.length === 0 ? { instances } : { instances, skipped: reasons.join(" ") };
+    return reasons.length === 0 ? { items } : { items, skipped: reasons.join(" ") };
   } catch (err) {
-    return { instances: [], skipped: `The stored object could not be read as a calendar event: ${reasonFrom(err)}` };
+    return { items: [], skipped: `The stored object could not be read as a calendar event: ${reasonFrom(err)}` };
   }
 }
