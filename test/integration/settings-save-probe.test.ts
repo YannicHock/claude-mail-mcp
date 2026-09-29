@@ -63,7 +63,14 @@ interface Connector {
   close(): Promise<void>;
 }
 
-async function startConnector(accounts: Account[] = []): Promise<Connector> {
+/** One line the connector logged, as its `Logger` was handed it. */
+interface LogLine {
+  level: string;
+  message: string;
+  fields: Record<string, unknown>;
+}
+
+async function startConnector(accounts: Account[] = [], lines?: LogLine[]): Promise<Connector> {
   const dir = await makeTmpDir();
   const accountsPath = `${dir}/accounts.json`;
   await writeFile(accountsPath, JSON.stringify({ version: 1, accounts }), "utf8");
@@ -77,6 +84,13 @@ async function startConnector(accounts: Account[] = []): Promise<Connector> {
     accountsFile: accountsPath,
     settingsSigningKey: SETTINGS_KEY,
     publicUrl: PUBLIC_URL,
+    ...(lines === undefined
+      ? {}
+      : {
+          log: (level: string, message: string, fields: Record<string, unknown> = {}) => {
+            lines.push({ level, message, fields });
+          },
+        }),
   });
   const server = await new Promise<Server>((resolve, reject) => {
     const s: Server = app.listen(0, "127.0.0.1", () => resolve(s));
@@ -333,6 +347,40 @@ test("Save anyway stores credentials the server would have refused", SKIP, async
     const accounts = await storedAccounts(accountsPath);
     assert.equal(accounts.length, 1);
     assert.equal(accounts[0]?.imap.pass, "not-the-password", "stored exactly as typed");
+  } finally {
+    await close();
+  }
+});
+
+test("every save says in the log whether it was tested first (#173)", SKIP, async () => {
+  // The refusal already left a `warn` line; a successful write left nothing, so
+  // an operator could not tell from the log whether a mailbox that fails every
+  // tool call had ever authenticated. *Save anyway* is exactly that case.
+  const lines: LogLine[] = [];
+  const { url, accountsPath, close } = await startConnector([], lines);
+  try {
+    const saved = (): LogLine[] =>
+      lines.filter((line) => line.message === "settings: a mailbox was saved");
+
+    const created = await post(url, "/settings/mailboxes", {
+      ...form(),
+      _stamp: await stampOf(accountsPath),
+    });
+    assert.equal(created.status, 303);
+    assert.deepEqual(saved().map((l) => [l.level, l.fields]), [
+      ["info", { action: "create", id: "work", probed: true }],
+    ]);
+
+    const edited = await post(url, "/settings/mailboxes/work", {
+      ...form({ "imap.pass": "not-the-password" }),
+      _stamp: await stampOf(accountsPath),
+      [SAVE_ANYWAY_FIELD]: CHECKBOX_ON,
+    });
+    assert.equal(edited.status, 303);
+    assert.deepEqual(saved()[1]?.fields, { action: "edit", id: "work", probed: false });
+    const everything = JSON.stringify(lines);
+    assert.equal(everything.includes("not-the-password"), false, "never the password");
+    assert.equal(everything.includes(PASSWORD), false, "never the password");
   } finally {
     await close();
   }

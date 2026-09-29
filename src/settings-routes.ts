@@ -619,6 +619,26 @@ async function gateOnProbe(opts: {
   return { proceed: false };
 }
 
+/**
+ * The line a successful write leaves, beside the `warn` a refused one leaves.
+ *
+ * `probed` is the whole point (#173): a mailbox stored through *Save anyway*
+ * was never authenticated, and an operator whose mailbox then fails every tool
+ * call has to be able to read that off the log. The wizard's own line already
+ * carried it; the settings UI, the path used for every mailbox after the first,
+ * left nothing at all. Written only once the store call has returned, so it can
+ * never claim a save that then lost to a stale stamp. The id and one boolean —
+ * never anything the operator typed.
+ */
+function logSaved(
+  log: Logger,
+  action: "create" | "edit",
+  id: string,
+  report: MailboxProbeReport | undefined
+): void {
+  log("info", "settings: a mailbox was saved", { action, id, probed: report !== undefined });
+}
+
 function findAccount(store: AccountsStore, id: string): Account | undefined {
   return store.list().find((a) => a.id === id);
 }
@@ -1378,6 +1398,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         throw err;
       }
       const wireReport = gate.report;
+      logSaved(log, "create", parsed.account.id, wireReport);
       if (json) {
         // 201 and not the browser's 303: there is nowhere to send a caller that
         // is not a browser, and the two facts it wants are the id it now has
@@ -1624,6 +1645,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       }
       throw err;
     }
+    logSaved(log, "edit", existing.id, gate.report);
     sendSavedPage(res, gate.report);
   });
 
