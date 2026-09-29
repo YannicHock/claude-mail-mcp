@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import ICAL from "ical.js";
 
 import { expandObject, impossibleRule, MAX_OCCURRENCES_PER_OBJECT } from "../../src/ical-expand.js";
+import { EXPANSION_DEADLINE_MS } from "../../src/ical-worker-pool.js";
 
 function ics(...lines: string[]): string {
   return `${lines.join("\r\n")}\r\n`;
@@ -667,7 +668,7 @@ describe("expandObject — one override per RECURRENCE-ID (review of #225)", () 
 });
 
 describe("expandObject — a long sparse series in an IANA zone stays well inside the deadline (review of #225)", () => {
-  it("expands a yearly series since the year 100 in New York, cold, in under a second", () => {
+  it("expands a yearly series since the year 100 in New York, cold, in under half the worker's deadline", () => {
     // 1,926 years from its start to 2026. Scanning every UTC year it touched
     // day by day cost 3.7 s — past the worker's 3 s deadline, so an honest
     // event was skipped as one that may never end.
@@ -688,6 +689,13 @@ describe("expandObject — a long sparse series in an IANA zone stays well insid
       instances.map((e) => e.start),
       ["2026-01-01T14:00:00.000Z"]
     );
-    assert.ok(elapsed < 1000, `took ${elapsed.toFixed(0)} ms`);
+    // The bound is the worker's deadline, halved, not a second (review of
+    // PR #232): alone this takes about 300 ms, but in the full unit suite, with
+    // other files' workers busy on the same cores, 850–970 ms, and a second
+    // failed now and then. What it guards against is the 3.7 s the day-by-day
+    // scan cost, past the 3 s deadline — an honest event then skipped as one
+    // that may never end. Half the deadline still fails that by more than
+    // two times, and says how close to the deadline an honest series may come.
+    assert.ok(elapsed < EXPANSION_DEADLINE_MS / 2, `took ${elapsed.toFixed(0)} ms, against a deadline of ${EXPANSION_DEADLINE_MS} ms`);
   });
 });
