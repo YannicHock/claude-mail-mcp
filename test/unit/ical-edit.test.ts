@@ -21,6 +21,7 @@ import {
   touchesTime,
 } from "../../src/ical-edit.js";
 import { ToolRefusal } from "../../src/tool-errors.js";
+import { buildIcs } from "../../src/caldav-client.js";
 
 const NOW = new Date("2026-09-28T12:00:00Z");
 
@@ -524,5 +525,182 @@ describe("sequenceOf (#214)", () => {
     // What applyEventPatch writes is what mainSequence then reads back.
     const written = applyEventPatch(RICH, "rich-1@example.com", { summary: "x" }, NOW);
     assert.equal(mainSequence(written, "rich-1@example.com"), sequenceOf(master(RICH, "rich-1@example.com")) + 1);
+  });
+});
+
+/** The VEVENT's DTSTART and DTEND lines exactly as written, for comparing two objects' times. */
+function timeLines(text: string): string[] {
+  const vevent = text.slice(text.indexOf("BEGIN:VEVENT"));
+  return [...vevent.matchAll(/\r\n((?:DTSTART|DTEND)[;:][^\r]*)/g)].map((m) => m[1]);
+}
+
+/** The patch's times, or what its refusal was about: two objects asked the same thing must answer the same. */
+function outcome(text: string, uid: string, patch: Parameters<typeof applyEventPatch>[2]): string[] | string {
+  try {
+    return timeLines(applyEventPatch(text, uid, patch, NOW));
+  } catch (err) {
+    if (!(err instanceof ToolRefusal)) throw err;
+    return /at or before it starts/.test(err.message) ? "ends at or before it starts" : err.message;
+  }
+}
+
+describe("applyEventPatch — the gap and the overlap in an object with its own VTIMEZONE (review of #224)", () => {
+  // RICH carries Berlin as an RRULE VTIMEZONE; the clocks go forward at 02:00
+  // on 2026-03-29 and back at 03:00 on 2026-10-25. RFC 5545 §3.3.5: a wall
+  // time in the gap is read with the offset from before it, one in the
+  // overlap is its first occurrence. ical.js's own reading of a VTIMEZONE
+  // does neither, and the write used it.
+
+  it("reads a wall time in the overlap as its first occurrence", () => {
+    // 02:30 is 00:30Z on the first pass; the end, 00:45Z, is after it. Read
+    // as the second pass (01:30Z), the start came after the end and the
+    // update was refused.
+    const out = applyEventPatch(RICH, "rich-1@example.com", { start: "2026-10-25T02:30:00", end: "2026-10-25T02:45:00+02:00" }, NOW);
+    assert.deepEqual(timeLines(out), [
+      "DTSTART;TZID=Europe/Berlin:20261025T023000",
+      "DTEND;TZID=Europe/Berlin:20261025T024500",
+    ]);
+  });
+
+  it("reads a wall time in the gap with the offset from before it, so 02:30 is written as 03:30", () => {
+    const out = applyEventPatch(RICH, "rich-1@example.com", { start: "2026-03-29T02:30:00" }, NOW);
+    assert.deepEqual(timeLines(out), [
+      "DTSTART;TZID=Europe/Berlin:20260329T033000",
+      "DTEND;TZID=Europe/Berlin:20260329T043000",
+    ]);
+  });
+
+  it("refuses 02:30 to 03:30 across the gap as the zero-length event RFC 5545 makes it, as it does without a VTIMEZONE", () => {
+    for (const [text, uid] of [[RICH, "rich-1@example.com"], [BERLIN_NO_VTIMEZONE, "nozone-1@example.com"]] as const) {
+      assert.throws(
+        () => applyEventPatch(text, uid, { start: "2026-03-29T02:30:00", end: "2026-03-29T03:30:00" }, NOW),
+        (err: unknown) =>
+          err instanceof ToolRefusal && /at or before it starts/.test(err.message) && /Nothing was changed/.test(err.message),
+        uid
+      );
+    }
+  });
+
+  it("keeps the length of an event moved by its start into the overlap, measured from the first pass", () => {
+    // One hour from 00:30Z is 01:30Z: the second 02:30, which no wall time
+    // names, so the end is written in UTC.
+    const out = applyEventPatch(RICH, "rich-1@example.com", { start: "2026-10-25T02:30:00" }, NOW);
+    assert.deepEqual(timeLines(out), ["DTSTART;TZID=Europe/Berlin:20261025T023000", "DTEND:20261025T013000Z"]);
+  });
+
+  it("writes the same times for an object with a VTIMEZONE as for one without", () => {
+    const patches = [
+      { start: "2026-10-25T02:30:00" },
+      { start: "2026-10-25T01:30:00" },
+      { start: "2026-10-25T02:30:00", end: "2026-10-25T03:30:00" },
+      { start: "2026-10-25T02:30:00+01:00", end: "2026-10-25T04:00:00" },
+      { start: "2026-03-29T02:30:00" },
+      { start: "2026-03-29T01:30:00", end: "2026-03-29T02:15:00" },
+      { start: "2026-03-29T02:30:00", end: "2026-03-29T03:30:00" },
+      { end: "2026-10-25T02:30:00" },
+      { start: "2026-07-01T09:00:00" },
+    ];
+    for (const patch of patches) {
+      assert.deepEqual(
+        outcome(RICH, "rich-1@example.com", patch),
+        outcome(BERLIN_NO_VTIMEZONE, "nozone-1@example.com", patch),
+        JSON.stringify(patch)
+      );
+    }
+  });
+});
+
+describe("applyEventPatch — a bound on the second pass through the overlap (review of #224)", () => {
+  it("writes an end that falls on the second 02:30 in UTC, not as a wall time that means the first", () => {
+    // Written as TZID 02:30, the end would read as 00:30Z, the start's own
+    // instant: a zero-length event for every RFC 5545 reader.
+    const out = applyEventPatch(BERLIN_NO_VTIMEZONE, "nozone-1@example.com", { start: "2026-10-25T02:30:00" }, NOW);
+    assert.deepEqual(timeLines(out), ["DTSTART;TZID=Europe/Berlin:20261025T023000", "DTEND:20261025T013000Z"]);
+  });
+
+  it("does not write an end before its start when the end's wall time is earlier than the start's", () => {
+    // 02:45 CEST is 00:45Z, 02:15 CET is 01:15Z: half an hour, but the wall
+    // times run backwards.
+    const out = applyEventPatch(
+      BERLIN_NO_VTIMEZONE,
+      "nozone-1@example.com",
+      { start: "2026-10-25T02:45:00+02:00", end: "2026-10-25T02:15:00+01:00" },
+      NOW
+    );
+    assert.deepEqual(timeLines(out), ["DTSTART;TZID=Europe/Berlin:20261025T024500", "DTEND:20261025T011500Z"]);
+  });
+
+  it("writes a start on the second pass in UTC too, and the end that has a wall time in the zone", () => {
+    const out = applyEventPatch(
+      BERLIN_NO_VTIMEZONE,
+      "nozone-1@example.com",
+      { start: "2026-10-25T02:30:00+01:00", end: "2026-10-25T04:00:00+01:00" },
+      NOW
+    );
+    assert.deepEqual(timeLines(out), ["DTSTART:20261025T013000Z", "DTEND;TZID=Europe/Berlin:20261025T040000"]);
+  });
+});
+
+/** An event create_event wrote on 2026-12-01 in Berlin, VTIMEZONE and all. */
+const CREATED = buildIcs(
+  {
+    calendarUrl: "https://dav.example/cal/",
+    uid: "created-1@claude-mail-mcp",
+    summary: "Created here",
+    start: "2026-12-01T10:00:00+01:00",
+    end: "2026-12-01T11:00:00+01:00",
+  },
+  "Europe/Berlin",
+  NOW
+);
+
+/** The instant `name` in `text` names when read by the object's own VTIMEZONE, as another client reads it. */
+function instantByVtimezone(text: string, name: "dtstart" | "dtend"): string {
+  const vcal = new ICAL.Component(ICAL.parse(text));
+  const component = vcal.getFirstSubcomponent("vtimezone");
+  assert.ok(component, "no VTIMEZONE");
+  const local = (vcal.getFirstSubcomponent("vevent")?.getFirstPropertyValue(name) as ICAL.Time).clone();
+  local.zone = new ICAL.Timezone(component);
+  return local.toJSDate().toISOString();
+}
+
+describe("applyEventPatch — the VTIMEZONE create_event wrote covers every time the event moves to (review of #224)", () => {
+  it("moves it years past the span its VTIMEZONE was generated for, as Berlin time, and the VTIMEZONE follows", () => {
+    // Generated for 2025-12 to 2027-12, the block's last observance is +0100:
+    // read as the zone's whole truth, 09:00 CEST was written as 08:00.
+    const out = applyEventPatch(CREATED, "created-1@claude-mail-mcp", { start: "2029-07-02T09:00:00+02:00" }, NOW);
+    assert.deepEqual(timeLines(out), [
+      "DTSTART;TZID=Europe/Berlin:20290702T090000",
+      "DTEND;TZID=Europe/Berlin:20290702T100000",
+    ]);
+    assert.equal(vtimezones(out).length, 1);
+    assert.equal(instantByVtimezone(out, "dtstart"), "2029-07-02T07:00:00.000Z");
+    assert.equal(instantByVtimezone(out, "dtend"), "2029-07-02T08:00:00.000Z");
+  });
+
+  it("moves it to before that span, where ical.js reads the block as offset 0", () => {
+    const out = applyEventPatch(CREATED, "created-1@claude-mail-mcp", { start: "2024-07-02T09:00:00+02:00" }, NOW);
+    assert.deepEqual(timeLines(out), [
+      "DTSTART;TZID=Europe/Berlin:20240702T090000",
+      "DTEND;TZID=Europe/Berlin:20240702T100000",
+    ]);
+    assert.equal(instantByVtimezone(out, "dtstart"), "2024-07-02T07:00:00.000Z");
+    assert.equal(instantByVtimezone(out, "dtend"), "2024-07-02T08:00:00.000Z");
+  });
+
+  it("leaves its VTIMEZONE byte for byte when the time is not touched", () => {
+    const out = applyEventPatch(CREATED, "created-1@claude-mail-mcp", { summary: "Renamed" }, NOW);
+    assert.equal(vtimezones(CREATED).length, 1);
+    assert.deepEqual(vtimezones(out), vtimezones(CREATED));
+  });
+
+  it("never rewrites a VTIMEZONE another client wrote, bounded or not, however far the event moves", () => {
+    // The same bounded block without this connector's mark is the other
+    // client's, and how that client reads the event.
+    const foreign = CREATED.replace(/X-CLAUDE-MAIL-MCP[^\r]*\r\n/, "");
+    for (const [text, uid] of [[foreign, "created-1@claude-mail-mcp"], [RICH, "rich-1@example.com"]] as const) {
+      const out = applyEventPatch(text, uid, { start: "2029-07-02T09:00:00+02:00" }, NOW);
+      assert.deepEqual(vtimezones(out), vtimezones(text), uid);
+    }
   });
 });

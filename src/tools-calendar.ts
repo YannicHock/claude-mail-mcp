@@ -203,7 +203,7 @@ export function registerCalendarTools(
     "create_event",
     {
       description:
-        "Create a new calendar event. WRITE OPERATION. Use all_day=true for date-only events (start/end should then be YYYY-MM-DD; end is exclusive — for a one-day event set end to the day after). The event is written in `timezone`, or the calendar's own zone, or UTC; the answer's `timezone` says which.",
+        "Create a new calendar event. WRITE OPERATION. Use all_day=true for date-only events (start/end should then be YYYY-MM-DD; end is exclusive — for a one-day event set end to the day after). The event is written in `timezone`, or the calendar's own zone, or UTC; the answer's `timezone` says which. The end must come after the start.",
       inputSchema: {
         calendar_url: calendarUrlSchema,
         summary: z.string().min(1).describe("Event title"),
@@ -251,7 +251,7 @@ export function registerCalendarTools(
     "update_event",
     {
       description:
-        "Change an existing calendar event. WRITE OPERATION. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. `start` alone moves the event and keeps its length. The answer carries the event's new `etag` for a further change; if it is null, call list_events before changing it again. This connector sends no invitation or update mail itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees when an event you organize is changed. Treat changing an event that has attendees as a message to real people, and confirm with the user first. A recurring event needs apply_to_series=true, and then only its summary, description and location can change; a single occurrence cannot be changed yet.",
+        "Change an existing calendar event. WRITE OPERATION. Pass the `etag` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. `start` alone moves the event and keeps its length as elapsed time (whole days for an all-day event): one that spans a daylight-saving change keeps its hours, not its clock times. The answer carries the event's new `etag` for a further change; if it is null, call list_events before changing it again. This connector sends no invitation or update mail itself. However, the calendar server may: some servers (e.g. Nextcloud) automatically email attendees when an event you organize is changed. Treat changing an event that has attendees as a message to real people, and confirm with the user first. A recurring event needs apply_to_series=true, and then only its summary, description and location can change; a single occurrence cannot be changed yet.",
       inputSchema: {
         calendar_url: calendarUrlSchema,
         uid: uidSchema,
@@ -261,7 +261,7 @@ export function registerCalendarTools(
         location: z.string().optional().describe("New location; an empty string removes it"),
         start: dateOrDateTime
           .optional()
-          .describe(`New start: ${DATE_OR_DATE_TIME}. Alone, it moves the event and keeps its length. ${IN_THE_EVENTS_ZONE}.`),
+          .describe(`New start: ${DATE_OR_DATE_TIME}. Alone, it moves the event and keeps its length as elapsed time. ${IN_THE_EVENTS_ZONE}.`),
         end: dateOrDateTime
           .optional()
           .describe(`New end: ${DATE_OR_DATE_TIME}; exclusive for an all-day event. ${IN_THE_EVENTS_ZONE}.`),
