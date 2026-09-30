@@ -13,12 +13,17 @@
  * "Nothing was deleted."), so a model reading it never has to guess whether
  * half of the call went through.
  *
- * It lives in a file of its own, importing nothing (#214). src/ical-edit.ts,
- * the pure module that decides what a write may do, throws it, and taking it
- * from tool-errors.ts pulled shared/credential-failure and the client pool's
- * types in with it. (src/ical-zones.ts and src/ical-expand.ts refuse nothing:
- * the reader reports an object it cannot read in `skipped` instead.) tool-errors.ts re-exports
- * it, so `instanceof` holds whichever path a caller imported it by.
+ * It lives in a file of its own, importing nothing (#214). The pure modules
+ * that decide what a write may do throw it — src/ical-edit.ts and the
+ * writers beside it (src/ical-occurrence-edit.ts, src/ical-series-shift.ts,
+ * src/ical-attendees.ts, src/ical-input.ts, src/ical-build.ts), and
+ * src/caldav-etag.ts for a write's guards — as does src/caldav-client.ts,
+ * and taking it from tool-errors.ts pulled shared/credential-failure and the
+ * client pool's types in with them. The reader refuses nothing: src/ical-expand.ts
+ * reports an object it cannot read in `skipped` instead, and src/ical-zones.ts
+ * throws `UnreadableTimezone`, which a writer turns into a refusal
+ * (`withReadableZones` in src/ical-edit.ts). tool-errors.ts re-exports it, so
+ * `instanceof` holds whichever path a caller imported it by.
  */
 export class ToolRefusal extends Error {
   override readonly name = "ToolRefusal";

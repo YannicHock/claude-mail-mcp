@@ -429,6 +429,93 @@ describe("lookup robustness (#211)", SKIP, () => {
     await mine.deleteEvent({ calendarUrl: own.calendarUrl, uid, etag: again, applyToSeries: true });
     assert.equal(await getRawEvent(own, "invited.ics"), null);
   });
+
+  it("a VTIMEZONE whose observance rule never matches: update_event's new start is refused with nothing written, not walked for ever on the connector's thread (milestone review of v0.7.4)", { timeout: 60_000 }, async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "hostile-zone@example.com";
+    const etag = await putRawEvent(own, "hostile-zone.ics", richEvent(uid, "Before"));
+    // Planted through the proxy: list_events reads it in a worker, but
+    // update_event places its times on the connector's own thread.
+    const hostile = ics(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Other Client//EN",
+      "BEGIN:VTIMEZONE",
+      "TZID:Hostile Standard Time",
+      "BEGIN:STANDARD",
+      "DTSTART:19701025T030000",
+      "TZOFFSETFROM:+0200",
+      "TZOFFSETTO:+0100",
+      "RRULE:FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30",
+      "END:STANDARD",
+      "END:VTIMEZONE",
+      "BEGIN:VEVENT",
+      `UID:${uid}`,
+      "DTSTAMP:20260901T080000Z",
+      "DTSTART;TZID=Hostile Standard Time:20261001T090000",
+      "DTEND;TZID=Hostile Standard Time:20261001T100000",
+      "SUMMARY:Before",
+      "END:VEVENT",
+      "END:VCALENDAR"
+    );
+    const proxy = await startCalDavProxy({ corruptObject: "hostile-zone.ics", corruptWith: hostile });
+    try {
+      const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+      const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
+      const message = await refusal(viaProxy.updateEvent({ calendarUrl, uid, etag, start: "2026-10-01T11:00:00" }));
+      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the object");
+      assert.match(message, /time zone definition could not be read/);
+      assert.match(message, /Hostile Standard Time/);
+      assert.match(message, /Nothing was changed/);
+      assert.match((await getRawEvent(own, "hostile-zone.ics")) ?? "", /SUMMARY:Before/);
+
+      // The reader says the same, at once, rather than at its deadline.
+      const { skipped } = await viaProxy.listEvents(calendarUrl, WINDOW.start, WINDOW.end);
+      assert.equal(skipped.length, 1);
+      assert.match(skipped[0].reason, /VTIMEZONE "Hostile Standard Time"/);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it("an object whose expansion ran out its deadline: update_event refuses a new time in it at once, remembered by its URL and ETag (milestone review of v0.7.4)", { timeout: 60_000 }, async () => {
+    const own = await makeRadicaleCalendar();
+    const uid = "remembered-hang@example.com";
+    const etag = await putRawEvent(own, "remembered-hang.ics", richEvent(uid, "Stand-in"));
+    // As above: no day of ISO week 1 is in June, and only the worker's
+    // deadline ends the walk.
+    const hangs = ics(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Other Client//EN",
+      "BEGIN:VEVENT",
+      `UID:${uid}`,
+      "DTSTAMP:20200101T000000Z",
+      "DTSTART:20200101T090000Z",
+      "DURATION:PT1H",
+      "RRULE:FREQ=DAILY;BYWEEKNO=1;BYMONTH=6",
+      "END:VEVENT",
+      "END:VCALENDAR"
+    );
+    const proxy = await startCalDavProxy({ corruptObject: "remembered-hang.ics", corruptWith: hangs });
+    try {
+      const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
+      const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
+      const { skipped } = await viaProxy.listEvents(calendarUrl, WINDOW.start, WINDOW.end);
+      assert.match(skipped[0]?.reason ?? "", /did not finish expanding/);
+
+      const started = Date.now();
+      const message = await refusal(
+        viaProxy.updateEvent({ calendarUrl, uid, etag, applyToSeries: true, start: "2020-01-01T10:00:00Z" })
+      );
+      assert.ok(Date.now() - started < 2_000, "the refusal waited for something");
+      assert.match(message, /could not be read in time/);
+      assert.match(message, /Nothing was changed/);
+      assert.match((await getRawEvent(own, "remembered-hang.ics")) ?? "", /SUMMARY:Stand-in/);
+    } finally {
+      await proxy.close();
+    }
+  });
 });
 
 describe("update_event", SKIP, () => {
@@ -1941,8 +2028,22 @@ describe("ORGANIZER and attendees (#204, #205, spec 2026-09-29 §2.1)", SKIP, ()
       });
       assert.deepEqual(updated.may_notify, ["ben@example.com", "dan@example.com"]);
 
+      // A meeting now: a new title may be sent to them as an update, so the
+      // answer names them too (milestone review of v0.7.4).
       const renamed = await call("update_event", { calendar_url: cal.calendarUrl, uid, etag: updated.etag, summary: "Renamed" });
-      assert.equal("may_notify" in renamed, false, "a change that leaves the guest list alone says nothing about it");
+      assert.deepEqual(renamed.may_notify, ["ben@example.com", "dan@example.com"]);
+
+      const deleted = await call("delete_event", { calendar_url: cal.calendarUrl, uid, etag: renamed.etag });
+      assert.deepEqual(deleted.may_notify, ["ben@example.com", "dan@example.com"]);
+
+      const plain = await call("create_event", {
+        calendar_url: cal.calendarUrl,
+        summary: "No one invited",
+        start: "2026-10-07T11:00:00Z",
+        end: "2026-10-07T12:00:00Z",
+      });
+      const quiet = await call("update_event", { calendar_url: cal.calendarUrl, uid: plain.uid, etag: await etagOf(String(plain.uid)), summary: "Still no one" });
+      assert.equal("may_notify" in quiet, false, "an event with no attendees is no meeting a server mails anyone about");
     } finally {
       await cleanupTmpDir(dir);
     }
@@ -1968,6 +2069,26 @@ describe("ORGANIZER and attendees (#204, #205, spec 2026-09-29 §2.1)", SKIP, ()
     const stored = await storedAs("attendees-theirs.ics");
     assert.match(stored, /SUMMARY:Planning \(my note\)/);
     assert.doesNotMatch(stored, /dan@example\.com/);
+  });
+
+  it("cancelling one occurrence of someone else's series writes an EXDATE into the account's copy, and names its organizer in mayNotify (milestone review of v0.7.4)", async () => {
+    const uid = "attendees-their-series@example.com";
+    await putRawEvent(
+      cal,
+      "attendees-their-series.ics",
+      seriesEvent(uid).replace(
+        "SUMMARY:Standup\r\n",
+        `SUMMARY:Standup\r\nORGANIZER;CN=Anna:mailto:anna@example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:${MAILBOX}\r\n`
+      )
+    );
+    const deleted = await withAddress().deleteEvent({
+      calendarUrl: cal.calendarUrl,
+      uid,
+      etag: await etagOf(uid),
+      recurrenceId: "2026-10-08T09:00:00.000Z",
+    });
+    assert.deepEqual(deleted.mayNotify, ["anna@example.com"]);
+    assert.match(await storedAs("attendees-their-series.ics"), /\r\nEXDATE:20261008T090000Z\r\n/);
   });
 
   it("adding an attendee who already is one is refused, and nothing is written", async () => {

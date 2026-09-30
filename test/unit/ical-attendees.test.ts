@@ -26,14 +26,14 @@ import {
   applyAttendeePatch,
   calendarUserAddresses,
   mailtoOf,
-  mayNotifyOnMove,
+  mayNotifyAbout,
   patchSeriesAttendees,
   schedulingObject,
   touchesAttendees,
   type AttendeePatch,
 } from "../../src/ical-attendees.js";
 import { applyEventPatch, changesSomething, type EventPatch } from "../../src/ical-edit.js";
-import { applyOccurrencePatch } from "../../src/ical-occurrence-edit.js";
+import { applyOccurrencePatch, excludeOccurrence } from "../../src/ical-occurrence-edit.js";
 import { parseCalendar, seriesFor } from "../../src/ical-parse.js";
 import { shiftSeries } from "../../src/ical-series-shift.js";
 import { ToolRefusal } from "../../src/tool-refusal.js";
@@ -620,28 +620,93 @@ describe("mayNotify: whom the calendar server may now email about the event (rev
     assert.deepEqual(edit.mayNotify, ["ben@example.com", "dan@example.com"]);
   });
 
-  it("is absent for a change that leaves the guest list alone", () => {
-    assert.equal(mayNotify(mine(), { summary: "Renamed" }), undefined);
+  it("is absent for a change to an event no server schedules: no attendees, or attendees with no organizer", () => {
+    assert.equal(mayNotify(PLAIN, { summary: "Renamed" }), undefined);
+    assert.equal(mayNotify(NO_ORGANIZER, { summary: "Renamed", start: "2026-10-01T11:00:00Z" }), undefined);
   });
 });
 
-describe("mayNotifyOnMove — whom the server may email when an event changes calendars (#212, spec 2026-09-29 §2.6)", () => {
+/**
+ * The milestone review of v0.7.4 found `may_notify` only on a write that
+ * changed the guest list, while every write to a scheduling object may make
+ * the server mail someone: a new title or time is an update to the
+ * attendees, a cancelled occurrence a cancellation, and on someone else's
+ * meeting any of them may send its organizer a reply. So every write to one
+ * answers whom (spec 2026-09-29 §2.1): on the account's own meeting, its
+ * attendees the server is free to schedule; on someone else's, its
+ * organizer.
+ */
+describe("mayNotify on every write to a meeting, not only a guest-list change (milestone review of v0.7.4)", () => {
+  const ctx = { nothingDone: CHANGED, now: NOW, own: OWN };
+  const UTC_SHAPE = SHAPES.find((s) => s.name === "UTC");
+  assert.ok(UTC_SHAPE);
+  /** A weekly series the account organizes (Ben plain), or `organizer`'s. */
+  const meetingSeries = (organizer = "ORGANIZER:mailto:me@cloud.example"): string =>
+    weekly(UTC_SHAPE, "FREQ=WEEKLY;COUNT=5", [organizer]);
+
+  it("a new title or time on the account's own meeting names its attendees the server is free to schedule", () => {
+    assert.deepEqual(applyEventPatch(parseCalendar(mine()), MEETING, { summary: "Renamed" }, ctx).mayNotify, ["ben@example.com"]);
+    assert.deepEqual(
+      applyEventPatch(parseCalendar(mine()), MEETING, { start: "2026-10-01T11:00:00Z" }, ctx).mayNotify,
+      ["ben@example.com"]
+    );
+  });
+
+  it("a new title on someone else's meeting names its organizer", () => {
+    assert.deepEqual(applyEventPatch(parseCalendar(THEIRS), MEETING, { summary: "Renamed" }, ctx).mayNotify, ["anna@example.com"]);
+  });
+
+  it("a series moved to a new time names the series' attendees", () => {
+    const text = meetingSeries();
+    assert.deepEqual(shiftSeries(parseCalendar(text), UID, null, { start: "2026-10-01T10:00:00Z" }, ctx).mayNotify, ["ben@example.com"]);
+  });
+
+  it("one occurrence changed names them too", () => {
+    const text = meetingSeries();
+    const found = occurrence(text, "2026-10-08T09:00:00.000Z");
+    assert.deepEqual(applyOccurrencePatch(parseCalendar(text), UID, found, { summary: "Just this one" }, ctx).mayNotify, ["ben@example.com"]);
+  });
+
+  it("one occurrence cancelled (an EXDATE) names them, and an attendee only its removed override listed", () => {
+    const text = meetingSeries().replace(
+      "SUMMARY:Weekly (moved)\r\n",
+      "SUMMARY:Weekly (moved)\r\nATTENDEE:mailto:ola@example.com\r\n"
+    );
+    const found = occurrence(text, "2026-10-15T09:00:00.000Z");
+    assert.deepEqual(excludeOccurrence(parseCalendar(text), UID, found, ctx).mayNotify, ["ben@example.com", "ola@example.com"]);
+  });
+
+  it("one occurrence of someone else's series cancelled names its organizer, who may be sent a decline", () => {
+    const text = meetingSeries("ORGANIZER;CN=Anna:mailto:anna@example.com");
+    const found = occurrence(text, "2026-10-08T09:00:00.000Z");
+    assert.deepEqual(excludeOccurrence(parseCalendar(text), UID, found, ctx).mayNotify, ["anna@example.com"]);
+  });
+
+  it("nothing for a series no server schedules", () => {
+    const text = weekly(UTC_SHAPE);
+    const found = occurrence(text, "2026-10-08T09:00:00.000Z");
+    assert.equal(excludeOccurrence(parseCalendar(text), UID, found, ctx).mayNotify, undefined);
+    assert.equal(shiftSeries(parseCalendar(text), UID, null, { start: "2026-10-01T10:00:00Z" }, ctx).mayNotify, undefined);
+  });
+});
+
+describe("mayNotifyAbout — whom the server may email when an event changes calendars (#212, spec 2026-09-29 §2.6)", () => {
   const every = (text: string): ICAL.Component[] => parseCalendar(text).vcal.getAllSubcomponents("vevent");
 
   it("the account's own meeting: every attendee the server is free to schedule, never one marked CLIENT", () => {
     assert.equal(schedulingObject(every(mine())), true);
-    assert.deepEqual(mayNotifyOnMove(every(mine()), OWN), ["ben@example.com"]);
+    assert.deepEqual(mayNotifyAbout(every(mine()), OWN), ["ben@example.com"]);
   });
 
   it("someone else's meeting: its organizer, who may be sent a reply as for a deletion", () => {
     assert.equal(schedulingObject(every(THEIRS)), true);
-    assert.deepEqual(mayNotifyOnMove(every(THEIRS), OWN), ["anna@example.com"]);
+    assert.deepEqual(mayNotifyAbout(every(THEIRS), OWN), ["anna@example.com"]);
   });
 
   it("nothing for attendees with no ORGANIZER, which no server schedules, and nothing for an event without attendees", () => {
     for (const text of [NO_ORGANIZER, PLAIN]) {
       assert.equal(schedulingObject(every(text)), false);
-      assert.equal(mayNotifyOnMove(every(text), OWN), undefined);
+      assert.equal(mayNotifyAbout(every(text), OWN), undefined);
     }
   });
 });

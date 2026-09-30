@@ -20,6 +20,18 @@ export function isWeak(etag: string): boolean {
   return /^W\//i.test(etag.trim());
 }
 
+/**
+ * `etag` as an `If-Match` can use it: the tag itself when the server gave a
+ * strong one, and undefined — guard with nothing — for none, or a weak one,
+ * which a strong comparison can never match (RFC 7232 §3.1). The one
+ * reading of a server's ETag header for a guard, which src/caldav-client.ts
+ * spelled out three times until the code-health review of the v0.7.4
+ * milestone.
+ */
+export function strongOrNone(etag: string | null): string | undefined {
+  return etag !== null && !isWeak(etag) ? etag : undefined;
+}
+
 /** How {@link requireEtag} treats a caller's ETag that does not match the stored one. */
 export interface RequireEtagOptions {
   /**

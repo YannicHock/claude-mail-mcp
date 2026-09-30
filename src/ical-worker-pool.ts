@@ -23,8 +23,8 @@
  * The pool is shared by every account, so the review of #225 added two
  * things that keep one account's bad calendar from being everyone's problem:
  *
- *   - **Turns, not one line.** Each request — one `expand()` call, one
- *     `run()` — is a group, and a free worker takes the next object from the
+ *   - **Turns, not one line.** Each request — one `runOnEach()` call, one
+ *     `runOn()` — is a group, and a free worker takes the next object from the
  *     group with the fewest objects in a worker, the longest-waiting first
  *     among equals. A `list_events` on account B no longer waits behind every
  *     object of account A's (six hanging objects held a one-object request
@@ -55,6 +55,7 @@
 import { createHash } from "node:crypto";
 import { Worker } from "node:worker_threads";
 
+import { describeFailure } from "../shared/credential-failure.js";
 import type { ExpandResult, ExpandWindow, StoredObject } from "./ical-expand.js";
 import {
   OP_ACTIONS,
@@ -129,12 +130,15 @@ export class PoolClosed extends Error {
  * The one sentence, for `skipped` or a refusal, that a failed operation
  * comes to. A timeout and a closed pool say so in their own words; anything
  * else is the worker's failure — it threw, ran out of heap, or could not be
- * started — with its message. `expand()` uses it, and so does every caller
- * of {@link ExpansionPool.run}, which rejects with the error as it is.
+ * started — with its message, bounded by `describeFailure`
+ * (shared/credential-failure.ts), since it reaches the tool's answer as it
+ * is. `expand()` uses it, and so does every caller of
+ * {@link ExpansionPool.runOn} and {@link ExpansionPool.runOnEach}, which
+ * reject with the error as it is.
  */
 export function reasonOf(err: unknown): string {
   if (err instanceof ExpansionTimeout || err instanceof PoolClosed) return err.message;
-  return `The connector's expansion worker failed on it: ${err instanceof Error ? err.message : String(err)}`;
+  return `The connector's expansion worker failed on it: ${describeFailure(err)}`;
 }
 
 /** One request's objects: they take turns with every other request's. */
@@ -148,8 +152,8 @@ interface Task {
   id: number;
   op: WorkerOpName;
   args: unknown[];
-  /** The object it runs on, for remembering a timeout; null for one that is not about a stored object. */
-  key: string | null;
+  /** The object it runs on, by {@link objectKey}, for remembering a timeout. */
+  key: string;
   group: Group;
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
@@ -200,23 +204,18 @@ export class ExpansionPool {
   }
 
   /**
-   * Run one {@link WorkerOps} operation in a worker, as a request of its own.
-   * Rejects with {@link ExpansionTimeout} when it outlives the deadline, with
-   * {@link PoolClosed} after {@link close}, and with a plain Error when the
-   * worker failed (it threw, ran out of heap, or could not start); turn any
-   * of them into words with {@link reasonOf}. A timeout here is not
-   * remembered, since nothing says which object it was: use {@link runOn}
-   * for an operation on a stored object.
-   */
-  run<K extends WorkerOpName>(op: K, ...args: Parameters<WorkerOps[K]>): Promise<ReturnType<WorkerOps[K]>> {
-    return this.submit(this.group(), null, op, args) as Promise<ReturnType<WorkerOps[K]>>;
-  }
-
-  /**
-   * {@link run} for an operation on one stored object: an object that timed
-   * out before, in any operation, is refused at once with the same
-   * {@link ExpansionTimeout}, and one that times out now is remembered.
-   * What PR 4's occurrence lookup by `recurrence_id` calls.
+   * Run one {@link WorkerOps} operation on one stored object in a worker, as
+   * a request of its own. Rejects with {@link ExpansionTimeout} when it
+   * outlives the deadline — and the object is remembered, so that for
+   * {@link HANGING_REMEMBERED_MS} it is refused at once, in any operation,
+   * with that same timeout — with {@link PoolClosed} after {@link close}, and
+   * with a plain Error when the worker failed (it threw, ran out of heap, or
+   * could not start); turn any of them into words with {@link reasonOf}.
+   * What the occurrence lookup by `recurrence_id` calls.
+   *
+   * Every operation is on a stored object: the code-health review of the
+   * v0.7.4 milestone removed `run()`, the one entry point for an operation
+   * that was not, which nothing called.
    */
   runOn<K extends WorkerOpName>(
     object: StoredObject,
@@ -290,7 +289,7 @@ export class ExpansionPool {
     return { tasks: [], running: 0 };
   }
 
-  private submit(group: Group, key: string | null, op: WorkerOpName, args: unknown[]): Promise<unknown> {
+  private submit(group: Group, key: string, op: WorkerOpName, args: unknown[]): Promise<unknown> {
     if (this.closed) return Promise.reject(new PoolClosed());
     const known = this.knownHanging(key);
     if (known !== null) return Promise.reject(known);
@@ -302,9 +301,20 @@ export class ExpansionPool {
     });
   }
 
+  /**
+   * The timeout `object` — this version of it, by its URL and ETag — ran into
+   * within {@link HANGING_REMEMBERED_MS}, or null: what {@link runOn} would
+   * refuse it with at once. For a caller about to work on the object on its
+   * own thread (milestone review of v0.7.4): `update_event` refuses to place
+   * a new time in an object whose expansion never finished, rather than be
+   * the first to find out on the connector's one thread why it did not.
+   */
+  hangingFor(object: StoredObject): ExpansionTimeout | null {
+    return this.knownHanging(objectKey(object));
+  }
+
   /** The timeout `key` ran into within {@link HANGING_REMEMBERED_MS}, or null. */
-  private knownHanging(key: string | null): ExpansionTimeout | null {
-    if (key === null) return null;
+  private knownHanging(key: string): ExpansionTimeout | null {
     const entry = this.hanging.get(key);
     if (entry === undefined) return null;
     if (Date.now() - entry.at > HANGING_REMEMBERED_MS) {
@@ -381,7 +391,7 @@ export class ExpansionPool {
       this.release(slot);
       void slot.worker.terminate();
       const timeout = new ExpansionTimeout(this.deadlineMs, OP_ACTIONS[task.op]);
-      if (task.key !== null) this.rememberHanging(task.key, timeout);
+      this.rememberHanging(task.key, timeout);
       task.reject(timeout);
       this.pump();
     }, this.deadlineMs);

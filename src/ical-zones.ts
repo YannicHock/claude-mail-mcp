@@ -61,6 +61,7 @@
  */
 
 import ICAL from "ical.js";
+import { impossibleRule } from "./ical-series.js";
 
 /** What zone a stored time is in, as {@link zoneOf} reads it. */
 export type ZoneKind =
@@ -388,9 +389,13 @@ function wallToInstantBy(wall: number, offsetAt: OffsetAt): number {
  * asked. The one VTIMEZONE this connector writes never leaves a time it
  * holds outside its span (see {@link coverGeneratedVtimezone}).
  *
- * Expanding a VTIMEZONE's observance rules is ical.js's own bounded walk to a
- * given year, the one every read of such a time already does; it is not an
- * event's recurrence rule.
+ * Expanding a VTIMEZONE's observance rules is ical.js's own walk to a given
+ * year, the one every read of such a time already does; it is not an event's
+ * recurrence rule. It runs on whichever thread asks — for a writer, the
+ * connector's own — so it is bounded here, not by ical.js: every VTIMEZONE a
+ * parse meets goes through {@link boundObservanceWalks}, and one whose rules
+ * it will not walk throws {@link UnreadableTimezone} from here instead of
+ * walking for ever (milestone review of v0.7.4).
  */
 function vtimezoneOffsetMs(zone: ICAL.Timezone, ms: number): number {
   if (!zone.component) return 0;
@@ -402,6 +407,135 @@ function vtimezoneOffsetMs(zone: ICAL.Timezone, ms: number): number {
     offset = change.utcOffset * 1000;
   }
   return offset;
+}
+
+/**
+ * A VTIMEZONE whose observance rules this connector will not walk (milestone
+ * review of v0.7.4): its message says which rule, and why. Thrown from
+ * wherever a time in the zone is first placed — ical.js's own arithmetic
+ * included — so a writer turns it into a refusal that says nothing was
+ * written (`withReadableZones` in src/ical-edit.ts), and the reader skips the
+ * object with the message as its reason.
+ */
+export class UnreadableTimezone extends Error {
+  constructor(tzid: string, why: string) {
+    super(`the VTIMEZONE "${tzid}" ${why}`);
+    this.name = "UnreadableTimezone";
+  }
+}
+
+/**
+ * Observance steps walked for one coverage of one VTIMEZONE — all its
+ * observances together — before it is refused. A real VTIMEZONE changes its
+ * offset once or twice a year: Outlook's start in 1601, which is about 430
+ * steps each to today, and a time in the year 9999 is about 17,000 for two
+ * observances. A yearly rule that lists every hour of every day passes that
+ * within its first year.
+ */
+export const MAX_OBSERVANCE_STEPS = 20_000;
+
+/**
+ * Why the observance rules of `vtimezone` cannot be walked to the end of
+ * `untilYear` on this thread, or null when they can — the walk
+ * ical.js's `_expandComponent` would make, bounded:
+ *
+ *   - **Yearly only.** `RecurIterator.next` gives up on a rule that never
+ *     matches only for MONTHLY and YEARLY, and a MONTHLY one whose BYMONTH
+ *     contracts can still loop inside one call; for YEARLY every BY part
+ *     expands, so each call ends. Every VTIMEZONE any client writes uses
+ *     `FREQ=YEARLY` — the offset changes on a day of a month — so anything
+ *     else is refused rather than walked.
+ *   - **Not impossible**, by `impossibleRule` (src/ical-series.ts): a yearly
+ *     rule that can never match would end, but only after ical.js's 28 tries
+ *     per step, and it has no offset change to give.
+ *   - **At most {@link MAX_OBSERVANCE_STEPS} steps**, counted across every
+ *     observance, between `next()` calls — which, for a yearly rule, each
+ *     return.
+ *
+ * Only the first RRULE of an observance is read, as ical.js reads only that
+ * one; an observance without a DTSTART is passed over, as ical.js passes it
+ * over. The rule is walked on a copy: ical.js's own walk rewrites a UTC
+ * UNTIL in place.
+ */
+function observanceProblem(vtimezone: ICAL.Component, untilYear: number): string | null {
+  let steps = 0;
+  for (const observance of vtimezone.getAllSubcomponents()) {
+    const prop = observance.getFirstProperty("rrule");
+    const start = observance.getFirstPropertyValue("dtstart");
+    if (prop === null || !(start instanceof ICAL.Time)) continue;
+    const rule = prop.getFirstValue() as ICAL.Recur;
+    const kind = observance.name.toUpperCase();
+    if (rule.freq !== "YEARLY") {
+      return `has a ${kind} rule that repeats FREQ=${rule.freq}, where a time zone changes its offset yearly, so this connector does not walk it`;
+    }
+    const impossible = impossibleRule(rule);
+    if (impossible !== null) return `has a ${kind} rule that can never match a date (${impossible})`;
+    const iterator = rule.clone().iterator(start);
+    for (let next = iterator.next(); next && next.year <= untilYear; next = iterator.next()) {
+      if (++steps > MAX_OBSERVANCE_STEPS) {
+        return `has observance rules that change its offset more than ${MAX_OBSERVANCE_STEPS} times before ${untilYear + 1}, which no time zone does`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The last year ical.js expands a VTIMEZONE to when asked for `year`: its
+ * `_ensureCoverage` rule — the year asked for, or this year if that is
+ * earlier, plus its `EXTRA_COVERAGE` — so that {@link observanceProblem}
+ * checks exactly the walk ical.js then makes.
+ */
+function coverageYear(year: number): number {
+  const minimum = ICAL.Timezone._minimumExpansionYear === -1 ? ICAL.Time.now().year : ICAL.Timezone._minimumExpansionYear;
+  return Math.max(year, minimum) + ICAL.Timezone.EXTRA_COVERAGE;
+}
+
+/**
+ * Bound every walk of the observance rules of `vcal`'s VTIMEZONEs (milestone
+ * review of v0.7.4, finding 1), in place, for this one parse.
+ *
+ * ical.js expands a VTIMEZONE's STANDARD and DAYLIGHT rules, in
+ * `Timezone._ensureCoverage`, the first time a time in the zone is placed in
+ * a given year — from {@link vtimezoneOffsetMs} and from its own
+ * `utcOffset`, which `toUnixTime`, `compare` and an event's `duration` all
+ * reach. It walks each rule with nothing to stop it, and a rule like
+ * `FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30` never ends: `list_events` survives it
+ * in a worker, under a deadline, but `update_event` places times on the
+ * connector's own thread, and a new `start` for such an event froze the
+ * process.
+ *
+ * So each VTIMEZONE's zone — the one ical.js caches on the VCALENDAR and
+ * hands every time in it — has its `_ensureCoverage` replaced, on that one
+ * object, by one that asks {@link observanceProblem} first whenever ical.js
+ * would walk, and throws {@link UnreadableTimezone} rather than walk what it
+ * refuses; a zone refused once is refused at once after that. What ical.js
+ * then walks, it walks exactly as before, so a VTIMEZONE that passes reads
+ * as it always did. Nothing is written back, and the process-wide
+ * `TimezoneService` is not touched.
+ */
+function boundObservanceWalks(vcal: ICAL.Component): void {
+  for (const vtimezone of vcal.getAllSubcomponents("vtimezone")) {
+    const tzid = String(vtimezone.getFirstPropertyValue("tzid") ?? "");
+    if (tzid === "") continue;
+    const zone = vcal.getTimeZoneByID(tzid) as ICAL.Timezone | null;
+    // A second VTIMEZONE with the same TZID is never the one a time gets.
+    if (zone === null || zone.component !== vtimezone) continue;
+    const expand = zone._ensureCoverage.bind(zone);
+    const state = zone as unknown as { expandedUntilYear: number };
+    let refused: UnreadableTimezone | null = null;
+    zone._ensureCoverage = (year: number): void => {
+      if (refused !== null) throw refused;
+      // ical.js's own test for whether it walks at all.
+      if (zone.changes.length > 0 && state.expandedUntilYear >= year) return;
+      const why = observanceProblem(vtimezone, coverageYear(year));
+      if (why !== null) {
+        refused = new UnreadableTimezone(tzid, why);
+        throw refused;
+      }
+      expand(year);
+    };
+  }
 }
 
 /** The question {@link OffsetAt} for an ical.js zone, `Intl` or VTIMEZONE. */
@@ -506,8 +640,13 @@ function forEachTime(prop: ICAL.Property, fn: (t: ICAL.Time) => void): void {
  *
  * Call it straight after parsing, before anything has read a time: ical.js
  * caches an instant once computed.
+ *
+ * It bounds, too, every walk of the object's own VTIMEZONEs' observance
+ * rules ({@link boundObservanceWalks}): the same moment, for the same reason
+ * — before any time in them has been placed.
  */
 export function withResolvedZones(vcal: ICAL.Component): { unresolved: string[] } {
+  boundObservanceWalks(vcal);
   const own = vtimezoneIds(vcal);
   const zones = new Map<string, IntlTimezone | null>();
   const unresolved: string[] = [];
@@ -910,7 +1049,7 @@ export function vtimezoneFromIntl(tz: string, fromMs: number, toMs: number): str
 }
 
 /** How far either side of the times it serves a generated VTIMEZONE reaches (spec §2.5 A). */
-const VTIMEZONE_MARGIN_MS = 366 * 86_400_000;
+const VTIMEZONE_MARGIN_MS = 366 * DAY_MS;
 
 /**
  * {@link vtimezoneFromIntl} for the IANA zone `tz`, covering every instant in
@@ -930,7 +1069,7 @@ export function generatedVtimezone(tz: string, instants: number[]): ICAL.Compone
  * {@link coverGeneratedVtimezone}): ten years, about 20 observances for a
  * zone with DST.
  */
-const SERIES_REACH_MS = 10 * 366 * 86_400_000;
+const SERIES_REACH_MS = 10 * 366 * DAY_MS;
 
 /**
  * The instants a series in `tzid` runs to beyond the times `vcal` holds, the

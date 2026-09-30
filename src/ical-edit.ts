@@ -50,7 +50,13 @@
  */
 
 import ICAL from "ical.js";
-import { patchSeriesAttendees, touchesAttendees, type AttendeePatch, type AttendeeResult } from "./ical-attendees.js";
+import {
+  mayNotifyAbout,
+  patchSeriesAttendees,
+  touchesAttendees,
+  type AttendeePatch,
+  type AttendeeResult,
+} from "./ical-attendees.js";
 import { calendarDate, dateMs, isoDate, timedBound } from "./ical-input.js";
 import { parseCalendar, seriesFor, type ParsedCalendar, type Series } from "./ical-parse.js";
 import { allDaySeries, currentOverrides, sequenceOf } from "./ical-series.js";
@@ -58,6 +64,7 @@ import {
   coverGeneratedVtimezone,
   hasOffset,
   storedInstant,
+  UnreadableTimezone,
   UTC_ZONE,
   writeZoneOf,
   writtenTime,
@@ -95,9 +102,10 @@ export interface EditContext {
   /**
    * The account's calendar user addresses (`ownAddresses` in
    * src/caldav-client.ts), which an attendee change needs to tell the
-   * account's own meeting from someone else's and to write its ORGANIZER.
-   * No default: a writer handed none has been told the account has none,
-   * and an attendee change is then refused.
+   * account's own meeting from someone else's and to write its ORGANIZER,
+   * and every write to an event the server schedules to say whom it may
+   * mail ({@link mayNotifyOf}). No default: a writer handed none has been
+   * told the account has none, and an attendee change is then refused.
    */
   own: readonly string[];
 }
@@ -157,10 +165,13 @@ export interface EditResult {
   /** Null when the write left no VEVENT it changed to know it by (see `excludeOccurrence` in src/ical-occurrence-edit.ts). */
   mark: WriteMark | null;
   /**
-   * For a write that changed the guest list (#205): whom the calendar server
-   * may now email about the event — `AttendeeResult.mayNotify` in
-   * src/ical-attendees.ts, which `update_event` answers as `may_notify`.
-   * Absent for any other write.
+   * Whom the calendar server may now email about the event, which
+   * `update_event` and `delete_event` answer as `may_notify`
+   * ({@link mayNotifyOf}): for a write that changed the guest list (#205),
+   * `AttendeeResult.mayNotify` in src/ical-attendees.ts; for any other write
+   * to an event the server schedules, its attendees or, on someone else's
+   * meeting, its organizer (milestone review of v0.7.4). Absent for an event
+   * the server does not schedule.
    */
   mayNotify?: string[];
 }
@@ -286,12 +297,39 @@ export function applyEventPatch(parsed: ParsedCalendar, uid: string, patch: Even
   if (master === undefined) {
     throw new Error(`applyEventPatch: no main VEVENT for UID ${uid}`);
   }
-  const guests = patchSeriesAttendees(master, overrides, patch, own, nothingDone);
-  patchText(master, patch);
-  if (touchesTime(patch)) patchTimes(master, patch, nothingDone);
-  const sequence = stampRevision(master, now);
-  stampOthers(guests, master, now);
-  return { ics: vcal.toString(), mark: { uid, sequence }, ...mayNotifyOf(guests) };
+  return withReadableZones(nothingDone, () => {
+    const guests = patchSeriesAttendees(master, overrides, patch, own, nothingDone);
+    patchText(master, patch);
+    if (touchesTime(patch)) patchTimes(master, patch, nothingDone);
+    const sequence = stampRevision(master, now);
+    stampOthers(guests, master, now);
+    return { ics: vcal.toString(), mark: { uid, sequence }, ...mayNotifyOf(guests, [master, ...overrides], own) };
+  });
+}
+
+/**
+ * Run one writer's `edit` of a parsed object, and turn a VTIMEZONE whose
+ * observance rules this connector will not walk (`UnreadableTimezone` from
+ * src/ical-zones.ts) into the refusal ending in `nothingDone` (milestone
+ * review of v0.7.4). Every entry point that edits a stored object —
+ * {@link applyEventPatch}, `shiftSeries`, `applyOccurrencePatch` and
+ * `excludeOccurrence` — runs its edit through here, so any time it places in
+ * such a zone, by its own arithmetic or by ical.js's, ends in an answer and
+ * not in a connector that no longer answers anyone. The edit works on the
+ * caller's parse in memory, so a refusal from the middle of it has written
+ * nothing.
+ */
+export function withReadableZones<T>(nothingDone: string, edit: () => T): T {
+  try {
+    return edit();
+  } catch (err) {
+    if (err instanceof UnreadableTimezone) {
+      throw new ToolRefusal(
+        `This event's time zone definition could not be read: ${err.message}, so its times cannot be placed. ${nothingDone}`
+      );
+    }
+    throw err;
+  }
 }
 
 /**
@@ -304,9 +342,29 @@ export function stampOthers(guests: AttendeeResult | null, stamped: ICAL.Compone
   for (const vevent of guests?.changed ?? []) if (vevent !== stamped) stampRevision(vevent, now);
 }
 
-/** The {@link EditResult.mayNotify} of a write whose attendee change answered `guests`; nothing for a write that made none. */
-export function mayNotifyOf(guests: AttendeeResult | null): Pick<EditResult, "mayNotify"> {
-  return guests === null ? {} : { mayNotify: guests.mayNotify };
+/**
+ * The {@link EditResult.mayNotify} of a write to `vevents` — every VEVENT of
+ * the UID — whose attendee change answered `guests` (spec 2026-09-29 §2.1):
+ * that change's own answer when it made one, which also names anyone it
+ * removed; otherwise, for a write to an event the server schedules, whom it
+ * may email about any write (`mayNotifyAbout` in src/ical-attendees.ts, by
+ * `own`), and nothing for one it does not. Every writer answers by this
+ * since the milestone review of v0.7.4: a new title or time on a meeting, a
+ * series moved, one occurrence changed or cancelled may each make the server
+ * mail someone, and until then only a guest-list change said whom.
+ */
+export function mayNotifyOf(
+  guests: AttendeeResult | null,
+  vevents: readonly ICAL.Component[],
+  own: readonly string[]
+): Pick<EditResult, "mayNotify"> {
+  const mayNotify = guests?.mayNotify ?? mayNotifyAbout(vevents, own);
+  return mayNotify === undefined ? {} : { mayNotify };
+}
+
+/** Every VEVENT `series` holds, its master first: what one scheduling object is, for {@link mayNotifyOf}. */
+export function everyVevent({ master, overrides }: Series): ICAL.Component[] {
+  return [...(master === undefined ? [] : [master]), ...overrides];
 }
 /**
  * Write the time `patch` asks for into `vevent` — a main VEVENT or an

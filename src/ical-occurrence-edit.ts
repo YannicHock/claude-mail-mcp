@@ -22,12 +22,15 @@
 import ICAL from "ical.js";
 import { applyAttendeePatch } from "./ical-attendees.js";
 import {
+  coverGenerated,
+  everyVevent,
   mayNotifyOf,
   patchText,
   patchTimes,
   stampOthers,
   stampRevision,
   touchesTime,
+  withReadableZones,
   type EditContext,
   type EditResult,
   type EventPatch,
@@ -35,6 +38,7 @@ import {
 import type { FoundOccurrence } from "./ical-expand.js";
 import { seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { allDaySeries, keyOf, modifiesFuture, sequenceOf } from "./ical-series.js";
+import { writeZoneOf, type WriteZone } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /**
@@ -232,6 +236,34 @@ function detachRangeAnchor(
   return plain;
 }
 
+/**
+ * The zones of every time `props` hold — a DTSTART, DTEND, RECURRENCE-ID or
+ * EXDATE a one-occurrence write has just put in the object — for
+ * `coverGenerated` (src/ical-edit.ts), which regenerates the VTIMEZONE this
+ * connector generated for any of them to cover them. A zone nothing can
+ * place has no block of this connector's, and is passed over.
+ *
+ * The milestone review of v0.7.4 found the EXDATE of a cancelled occurrence
+ * and the RECURRENCE-ID of an override made for a new title written into a
+ * generated zone without it: only `patchTimes` covered, so only a write that
+ * moved a time did, and the block went on reading the zone by its last
+ * observance past its span.
+ */
+function writtenZones(props: ReadonlyArray<ICAL.Property | null>): WriteZone[] {
+  const zones: WriteZone[] = [];
+  for (const prop of props) {
+    if (prop === null) continue;
+    const zone = writeZoneOf(prop);
+    if (zone.kind !== "unresolved") zones.push(zone);
+  }
+  return zones;
+}
+
+/** The time properties of `ve` that name where it is, for {@link writtenZones}. */
+function timesOf(ve: ICAL.Component): Array<ICAL.Property | null> {
+  return ["dtstart", "dtend", "recurrence-id"].map((name) => ve.getFirstProperty(name));
+}
+
 /** The VEVENT at `index` in `vcal` (document order), which `findOccurrence` named as an override of `uid`. */
 function overrideAt(vcal: ICAL.Component, uid: string, index: number): ICAL.Component {
   const ve = vcal.getAllSubcomponents("vevent")[index];
@@ -276,7 +308,15 @@ function overrideAt(vcal: ICAL.Component, uid: string, index: number): ICAL.Comp
  * Refused, ending in `nothingDone`: switching one occurrence between all-day
  * and timed — it keeps the form of its series, whose RECURRENCE-ID must
  * match the master's — whatever {@link applyAttendeePatch} refuses, and
- * whatever {@link patchTimes} refuses.
+ * whatever {@link patchTimes} refuses, and a VTIMEZONE whose observance rules
+ * this connector will not walk (`withReadableZones` in src/ical-edit.ts).
+ *
+ * Every time the write leaves on the override — its RECURRENCE-ID and
+ * DTSTART when it was just made, a new time — is covered by the VTIMEZONE
+ * this connector generated for its zone, if it has one ({@link writtenZones};
+ * milestone review of v0.7.4). The answer's `mayNotify` is `mayNotifyOf`'s
+ * (src/ical-edit.ts): for a meeting, whom the server may email about the
+ * change, not only when the guest list changed.
  */
 export function applyOccurrencePatch(
   parsed: ParsedCalendar,
@@ -293,29 +333,36 @@ export function applyOccurrencePatch(
     );
   }
   const { master } = seriesFor(vcal, uid);
-  let target: ICAL.Component;
-  if (occurrence.current !== null) {
-    target = overrideAt(vcal, uid, occurrence.current);
-    // The override of the occurrence a THISANDFUTURE change starts at: its
-    // changes reach every later one, so this one is taken out of it first.
-    if (master !== undefined && modifiesFuture(target)) {
-      target = detachRangeAnchor(vcal, master, target, occurrence, nothingDone, now);
+  return withReadableZones(nothingDone, () => {
+    let target: ICAL.Component;
+    if (occurrence.current !== null) {
+      target = overrideAt(vcal, uid, occurrence.current);
+      // The override of the occurrence a THISANDFUTURE change starts at: its
+      // changes reach every later one, so this one is taken out of it first.
+      if (master !== undefined && modifiesFuture(target)) {
+        target = detachRangeAnchor(vcal, master, target, occurrence, nothingDone, now);
+      }
+    } else {
+      if (master === undefined) throw new Error(`applyOccurrencePatch: no main VEVENT for UID ${uid} to copy`);
+      target =
+        occurrence.range === null
+          ? overrideFrom(master, occurrence)
+          : overrideFromRange(master, overrideAt(vcal, uid, occurrence.range), occurrence);
+      vcal.addSubcomponent(target);
     }
-  } else {
-    if (master === undefined) throw new Error(`applyOccurrencePatch: no main VEVENT for UID ${uid} to copy`);
-    target =
-      occurrence.range === null
-        ? overrideFrom(master, occurrence)
-        : overrideFromRange(master, overrideAt(vcal, uid, occurrence.range), occurrence);
-    vcal.addSubcomponent(target);
-  }
-  const guests = applyAttendeePatch(target, patch, own, nothingDone);
-  patchText(target, patch);
-  if (touchesTime(patch)) patchTimes(target, patch, nothingDone);
-  const sequence = stampRevision(target, now);
-  stampOthers(guests, target, now);
-  const override = keyOf(new ICAL.Event(target).recurrenceId, allDaySeries(master));
-  return { ics: vcal.toString(), mark: { uid, sequence, override }, ...mayNotifyOf(guests) };
+    const guests = applyAttendeePatch(target, patch, own, nothingDone);
+    patchText(target, patch);
+    if (touchesTime(patch)) patchTimes(target, patch, nothingDone);
+    // Whatever wrote them — a new override, a THISANDFUTURE change moved on
+    // to the next occurrence, a new time — every time this write left on
+    // the override, and on the range override it may have moved, is covered.
+    const range = seriesFor(vcal, uid).overrides.filter((ve) => ve !== target && modifiesFuture(ve));
+    coverGenerated(vcal, writtenZones([target, ...range].flatMap(timesOf)));
+    const sequence = stampRevision(target, now);
+    stampOthers(guests, target, now);
+    const override = keyOf(new ICAL.Event(target).recurrenceId, allDaySeries(master));
+    return { ics: vcal.toString(), mark: { uid, sequence, override }, ...mayNotifyOf(guests, everyVevent(seriesFor(vcal, uid)), own) };
+  });
 }
 
 /**
@@ -324,6 +371,14 @@ export function applyOccurrencePatch(
  * value type and zone ({@link originalStart}), every override of it removed,
  * and the master's revision stamped. The object itself is kept even when this
  * was the series' last occurrence; `seriesEmpty` says so, for the answer.
+ *
+ * The EXDATE is covered by the VTIMEZONE this connector generated for its
+ * zone, if it has one ({@link writtenZones}; milestone review of v0.7.4). The
+ * answer's `mayNotify` is `mayNotifyOf`'s (src/ical-edit.ts), read before
+ * anything is removed, by `ctx.own`: for the account's own meeting, its
+ * attendees — one only the removed override listed among them — who may be
+ * sent a cancellation; for someone else's, its organizer, who may be sent a
+ * decline.
  *
  * An object with no master has no series to exclude from: the occurrence's
  * overrides are removed and nothing else. It is the caller's to delete the
@@ -337,32 +392,42 @@ export function applyOccurrencePatch(
  * ({@link detachRangeAnchor}), so the change still reaches every later
  * occurrence — it used to be removed as that occurrence's override, and every
  * later occurrence went back to the series' old time and title. That is the
- * one refusal here, ending in `nothingDone`.
+ * one refusal here, ending in `nothingDone`, besides a VTIMEZONE whose
+ * observance rules this connector will not walk (`withReadableZones`).
  */
 export function excludeOccurrence(
   parsed: ParsedCalendar,
   uid: string,
   occurrence: FoundOccurrence,
-  nothingDone: string,
-  now: Date = new Date()
+  ctx: EditContext
 ): EditResult & { seriesEmpty: boolean } {
+  const { nothingDone, now, own } = ctx;
   const { vcal } = parsed;
-  const { master } = seriesFor(vcal, uid);
+  const series = seriesFor(vcal, uid);
+  const { master } = series;
   const vevents = vcal.getAllSubcomponents("vevent");
-  let removed = occurrence.overrides.map((index) => vevents[index]);
-  const current = occurrence.current === null ? undefined : overrideAt(vcal, uid, occurrence.current);
-  if (master !== undefined && current !== undefined && modifiesFuture(current)) {
-    // The occurrence a THISANDFUTURE change starts at: that change moves on
-    // to the next occurrence rather than going with this one, so every later
-    // occurrence stays as it was listed.
-    const detached = detachRangeAnchor(vcal, master, current, occurrence, nothingDone, now);
-    if (detached !== current) removed = [...removed.filter((ve) => ve !== current), detached];
-  }
-  for (const ve of removed) vcal.removeSubcomponent(ve);
-  const seriesEmpty = !occurrence.others;
-  if (master === undefined) return { ics: vcal.toString(), mark: null, seriesEmpty };
-  const { time, tzid } = originalStart(master, occurrence);
-  master.addProperty(timeProperty("exdate", time, tzid));
-  const sequence = stampRevision(master, now);
-  return { ics: vcal.toString(), mark: { uid, sequence }, seriesEmpty };
+  // Whom the server may mail is read before anything is removed: an
+  // attendee only the cancelled occurrence's override listed may be sent
+  // the cancellation too.
+  const notified = mayNotifyOf(null, everyVevent(series), own);
+  return withReadableZones(nothingDone, () => {
+    let removed = occurrence.overrides.map((index) => vevents[index]);
+    const current = occurrence.current === null ? undefined : overrideAt(vcal, uid, occurrence.current);
+    if (master !== undefined && current !== undefined && modifiesFuture(current)) {
+      // The occurrence a THISANDFUTURE change starts at: that change moves on
+      // to the next occurrence rather than going with this one, so every later
+      // occurrence stays as it was listed.
+      const detached = detachRangeAnchor(vcal, master, current, occurrence, nothingDone, now);
+      if (detached !== current) removed = [...removed.filter((ve) => ve !== current), detached];
+    }
+    for (const ve of removed) vcal.removeSubcomponent(ve);
+    const seriesEmpty = !occurrence.others;
+    if (master === undefined) return { ics: vcal.toString(), mark: null, seriesEmpty, ...notified };
+    const { time, tzid } = originalStart(master, occurrence);
+    const exdate = master.addProperty(timeProperty("exdate", time, tzid));
+    const range = seriesFor(vcal, uid).overrides.filter(modifiesFuture);
+    coverGenerated(vcal, writtenZones([exdate, ...range.flatMap(timesOf)]));
+    const sequence = stampRevision(master, now);
+    return { ics: vcal.toString(), mark: { uid, sequence }, seriesEmpty, ...notified };
+  });
 }

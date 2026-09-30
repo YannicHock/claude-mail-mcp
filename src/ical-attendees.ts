@@ -305,7 +305,7 @@ function checkOrganizer(vevents: readonly ICAL.Component[], own: readonly string
  * is none of the account's `own` addresses, as written (a `mailto:` URI), or
  * undefined when every one named is the account's, or none is named: the
  * one test of "someone else's meeting" that {@link checkOrganizer} and
- * {@link mayNotifyOnMove} share (code-health review of PR #231).
+ * {@link mayNotifyAbout} share (code-health review of PR #231).
  */
 function foreignOrganizer(vevents: readonly ICAL.Component[], own: readonly string[]): string | undefined {
   const mine = new Set(own.map(addressKey));
@@ -423,24 +423,32 @@ export function schedulingObject(vevents: readonly ICAL.Component[]): boolean {
 }
 
 /**
- * Whom the calendar server may email when `vevents` — every VEVENT of one
- * UID — are moved to another calendar (`move_event`, #212, spec 2026-09-29
- * §2.6), or undefined for an event it does not schedule at all
- * ({@link schedulingObject}).
+ * Whom the calendar server may email about a write to `vevents` — every
+ * VEVENT of one UID — or undefined for an event it does not schedule at all
+ * ({@link schedulingObject}): the `may_notify` of every write that does not
+ * change the guest list (whose own answer is {@link AttendeeResult.mayNotify}).
+ * `own` is the account's calendar user addresses, which tell its own
+ * meeting from someone else's.
  *
- * A move changes nothing in the object, but a server may see it as a
- * deletion in one calendar and a creation in the other, and schedule both —
- * whether Nextcloud does is acceptance A5's to record. So, the same honesty
- * rule as `may_notify` everywhere else:
+ * Any write to a scheduling object may make the server mail someone: a new
+ * title or time is an update to the attendees, a cancelled occurrence or a
+ * deleted meeting a cancellation, and a move may be seen as a deletion in
+ * one calendar and a creation in the other (`move_event`, #212, spec
+ * 2026-09-29 §2.6; whether Nextcloud does is acceptance A5's to record). So
+ * the same honesty rule as `may_notify` everywhere else:
  *
  *   - **The account's own meeting:** every attendee it is free to schedule
- *     ({@link schedulable}), who may be sent a cancellation and a new
- *     invitation.
+ *     ({@link schedulable}), who may be sent an update, a cancellation, or a
+ *     cancellation and a new invitation.
  *   - **Someone else's:** its organizer — the account is an attendee there,
- *     and deleting an invitation may send the organizer a decline, as
- *     `delete_event` already says for Nextcloud.
+ *     and deleting the invitation, or cancelling one occurrence of it with an
+ *     EXDATE, may send the organizer a decline, as Nextcloud does.
+ *
+ * Written for `move_event` as `mayNotifyOnMove`; every writer answers by it
+ * since the milestone review of v0.7.4, which found `update_event` and
+ * `delete_event` silent about every write but a guest-list change.
  */
-export function mayNotifyOnMove(vevents: readonly ICAL.Component[], own: readonly string[]): string[] | undefined {
+export function mayNotifyAbout(vevents: readonly ICAL.Component[], own: readonly string[]): string[] | undefined {
   if (!schedulingObject(vevents)) return undefined;
   const foreign = foreignOrganizer(vevents, own);
   if (foreign !== undefined) return [foreign.trim().replace(MAILTO, "")];

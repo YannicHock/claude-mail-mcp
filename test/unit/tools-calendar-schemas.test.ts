@@ -348,6 +348,30 @@ describe("attendees on the calendar tools (#204, #205, spec 2026-09-29 §2.1)", 
     });
   });
 
+  it("every writing tool says its answer's may_notify lists whom the calendar server may email, which is now true of each (milestone review of v0.7.4)", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      for (const tool of ["create_event", "update_event", "delete_event", "move_event"]) {
+        assert.match(tools.get(tool)?.config.description ?? "", /The answer's `may_notify` lists whom the calendar server may email/, tool);
+      }
+    });
+  });
+
+  it("delete_event says cancelling one occurrence of someone else's meeting may send its organizer a decline, not only deleting an invitation to one (milestone review of v0.7.4)", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const text = tools.get("delete_event")?.config.description ?? "";
+      assert.match(text, /one occurrence of a meeting someone else organizes[^.]*may send (?:its|the) organizer a decline/);
+    });
+  });
+
+  it("notify_attendees says false covers only the attendees this call marks, and that later changes and deletions may still mail the rest (milestone review of v0.7.4)", async () => {
+    await withCalendarTools(CLOSED, async (tools) => {
+      const text = schemaOf(tools, "update_event").notify_attendees?.description ?? "";
+      assert.match(text, /only asks/);
+      assert.match(text, /[Ll]ater change[^.]*or (?:deleting|deletion)[^.]*may still/);
+      assert.doesNotMatch(text, /no one is (?:ever )?mailed|never mailed/i);
+    });
+  });
+
   it("create_event, update_event and delete_event say the server may mail attendees, and to confirm first", async () => {
     await withCalendarTools(CLOSED, async (tools) => {
       for (const tool of ["create_event", "update_event", "delete_event"]) {

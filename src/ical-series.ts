@@ -54,6 +54,43 @@ export function sequenceOf(vevent: ICAL.Component): number {
   return Number.isFinite(sequence) ? sequence : 0;
 }
 
+/** The most days each month can have, February's in a leap year. */
+const LONGEST_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/**
+ * Why `recur` can never match a date, or null when it can — checked before a
+ * rule is walked, because ical.js cannot be trusted to find out by walking it.
+ * Reads the rule's parts and walks nothing, so it is safe on any thread.
+ *
+ * `RecurIterator.next` gives up on a rule that matches nothing only for
+ * MONTHLY and YEARLY. For DAILY, HOURLY, MINUTELY and SECONDLY it keeps
+ * stepping inside one `next()` call for ever, so `MAX_STEPS_PER_OBJECT`
+ * (src/ical-expand.ts), which counts `next()` calls, never gets a say:
+ * `FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30` froze the whole connector (review of
+ * #223). An invitation a server files on its own is enough to plant one.
+ *
+ * This is the cheap answer to the common shape — a day of the month that none
+ * of the months given has — and nothing more. For an event's rule the
+ * guarantee is the deadline src/ical-worker-pool.ts runs every expansion
+ * under, which also catches the shapes this does not (`BYWEEKNO=1;BYMONTH=6`),
+ * and a rule that does match but so rarely that one `next()` walks for
+ * minutes. For a VTIMEZONE's observance rule, walked on the connector's own
+ * thread by every write that places a time, it is one of the checks of
+ * `boundObservanceWalks` (src/ical-zones.ts).
+ *
+ * Moved here from src/ical-expand.ts, which still exports it, in the
+ * milestone review of v0.7.4: src/ical-zones.ts needs it, and importing the
+ * reader from there would be a cycle.
+ */
+export function impossibleRule(recur: ICAL.Recur): string | null {
+  const months = recur.parts.BYMONTH;
+  const days = recur.parts.BYMONTHDAY;
+  if (months === undefined || months.length === 0 || days === undefined || days.length === 0) return null;
+  const longest = Math.max(...months.map((m) => LONGEST_MONTH[m - 1] ?? 0));
+  if (days.some((d) => d !== 0 && Math.abs(d) <= longest)) return null;
+  return `BYMONTHDAY=${days.join(",")} is a day none of BYMONTH=${months.join(",")} has`;
+}
+
 /** An override VEVENT with the one ICAL.Event read from it, built once and used for its key, times and all. */
 export interface Override {
   ve: ICAL.Component;
