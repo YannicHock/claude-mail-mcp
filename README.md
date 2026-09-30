@@ -40,13 +40,17 @@ Exposes 17 MCP tools to Claude:
 
 | Tool | Purpose |
 |------|---------|
-| `list_calendars` | Discover CalDAV calendars |
-| `list_events` | Events in a time window (recurrences expanded) |
-| `create_event` | Add new event (writes to CalDAV) |
-| `update_event` | Change an event's time, title, location or description (ETag-guarded) |
-| `delete_event` | Delete an event (permanent — CalDAV has no trash) |
+| `list_calendars` | Discover CalDAV calendars, with each one's time zone |
+| `list_events` | Events in a time window, each occurrence of a series listed with the `recurrenceId` that addresses it, its `timezone` and whether it blocks time; an event that cannot be read is named in `skipped` instead of failing the calendar |
+| `create_event` | Add an event, in a time zone of your choosing or the calendar's own; with attendees, the account is the organizer |
+| `update_event` | Change an event, one occurrence of a series (`recurrence_id`), or a whole series (`apply_to_series`, including a new clock time for every occurrence); invite or remove attendees (ETag-guarded) |
+| `delete_event` | Delete an event, one occurrence of a series, or a whole series (permanent — CalDAV has no trash; ETag-guarded) |
 | `move_event` | Move an event, unchanged, into another calendar of the same account (ETag-guarded) |
-| `find_free_slot` | Compute free intervals across one or more calendars |
+| `find_free_slot` | Free intervals across one or more calendars, with working hours applied to every day in a time zone of your choosing |
+
+**The calendar server may mail real people.** This connector sends no mail to attendees itself (sending invitations from the connector is [#29](https://github.com/YannicHock/claude-mail-mcp/issues/29), planned for v0.8). A calendar server that schedules may, though: Nextcloud emails the attendees of an event the account organizes when it is created, changed or deleted, and that mail cannot be recalled. So `create_event` with attendees and `update_event` adding or removing one cannot be called without `notify_attendees`: `true` lets the server email them, `false` asks it not to (`SCHEDULE-AGENT=CLIENT`). Every writing tool tells Claude to confirm with you first, and every answer that changes a guest list lists in `may_notify` whom the server may now email. Removing someone with `notify_attendees: false` is refused until it is confirmed that Nextcloud then stays silent.
+
+**What the calendar tools handle.** Recurring events are expanded in the connector, so all-day, floating and zoned series, and an invitation to a single occurrence of someone else's series, are listed like any other. One occurrence can be changed or cancelled by its `recurrence_id`; a whole series can be given a new clock time or length, each occurrence keeping its date, with cancelled and individually changed occurrences staying what they were. A changed time keeps the event's own time zone (Berlin stays Berlin, UTC stays UTC, floating stays floating). `find_free_slot` does not count transparent ("show as free"), cancelled or declined events as busy. What is refused, with a reason: changing the day a series falls on (only its time), a series whose rule fixes its own times, one occurrence moved to another calendar, answering an invitation, and a `find_free_slot` range over 366 days. An occurrence where another app's "this and all following" change begins can be changed alone only when the occurrence after it has no changes of its own. Tasks (VTODO) are [#215](https://github.com/YannicHock/claude-mail-mcp/issues/215), planned for v0.9.
 
 Every tool accepts an optional `account: "<id>"` parameter to pick a mailbox; omit it to use the default account. So "list unread in INBOX of work account" vs "compare today's calendar across work and personal" both work in one connector.
 
