@@ -970,13 +970,24 @@ So the tools make the choice explicit rather than leaving it to the server:
   lists none. On Nextcloud that is the address the server recognises as "you
   organize this".
 - Every writing tool, `move_event` included, tells Claude to confirm with the
-  user before touching an event that has attendees, and every answer that
-  changes a guest list carries `may_notify`: everyone the server may now email.
-  Deleting an invitation to one occurrence of someone else's series may send its
-  organizer a decline.
+  user before touching an event that has attendees, and every write to a
+  meeting answers `may_notify`: whom the server may now email. For a meeting
+  the account organizes, that is its attendees the server is free to schedule,
+  after a new title or time, a cancelled occurrence or a deletion as much as
+  after a guest-list change. For a meeting someone else organizes, it is the
+  organizer: deleting it, cancelling one occurrence of it (an `EXDATE` in the
+  account's copy), or deleting an invitation to one occurrence of it may send
+  them a decline.
 
-If you would rather no one is ever mailed, use a calendar server without
-scheduling, or tell Claude to pass `notify_attendees: false`.
+`notify_attendees: false` does not mean no one is mailed. It marks only the
+attendees that call adds `SCHEDULE-AGENT=CLIENT` (and, when the call is the one
+that makes the account the event's `ORGANIZER`, the attendees already listed),
+and that only asks the server to send them nothing: whether Nextcloud honours it
+is what acceptance point A2 has to show, and it has not been run yet. An
+attendee listed plainly, without that mark, stays one the server may mail: a
+later change to the meeting, or deleting it or one of its occurrences, may send
+them an update or a cancellation whatever an earlier call said. If you would
+rather no one is ever mailed, use a calendar server without scheduling.
 
 ---
 
