@@ -63,13 +63,20 @@
  * person without saying whether the server may mail them — "confirm with
  * the user first" made structural. `true` writes the attendees plainly;
  * `false` marks the ones the call adds `SCHEDULE-AGENT=CLIENT` (RFC 6638),
- * which asks the server to send them nothing. Removing attendees with
- * `false` is refused until acceptance A2 shows a server honours it
- * (`REMOVE_WITHOUT_NOTIFY_HONOURED` in src/ical-attendees.ts). Since an
- * ORGANIZER written by the call changes whom the server contacts — every
- * attendee already listed, not only the ones added — each answer that
- * changes a guest list says whom the server may now email, as `may_notify`
- * (review of PR #230).
+ * which only asks the server to send them nothing — and only them: a later
+ * change to the event, or its deletion, may still make the server mail any
+ * attendee it is free to schedule, and the texts say so rather than let
+ * `false` read as "no one is mailed" (milestone review of v0.7.4). Removing
+ * attendees with `false` is refused until acceptance A2 shows a server
+ * honours it (`REMOVE_WITHOUT_NOTIFY_HONOURED` in src/ical-attendees.ts).
+ *
+ * Every write's answer says whom the server may now email, as `may_notify`
+ * ({@link MAY_NOTIFY_ANSWER}): an ORGANIZER written by a call changes whom
+ * the server contacts — every attendee already listed, not only the ones
+ * added (review of PR #230) — and any write to a meeting, a new title or
+ * time, a cancelled occurrence, a deletion, a move, may make it mail the
+ * attendees, or the organizer of someone else's meeting. Until the
+ * milestone review of v0.7.4 only a guest-list change said so.
  *
  * **What is refused, and stays so.** Answering an invitation (a PARTSTAT of
  * the account's own) belongs with iMIP (#29). A series' day, as opposed to its
@@ -194,6 +201,17 @@ const SERVER_MAY_MAIL =
 const SERVER_MAY_MAIL_ON_MOVE =
   "This connector sends no mail itself. However, your calendar server may: it may treat a move as a deletion from one calendar and a creation in the other, and email the attendees of an event you organize (or the organizer of someone else's meeting) accordingly, and that mail cannot be recalled. Confirm with the user before moving an event that has attendees.";
 
+/**
+ * What every writing tool says of its answer's `may_notify` (spec 2026-09-29
+ * §2.1), and since the milestone review of v0.7.4 true of each: every write
+ * to an event the server schedules answers it (`mayNotifyOf` in
+ * src/ical-edit.ts, `mayNotifyAbout` in src/ical-attendees.ts), not only one
+ * that changes a guest list. One sentence for the four tools, so none of
+ * them can promise it where the code does not give it.
+ */
+const MAY_NOTIFY_ANSWER =
+  "The answer's `may_notify` lists whom the calendar server may email about this call: for a meeting you organize, its attendees the server is free to schedule (including anyone taken off the guest list with notify_attendees: true); for a meeting someone else organizes, its organizer. It is absent for an event with no attendees, or with attendees and no organizer, which no server schedules.";
+
 /** Why `notify_attendees` is refused missing: the refinement's message, which the model is shown. */
 const NOTIFY_REQUIRED =
   "notify_attendees is required when attendees are added or removed: true lets the calendar server email them, false asks it not to. Confirm with the user which they want first.";
@@ -202,7 +220,7 @@ const notifyAttendeesSchema = z
   .boolean()
   .optional()
   .describe(
-    "Required whenever attendees are added or removed (create_event's attendees, update_event's add_attendees or remove_attendees): this is where real people may get mail, so ask the user which they want and confirm with the user before the call. true: the attendees are written plainly, and the calendar server may then email them an invitation, update or cancellation on its own; that mail cannot be recalled. false: each attendee this call adds is marked SCHEDULE-AGENT=CLIENT, which asks the calendar server to send them nothing; the event lists them, and whether the server honours the request is up to the server. Removing attendees with false is refused for now, since the server may send them a cancellation regardless: leave them listed, or confirm with the user that they may be emailed and pass true. On an event that has attendees but no organizer yet, the account becomes its organizer, and the attendees already listed are treated like the ones added: with true, the server may email them too. The answer's may_notify lists everyone the calendar server may now email about the event."
+    "Required whenever attendees are added or removed (create_event's attendees, update_event's add_attendees or remove_attendees): this is where real people may get mail, so ask the user which they want and confirm with the user before the call. true: the attendees are written plainly, and the calendar server may then email them an invitation, update or cancellation on its own; that mail cannot be recalled. false: each attendee this call adds is marked SCHEDULE-AGENT=CLIENT, which only asks the calendar server to send them nothing; the event lists them, and whether the server honours the request is up to the server. It covers only the attendees this call marks: a later change to the event, or deleting it or one of its occurrences, may still make the server email any attendee it is free to schedule. Removing attendees with false is refused for now, since the server may send them a cancellation regardless: leave them listed, or confirm with the user that they may be emailed and pass true. On an event that has attendees but no organizer yet, the account becomes its organizer, and the attendees already listed are treated like the ones added: with true, the server may email them too. The answer's may_notify lists everyone the calendar server may now email about the event."
   );
 
 /**
@@ -225,7 +243,8 @@ function notifyRequired<T extends { notify_attendees?: boolean }>(
 /**
  * A write's answer as the tool gives it: `success`, and the client's
  * `mayNotify` — whom the calendar server may now email (review of PR #230)
- * — as `may_notify`, only where the write changed a guest list.
+ * — as `may_notify`, wherever the client gave one: every write to an event
+ * the server schedules ({@link MAY_NOTIFY_ANSWER}).
  */
 function withMayNotify<T extends { mayNotify?: string[] }>(result: T): Record<string, unknown> {
   const { mayNotify, ...rest } = result;
@@ -311,7 +330,7 @@ export function registerCalendarTools(
     "create_event",
     {
       description:
-        `Create a new calendar event. WRITE OPERATION. Use all_day=true for date-only events (start/end should then be YYYY-MM-DD; end is exclusive — for a one-day event set end to the day after). The event is written in \`timezone\`, or the calendar's own zone, or UTC; the answer's \`timezone\` says which. The end must come after the start. With attendees, the account is written as the event's ORGANIZER, notify_attendees is required, and the answer's \`may_notify\` lists whom the calendar server may now email. ${SERVER_MAY_MAIL}`,
+        `Create a new calendar event. WRITE OPERATION. Use all_day=true for date-only events (start/end should then be YYYY-MM-DD; end is exclusive — for a one-day event set end to the day after). The event is written in \`timezone\`, or the calendar's own zone, or UTC; the answer's \`timezone\` says which. The end must come after the start. With attendees, the account is written as the event's ORGANIZER, and notify_attendees is required. ${SERVER_MAY_MAIL} ${MAY_NOTIFY_ANSWER}`,
       inputSchema: z.object({
         calendar_url: calendarUrlSchema,
         summary: z.string().min(1).describe("Event title"),
@@ -361,7 +380,7 @@ export function registerCalendarTools(
     "update_event",
     {
       description:
-        `Change an existing calendar event. WRITE OPERATION. Pass the \`etag\` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. \`start\` alone moves the event and keeps its length as elapsed time (whole days for an all-day event): one that spans a daylight-saving change keeps its hours, not its clock times. The answer carries the event's new \`etag\` for a further change; if it is null, call list_events before changing it again. ${SERVER_MAY_MAIL} add_attendees and remove_attendees change who is invited, and need notify_attendees; only its organizer changes an event's guest list, so they are refused on a meeting someone else organizes, whose text and time can still be changed. With recurrence_id they change that one occurrence's guest list, and with apply_to_series every occurrence's. The answer's \`may_notify\` then lists whom the calendar server may now email: on an event that had attendees but no organizer, that includes the attendees already listed. One occurrence of a recurring event: pass its recurrence_id from list_events, and only that occurrence changes. The whole series: pass apply_to_series=true. A series' start and end then give every occurrence a new clock time and/or length, each keeping its date — start and end describe the series' first occurrence, or the one recurrence_id names — and the day of a series cannot be changed, only its time. Cancelled and individually changed occurrences stay the ones they were. An invitation to a single occurrence of someone else's series is changed like one occurrence, with or without recurrence_id.`,
+        `Change an existing calendar event. WRITE OPERATION. Pass the \`etag\` list_events returned: if the event was changed elsewhere since, nothing is written and you are told to read it again. Only the fields you pass change; everything else — attendees, reminders, recurrence rules — is kept exactly as it is. \`start\` alone moves the event and keeps its length as elapsed time (whole days for an all-day event): one that spans a daylight-saving change keeps its hours, not its clock times. The answer carries the event's new \`etag\` for a further change; if it is null, call list_events before changing it again. ${SERVER_MAY_MAIL} add_attendees and remove_attendees change who is invited, and need notify_attendees; only its organizer changes an event's guest list, so they are refused on a meeting someone else organizes, whose text and time can still be changed. With recurrence_id they change that one occurrence's guest list, and with apply_to_series every occurrence's. On an event that had attendees but no organizer, adding or removing one makes the account its organizer, and the attendees already listed become ones the server may email too. ${MAY_NOTIFY_ANSWER} One occurrence of a recurring event: pass its recurrence_id from list_events, and only that occurrence changes. The whole series: pass apply_to_series=true. A series' start and end then give every occurrence a new clock time and/or length, each keeping its date — start and end describe the series' first occurrence, or the one recurrence_id names — and the day of a series cannot be changed, only its time. Cancelled and individually changed occurrences stay the ones they were. An invitation to a single occurrence of someone else's series is changed like one occurrence, with or without recurrence_id.`,
       inputSchema: z.object({
         calendar_url: calendarUrlSchema,
         uid: uidSchema,
@@ -425,7 +444,7 @@ export function registerCalendarTools(
     "delete_event",
     {
       description:
-        `Delete a calendar event. DESTRUCTIVE AND PERMANENT: CalDAV has no trash, so a deleted event cannot be recovered. ${SERVER_MAY_MAIL} Pass the \`etag\` list_events returned: if the event was changed elsewhere since, nothing is deleted. To cancel one occurrence of a recurring event, pass its recurrence_id from list_events: that one occurrence is removed from the series (an EXDATE), the rest stay, and the answer carries the series' new \`etag\`. A whole recurring event needs apply_to_series=true and is then deleted with every occurrence. Deleting an invitation to a single occurrence of someone else's series deletes the stored invitation; on some servers (e.g. Nextcloud) that may send the organizer a decline.`,
+        `Delete a calendar event. DESTRUCTIVE AND PERMANENT: CalDAV has no trash, so a deleted event cannot be recovered. ${SERVER_MAY_MAIL} Pass the \`etag\` list_events returned: if the event was changed elsewhere since, nothing is deleted. To cancel one occurrence of a recurring event, pass its recurrence_id from list_events: that one occurrence is removed from the series (an EXDATE), the rest stay, and the answer carries the series' new \`etag\`. A whole recurring event needs apply_to_series=true and is then deleted with every occurrence. Deleting a meeting someone else organizes, or cancelling one occurrence of a meeting someone else organizes (an EXDATE in your copy of it), may send its organizer a decline on some servers (e.g. Nextcloud). An invitation to a single occurrence of someone else's series is deleted whole, with its recurrence_id or apply_to_series=true. ${MAY_NOTIFY_ANSWER}`,
       inputSchema: {
         calendar_url: calendarUrlSchema,
         uid: uidSchema,
@@ -446,7 +465,7 @@ export function registerCalendarTools(
           applyToSeries: args.apply_to_series,
         })
       );
-      return asJson({ success: true, ...result });
+      return asJson(withMayNotify(result));
     }
   );
 
@@ -454,7 +473,7 @@ export function registerCalendarTools(
     "move_event",
     {
       description:
-        `Move an event to another calendar of the same account. WRITE OPERATION. The event is moved as it is stored: its UID, attendees, reminders and everything else stay unchanged. Pass the \`etag\` list_events returned: if the event was changed elsewhere since, nothing is moved. A recurring event moves whole and needs apply_to_series=true; one occurrence cannot be moved to another calendar, so recurrence_id is refused. Refused, with nothing moved, when the target calendar already has an event with this UID or an object of the same name. The answer gives the event's new \`url\` and \`etag\`, and \`via\`: "move" when the server moved it itself, "copy-then-delete" when it refused to and the event was copied into the target calendar and then deleted from the source, in which case the \`etag\` is a new one. If the source cannot be deleted, the copy is removed again and nothing is moved. A refusal that names both URLs means the event may be in both calendars, or that it is unclear where it went: call list_events on both before anything else. ${SERVER_MAY_MAIL_ON_MOVE} The answer's \`may_notify\` then lists whom the calendar server may email.`,
+        `Move an event to another calendar of the same account. WRITE OPERATION. The event is moved as it is stored: its UID, attendees, reminders and everything else stay unchanged. Pass the \`etag\` list_events returned: if the event was changed elsewhere since, nothing is moved. A recurring event moves whole and needs apply_to_series=true; one occurrence cannot be moved to another calendar, so recurrence_id is refused. Refused, with nothing moved, when the target calendar already has an event with this UID or an object of the same name. The answer gives the event's new \`url\` and \`etag\`, and \`via\`: "move" when the server moved it itself, "copy-then-delete" when it refused to and the event was copied into the target calendar and then deleted from the source, in which case the \`etag\` is a new one. If the source cannot be deleted, the copy is removed again and nothing is moved. A refusal that names both URLs means the event may be in both calendars, or that it is unclear where it went: call list_events on both before anything else. ${SERVER_MAY_MAIL_ON_MOVE} ${MAY_NOTIFY_ANSWER}`,
       inputSchema: {
         calendar_url: calendarUrlSchema.describe("The calendar the event is in now, as returned by list_calendars"),
         uid: uidSchema,

@@ -10,6 +10,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+import { buildIcs } from "../../src/ical-build.js";
 import { writtenBy, type EventPatch } from "../../src/ical-edit.js";
 import { expandObject, findOccurrence } from "../../src/ical-expand.js";
 import { applyOccurrencePatch, excludeOccurrence } from "../../src/ical-occurrence-edit.js";
@@ -40,7 +41,7 @@ function updateOne(text: string, rid: string | null, patch: EventPatch, uid = UI
 }
 
 function deleteOne(text: string, rid: string, uid = UID): string {
-  return excludeOccurrence(parseCalendar(text), uid, occurrence(text, rid, uid), DELETED, NOW).ics;
+  return excludeOccurrence(parseCalendar(text), uid, occurrence(text, rid, uid), { nothingDone: DELETED, now: NOW, own: [] }).ics;
 }
 
 describe("findOccurrence — a recurrence_id is matched against the expanded series, never built (spec §2.3)", () => {
@@ -438,5 +439,64 @@ describe("an override with no master (#211.3)", () => {
   it("needs a recurrence_id on a series that has a master", () => {
     const found = findOccurrence(weekly(SHAPES[2]), UID, null);
     assert.equal(found.found, false);
+  });
+});
+
+/**
+ * The VTIMEZONE `create_event` generates covers the span it was made for, a
+ * year either side, and a writer that puts a time in its zone regenerates it
+ * to cover that time (review of #224). The milestone review of v0.7.4 found
+ * two writers that did not: the EXDATE of a cancelled occurrence, and the
+ * RECURRENCE-ID of an occurrence given only a new title. Outside the block's
+ * span every other client reads the zone by its last observance — Berlin at
+ * +0100 through every summer — and so places that time an hour away.
+ */
+describe("a VTIMEZONE this connector generated covers every time a one-occurrence write puts in its zone (milestone review of v0.7.4)", () => {
+  // Created on 2026-12-01 in Berlin, so its block runs 2025-12 to 2027-12;
+  // another client then made it a monthly series, which the block was never
+  // regenerated for.
+  const uid = "created-series@claude-mail-mcp";
+  const created = buildIcs(
+    {
+      uid,
+      summary: "Created here",
+      start: "2026-12-01T10:00:00+01:00",
+      end: "2026-12-01T11:00:00+01:00",
+    },
+    "Europe/Berlin",
+    "Nothing was created.",
+    NOW
+  ).replace("SUMMARY:Created here\r\n", "SUMMARY:Created here\r\nRRULE:FREQ=MONTHLY;COUNT=60\r\n");
+
+  /** The recurrence_id `list_events` gives the occurrence on `ymd`: whatever the block says it is. */
+  function ridOn(ymd: string): string {
+    const day = Date.parse(`${ymd}T00:00:00Z`);
+    const { instances } = expandObject(
+      created,
+      { start: day - 86_400_000, end: day + 2 * 86_400_000 },
+      { url: "https://dav.example/cal/created.ics", etag: null }
+    );
+    const found = instances.find((e) => e.recurrenceId?.startsWith(ymd));
+    assert.ok(found?.recurrenceId, `no occurrence on ${ymd}`);
+    return found.recurrenceId;
+  }
+
+  it("the fixture's block does not reach 2029, which is what the writes below must change", () => {
+    assert.equal(vtimezones(created).length, 1);
+    assert.doesNotMatch(vtimezones(created)[0], /DTSTART:2029/);
+  });
+
+  it("cancelling an occurrence in 2029 regenerates the block to cover the EXDATE", () => {
+    const out = deleteOne(created, ridOn("2029-07-01"), uid);
+    assert.match(out, /EXDATE;TZID=Europe\/Berlin:20290701T100000/);
+    assert.equal(vtimezones(out).length, 1);
+    assert.match(vtimezones(out)[0], /DTSTART:2029/);
+  });
+
+  it("a new title for an occurrence in 2029 regenerates the block to cover its RECURRENCE-ID", () => {
+    const out = updateOne(created, ridOn("2029-07-01"), { summary: "Just this one" }, uid);
+    assert.match(out, /RECURRENCE-ID;TZID=Europe\/Berlin:20290701T100000/);
+    assert.equal(vtimezones(out).length, 1);
+    assert.match(vtimezones(out)[0], /DTSTART:2029/);
   });
 });

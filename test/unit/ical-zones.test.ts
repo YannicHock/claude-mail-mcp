@@ -14,8 +14,10 @@
  * 2026–2030 respectively.
  */
 
+import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import ICAL from "ical.js";
 
 import {
@@ -434,5 +436,99 @@ describe("wall times in the years 0–99 are those years, not 1900–1999", () =
     assert.equal(storedInstant(floating, { kind: "floating" }), utc);
     assert.deepEqual(addToWall(wall, 86_400), { ...wall, day: 2 });
     assert.deepEqual(addToWall({ ...wall, year: 99, month: 12, day: 31 }, 86_400), { ...wall, year: 100 });
+  });
+});
+
+/**
+ * A VTIMEZONE whose observance rule never matches a date (milestone review
+ * of v0.7.4, finding 1). `list_events` reads it in a worker, under a
+ * deadline; the writers read it on the connector's own thread, where
+ * ical.js's `_ensureCoverage` walked the rule with nothing to stop it —
+ * `update_event` with a new `start` never returned, and nothing else did
+ * either.
+ *
+ * A synchronous loop cannot be stopped by a node:test timeout in the same
+ * process, so each case runs in a child process with a deadline of its own:
+ * a hang is a failure here, not a test run that never ends.
+ */
+describe("a VTIMEZONE whose observance rule never matches is refused, not walked for ever (milestone review of v0.7.4)", () => {
+  const HOSTILE_ZONE = [
+    "BEGIN:VTIMEZONE",
+    "TZID:Hostile Standard Time",
+    "BEGIN:STANDARD",
+    "DTSTART:19701025T030000",
+    "TZOFFSETFROM:+0200",
+    "TZOFFSETTO:+0100",
+    "RRULE:FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30",
+    "END:STANDARD",
+    "END:VTIMEZONE",
+  ];
+
+  function hostile(uid: string, ...extra: string[]): string {
+    return ics(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Other Client//EN",
+      ...HOSTILE_ZONE,
+      "BEGIN:VEVENT",
+      `UID:${uid}`,
+      "DTSTAMP:20260901T080000Z",
+      "DTSTART;TZID=Hostile Standard Time:20261001T090000",
+      "DTEND;TZID=Hostile Standard Time:20261001T100000",
+      ...extra,
+      "SUMMARY:Planning",
+      "END:VEVENT",
+      "END:VCALENDAR"
+    );
+  }
+
+  /**
+   * Run `call` — an expression over `parsed`, the parse of `text`, and `ctx`
+   * — in a child process, and answer what it printed: the error's class and
+   * message, or "WROTE". A child still running after `deadlineMs` is killed,
+   * and the answer says it hung.
+   */
+  function inChild(text: string, call: string, deadlineMs = 20_000): string {
+    const src = (name: string): string =>
+      JSON.stringify(pathToFileURL(fileURLToPath(new URL(`../../src/${name}`, import.meta.url))).href);
+    const script = [
+      `const { parseCalendar } = await import(${src("ical-parse.ts")});`,
+      `const { applyEventPatch } = await import(${src("ical-edit.ts")});`,
+      `const { shiftSeries } = await import(${src("ical-series-shift.ts")});`,
+      `const parsed = parseCalendar(${JSON.stringify(text)});`,
+      `const ctx = { nothingDone: "Nothing was changed.", now: new Date("2026-09-30T12:00:00Z"), own: [] };`,
+      "try {",
+      `  ${call};`,
+      `  console.log("WROTE");`,
+      "} catch (err) {",
+      "  console.log(`${err.constructor.name}: ${err.message}`);",
+      "}",
+    ].join("\n");
+    const run = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+      encoding: "utf8",
+      timeout: deadlineMs,
+    });
+    if (run.error !== undefined || run.signal !== null) return `HUNG (${run.signal ?? String(run.error)})`;
+    return `${run.stdout}${run.stderr}`.trim();
+  }
+
+  it("update_event's move of one event (applyEventPatch) is refused, with nothing written", { timeout: 60_000 }, () => {
+    const answer = inChild(
+      hostile("hostile-once@example.com"),
+      `applyEventPatch(parsed, "hostile-once@example.com", { start: "2026-10-01T11:00:00" }, ctx)`
+    );
+    assert.match(answer, /^ToolRefusal: /);
+    assert.match(answer, /time zone definition could not be read/);
+    assert.match(answer, /Nothing was changed\.$/);
+  });
+
+  it("a series' new time (shiftSeries) is refused the same way", { timeout: 60_000 }, () => {
+    const answer = inChild(
+      hostile("hostile-series@example.com", "RRULE:FREQ=WEEKLY;COUNT=3"),
+      `shiftSeries(parsed, "hostile-series@example.com", null, { start: "2026-10-01T11:00:00" }, ctx)`
+    );
+    assert.match(answer, /^ToolRefusal: /);
+    assert.match(answer, /time zone definition could not be read/);
+    assert.match(answer, /Nothing was changed\.$/);
   });
 });

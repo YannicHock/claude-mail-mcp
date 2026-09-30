@@ -23,6 +23,7 @@ import {
   setTime,
   shown,
   stampRevision,
+  withReadableZones,
   type EditContext,
   type EditResult,
   type EventPatch,
@@ -99,8 +100,12 @@ const SUB_DAILY = new Set(["HOURLY", "MINUTELY", "SECONDLY"]);
  * occurrence it describes (the day of a series is its rule's, not its time);
  * a rule whose times are its own — a sub-daily FREQ, or BYHOUR, BYMINUTE or
  * BYSECOND — when the start moves; a switch between all-day and timed; an
- * end at or before the start; an offset for a floating series; and a zone
- * nothing can place. "This and all following occurrences" is not this
+ * end at or before the start; an offset for a floating series; a zone
+ * nothing can place; and a VTIMEZONE whose observance rules this connector
+ * will not walk on its own thread (`withReadableZones` in src/ical-edit.ts,
+ * milestone review of v0.7.4). The answer's `mayNotify` is `mayNotifyOf`'s
+ * (src/ical-edit.ts): for a meeting, whom the server may email about the
+ * new time. "This and all following occurrences" is not this
  * function's: it would be a new series (§2.4 C, out of v0.7.4).
  */
 export function shiftSeries(
@@ -110,10 +115,24 @@ export function shiftSeries(
   patch: EventPatch,
   ctx: EditContext
 ): EditResult {
-  const { nothingDone, now, own } = ctx;
+  const { nothingDone } = ctx;
   const { vcal } = parsed;
   const { master, overrides } = seriesFor(vcal, uid);
   if (master === undefined) throw new Error(`shiftSeries: no main VEVENT for UID ${uid}`);
+  return withReadableZones(nothingDone, () => shiftMaster(vcal, uid, master, overrides, anchor, patch, ctx));
+}
+
+/** {@link shiftSeries} once its master is found, run through `withReadableZones` (src/ical-edit.ts). */
+function shiftMaster(
+  vcal: ICAL.Component,
+  uid: string,
+  master: ICAL.Component,
+  overrides: ICAL.Component[],
+  anchor: FoundOccurrence | null,
+  patch: EventPatch,
+  ctx: EditContext
+): EditResult {
+  const { nothingDone, now, own } = ctx;
   const startProp = master.getFirstProperty("dtstart") as ICAL.Property;
   const start = startProp.getFirstValue() as ICAL.Time;
   const allDay = start.isDate;
@@ -140,7 +159,7 @@ export function shiftSeries(
   const sequence = stampRevision(master, now);
   touched.delete(master);
   for (const ve of touched) stampRevision(ve, now);
-  return { ics: vcal.toString(), mark: { uid, sequence }, ...mayNotifyOf(guests) };
+  return { ics: vcal.toString(), mark: { uid, sequence }, ...mayNotifyOf(guests, [master, ...overrides], own) };
 }
 
 /**

@@ -62,17 +62,24 @@
  */
 
 import ICAL from "ical.js";
+import { describeFailure } from "../shared/credential-failure.js";
 import { parseCalendar, seriesFor, seriesIn, type ParsedCalendar } from "./ical-parse.js";
 import {
   allDaySeries,
   currentOverrides,
   governingRange,
+  impossibleRule,
   instantOf,
   keyOf,
   modifiesFuture,
   type Override,
 } from "./ical-series.js";
 import { hasOffset, isFloating, wallAt, wallOf, writeZoneOf, zoneNameOf, type ZonedWall } from "./ical-zones.js";
+
+// Where its unit tests have always found it; it lives in src/ical-series.ts
+// since the milestone review of v0.7.4, so that src/ical-zones.ts can refuse
+// a VTIMEZONE's observance rule by it without importing this module.
+export { impossibleRule };
 
 /** Instances listed per object and window before the rest are cut off (spec §2.2). */
 export const MAX_OCCURRENCES_PER_OBJECT = 1000;
@@ -199,37 +206,6 @@ function inWindow(start: ICAL.Time, end: ICAL.Time, window: ExpandWindow): boole
   const e = instantOf(end);
   if (e > s) return s < window.end && e > window.start;
   return s >= window.start && s < window.end;
-}
-
-/** The most days each month can have, February's in a leap year. */
-const LONGEST_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-
-/**
- * Why `recur` can never match a date, or null when it can — checked before a
- * rule is walked, because ical.js cannot be trusted to find out by walking it.
- *
- * `RecurIterator.next` gives up on a rule that matches nothing only for
- * MONTHLY and YEARLY. For DAILY, HOURLY, MINUTELY and SECONDLY it keeps
- * stepping inside one `next()` call for ever, so {@link MAX_STEPS_PER_OBJECT},
- * which counts `next()` calls, never gets a say: `FREQ=DAILY;BYMONTH=2;
- * BYMONTHDAY=30` froze the whole connector (review of #223). An invitation
- * a server files on its own is enough to plant one.
- *
- * This is the cheap answer to the common shape — a day of the month that none
- * of the months given has — and nothing more. The guarantee is the deadline
- * src/ical-worker-pool.ts runs every expansion under, which also catches the
- * shapes this does not (`BYWEEKNO=1;BYMONTH=6`), and a rule that does match
- * but so rarely that one `next()` walks for minutes.
- *
- * @internal Exported for its unit tests; {@link occurrencesIn} is its one caller.
- */
-export function impossibleRule(recur: ICAL.Recur): string | null {
-  const months = recur.parts.BYMONTH;
-  const days = recur.parts.BYMONTHDAY;
-  if (months === undefined || months.length === 0 || days === undefined || days.length === 0) return null;
-  const longest = Math.max(...months.map((m) => LONGEST_MONTH[m - 1] ?? 0));
-  if (days.some((d) => d !== 0 && Math.abs(d) <= longest)) return null;
-  return `BYMONTHDAY=${days.join(",")} is a day none of BYMONTH=${months.join(",")} has`;
 }
 
 /**
@@ -576,7 +552,7 @@ export function findOccurrence(ics: string, uid: string, recurrenceId: string | 
   try {
     return lookUpOccurrence(ics, uid, recurrenceId);
   } catch (err) {
-    return { found: false, reason: `The stored event could not be read to find the occurrence: ${reasonFrom(err)}.` };
+    return { found: false, reason: `The stored event could not be read to find the occurrence: ${describeFailure(err)}.` };
   }
 }
 
@@ -750,12 +726,6 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
   };
 }
 
-/** An error's message, on one line and bounded, for `skipped`. */
-function reasonFrom(err: unknown): string {
-  const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
-  return message.length > 200 ? `${message.slice(0, 199)}…` : message;
-}
-
 function toInstance(o: Occurrence, opts: ExpandOptions): CalendarEvent {
   const ve = o.vevent;
   const text = (name: string): string | null => {
@@ -816,7 +786,7 @@ export function readObject<T>(
   try {
     parsed = parseCalendar(ics);
   } catch (err) {
-    return { items: [], skipped: `The stored object could not be read as iCalendar: ${reasonFrom(err)}` };
+    return { items: [], skipped: `The stored object could not be read as iCalendar: ${describeFailure(err)}` };
   }
   try {
     const { vcal, unresolved } = parsed;
@@ -842,6 +812,6 @@ export function readObject<T>(
     }
     return reasons.length === 0 ? { items } : { items, skipped: reasons.join(" ") };
   } catch (err) {
-    return { items: [], skipped: `The stored object could not be read as a calendar event: ${reasonFrom(err)}` };
+    return { items: [], skipped: `The stored object could not be read as a calendar event: ${describeFailure(err)}` };
   }
 }

@@ -28,12 +28,13 @@ import {
   DAVCalendarObject,
 } from "tsdav";
 import { randomUUID } from "node:crypto";
+import type ICAL from "ical.js";
 import { buildIcs, builtZoneName, type NewEventFields } from "./ical-build.js";
 import {
   addressKey,
   calendarUserAddresses,
   mailtoOf,
-  mayNotifyOnMove,
+  mayNotifyAbout,
   notifyChoice,
   schedulable,
   schedulingObject,
@@ -43,6 +44,7 @@ import {
   applyEventPatch,
   changesSomething,
   describeSeries,
+  everyVevent,
   touchesTime,
   writtenBy,
   type EditResult,
@@ -142,16 +144,20 @@ export interface CreatedEvent {
   mayNotify?: string[];
 }
 
-/** What `update_event` answers: the event, its new ETag, and for a guest-list change whom the server may now email. */
+/** What `update_event` answers: the event, its new ETag, and for a meeting whom the server may now email. */
 export interface UpdatedEvent {
   uid: string;
   url: string;
   etag: string | null;
   /**
-   * For a change to the guest list: everyone the calendar server may now
-   * email about the event — `mayNotify` in src/ical-attendees.ts, which
-   * names the attendees already listed, too, when this call made the
-   * account the event's organizer. Absent for any other change.
+   * For a write to an event the server schedules: everyone the calendar
+   * server may now email about it (`EditResult.mayNotify` in
+   * src/ical-edit.ts). For a change to the guest list that is
+   * `AttendeeResult.mayNotify` in src/ical-attendees.ts, which names the
+   * attendees already listed, too, when this call made the account the
+   * event's organizer; for any other change, the meeting's attendees, or
+   * the organizer of someone else's (milestone review of v0.7.4). Absent
+   * for an event the server does not schedule.
    */
   mayNotify?: string[];
 }
@@ -186,6 +192,13 @@ export interface DeletedEvent {
   etag?: string | null;
   /** Said when deleting one occurrence left the series with none. */
   note?: string;
+  /**
+   * For an event the server schedules: whom it may email about the deletion
+   * — the meeting's attendees, who may be sent a cancellation, or the
+   * organizer of someone else's, who may be sent a decline (`mayNotifyAbout`
+   * in src/ical-attendees.ts; milestone review of v0.7.4). Absent otherwise.
+   */
+  mayNotify?: string[];
 }
 
 /** Which event `move_event` moves, and where to (#212, spec 2026-09-29 §2.6). */
@@ -216,7 +229,7 @@ export interface MovedEvent {
   via: MoveMethod;
   /**
    * For an event the server schedules: whom it may email about the move —
-   * `mayNotifyOnMove` in src/ical-attendees.ts. Absent otherwise.
+   * `mayNotifyAbout` in src/ical-attendees.ts. Absent otherwise.
    */
   mayNotify?: string[];
 }
@@ -524,8 +537,16 @@ export class CalDavClient {
    * src/ical-attendees.ts, with {@link ownAddresses} to tell the account's own
    * meeting from someone else's. Without `notifyAttendees` the call is refused
    * before the server is contacted; a lookup of those addresses that fails is
-   * a refusal too, ending in "Nothing was changed" ({@link ownFor}). The
-   * answer's `mayNotify` names whom the server may now email.
+   * a refusal too, ending in "Nothing was changed" ({@link ownFor}).
+   *
+   * Milestone review of v0.7.4: the answer's `mayNotify` names whom the
+   * server may now email after any write to an event it schedules — a new
+   * title or time, a series moved, one occurrence changed — not only after
+   * a guest-list change (`mayNotifyOf` in src/ical-edit.ts), so the account's
+   * addresses are looked up for every such write ({@link ownIfNeeded}). And
+   * a new time is refused at once in an object the worker pool remembers
+   * running out its deadline ({@link refuseKnownHanging}): the times are
+   * placed on this thread.
    */
   async updateEvent(update: EventUpdate): Promise<UpdatedEvent> {
     const nothingDone = "Nothing was changed, and no event was created.";
@@ -544,8 +565,10 @@ export class CalDavClient {
     }
     const calendar = await this.findCalendar(update.calendarUrl);
     const stored = await this.findStoredEvent(calendar, update.uid, nothingDone);
-    const own = touchesAttendees(update) ? await this.ownFor(nothingDone) : [];
-    const shape = describeSeries(seriesFor(stored.parsed.vcal, update.uid));
+    if (touchesTime(update)) refuseKnownHanging(stored, update.uid, nothingDone);
+    const series = seriesFor(stored.parsed.vcal, update.uid);
+    const own = await this.ownIfNeeded(touchesAttendees(update), everyVevent(series), nothingDone);
+    const shape = describeSeries(series);
     const target: WriteTarget = { calendar, uid: update.uid, url: stored.url, nothingDone };
     const ctx = { nothingDone, now: new Date(), own };
     let edit: EditResult;
@@ -682,6 +705,13 @@ export class CalDavClient {
    * the object deleted when it held nothing else. `recurrenceId` with
    * `applyToSeries: true` is contradictory and refused before the server is
    * contacted.
+   *
+   * For an event the server schedules, the answer's `mayNotify` names whom
+   * it may email about the deletion (milestone review of v0.7.4): the
+   * meeting's attendees, who may be sent a cancellation, or the organizer of
+   * someone else's, who may be sent a decline — for one occurrence as for
+   * the whole event. That needs the account's addresses, and a lookup of
+   * them that fails is a refusal ({@link ownIfNeeded}).
    */
   async deleteEvent(target: EventTarget): Promise<DeletedEvent> {
     const nothingDone = "Nothing was deleted.";
@@ -693,23 +723,27 @@ export class CalDavClient {
     }
     const calendar = await this.findCalendar(target.calendarUrl);
     const stored = await this.findStoredEvent(calendar, target.uid, nothingDone);
-    const shape = describeSeries(seriesFor(stored.parsed.vcal, target.uid));
+    const series = seriesFor(stored.parsed.vcal, target.uid);
+    const vevents = everyVevent(series);
+    const shape = describeSeries(series);
     const writeTarget: WriteTarget = { calendar, uid: target.uid, url: stored.url, nothingDone };
     if (recurrenceId !== undefined) {
       const ifMatch = requireEtag(target, stored, nothingDone);
       const found = await this.occurrence(stored, target.uid, recurrenceId, nothingDone);
-      const edit = excludeOccurrence(stored.parsed, target.uid, found, nothingDone);
+      const own = await this.ownIfNeeded(false, vevents, nothingDone);
+      const edit = excludeOccurrence(stored.parsed, target.uid, found, { nothingDone, now: new Date(), own });
+      const notified = edit.mayNotify === undefined ? {} : { mayNotify: edit.mayNotify };
       if (!(shape.overrideOnly && edit.seriesEmpty)) {
         const etag = await this.putEdit(writeTarget, ifMatch, edit);
         const note =
           edit.seriesEmpty
             ? "That was the series' last occurrence: it has no occurrences left, but the event itself was kept. Delete it with apply_to_series: true to remove it."
             : undefined;
-        return { uid: target.uid, url: stored.url, etag, ...(note === undefined ? {} : { note }) };
+        return { uid: target.uid, url: stored.url, etag, ...(note === undefined ? {} : { note }), ...notified };
       }
       // The only occurrence of an object with no master: nothing would be left.
       await this.deleteObject(writeTarget, ifMatch);
-      return { uid: target.uid, url: stored.url };
+      return { uid: target.uid, url: stored.url, ...notified };
     }
     if (shape.overrideOnly && target.applyToSeries !== true) {
       // #211.3: not "every occurrence" — the object holds only this one.
@@ -720,8 +754,10 @@ export class CalDavClient {
     if (shape.recurring && target.applyToSeries !== true) {
       throw seriesRefusal(target.uid, "delete");
     }
-    await this.deleteObject(writeTarget, requireEtag(target, stored, nothingDone));
-    return { uid: target.uid, url: stored.url };
+    const ifMatch = requireEtag(target, stored, nothingDone);
+    const mayNotify = mayNotifyAbout(vevents, await this.ownIfNeeded(false, vevents, nothingDone));
+    await this.deleteObject(writeTarget, ifMatch);
+    return { uid: target.uid, url: stored.url, ...(mayNotify === undefined ? {} : { mayNotify }) };
   }
 
   /** DELETE the stored object `target` names, guarded by `ifMatch` through {@link guardedWrite}. */
@@ -766,7 +802,7 @@ export class CalDavClient {
    * which acceptance A5 records.
    *
    * For an event the server schedules, the answer's `mayNotify` names whom
-   * it may email ({@link mayNotifyOnMove}), which needs the account's
+   * it may email ({@link mayNotifyAbout}), which needs the account's
    * addresses: a lookup of them that fails is a refusal ({@link ownFor}).
    */
   async moveEvent(move: EventMove): Promise<MovedEvent> {
@@ -789,9 +825,8 @@ export class CalDavClient {
     }
     // R11: Radicale moves whatever If-Match says, so any mismatch is refused here.
     const ifMatch = requireEtag(move, stored, nothingDone, { strict: true });
-    const vevents = [...(series.master === undefined ? [] : [series.master]), ...series.overrides];
-    const own = schedulingObject(vevents) ? await this.ownFor(nothingDone) : [];
-    const mayNotify = mayNotifyOnMove(vevents, own);
+    const vevents = everyVevent(series);
+    const mayNotify = mayNotifyAbout(vevents, await this.ownIfNeeded(false, vevents, nothingDone));
     const twin = await this.lookUp(target, move.uid);
     if (twin !== null) throw uidTaken(move.uid, nothingDone, twin.url);
     const from: WriteTarget = { calendar: source, uid: move.uid, url: stored.url, nothingDone };
@@ -1444,6 +1479,24 @@ export class CalDavClient {
     }
   }
 
+  /**
+   * The account's own addresses for a write that needs them — one that
+   * changes the guest list (`guestList`), or any write to an event the
+   * server schedules (`schedulingObject` of `vevents`, every VEVENT of its
+   * UID), whose `may_notify` tells the account's own meeting from someone
+   * else's by them (milestone review of v0.7.4) — through {@link ownFor}, so
+   * a lookup that fails is a refusal ending in `nothingDone`, before
+   * anything is written. None for any other write: nothing is looked up for
+   * an event no server mails anyone about.
+   */
+  private async ownIfNeeded(
+    guestList: boolean,
+    vevents: readonly ICAL.Component[],
+    nothingDone: string
+  ): Promise<readonly string[]> {
+    return guestList || schedulingObject(vevents) ? this.ownFor(nothingDone) : [];
+  }
+
   private async findCalendar(url: string): Promise<DAVCalendar> {
     const calendars = await (await this.ensureClient()).fetchCalendars();
     const match = calendars.find((c) => c.url === url || c.url.replace(/\/$/, "") === url.replace(/\/$/, ""));
@@ -1500,7 +1553,23 @@ function uidFilter(uid: string) {
   };
 }
 
-/** What `updateEvent` answers for a write of `edit`: its `mayNotify` only when it changed the guest list. */
+/**
+ * `update_event`'s refusal of a time written into `stored` when the pool
+ * remembers this version of it (URL and ETag) running out its deadline
+ * (`ExpansionPool.hangingFor` in src/ical-worker-pool.ts; milestone review
+ * of v0.7.4). The writers place times on the connector's own thread; an
+ * object whose expansion never finished in a worker is not one to be the
+ * first to find out on that thread why. Ends in `nothingDone`.
+ */
+function refuseKnownHanging(stored: FoundObject, uid: string, nothingDone: string): void {
+  const known = expansionPool.hangingFor({ url: stored.url, etag: stored.etag, data: stored.data });
+  if (known === null) return;
+  throw new ToolRefusal(
+    `"${uid}" could not be read in time when it was last listed: ${known.message} Its times cannot be changed safely until it can be read. ${nothingDone}`
+  );
+}
+
+/** What `updateEvent` answers for a write of `edit`: its `mayNotify` whenever the edit gave one (`mayNotifyOf` in src/ical-edit.ts). */
 function updated(uid: string, url: string, etag: string | null, edit: EditResult): UpdatedEvent {
   return { uid, url, etag, ...(edit.mayNotify === undefined ? {} : { mayNotify: edit.mayNotify }) };
 }
