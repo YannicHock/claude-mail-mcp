@@ -420,7 +420,7 @@ describe("wall times in the years 0–99 are those years, not 1900–1999", () =
     const ms = zonedWallToInstant(50, 1, 1, 9, 0, "Europe/Berlin");
     assert.deepEqual(instantToZonedWall(ms, "Europe/Berlin"), { ...wall, second: 0 });
     const tz = new IntlTimezone("Europe/Berlin", "Europe/Berlin");
-    const time = new ICAL.Time({ year: 50, month: 1, day: 1, hour: 9, minute: 0, second: 0, isDate: false });
+    const time = ICAL.Time.fromData({ year: 50, month: 1, day: 1, hour: 9, minute: 0, second: 0, isDate: false }, undefined);
     assert.equal(tz.utcOffset(time) * 1000, utcOffsetMs(ms, "Europe/Berlin"));
   });
 
@@ -430,7 +430,7 @@ describe("wall times in the years 0–99 are those years, not 1900–1999", () =
   });
 
   it("storedInstant reads a floating time in the year 50, and addToWall steps it on its own clock", () => {
-    const floating = new ICAL.Time({ year: 50, month: 1, day: 1, hour: 9, minute: 0, second: 30, isDate: false });
+    const floating = ICAL.Time.fromData({ year: 50, month: 1, day: 1, hour: 9, minute: 0, second: 30, isDate: false }, undefined);
     assert.equal(storedInstant(floating, { kind: "floating" }), utc);
     assert.deepEqual(addToWall(wall, 86_400), { ...wall, day: 2 });
     assert.deepEqual(addToWall({ ...wall, year: 99, month: 12, day: 31 }, 86_400), { ...wall, year: 100 });
