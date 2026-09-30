@@ -1049,7 +1049,7 @@ export function vtimezoneFromIntl(tz: string, fromMs: number, toMs: number): str
 }
 
 /** How far either side of the times it serves a generated VTIMEZONE reaches (spec §2.5 A). */
-const VTIMEZONE_MARGIN_MS = 366 * 86_400_000;
+const VTIMEZONE_MARGIN_MS = 366 * DAY_MS;
 
 /**
  * {@link vtimezoneFromIntl} for the IANA zone `tz`, covering every instant in
@@ -1069,7 +1069,7 @@ export function generatedVtimezone(tz: string, instants: number[]): ICAL.Compone
  * {@link coverGeneratedVtimezone}): ten years, about 20 observances for a
  * zone with DST.
  */
-const SERIES_REACH_MS = 10 * 366 * 86_400_000;
+const SERIES_REACH_MS = 10 * 366 * DAY_MS;
 
 /**
  * The instants a series in `tzid` runs to beyond the times `vcal` holds, the

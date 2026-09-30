@@ -74,7 +74,7 @@ import {
   modifiesFuture,
   type Override,
 } from "./ical-series.js";
-import { hasOffset, isFloating, wallAt, wallOf, writeZoneOf, zoneNameOf, type ZonedWall } from "./ical-zones.js";
+import { DAY_MS, hasOffset, isFloating, wallAt, wallOf, writeZoneOf, zoneNameOf, type ZonedWall } from "./ical-zones.js";
 
 // Where its unit tests have always found it; it lives in src/ical-series.ts
 // since the milestone review of v0.7.4, so that src/ical-zones.ts can refuse
@@ -378,7 +378,7 @@ export function occurrencesIn(
     // day of margin covers a length that a DST change stretches.
     const lengthMs = event.duration.toSeconds() * 1000;
     const passOver =
-      overrides.length === 0 && periods.size === 0 ? window.start - lengthMs - 86_400_000 : -Infinity;
+      overrides.length === 0 && periods.size === 0 ? window.start - lengthMs - DAY_MS : -Infinity;
     let steps = 0;
     for (let next = iterator.next(); next; next = iterator.next()) {
       if (++steps > MAX_STEPS_PER_OBJECT) {
@@ -632,7 +632,7 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
   const iterator = recurrenceWalk(event, master, allDay);
   // Nothing more than a day or two past the instant asked for can be it; a
   // zone's offset is at most 14 hours.
-  const limit = want.ms + 2 * 86_400_000;
+  const limit = want.ms + 2 * DAY_MS;
   let match: ICAL.Time | null = null;
   // The occurrence right after the match: one step more, so that a write can
   // move a RANGE=THISANDFUTURE override on to it (`FoundOccurrence.next`).

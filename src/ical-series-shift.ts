@@ -34,6 +34,7 @@ import { seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { keyOf } from "./ical-series.js";
 import {
   addToWall,
+  DAY_MS,
   clockSeconds,
   dayOf,
   instantAt,
@@ -183,7 +184,7 @@ function shiftAllDaySeries(
   }
   if (patch.end === undefined) return;
   const endDay = calendarDate("end", patch.end, nothingDone);
-  const days = Math.round((dateMs(endDay) - dateMs(anchorDay)) / 86_400_000);
+  const days = Math.round((dateMs(endDay) - dateMs(anchorDay)) / DAY_MS);
   if (days <= 0) {
     throw new ToolRefusal(
       `Every occurrence would end (${endDay}) on or before it starts (${anchorDay}). For an all-day event the end date is exclusive. ${nothingDone}`
@@ -195,7 +196,7 @@ function shiftAllDaySeries(
       return;
     }
     const own = ve.getFirstPropertyValue("dtstart") as ICAL.Time;
-    setTime(ve, "dtend", ICAL.Time.fromDateString(isoDate(dateMs(own.toString().slice(0, 10)) + days * 86_400_000)), null);
+    setTime(ve, "dtend", ICAL.Time.fromDateString(isoDate(dateMs(own.toString().slice(0, 10)) + days * DAY_MS)), null);
   };
   lengthen(master);
   for (const ve of overrides) {

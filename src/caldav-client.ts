@@ -78,10 +78,10 @@ import {
   assertWritten,
   changedSinceRead,
   DavWriteError,
-  isWeak,
   notFound,
   refuseLostRace,
   requireEtag,
+  strongOrNone,
   unfoldedIcs,
   writeFailure,
 } from "./caldav-etag.js";
@@ -277,6 +277,13 @@ export interface WriteTarget {
 }
 
 /** A stored object the UID lookup found, with the one parse of it every write reuses. */
+/**
+ * What {@link CalDavClient}'s `readBackUnchanged` found at a URL: the status
+ * of a read that failed, or whether the text is still what was written and
+ * the strong ETag the read gave, if any.
+ */
+type ReadBack = { status: number; unchanged?: undefined; ifMatch?: undefined } | { status?: undefined; unchanged: boolean; ifMatch: string | undefined };
+
 interface FoundObject extends StoredObject {
   parsed: ParsedCalendar;
 }
@@ -504,8 +511,7 @@ export class CalDavClient {
       iCalString: ics,
     });
     assertWritten(res, "PUT");
-    const base = calendar.url.endsWith("/") ? calendar.url : `${calendar.url}/`;
-    const created: CreatedEvent = { url: `${base}${filename}`, uid, timezone: builtZoneName(ics) };
+    const created: CreatedEvent = { url: objectUrl(calendar.url, filename), uid, timezone: builtZoneName(ics) };
     if (!invites) return created;
     return { ...created, mayNotify: schedulable(parseCalendar(ics).vcal.getAllSubcomponents("vevent"), [], own) };
   }
@@ -1059,24 +1065,42 @@ export class CalDavClient {
    * guard the DELETE with.
    */
   private async sourceUnchanged(from: WriteTarget, data: string): Promise<{ ifMatch: string | undefined } | ToolRefusal> {
-    let now: Response;
+    let read: ReadBack;
     try {
-      now = await this.davFetch("GET", from.url);
+      read = await this.readBackUnchanged(from.url, data);
     } catch (err) {
       return new ToolRefusal(
         `The event "${from.uid}" could not be read back from ${from.url} to check that it was not changed since (${classifyFailure(err).reason}). ${from.nothingDone}`
       );
     }
-    if (!now.ok) {
-      await now.arrayBuffer();
-      if (now.status === 404) return notFound(from.uid, from.calendar.url, from.nothingDone);
+    if (read.status === 404) return notFound(from.uid, from.calendar.url, from.nothingDone);
+    if (read.status !== undefined) {
       return new ToolRefusal(
-        `The event "${from.uid}" could not be read back from ${from.url} to check that it was not changed since (the server answered ${now.status}). ${from.nothingDone}`
+        `The event "${from.uid}" could not be read back from ${from.url} to check that it was not changed since (the server answered ${read.status}). ${from.nothingDone}`
       );
     }
-    if (unfoldedIcs(await now.text()) !== unfoldedIcs(data)) return changedSinceRead(from.uid, from.nothingDone);
-    const tag = now.headers.get("etag");
-    return { ifMatch: tag !== null && !isWeak(tag) ? tag : undefined };
+    if (!read.unchanged) return changedSinceRead(from.uid, from.nothingDone);
+    return { ifMatch: read.ifMatch };
+  }
+
+  /**
+   * GET `url` and compare what it holds with `data`, after line endings and
+   * folding and nothing else ({@link unfoldedIcs}): the check both
+   * {@link sourceUnchanged} and {@link removeCopy} make before a DELETE no
+   * strong ETag guards, which each wrote out in full until the code-health
+   * review of the v0.7.4 milestone. Answers the status of a read that failed
+   * (its body drained), or whether the text is unchanged and the strong ETag
+   * the read gave, if any, to guard the DELETE with. A request that fails
+   * outright throws, for the caller to word.
+   */
+  private async readBackUnchanged(url: string, data: string): Promise<ReadBack> {
+    const now = await this.davFetch("GET", url);
+    if (!now.ok) {
+      await now.arrayBuffer();
+      return { status: now.status };
+    }
+    const unchanged = unfoldedIcs(await now.text()) === unfoldedIcs(data);
+    return { unchanged, ifMatch: strongOrNone(now.headers.get("etag")) };
   }
 
   /**
@@ -1127,19 +1151,13 @@ export class CalDavClient {
    * with the ETag that read gave, where it gave a strong one.
    */
   private async removeCopy(url: string, data: string, copyEtag: string | null): Promise<string | null> {
-    let guard: string | undefined;
-    if (copyEtag !== null && !isWeak(copyEtag)) {
-      guard = copyEtag;
-    } else {
-      const now = await this.davFetch("GET", url);
-      if (!now.ok) {
-        await now.arrayBuffer();
-        if (now.status === 404) return null;
-        return `it could not be read back to check it (the server answered ${now.status})`;
-      }
-      if (unfoldedIcs(await now.text()) !== unfoldedIcs(data)) return "it changed after it was written";
-      const tag = now.headers.get("etag");
-      guard = tag !== null && !isWeak(tag) ? tag : undefined;
+    let guard = strongOrNone(copyEtag);
+    if (guard === undefined) {
+      const read = await this.readBackUnchanged(url, data);
+      if (read.status === 404) return null;
+      if (read.status !== undefined) return `it could not be read back to check it (the server answered ${read.status})`;
+      if (!read.unchanged) return "it changed after it was written";
+      guard = read.ifMatch;
     }
     const res = await this.davFetch("DELETE", url, guard === undefined ? {} : { "if-match": guard });
     await res.arrayBuffer();
@@ -1202,7 +1220,7 @@ export class CalDavClient {
       const again = await this.findStoredEvent(calendar, uid, nothingDone);
       if (again.url !== url) throw notFound(uid, calendar.url, nothingDone);
       // A weak ETag can never satisfy If-Match (RFC 7232 §3.1), so it guards nothing.
-      res = await write(again.etag !== null && !isWeak(again.etag) ? again.etag : undefined);
+      res = await write(strongOrNone(again.etag));
     }
     refuseLostRace(res, uid, calendar.url, nothingDone);
     assertWritten(res, method);
@@ -1497,9 +1515,16 @@ export class CalDavClient {
     return guestList || schedulingObject(vevents) ? this.ownFor(nothingDone) : [];
   }
 
+  /**
+   * The calendar `url` names, among the account's: compared by
+   * {@link sameCollection}, the one test of "one collection" (code-health
+   * review of the v0.7.4 milestone; this kept a copy of its own that allowed
+   * one trailing slash, not several). A URL that names none is an error
+   * pointing at `list_calendars`.
+   */
   private async findCalendar(url: string): Promise<DAVCalendar> {
     const calendars = await (await this.ensureClient()).fetchCalendars();
-    const match = calendars.find((c) => c.url === url || c.url.replace(/\/$/, "") === url.replace(/\/$/, ""));
+    const match = calendars.find((c) => sameCollection(c.url, url));
     if (!match) {
       throw new Error(
         `Calendar not found: ${url}. Use list_calendars to discover available URLs.`
