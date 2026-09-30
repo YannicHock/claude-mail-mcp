@@ -74,6 +74,15 @@ describe("shiftSeries — a new clock time for every occurrence, each keeping it
       assert.equal(starts(out).length, 4, unfold(out));
     });
 
+    it(`${shape.name}: a series of DTSTART and RDATE with no RRULE moves by its DTSTART occurrence, which the lookup finds (#226)`, () => {
+      const text = series(shape, "20261001", "NONE", [shape.line("RDATE", "20261008", "0900")]).replace("RRULE:NONE\r\n", "");
+      assert.equal(starts(text).length, 2);
+      const out = unfold(shifted(text, { start: "2026-10-01T15:00:00" }, shape.reported("2026-10-01")));
+      assert.match(out, new RegExp(`\\r\\n${escape(shape.line("DTSTART", "20261001", "1500"))}\\r\\n`));
+      assert.match(out, new RegExp(`\\r\\n${escape(shape.line("RDATE", "20261008", "1500"))}\\r\\n`));
+      assert.equal(starts(out).length, 2);
+    });
+
     it(`${shape.name}: an RDATE is shifted with the series, so it keeps naming its occurrence`, () => {
       const text = series(shape, "20261015", "FREQ=WEEKLY;COUNT=2", [shape.line("RDATE", "20261103", "0900")]);
       const out = shifted(text, { start: "2026-10-15T15:00:00" });

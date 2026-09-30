@@ -210,6 +210,50 @@ describe("applyOccurrencePatch — one occurrence changed (#206)", () => {
 });
 
 /**
+ * A series of DTSTART and two RDATEs, with no RRULE (#226): ical.js's iterator
+ * leaves the DTSTART instance out of such a series, so `list_events` lost it
+ * and no write could name it. RFC 5545 §3.8.5.2 makes it the first instance.
+ */
+function rdateOnly(shape: Shape): string {
+  const text = series(shape, "20261001", "NONE", [shape.line("RDATE", "20261008", "0900"), shape.line("RDATE", "20261015", "0900")]);
+  return text.replace("RRULE:NONE\r\n", "");
+}
+
+describe("an RDATE series' DTSTART occurrence is one like any other (#226)", () => {
+  for (const shape of SHAPES) {
+    it(`${shape.name}: is listed, found by its recurrence_id, changed alone, and deleted by an EXDATE`, () => {
+      const text = rdateOnly(shape);
+      const first = shape.reported("2026-10-01");
+      assert.deepEqual(
+        listed(text).map(([r]) => r),
+        [first, shape.reported("2026-10-08"), shape.reported("2026-10-15")]
+      );
+      const found = occurrence(text, first);
+      assert.equal(found.recurrenceId, first);
+      assert.equal(found.others, true);
+      assert.deepEqual(found.next, { wall: occurrence(text, shape.reported("2026-10-08")).wall, overridden: false });
+
+      const changed = updateOne(text, first, { summary: "Opening" });
+      assert.deepEqual(
+        listed(changed).map(([r, , summary]) => [r, summary]),
+        [
+          [first, "Opening"],
+          [shape.reported("2026-10-08"), "Weekly"],
+          [shape.reported("2026-10-15"), "Weekly"],
+        ]
+      );
+
+      const deleted = deleteOne(text, first);
+      assert.match(block(deleted, null), new RegExp(`\\r\\n${escape(shape.line("EXDATE", "20261001", "0900"))}\\r\\n`));
+      assert.deepEqual(
+        listed(deleted).map(([r]) => r),
+        [shape.reported("2026-10-08"), shape.reported("2026-10-15")]
+      );
+    });
+  }
+});
+
+/**
  * A change another client made to "this and all following occurrences": an
  * override with `RECURRENCE-ID;RANGE=THISANDFUTURE`, which moves and retitles
  * every occurrence from its own on. Each one-occurrence write must change

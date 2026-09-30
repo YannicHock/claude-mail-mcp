@@ -1,66 +1,85 @@
 /**
- * Calendar tool registry (v0.2).
+ * Calendar tool registry: the seven calendar tools as the model sees them —
+ * names, descriptions and input schemas — each handing its work to the
+ * account's `CalDavClient` (src/caldav-client.ts).
  *
- * Calendar tools are registered for any account that has CalDAV configured.
- * Each tool accepts an optional `account` parameter selecting which mailbox's
- * calendar to act on. If the resolved account has no CalDAV, the tool
- * surfaces a clear error rather than silently failing.
+ * The tools are always registered. Each takes an optional `account`
+ * selecting whose calendar to act on, and one whose account has no CalDAV
+ * configured answers with a clear error naming that account rather than
+ * failing silently.
  *
- * Times given to a tool are ISO 8601 with timezone offset (e.g.
- * 2026-05-22T09:00:00+02:00), or `YYYY-MM-DD` for an all-day event. Times
- * `list_events` reports are UTC instants, `YYYY-MM-DD` for an all-day event,
- * and clock time with no offset for a floating one, beside the event's
- * `timezone` (v0.7.4, spec 2026-09-29 §2.5).
+ * **What the calendar can do** (v0.7.4 closed every limit the v0.7.2
+ * acceptance run listed; spec 2026-09-29):
  *
- * A time written keeps a zone (v0.7.4, #208, #209): `update_event` writes a
- * new time in the event's own zone — Berlin local time with its TZID, UTC,
- * a date, or clock time for a floating event, which is refused a time with an
- * offset — and `create_event` writes in its `timezone`, else the calendar's
- * own zone, else UTC. A time given without an offset is clock time in that
- * zone.
+ *   - `list_calendars`, and `list_events` over a window. Recurrence is
+ *     expanded in the connector, not on the server (§2.2): a series is listed
+ *     occurrence by occurrence, each with the `recurrenceId` that addresses
+ *     it, and an object that cannot be read costs only itself — it is named
+ *     in the answer's `skipped`, with the reason, and the rest of the
+ *     calendar is listed (R1–R3, #211).
+ *   - `create_event`, in a `timezone` of the caller's choosing, else the
+ *     calendar's own zone, else UTC.
+ *   - `update_event` and `delete_event` (#152, #153), guarded by the ETag
+ *     `list_events` hands out. A series is touched as a whole only with
+ *     `apply_to_series`. One occurrence is addressed by `recurrence_id`,
+ *     matched against the expanded series, never constructed (#206, §2.3).
+ *     With `apply_to_series`, `update_event`'s `start` and `end` give every
+ *     occurrence a new clock time or length, each keeping its date (#207,
+ *     §2.4). An update edits the stored object in place — see
+ *     src/ical-edit.ts — so attendees, alarms and anything else this
+ *     connector does not model survive it.
+ *   - `move_event` (#212, §2.6): an event, whole and unchanged, into another
+ *     calendar of the same account — a WebDAV MOVE, or a copy into the target
+ *     and a delete from the source where the server refuses MOVE; the
+ *     answer's `via` says which. Its ETag is compared in the connector before
+ *     anything is sent, since Radicale ignores `If-Match` on MOVE (R11).
+ *   - `find_free_slot` (#213, R14, §2.7): the gaps across one or more
+ *     calendars, with working hours applied to every day of the range on the
+ *     clock of `timezone`, and transparent, cancelled and self-declined
+ *     events not counted busy.
  *
- * v0.7.4 (spec 2026-09-29 §2.2): `list_events` expands recurrence in the
- * connector, so an all-day series, a floating series or an invitation to one
- * instance no longer fails the whole calendar (R1–R3), and an object that
- * cannot be read is named in the answer's `skipped` instead (#211).
+ * **Times.** A time given to a tool is ISO 8601 with an offset (e.g.
+ * 2026-05-22T09:00:00+02:00), or `YYYY-MM-DD` for an all-day event. A time
+ * `list_events` reports is a UTC instant, `YYYY-MM-DD` for an all-day event,
+ * or clock time with no offset for a floating one, beside the event's
+ * `timezone` (§2.5). A time written keeps the event's zone (#208, #209):
+ * `update_event` writes Berlin local time with its TZID, UTC, a date, or
+ * clock time for a floating event — which is refused a time with an offset,
+ * since dropping it would move the event — and a time without an offset is
+ * clock time in that zone.
  *
- * What the calendar can do: list calendars and events, create an event, find
- * free time, and since v0.7.2 change (`update_event`, #152) and delete
- * (`delete_event`, #153) an existing one. Both writes are guarded by the ETag
- * `list_events` returns, and need `apply_to_series` to touch a series as a
- * whole (spec 2026-09-28 §4). Since v0.7.4 they address one occurrence by the
- * `recurrence_id` `list_events` reports (#206, spec 2026-09-29 §2.3), and
- * `update_event` gives a series a new clock time or length, every occurrence
- * keeping its date (#207, §2.4). An update
- * edits the stored object in place — see src/ical-edit.ts — so attendees,
- * alarms and anything else this connector does not model survive it.
- *
- * `move_event` (v0.7.4, #212, spec 2026-09-29 §2.6) moves an event, whole,
- * into another calendar of the same account, unchanged: a WebDAV MOVE, or a
- * copy into the target and a delete from the source where the server
- * refuses MOVE, and the answer's `via` says which. Its ETag is compared in
- * the connector before anything is sent, since Radicale ignores `If-Match`
- * on MOVE (R11).
- *
- * Attendees (v0.7.4, #204, #205, spec 2026-09-29 §2.1). No tool sends mail
- * to attendees: there is no iMIP yet (#29). The calendar server may send its
- * own, though — Nextcloud mails attendees of an event you organize when it
- * is changed or deleted (found on the v0.7.2 acceptance run) — and whether it
- * does for a new event or a changed guest list is what acceptance A1/A2
- * records. So every text here says "may", and never what a server will do.
- * `create_event` with `attendees` and `update_event` with `add_attendees` or
- * `remove_attendees` write the account as ORGANIZER and cannot be called
- * without `notify_attendees`: a refinement over the tool's whole input
- * schema makes it required exactly when one of those lists is non-empty, so
- * the model cannot add a person without saying whether the server may mail
- * them — "confirm with the user first" made structural. `false` marks the
- * attendees the call adds `SCHEDULE-AGENT=CLIENT` (RFC 6638), which asks the
- * server to send them nothing. Removing attendees with `false` is refused
- * until acceptance A2 shows the server honours it (spec §2.1,
- * `REMOVE_WITHOUT_NOTIFY_HONOURED` in src/ical-attendees.ts). And since an
+ * **Who may be mailed** (#204, #205, §2.1). This connector sends no mail to
+ * anyone: iMIP is #29, milestone v0.8. The calendar server may send its own —
+ * Nextcloud mails the attendees of an event the account organizes when it is
+ * created, changed or deleted — and that mail cannot be recalled. So every
+ * writing tool's description tells the model to confirm with the user
+ * first, in {@link SERVER_MAY_MAIL} or, for a move, {@link SERVER_MAY_MAIL_ON_MOVE},
+ * and says "may", never what a given server will do: that is acceptance
+ * A1, A2, A5 and A6's to record. `create_event` with `attendees` and
+ * `update_event` with `add_attendees` or `remove_attendees` write the account
+ * as ORGANIZER and cannot be called without `notify_attendees`: a
+ * refinement over the tool's whole input schema makes it required exactly
+ * when one of those lists is non-empty, so the model cannot add or remove a
+ * person without saying whether the server may mail them — "confirm with
+ * the user first" made structural. `true` writes the attendees plainly;
+ * `false` marks the ones the call adds `SCHEDULE-AGENT=CLIENT` (RFC 6638),
+ * which asks the server to send them nothing. Removing attendees with
+ * `false` is refused until acceptance A2 shows a server honours it
+ * (`REMOVE_WITHOUT_NOTIFY_HONOURED` in src/ical-attendees.ts). Since an
  * ORGANIZER written by the call changes whom the server contacts — every
- * attendee already listed, not only the ones added — the answer says whom it
- * may now email, as `may_notify` (review of PR #230).
+ * attendee already listed, not only the ones added — each answer that
+ * changes a guest list says whom the server may now email, as `may_notify`
+ * (review of PR #230).
+ *
+ * **What is refused, and stays so.** Answering an invitation (a PARTSTAT of
+ * the account's own) belongs with iMIP (#29). A series' day, as opposed to its
+ * time, is a change to its rule; a rule whose times are its own (hourly or
+ * finer, or one with BYHOUR, BYMINUTE or BYSECOND) cannot be given a new
+ * time. One occurrence where another app's `RANGE=THISANDFUTURE` change
+ * begins is changed alone only when the occurrence after it has no changes
+ * of its own. One occurrence cannot be moved to another calendar. A
+ * `find_free_slot` range is at most {@link MAX_FREE_SLOT_RANGE_DAYS} days.
+ * Tasks (VTODO) are #215, milestone v0.9.
  *
  * Those refusals are answers, not failures. They are thrown as `ToolRefusal`,
  * which `reportingFailures()` passes through word for word with no log line: a
@@ -133,8 +152,8 @@ const accountSchema = z
   );
 
 // The fields every tool that names one stored event shares (#214). One
-// definition each, so update_event, delete_event and the writes still to come
-// cannot describe the same argument two ways.
+// definition each, so update_event, delete_event and move_event cannot
+// describe the same argument two ways.
 
 const calendarUrlSchema = z
   .string()

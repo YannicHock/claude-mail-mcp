@@ -947,6 +947,37 @@ Claude Code does not need this layer either — it can use the connector's stati
 token directly, which is why loopback redirect URIs stay off unless you set
 `ALLOW_LOOPBACK_REDIRECT=true`.
 
+### Your calendar server may send mail
+
+The connector sends no mail to anyone from the calendar tools: it has no iMIP
+(that is [#29](https://github.com/YannicHock/claude-mail-mcp/issues/29), v0.8).
+The calendar server may, on its own. A server that implements CalDAV scheduling
+(RFC 6638) — Nextcloud does — emails the attendees of an event the account
+organizes when it is created, changed or deleted: the v0.7.2 acceptance run on
+Nextcloud saw it mail on a change and on a deletion. Radicale has no scheduling and mails no one. That
+mail goes to real people and cannot be recalled.
+
+So the tools make the choice explicit rather than leaving it to the server:
+
+- `create_event` with `attendees`, and `update_event` with `add_attendees` or
+  `remove_attendees`, cannot be called without `notify_attendees`. `true` writes
+  the attendees plainly and the server may email them; `false` marks the ones
+  added `SCHEDULE-AGENT=CLIENT`, which asks the server to send them nothing.
+  Removing attendees with `false` is refused until the acceptance run shows the
+  server honours it.
+- With attendees, the account is written as the event's `ORGANIZER`: the first
+  `mailto:` its CalDAV principal lists, or the mailbox's sender address where it
+  lists none. On Nextcloud that is the address the server recognises as "you
+  organize this".
+- Every writing tool, `move_event` included, tells Claude to confirm with the
+  user before touching an event that has attendees, and every answer that
+  changes a guest list carries `may_notify`: everyone the server may now email.
+  Deleting an invitation to one occurrence of someone else's series may send its
+  organizer a decline.
+
+If you would rather no one is ever mailed, use a calendar server without
+scheduling, or tell Claude to pass `notify_attendees: false`.
+
 ---
 
 ## 7. Verify

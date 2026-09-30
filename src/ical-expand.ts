@@ -22,7 +22,9 @@
  * the reason, in `skipped` (#211.2), and the rest of the calendar is listed.
  *
  * Expansion is ical.js's: RRULE, RDATE, EXDATE and the override VEVENTs, with
- * `RANGE=THISANDFUTURE` honoured. Zones come from src/ical-zones.ts, so a TZID
+ * `RANGE=THISANDFUTURE` honoured — with one correction, {@link recurrenceWalk}:
+ * ical.js leaves the DTSTART instance out of a series that has RDATE and no
+ * RRULE (#226). Zones come from src/ical-zones.ts, so a TZID
  * the object carries no VTIMEZONE for is placed through `Intl` (R6), and one
  * that cannot be placed skips the object rather than reading as floating.
  *
@@ -254,6 +256,75 @@ function periodsOf(master: ICAL.Component, allDay: boolean): Map<string, ICAL.Pe
   return periods;
 }
 
+/** The walk of a series' original starts, one per call, null at the end: what {@link recurrenceWalk} hands out. */
+interface RecurrenceWalk {
+  next(): ICAL.Time | null;
+}
+
+/**
+ * The original starts of `master`'s occurrences, in order — ical.js's
+ * iterator, with the one case it gets wrong put right (#226).
+ *
+ * RFC 5545 §3.8.5.2: the recurrence set is the DTSTART instance, plus every
+ * RRULE and RDATE instance, minus EXDATE. Given RDATE and **no** RRULE,
+ * ical.js's iterator lists the RDATE instances and leaves the DTSTART one
+ * out, so `list_events` lost a series' first occurrence and no write could
+ * name it by its `recurrence_id`. With an RRULE it lists DTSTART itself, and
+ * with neither, DTSTART alone; both are left to it.
+ *
+ * So for that one shape the DTSTART instance is put back in its place among
+ * the RDATEs (one may lie before it), unless an EXDATE names it, and an RDATE
+ * that names the same start — however it is written, matched by
+ * {@link keyOf} as overrides are — is not listed a second time: the DTSTART
+ * value is the one handed out, in the master's own zone. It covers a series
+ * whose impossible RRULE was dropped before the walk as well, which is left
+ * with exactly that shape.
+ *
+ * {@link occurrencesIn} and {@link findOccurrence} both walk through this,
+ * so what `list_events` lists and what a `recurrence_id` can name — the
+ * anchor of a series' new time included (src/ical-series-shift.ts) — cannot
+ * disagree. Like the iterator, it runs only in a worker (src/ical-worker-ops.ts).
+ */
+function recurrenceWalk(event: ICAL.Event, master: ICAL.Component, allDay: boolean): RecurrenceWalk {
+  const iterator = event.iterator();
+  let done = false;
+  const pull = (): ICAL.Time | null => {
+    if (done) return null;
+    const next = iterator.next();
+    if (!next) done = true;
+    return next || null;
+  };
+  if (master.hasProperty("rrule") || !master.hasProperty("rdate")) return { next: pull };
+
+  const start = event.startDate;
+  const startKey = keyOf(start, allDay);
+  const excluded = master
+    .getAllProperties("exdate")
+    .some((prop) => (prop.getValues() as unknown[]).some((v) => v instanceof ICAL.Time && keyOf(v, allDay) === startKey));
+  let pending: ICAL.Time | null = excluded ? null : start.clone();
+  // A value pulled from the iterator but not handed out yet, because the
+  // DTSTART instance came before it.
+  let held: ICAL.Time | null = null;
+  return {
+    next(): ICAL.Time | null {
+      const upcoming = held ?? pull();
+      held = null;
+      if (pending === null) return upcoming;
+      if (upcoming !== null && keyOf(upcoming, allDay) === startKey) {
+        pending = null;
+        return start.clone();
+      }
+      if (upcoming === null || instantOf(pending) < instantOf(upcoming)) {
+        const first = pending;
+        pending = null;
+        held = upcoming;
+        return first;
+      }
+      return upcoming;
+    },
+  };
+}
+
 /**
  * Every occurrence in `vcal` that overlaps `window`, earliest first, with at
  * most `cap` of them. `vcal` must have come from `parseCalendar`
@@ -323,7 +394,7 @@ export function occurrencesIn(
     const event = new ICAL.Event(master, { exceptions: overrides.filter(modifiesFuture) });
     const byKey = currentOverrides(overrides, allDay);
 
-    const iterator = event.iterator();
+    const iterator = recurrenceWalk(event, master, allDay);
     const met = new Set<Override>();
     // Walking up to the window is most of the work for an old series; an
     // occurrence that ends well before it, with no override or period to
@@ -582,7 +653,7 @@ function lookUpOccurrence(ics: string, uid: string, recurrenceId: string | null)
   const startZone = writeZoneOf(startProp);
   const ranges = overrides.filter(modifiesFuture);
   const event = new ICAL.Event(master, { exceptions: ranges });
-  const iterator = event.iterator();
+  const iterator = recurrenceWalk(event, master, allDay);
   // Nothing more than a day or two past the instant asked for can be it; a
   // zone's offset is at most 14 hours.
   const limit = want.ms + 2 * 86_400_000;

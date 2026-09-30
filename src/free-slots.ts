@@ -36,7 +36,7 @@
  * stops at its `limit` rather than walking the rest of the range.
  */
 
-import { addToWall, calendarZone, DAY_MS, instantAt, wallAt, zonedWriteZone, type WriteZone, type ZonedWall } from "./ical-zones.js";
+import { addToWall, calendarZone, DAY_MS, instantAt, utcMs, wallAt, zonedWriteZone, type WriteZone, type ZonedWall } from "./ical-zones.js";
 
 /**
  * The longest range `find_free_slot` searches, in days of 24 hours: a year,
@@ -224,8 +224,7 @@ function isoInZone(ms: number, zone: WriteZone): string {
   const pad = (n: number, width = 2): string => String(n).padStart(width, "0");
   const clock = `${pad(wall.year, 4)}-${pad(wall.month)}-${pad(wall.day)}T${pad(wall.hour)}:${pad(wall.minute)}:${pad(wall.second)}`;
   if (zone.kind !== "zoned") return `${clock}Z`;
-  // Not `Date.UTC`, which reads a year 0–99 as 1900–1999.
-  const wallMs = new Date(0).setUTCFullYear(wall.year, wall.month - 1, wall.day) + ((wall.hour * 60 + wall.minute) * 60 + wall.second) * 1000;
+  const wallMs = utcMs(wall.year, wall.month, wall.day, wall.hour, wall.minute, wall.second);
   const offsetMinutes = Math.round((wallMs - whole) / 60_000);
   const sign = offsetMinutes < 0 ? "-" : "+";
   const abs = Math.abs(offsetMinutes);
