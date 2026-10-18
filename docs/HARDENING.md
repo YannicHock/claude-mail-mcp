@@ -896,7 +896,14 @@ it at three points:
   through one guarded `fetch`: tsdav's, the client's own, and the connection test's.
   That `fetch` refuses such a request before sending it. Redirects that `fetch`
   follows by itself need no check, because it drops `Authorization` on a cross-origin
-  redirect.
+  redirect. One exception keeps that Nextcloud working: a link to `http://` on the
+  host of the configured `https://` URL, with no port or port 80, is sent over
+  `https://` to the same host instead, and the server's answers have such links
+  rewritten to `https://` (only the `Location` header and DAV `href` elements, never
+  event data), so calendar URLs are reported as `https://`. Another host, another
+  port, or a configured `http://` URL is refused as before; one `warn` per account
+  names the host and the fix on the server's side, `'overwriteprotocol' => 'https'`
+  in Nextcloud's `config.php`.
 
 **Residual risk:** unlike IMAP and SMTP, a CalDAV request is not pinned to the
 address that was checked, because `fetch` resolves the name again. A resolver that

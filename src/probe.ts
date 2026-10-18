@@ -35,8 +35,15 @@ import {
 import { CONNECTOR_PROBE_BUDGET_MS } from "../shared/settings-api.js";
 import { guardedCaldavFetch } from "./caldav-url.js";
 
-/** Every CalDAV request the probe makes, refused to a URL the credentials must not go to (#247). */
-const caldavFetch = guardedCaldavFetch();
+/**
+ * The fetch for every CalDAV request of one probe of `url`: refused to a URL
+ * the credentials must not go to (#247), and a link to http:// on `url`'s own
+ * https:// host sent over https:// instead — a Nextcloud behind a TLS proxy
+ * (#247 follow-up). The probe has no logger; the saved account's client warns.
+ */
+function caldavFetchFor(url: string): typeof fetch {
+  return guardedCaldavFetch(undefined, undefined, { configuredUrl: url });
+}
 
 export const PER_PROBE_TIMEOUT_MS = 10_000;
 
@@ -287,7 +294,8 @@ export const CALDAV_DISCOVERY_FAILURE_PREFIX =
  */
 async function caldavPreflight(
   creds: CalDavCreds,
-  signal: AbortSignal
+  signal: AbortSignal,
+  caldavFetch: typeof fetch
 ): Promise<ProbeResult | null> {
   const basic = Buffer.from(`${creds.user}:${creds.pass}`, "utf8").toString("base64");
   const response = await caldavFetch(creds.url, {
@@ -363,10 +371,11 @@ async function caldavPreflight(
  */
 async function probeCalDav(creds: CalDavCreds, perProbeMs: number): Promise<ProbeResult> {
   const controller = new AbortController();
+  const caldavFetch = caldavFetchFor(creds.url);
   try {
     return await withTimeout(
       (async (): Promise<ProbeResult> => {
-        const rejected = await caldavPreflight(creds, controller.signal);
+        const rejected = await caldavPreflight(creds, controller.signal, caldavFetch);
         if (rejected) return rejected;
 
         try {
