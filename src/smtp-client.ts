@@ -7,6 +7,14 @@
 
 import nodemailer, { Transporter, SendMailOptions } from "nodemailer";
 
+import {
+  smtpTlsOptions,
+  localMailAddress,
+  isStartTlsUnavailable,
+  STARTTLS_REQUIRED_MESSAGE,
+  type LocalAddressCheck,
+} from "./mail-tls.js";
+
 export interface SmtpAuth {
   host: string;
   port: number;
@@ -53,29 +61,55 @@ export interface SendResult {
   response?: string;
 }
 
-export class SmtpClient {
-  private readonly transporter: Transporter;
-  private readonly defaults: SmtpDefaults;
+export interface SmtpClientOptions {
+  /** Where a local host is reached in plaintext, or null (#220). Tests only. */
+  localAddress?: LocalAddressCheck;
+}
 
-  constructor(auth: SmtpAuth, defaults: SmtpDefaults) {
-    this.transporter = nodemailer.createTransport({
-      host: auth.host,
-      port: auth.port,
-      secure: auth.secure,
-      auth: { user: auth.user, pass: auth.pass },
-    });
+export class SmtpClient {
+  private readonly auth: SmtpAuth;
+  private readonly defaults: SmtpDefaults;
+  private readonly localAddress: LocalAddressCheck;
+
+  constructor(auth: SmtpAuth, defaults: SmtpDefaults, options: SmtpClientOptions = {}) {
+    this.auth = auth;
     this.defaults = defaults;
+    this.localAddress = options.localAddress ?? localMailAddress;
+  }
+
+  /**
+   * A transport per send. The plain (non-pooled) transport opens a connection
+   * per message anyway, so nothing is lost, and what `secure: false` means is
+   * decided at the moment the password would be sent: STARTTLS or nothing on
+   * a host that is not local (#220, src/mail-tls.ts). `tls` carries the host
+   * too: a local name is connected to at the address it was checked at.
+   */
+  private async transporter(): Promise<Transporter> {
+    const tls = await smtpTlsOptions(this.auth.host, this.auth.secure, this.localAddress);
+    return nodemailer.createTransport({
+      port: this.auth.port,
+      ...tls,
+      auth: { user: this.auth.user, pass: this.auth.pass },
+    });
   }
 
   async send(msg: OutgoingMessage): Promise<SendResult> {
     const mail = this.toMailOptions(msg);
-    const info = await this.transporter.sendMail(mail);
-    return {
-      messageId: info.messageId,
-      accepted: (info.accepted ?? []).map(String),
-      rejected: (info.rejected ?? []).map(String),
-      response: info.response,
-    };
+    const transporter = await this.transporter();
+    try {
+      const info = await transporter.sendMail(mail);
+      return {
+        messageId: info.messageId,
+        accepted: (info.accepted ?? []).map(String),
+        rejected: (info.rejected ?? []).map(String),
+        response: info.response,
+      };
+    } catch (err) {
+      // nodemailer's own "Error upgrading connection with STARTTLS" says what, not why.
+      throw isStartTlsUnavailable(err) ? new Error(STARTTLS_REQUIRED_MESSAGE) : err;
+    } finally {
+      transporter.close();
+    }
   }
 
   /**

@@ -445,6 +445,13 @@ Fatal startup error: Error: EACCES: permission denied, open '/data/accounts.json
 Writing it through the image cannot produce that: the process doing the writing is
 the process that has to read it back.
 
+`"tls": true` is implicit TLS (993, 465). `"tls": false` is STARTTLS (143, 587),
+and requires it: a server that does not offer STARTTLS is refused before the
+password is sent. Only a host on loopback or a private network — an address such
+as `127.0.0.1` or `172.18.0.4`, or a short name such as a Docker service that
+resolves only to one — may still be spoken to in plaintext. See
+[HARDENING.md](HARDENING.md#threat-scenarios) for the exact rule (#220).
+
 Add a `"caldav": { "url": …, "user": …, "pass": … }` block per account if your
 provider speaks CalDAV. Multiple accounts go in the same array — see the
 [README](../README.md#what-it-does) for the multi-account model. `"new"` and

@@ -18,6 +18,14 @@ import { createDAVClient } from "tsdav";
 import type { ImapCreds, SmtpCreds, CalDavCreds } from "./accounts.js";
 import { withTimeout } from "./timeout.js";
 import {
+  imapTlsOptions,
+  smtpTlsOptions,
+  localMailAddress,
+  isStartTlsUnavailable,
+  STARTTLS_REQUIRED_MESSAGE,
+  type LocalAddressCheck,
+} from "./mail-tls.js";
+import {
   classifyFailure,
   describeFailure,
   CREDENTIAL_REJECTION_MESSAGE,
@@ -82,6 +90,12 @@ export interface ProbeReport {
  * login or was never reached. Nothing here re-derives that from a message.
  */
 function toFailure(err: unknown): ProbeResult {
+  // A server refused for not offering STARTTLS (#220) answered, and was never
+  // sent the credentials: not a rejection, and its library's wording says what
+  // happened without saying why that is a failure. src/mail-tls.ts says both.
+  if (isStartTlsUnavailable(err)) {
+    return { ok: false, message: STARTTLS_REQUIRED_MESSAGE, credentialRejection: false };
+  }
   const { credentialRejection, reason } = classifyFailure(err);
   return { ok: false, message: reason, credentialRejection };
 }
@@ -119,11 +133,24 @@ function toFailure(err: unknown): ProbeResult {
  * failure it describes has already been returned — so it is deliberately a
  * no-op sink. See the mid-LOGIN-drop case in test/unit/probe.test.ts.
  */
-async function probeImap(creds: ImapCreds, perProbeMs: number): Promise<ProbeResult> {
+async function probeImap(
+  creds: ImapCreds,
+  perProbeMs: number,
+  localAddress: LocalAddressCheck
+): Promise<ProbeResult> {
+  // STARTTLS or nothing for `tls: false` on a host that is not local (#220);
+  // a local name is connected to at the address it was checked at, which
+  // `tls` carries as `host`. The lookup this may take is bounded by the same
+  // per-probe deadline.
+  let tls: Awaited<ReturnType<typeof imapTlsOptions>>;
+  try {
+    tls = await withTimeout(imapTlsOptions(creds.host, creds.tls, localAddress), perProbeMs, "IMAP");
+  } catch (err) {
+    return toFailure(err);
+  }
   const client = new ImapFlow({
-    host: creds.host,
     port: creds.port,
-    secure: creds.tls,
+    ...tls,
     auth: { user: creds.user, pass: creds.pass },
     logger: false,
     connectionTimeout: perProbeMs,
@@ -169,11 +196,21 @@ async function probeImap(creds: ImapCreds, perProbeMs: number): Promise<ProbeRes
  * likewise ref'd, so leaving them unset would strand a live socket for
  * minutes past the point this function has already reported failure.
  */
-async function probeSmtp(creds: SmtpCreds, perProbeMs: number): Promise<ProbeResult> {
+async function probeSmtp(
+  creds: SmtpCreds,
+  perProbeMs: number,
+  localAddress: LocalAddressCheck
+): Promise<ProbeResult> {
+  // As in probeImap(): `requireTLS` for `tls: false` on a host that is not local.
+  let tls: Awaited<ReturnType<typeof smtpTlsOptions>>;
+  try {
+    tls = await withTimeout(smtpTlsOptions(creds.host, creds.tls, localAddress), perProbeMs, "SMTP");
+  } catch (err) {
+    return toFailure(err);
+  }
   const transporter = nodemailer.createTransport({
-    host: creds.host,
     port: creds.port,
-    secure: creds.tls,
+    ...tls,
     auth: { user: creds.user, pass: creds.pass },
     connectionTimeout: perProbeMs,
     greetingTimeout: perProbeMs,
@@ -384,15 +421,21 @@ async function probeCalDav(creds: CalDavCreds, perProbeMs: number): Promise<Prob
  */
 export async function probeAccount(
   input: ProbeInput,
-  opts: { perProbeMs?: number; totalMs?: number } = {}
+  opts: {
+    perProbeMs?: number;
+    totalMs?: number;
+    /** Where a local host is reached in plaintext, or null (#220). Tests only. */
+    localAddress?: LocalAddressCheck;
+  } = {}
 ): Promise<ProbeReport> {
   const perProbeMs = opts.perProbeMs ?? PER_PROBE_TIMEOUT_MS;
   const totalMs = opts.totalMs ?? TOTAL_TIMEOUT_MS;
+  const localAddress = opts.localAddress ?? localMailAddress;
 
   const runAll = async (): Promise<ProbeReport> => {
     const [imap, smtp, caldav] = await Promise.all([
-      probeImap(input.imap, perProbeMs).catch(toFailure),
-      probeSmtp(input.smtp, perProbeMs).catch(toFailure),
+      probeImap(input.imap, perProbeMs, localAddress).catch(toFailure),
+      probeSmtp(input.smtp, perProbeMs, localAddress).catch(toFailure),
       input.caldav
         ? probeCalDav(input.caldav, perProbeMs).catch(toFailure)
         : Promise.resolve(null),

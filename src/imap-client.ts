@@ -12,6 +12,14 @@
 import { ImapFlow, ImapFlowOptions, FetchMessageObject } from "imapflow";
 import { simpleParser, ParsedMail } from "mailparser";
 
+import {
+  imapTlsOptions,
+  localMailAddress,
+  isStartTlsUnavailable,
+  STARTTLS_REQUIRED_MESSAGE,
+  type LocalAddressCheck,
+} from "./mail-tls.js";
+
 export interface ImapAuth {
   host: string;
   port: number;
@@ -68,12 +76,20 @@ export interface SearchCriteria {
   flagged?: boolean;
 }
 
+export interface ImapClientOptions {
+  /** Where a local host is reached in plaintext, or null (#220). Tests only. */
+  localAddress?: LocalAddressCheck;
+}
+
 export class ImapClient {
   private client: ImapFlow | null = null;
   private connecting: Promise<ImapFlow> | null = null;
   private readonly opts: ImapFlowOptions;
+  private readonly host: string;
+  private readonly localAddress: LocalAddressCheck;
 
-  constructor(auth: ImapAuth) {
+  constructor(auth: ImapAuth, options: ImapClientOptions = {}) {
+    this.host = auth.host;
     this.opts = {
       host: auth.host,
       port: auth.port,
@@ -81,18 +97,30 @@ export class ImapClient {
       auth: { user: auth.user, pass: auth.pass },
       logger: false,
     };
+    this.localAddress = options.localAddress ?? localMailAddress;
   }
 
   private async ensureConnected(): Promise<ImapFlow> {
     if (this.client && this.client.usable) return this.client;
     if (this.connecting) return this.connecting;
     this.connecting = (async (): Promise<ImapFlow> => {
-      const client = new ImapFlow(this.opts);
+      // Decided on every connect rather than once: a name's addresses can
+      // change while the connector runs, and the check is one lookup at most
+      // (src/mail-tls.ts). `secure: false` on a host that is not local is
+      // STARTTLS or nothing (#220), and a local name is connected to at the
+      // address it was checked at, which `tls` carries as `host`.
+      const tls = await imapTlsOptions(this.host, this.opts.secure === true, this.localAddress);
+      const client = new ImapFlow({ ...this.opts, ...tls });
       client.on("error", () => {
         // Mark unusable so next call reconnects.
         if (this.client === client) this.client = null;
       });
-      await client.connect();
+      try {
+        await client.connect();
+      } catch (err) {
+        // imapflow's own "Server does not support STARTTLS" says what, not why.
+        throw isStartTlsUnavailable(err) ? new Error(STARTTLS_REQUIRED_MESSAGE) : err;
+      }
       this.client = client;
       this.connecting = null;
       return client;

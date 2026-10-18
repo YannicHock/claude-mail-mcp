@@ -833,6 +833,35 @@ subscribe to advisories and run `npm audit`.
 **MITM between claude.ai and the deployment.** TLS with a valid certificate, HSTS,
 no HTTP fallback. Residual risk: very low.
 
+**MITM between the connector and a mail server (STARTTLS stripping).** An account
+with `"tls": false` uses STARTTLS, and before v0.7.5 only when the server offered
+it: an attacker on the path who removed `STARTTLS` from the server's capabilities
+was sent the password in cleartext. Since #220, `tls: false` *requires* STARTTLS
+(imapflow's `doSTARTTLS`, nodemailer's `requireTLS`), and a server that does not
+offer it is refused before `LOGIN` or `AUTH`, by the connection test and by both
+clients alike. Plaintext is still allowed to a host that is local, decided by
+`src/mail-tls.ts` in this order:
+
+1. An address literal is local when it is not public: loopback, RFC 1918,
+   link-local, unique local, CGNAT — the same ranges the lookup refuses to connect
+   to.
+2. A name is local only when no public DNS name could have its shape: a single
+   label (`localhost`, a Docker service such as `protonmail-bridge`), or a name
+   under `.localhost`, `.local`, `.home.arpa` or `.internal`. Every other name
+   requires STARTTLS and is not looked up, so no DNS answer, forged or not, can let
+   `smtp.gmail.com` fall back to plaintext.
+3. Such a name must then resolve, and only to non-public addresses. A short name a
+   search domain turns into a public server therefore requires STARTTLS too.
+
+A name allowed plaintext by step 3 is then connected to at the address that was
+checked (IPv4 first), with the name kept for SNI and the certificate check, and is
+not resolved again: a resolver that answered the check with a private address and
+the connection with a public one would otherwise get a plaintext login to a public
+host. Residual risk: an attacker who controls the operator's own resolver for a
+name of that form, or the private network itself, against a server spoken to in
+plaintext there, which is what plaintext on a private network always meant. A certificate
+the connector does not trust still fails the STARTTLS handshake, as before.
+
 **A compromised MCP client.** It holds an access token and can call every tool that
 token's scope allows, against every configured mailbox. Revoke it from
 `/settings/clients`; the access token dies with the session on the next request,

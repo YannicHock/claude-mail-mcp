@@ -24,6 +24,11 @@ import { createServer, type Server, type Socket } from "node:net";
 
 export interface FakeImapServer {
   readonly port: number;
+  /**
+   * Every command line any client sent, in order. What lets a test say a
+   * client never got as far as `LOGIN` (#220), not only that it failed.
+   */
+  readonly received: readonly string[];
   close(): Promise<void>;
 }
 
@@ -37,6 +42,7 @@ type LineHandler = (socket: Socket, line: string) => void;
  */
 async function startFakeImapServer(handleLine: LineHandler): Promise<FakeImapServer> {
   const sockets = new Set<Socket>();
+  const received: string[] = [];
 
   const server: Server = createServer((socket) => {
     sockets.add(socket);
@@ -53,6 +59,7 @@ async function startFakeImapServer(handleLine: LineHandler): Promise<FakeImapSer
       while ((index = buffer.indexOf("\r\n")) !== -1) {
         const line = buffer.slice(0, index);
         buffer = buffer.slice(index + 2);
+        received.push(line);
         handleLine(socket, line);
       }
     });
@@ -70,6 +77,7 @@ async function startFakeImapServer(handleLine: LineHandler): Promise<FakeImapSer
 
   return {
     port: address.port,
+    received,
     close: () =>
       new Promise<void>((resolve) => {
         for (const socket of sockets) socket.destroy();
