@@ -84,7 +84,7 @@ import type {
   UpdatedEvent,
   WriteTarget,
 } from "./caldav-types.js";
-import { guardedCaldavFetch, objectName, objectUrl, sameCollection } from "./caldav-url.js";
+import { guardedCaldavFetch, objectName, objectUrl, sameCollection, upgradedCaldavUrl } from "./caldav-url.js";
 import { ToolRefusal } from "./tool-refusal.js";
 import { classifyFailure } from "../shared/credential-failure.js";
 import type { Logger } from "../shared/log.js";
@@ -119,7 +119,22 @@ export class CalDavClient {
     this.log = options.log ?? (() => {});
     this.accountId = options.accountId;
     this.address = options.address;
-    this.fetch = guardedCaldavFetch(options.fetch);
+    // A Nextcloud behind a TLS proxy speaks of http:// links on its own
+    // https:// host; the guard sends those over https:// (#247 follow-up),
+    // and this says so once, with the fix on the server's side.
+    this.fetch = guardedCaldavFetch(options.fetch, undefined, {
+      configuredUrl: auth.url,
+      onUpgrade: (host) =>
+        this.log(
+          "warn",
+          "caldav: the server advertises http:// links on its own https:// host; they are used over https:// instead",
+          {
+            account: this.accountId,
+            host,
+            fix: "On Nextcloud, set 'overwriteprotocol' => 'https' in config.php so it advertises https:// links itself.",
+          }
+        ),
+    });
     this.mover = new CalDavMove({
       davFetch: (method, url, headers, body) => this.davFetch(method, url, headers, body),
       lookUp: (calendar, uid) => this.lookUp(calendar, uid),
@@ -947,7 +962,10 @@ export class CalDavClient {
    */
   private async findCalendar(url: string): Promise<DAVCalendar> {
     const calendars = await (await this.ensureClient()).fetchCalendars();
-    const match = calendars.find((c) => sameCollection(c.url, url));
+    // A same-host http:// URL in either hand is the https:// one the guard
+    // sends it to (#247 follow-up): the server's own links, or an older answer.
+    const wanted = upgradedCaldavUrl(url, this.auth.url);
+    const match = calendars.find((c) => sameCollection(upgradedCaldavUrl(c.url, this.auth.url), wanted));
     if (!match) {
       throw new Error(
         `Calendar not found: ${url}. Use list_calendars to discover available URLs.`

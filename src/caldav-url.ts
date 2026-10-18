@@ -32,7 +32,9 @@
  *     scheme (a Nextcloud behind a TLS proxy), or an absolute `http://` href
  *     in a PROPFIND answer — and tsdav follows both with the credentials. The
  *     CalDAV client, its own requests and the connection test all go through
- *     this one fetch.
+ *     this one fetch. A link to `http://` on the host of the configured
+ *     `https://` URL itself is not refused but sent over `https://` (see
+ *     {@link guardedCaldavFetch}), so such a Nextcloud keeps working.
  *
  * What it does not do is pin the connection to the address it checked, as
  * #220 does for IMAP and SMTP: `fetch` resolves the name again, so a resolver
@@ -89,6 +91,64 @@ export async function caldavUrlProblem(url: string, deps: MailTlsDeps = defaultD
 }
 
 /**
+ * The host of the account's configured CalDAV URL, lower case and without a
+ * trailing dot, when that URL is `https://`; `null` otherwise — an `http://`
+ * configured URL upgrades nothing.
+ */
+function httpsHost(configuredUrl: string | undefined): string | null {
+  if (configuredUrl === undefined) return null;
+  try {
+    const parsed = new URL(configuredUrl.trim());
+    return parsed.protocol === "https:" ? bareHost(parsed.hostname) : null;
+  } catch {
+    return null;
+  }
+}
+
+function bareHost(hostname: string): string {
+  return hostname.toLowerCase().replace(/\.$/, "");
+}
+
+/**
+ * `url` sent over `https://` instead, when it is `http://` on `host` (from
+ * {@link httpsHost}) with no port or port 80; `null` when it is anything else.
+ * Only the scheme changes, so the port becomes https's default.
+ */
+function sameHostHttps(url: URL, host: string | null): URL | null {
+  if (host === null || url.protocol !== "http:" || url.port !== "" || bareHost(url.hostname) !== host) return null;
+  const upgraded = new URL(url.href);
+  upgraded.protocol = "https:";
+  return upgraded;
+}
+
+/**
+ * `url` in its `https://` form when it is an `http://` URL on the host of the
+ * account's `https://` configured URL — no port, or port 80 — and `url`
+ * unchanged otherwise, a string that is no URL included: the URL the guard
+ * sends such a request to. `CalDavClient.findCalendar` compares by it, so a
+ * `calendar_url` in either form names the one calendar.
+ */
+export function upgradedCaldavUrl(url: string, configuredUrl: string): string {
+  try {
+    return sameHostHttps(new URL(url.trim()), httpsHost(configuredUrl))?.href ?? url;
+  } catch {
+    return url;
+  }
+}
+
+/** What {@link guardedCaldavFetch} needs to send same-host `http://` links over `https://`. */
+export interface SameHostUpgrade {
+  /** The account's configured CalDAV URL. Only an `https://` one upgrades anything. */
+  configuredUrl: string;
+  /**
+   * Called once per guard — once per account's client — the first time a link
+   * to `http://` on the configured host is sent or handed on as `https://`,
+   * with that host, so the operator can be told the server needs fixing.
+   */
+  onUpgrade?: (host: string) => void;
+}
+
+/**
  * A `fetch` that checks the URL of every request with
  * {@link caldavUrlProblem} and refuses it, before sending anything, when the
  * credentials must not go there. `base` is the fetch it hands the rest to:
@@ -98,22 +158,119 @@ export async function caldavUrlProblem(url: string, deps: MailTlsDeps = defaultD
  * `Authorization` on a redirect to another origin, and a same-origin redirect
  * cannot change the scheme. tsdav's discovery reads its redirect with
  * `redirect: "manual"` and requests the target itself, through here.
+ *
+ * ## A Nextcloud behind a TLS proxy (#247 follow-up)
+ *
+ * With `upgrade`, a server configured as `https://` that speaks of `http://`
+ * links on its own host — a Nextcloud behind a TLS-terminating proxy, which
+ * believes it runs on http:// — keeps working instead of being refused:
+ *
+ *   - **A request** to `http://` on the configured host (compared case-
+ *     insensitively, a trailing dot ignored), with no port or port 80, is
+ *     sent to `https://` on the same host and https's default port. Never
+ *     another host, never another port, never a downgrade.
+ *   - **An answer** from `https://` on the configured host has those links
+ *     rewritten to their `https://` form before tsdav reads it: the
+ *     `Location` of a redirect, and the text of every DAV `href` element.
+ *     Nothing else in the body is touched — `calendar-data`, the user's own
+ *     event, least of all. tsdav resolves later hrefs against the URLs it
+ *     holds and compares some as strings (`urlMatches` in its `fetchHomeUrl`,
+ *     and `everyObjectIn` in src/caldav-client.ts), so the configured
+ *     `https://` root mixed with the server's `http://` links would fail
+ *     discovery; rewritten, tsdav holds `https://` URLs only, and the
+ *     calendar URLs Claude is shown are the ones requests go to.
+ *
+ * The first of either is reported through `upgrade.onUpgrade`, once.
  */
-export function guardedCaldavFetch(base?: typeof fetch, deps: MailTlsDeps = defaultDeps): typeof fetch {
+export function guardedCaldavFetch(
+  base?: typeof fetch,
+  deps: MailTlsDeps = defaultDeps,
+  upgrade?: SameHostUpgrade
+): typeof fetch {
+  const host = httpsHost(upgrade?.configuredUrl);
+  let reported = false;
+  const report = (): void => {
+    if (reported || host === null) return;
+    reported = true;
+    upgrade?.onUpgrade?.(host);
+  };
   return async (input, init) => {
     const href = input instanceof Request ? input.url : String(input);
-    const problem = await caldavUrlProblem(href, deps);
-    if (problem !== null) {
-      let origin = href;
-      try {
-        origin = new URL(href).origin;
-      } catch {
-        // Not a URL: caldavUrlProblem passed it, so this is unreachable in practice.
-      }
-      throw new Error(`The CalDAV request to ${origin} was not made, and no password was sent: ${problem}`);
+    let target: URL | null = null;
+    try {
+      target = new URL(href);
+    } catch {
+      // Not a URL: caldavUrlProblem passes it on, as before.
     }
-    return (base ?? globalThis.fetch)(input, init);
+    const upgraded = target === null ? null : sameHostHttps(target, host);
+    if (upgraded !== null) {
+      report();
+      target = upgraded;
+      input = input instanceof Request ? new Request(upgraded.href, input) : upgraded.href;
+    } else {
+      const problem = await caldavUrlProblem(href, deps);
+      if (problem !== null) {
+        throw new Error(`The CalDAV request to ${target?.origin ?? href} was not made, and no password was sent: ${problem}`);
+      }
+    }
+    const response = await (base ?? globalThis.fetch)(input, init);
+    if (target === null || target.protocol !== "https:" || host === null || bareHost(target.hostname) !== host) {
+      return response;
+    }
+    return httpsLinks(response, host, report);
   };
+}
+
+/**
+ * `response` with its links to `http://` on `host` — no port or port 80 —
+ * given in their `https://` form: the `Location` of a redirect, and the text
+ * of every DAV `href` element of an XML answer. The response itself when it
+ * has neither. See {@link guardedCaldavFetch}.
+ */
+async function httpsLinks(response: Response, host: string, report: () => void): Promise<Response> {
+  const location = response.headers.get("location");
+  const newLocation = location === null ? null : rewriteLocation(location, host);
+  const isXml = response.headers.get("content-type")?.toLowerCase().includes("xml") ?? false;
+  if (newLocation === null && (!isXml || response.body === null)) return response;
+  const body = response.body === null ? null : await response.text();
+  const newBody = body === null || !isXml ? null : rewriteHrefs(body, host);
+  if (newLocation !== null || newBody !== null) report();
+  const headers = new Headers(response.headers);
+  if (newLocation !== null) headers.set("location", newLocation);
+  // The body is decoded text now, and perhaps of another length.
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  const rewritten = new Response(newBody ?? body, { status: response.status, statusText: response.statusText, headers });
+  // tsdav reports `response.url` as the href of an answer it cannot parse.
+  Object.defineProperty(rewritten, "url", { value: response.url });
+  return rewritten;
+}
+
+/** `location` in its `https://` form when it is `http://` on `host`; `null` when it is not. */
+function rewriteLocation(location: string, host: string): string | null {
+  try {
+    return sameHostHttps(new URL(location), host)?.href ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `xml` with the text of every DAV `href` element that is an `http://` URL on
+ * `host`, with no port or port 80, in its `https://` form; `null` when there
+ * is none. An element named `href` with any namespace prefix or none — the
+ * prefix is the server's choice — and only its text: an escaped
+ * `&lt;href&gt;` inside `calendar-data` is no element.
+ */
+function rewriteHrefs(xml: string, host: string): string | null {
+  const name = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`(<(?:[A-Za-z_][\\w.-]*:)?href(?:\\s[^>]*)?>\\s*)http://${name}\\.?(?::80)?(?=[/?#<\\s])`, "gi");
+  let changed = false;
+  const out = xml.replace(pattern, (_match, open: string) => {
+    changed = true;
+    return `${open}https://${host}`;
+  });
+  return changed ? out : null;
 }
 
 /** True when two calendar URLs name one collection: equal but for trailing slashes. */
