@@ -467,6 +467,13 @@ interface ConnectorBehaviour {
    * whichever screen the lookup leads to.
    */
   unsupported?: string;
+  /**
+   * The mailboxes the connector's `/health` lists — what step 2 asks to decide
+   * whether this mailbox claims the default (#162). `undefined` leaves
+   * `/health` unanswered (a 404), which the wizard reads as a connector it
+   * cannot reach.
+   */
+  accounts?: Array<{ id: string; label: string }>;
 }
 
 /**
@@ -548,6 +555,10 @@ function stubConnector(harness: Harness, behaviour: ConnectorBehaviour = {}): vo
 
   harness.upstream.respondWith((req, res, requestBody) => {
     const url = req.url ?? "";
+    if (req.method === "GET" && url === "/health" && behaviour.accounts !== undefined) {
+      json(res, 200, { status: "ok", version: "0.8.0", accounts: behaviour.accounts });
+      return;
+    }
     if (req.method === "POST" && url === "/settings/providers") {
       if (behaviour.providersAnswer === "reset") {
         res.destroy();
@@ -655,6 +666,15 @@ async function reachStep2(harness: Harness): Promise<void> {
 
 function upstreamPosts(harness: Harness, url: string): number {
   return harness.upstream.requests.filter((r) => r.method === "POST" && r.url === url).length;
+}
+
+/** The mailbox draft of the save that reached the connector, found by route rather than position. */
+function createdDraft(harness: Harness): MailboxRequestBody["mailbox"] {
+  const create = harness.upstream.requests.find(
+    (r) => r.method === "POST" && r.url === "/settings/mailboxes"
+  );
+  assert.ok(create, "the save reached the connector");
+  return (JSON.parse(create.body) as MailboxRequestBody).mailbox;
 }
 
 test("credentials that fail the probe are not saved", async () => {
@@ -1834,11 +1854,12 @@ test("a domain that publishes its settings gets a confirmation screen, not a sav
     assert.match(html, /smtp\.example\.com:465/);
     assert.match(html, /https:\/\/dav\.example\.com\//);
 
-    // Shown, never applied: one call went out, and it was the lookup. Nothing
-    // was probed and nothing was written, so a wrong answer costs a glance.
+    // Shown, never applied: the lookup, and the read of which mailboxes exist
+    // that decides whether this one claims the default (#162). Nothing was
+    // probed and nothing was written, so a wrong answer costs a glance.
     assert.deepEqual(
       harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
-      ["POST /settings/autoconfig"]
+      ["POST /settings/autoconfig", "GET /health"]
     );
     // And the address went over on its own — the password stays on this side
     // until there is a server to send it to.
@@ -1964,13 +1985,18 @@ test("Continue on the confirmation screen probes and stores what was shown", asy
     assert.equal(res.headers.get("location"), `/setup/${harness.claimToken}/connect`);
     assert.deepEqual(
       harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
-      ["POST /settings/autoconfig", "GET /settings/mailboxes/new", "POST /settings/mailboxes"]
+      [
+        "POST /settings/autoconfig",
+        "GET /health",
+        "GET /settings/mailboxes/new",
+        "POST /settings/mailboxes",
+      ]
     );
 
     // The one password the screen asked for reaches both services. A screen
     // with two boxes cannot express a mailbox whose IMAP and SMTP logins take
     // different passwords, and the full form is where that case is expressed.
-    const create = harness.upstream.requests[2];
+    const create = harness.upstream.requests[3];
     const body = JSON.parse(create.body) as MailboxRequestBody;
     assert.equal(body.mailbox.imap.pass, MAILBOX_PASSWORD);
     assert.equal(body.mailbox.smtp.pass, MAILBOX_PASSWORD);
@@ -2008,8 +2034,7 @@ test("a found CalDAV endpoint is stored with the same password, and only then", 
     const res = await postSetupForm(harness, "/mailbox", { ...hidden, _action: "save" });
     assert.equal(res.status, 303);
 
-    const body = JSON.parse(harness.upstream.requests[2].body) as MailboxRequestBody;
-    assert.deepEqual(body.mailbox.caldav, {
+    assert.deepEqual(createdDraft(harness).caldav, {
       url: "https://dav.example.com/",
       user: "anna@example.com",
       pass: MAILBOX_PASSWORD,
@@ -2122,7 +2147,12 @@ test("a password the lookup carried is not asked for a second time", async () =>
     }
     assert.match(form, /carried over/i);
     assert.equal(lookups(harness), 1, "nothing but the lookup was contacted");
-    assert.equal(harness.upstream.requests.length, 1);
+    // …and the read of which mailboxes exist, once per screen that renders a
+    // mailbox's values (#162). Nothing was probed, nothing written.
+    assert.deepEqual(
+      harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
+      ["POST /settings/autoconfig", "GET /health", "GET /health"]
+    );
 
     // The state file is the thing this must not have bought: progress and a
     // version, and no secret anywhere near it — #23's rule, unweakened.
@@ -2224,8 +2254,12 @@ test("Edit these hands the same settings to the full form, with the password", a
     // No CalDAV URL was confirmed, so no CalDAV password is guessed at: a block
     // that is nothing but a password probes a server nobody named.
     assert.ok(html.includes(`name="${MAILBOX_FIELDS.caldavPass}" type="password" value=""`));
-    // Nothing was contacted.
-    assert.equal(harness.upstream.requests.length, 0);
+    // Nothing was probed or written: the one call is the read of which
+    // mailboxes exist, which decides whether this one claims the default (#162).
+    assert.deepEqual(
+      harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
+      ["GET /health"]
+    );
   } finally {
     await harness.close();
   }
@@ -2253,11 +2287,12 @@ test("choosing a provider fills the full form in rather than saving behind the o
     assert.match(html, /https:\/\/posteo\.de:8443\/calendars\/anna\/default/);
     assert.match(html, /Posteo settings have been filled in/);
     // Reading the table is the one thing this step now asks the connector for
-    // (#141) — the values live there, not here. Nothing was probed and nothing
-    // was stored, which is the property that matters.
+    // (#141) — the values live there, not here — beside the read of which
+    // mailboxes exist that decides the default (#162). Nothing was probed and
+    // nothing was stored, which is the property that matters.
     assert.deepEqual(
       harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
-      ["POST /settings/providers"]
+      ["POST /settings/providers", "GET /health"]
     );
   } finally {
     await harness.close();
@@ -2286,7 +2321,7 @@ test("Other leads to an empty form with TLS still on and the address kept", asyn
     assert.match(html, new RegExp(`name="${MAILBOX_FIELDS.smtpTls}"[^>]*checked`));
     assert.deepEqual(
       harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
-      ["POST /settings/providers"]
+      ["POST /settings/providers", "GET /health"]
     );
   } finally {
     await harness.close();
@@ -2493,11 +2528,12 @@ test("an outlook.com address is called out at the lookup, on the screen it leads
 
     assert.equal(res.status, 200, "a warning is not a refusal");
     assert.match(await res.text(), /no password will connect/);
-    // One call went out and it was the lookup — the moment §5.3 says already
-    // exists. Nothing was probed and nothing was written to be told this.
+    // The lookup went out — the moment §5.3 says already exists — and the read
+    // of which mailboxes exist (#162). Nothing was probed and nothing was
+    // written to be told this.
     assert.deepEqual(
       harness.upstream.requests.map((r) => `${r.method} ${r.url}`),
-      ["POST /settings/autoconfig"]
+      ["POST /settings/autoconfig", "GET /health"]
     );
   } finally {
     await harness.close();
@@ -2930,6 +2966,112 @@ test("a refusal at an address the wizard was never warned about still explains i
       1,
       "and say it once — the connector's message already assumes the box is there"
     );
+  } finally {
+    await harness.close();
+  }
+});
+
+// ---- #162: only the first mailbox claims the default -----------------------
+
+/** Whether a rendered step 2 screen carries the `default` field at all. */
+function carriesDefault(html: string): boolean {
+  return html.includes(`name="${MAILBOX_FIELDS.isDefault}"`);
+}
+
+test("step 2 against a connector with no mailbox yet claims the default (#162)", async () => {
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { accounts: [], suggestion: suggestionFor() });
+
+    // The full form, reached from its own link.
+    const manual = await (await getSetup(harness, "/mailbox?view=manual")).text();
+    assert.equal(hiddenFields(manual)[MAILBOX_FIELDS.isDefault], "1");
+
+    // The confirmation screen a lookup leads to, whose hidden fields are the save.
+    const found = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    const hidden = hiddenFields(await found.text());
+    assert.equal(hidden[MAILBOX_FIELDS.isDefault], "1");
+
+    const saved = await postSetupForm(harness, "/mailbox", { ...hidden, _action: "save" });
+    assert.equal(saved.status, 303);
+    assert.equal(createdDraft(harness).default, true);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("step 2 against a connector that already has a mailbox does not take the default (#162)", async () => {
+  // The issue's own case: the operator finished step 2, went Back from step 3,
+  // and is adding a second mailbox. They came to add one, not to demote the one
+  // they already had — so this screen sends no `default` at all, and the
+  // connector's store keeps the first one where it is.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, {
+      accounts: [{ id: "main", label: "Main mailbox" }],
+      suggestion: suggestionFor(),
+    });
+
+    const manual = await (await getSetup(harness, "/mailbox?view=manual")).text();
+    assert.equal(carriesDefault(manual), false, "the full form still claims the default");
+
+    const found = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    const hidden = hiddenFields(await found.text());
+    assert.equal(
+      hidden[MAILBOX_FIELDS.isDefault] ?? "",
+      "",
+      "the confirmation screen still claims the default"
+    );
+
+    // And what that screen submits, the connector receives without the flag.
+    const saved = await postSetupForm(harness, "/mailbox", { ...hidden, _action: "save" });
+    assert.equal(saved.status, 303);
+    assert.equal(createdDraft(harness).default, false);
+
+    // A provider preset and Edit these lead to the same full form, and neither
+    // claims the default either.
+    const preset = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@posteo.net",
+      [PROVIDER_FIELD]: "posteo",
+      _action: "provider",
+    });
+    assert.equal(carriesDefault(await preset.text()), false, "a preset claims the default");
+
+    const edit = await postSetupForm(harness, "/mailbox", { ...hidden, _action: "edit" });
+    assert.equal(carriesDefault(await edit.text()), false, "Edit these claims the default");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("step 2 with the connector's /health unreachable still claims the default (#162)", async () => {
+  // As before #162. On an empty instance that is right, and on one that has a
+  // mailbox the wizard cannot tell — the store's own rule (#139) keeps a first
+  // mailbox the default either way.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+    stubConnector(harness, { suggestion: suggestionFor() });
+
+    const manual = await (await getSetup(harness, "/mailbox?view=manual")).text();
+    assert.equal(hiddenFields(manual)[MAILBOX_FIELDS.isDefault], "1");
+
+    const found = await postSetupForm(harness, "/mailbox", {
+      [ADDRESS_FIELD]: "anna@example.com",
+      [SHARED_PASSWORD_FIELD]: MAILBOX_PASSWORD,
+      _action: "lookup",
+    });
+    assert.equal(hiddenFields(await found.text())[MAILBOX_FIELDS.isDefault], "1");
   } finally {
     await harness.close();
   }

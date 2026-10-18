@@ -998,7 +998,9 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       [MAILBOX_FIELDS.label]: identity.label,
       // The first mailbox on a fresh instance is the one the mail tools reach
       // for when none is named; a further one is not, unless the operator says
-      // so on the full form.
+      // so on the full form. The setup wizard's `stepDefaults`
+      // (oauth/src/setup-routes.ts) is the other half of this rule (#162):
+      // change one, change both.
       [MAILBOX_FIELDS.isDefault]: existing.length === 0 ? CHECKBOX_ON : "",
       [MAILBOX_FIELDS.imapPort]: "993",
       [MAILBOX_FIELDS.smtpPort]: "465",

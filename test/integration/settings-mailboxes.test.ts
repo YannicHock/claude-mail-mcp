@@ -895,6 +895,50 @@ test("a JSON create stores the account and answers 201 with the id and the new s
   }
 });
 
+test("a second JSON create without `default` leaves the first mailbox the default (#162)", async () => {
+  // The wizard's half of #162 is to send `default` only for the first mailbox
+  // (oauth/src/setup-routes.ts, `stepDefaults`). This is the store's half,
+  // pinned from the side the wizard talks to: the #139 rule moves the flag only
+  // when a create carries it, so a create that does not leaves it alone.
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const first = await postJson(url, "/settings/mailboxes", {
+      _csrf: CSRF,
+      _stamp: await stampOf(accountsPath),
+      mailbox: validDraft({ id: "main", label: "Main mailbox", default: true }),
+      [SAVE_ANYWAY_FIELD]: true,
+    });
+    assert.equal(first.status, 201);
+
+    const second = await postJson(url, "/settings/mailboxes", {
+      _csrf: CSRF,
+      _stamp: await stampOf(accountsPath),
+      mailbox: validDraft({ id: "second", label: "Second mailbox", default: false }),
+      [SAVE_ANYWAY_FIELD]: true,
+    });
+    assert.equal(second.status, 201);
+
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")).accounts as Account[];
+    assert.deepEqual(
+      stored.map((account) => [account.id, account.default === true]),
+      [
+        ["main", true],
+        ["second", false],
+      ]
+    );
+    // And what the wizard's step 3 and the settings page read back agrees.
+    const health = (await (await fetch(`${url}/health`)).json()) as {
+      accounts: Array<{ id: string; default?: boolean }>;
+    };
+    assert.deepEqual(
+      health.accounts.filter((account) => account.default === true).map((account) => account.id),
+      ["main"]
+    );
+  } finally {
+    await close();
+  }
+});
+
 test("a JSON create carries a CalDAV block through when the draft has one", async () => {
   const { url, accountsPath, close } = await startConnector();
   try {

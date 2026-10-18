@@ -497,6 +497,16 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     const client = mailboxes;
 
     /**
+     * What this submission's mailbox starts out as — whether it claims the
+     * default included (#162) — asked of the connector once, and only by the
+     * actions that render a mailbox's values. `test` and `save` carry their own
+     * in the form and never ask.
+     */
+    let defaults: Record<string, string> | null = null;
+    const mailboxDefaults = async (): Promise<Record<string, string>> =>
+      (defaults ??= stepDefaults(await connectorHasMailbox()));
+
+    /**
      * One step of the cascade, in this wizard's chrome.
      *
      * Which step it is was decided by `stepFrom*` in settings-api.ts, which the
@@ -563,7 +573,10 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
             // "found nothing, here is the manual form" and lose the sentence on
             // the way, which is the shape #180 says to watch for.
             page(200, {
-              values: carrying(emptyMailboxValues(decided.email), decided.password),
+              values: carrying(
+                { ...(await mailboxDefaults()), ...emptyMailboxValues(decided.email) },
+                decided.password
+              ),
             });
             return;
           }
@@ -628,7 +641,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
           email,
           password,
           found,
-          defaults: stepDefaults(),
+          defaults: await mailboxDefaults(),
           unsupported: carried,
         })
       );
@@ -648,7 +661,9 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         // nothing to resolve the chosen id against, and the form is where the
         // operator was heading anyway. `page` puts the carried warning back on
         // it, so this path drops nothing either.
-        page(200, { values: carrying(emptyMailboxValues(email), password) });
+        page(200, {
+          values: carrying({ ...(await mailboxDefaults()), ...emptyMailboxValues(email) }, password),
+        });
         return;
       }
 
@@ -657,7 +672,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         password,
         chosen,
         presets,
-        defaults: stepDefaults(),
+        defaults: await mailboxDefaults(),
         unsupported: carried,
       });
       if (decided.view === "manual" && decided.preset !== null) {
@@ -679,9 +694,24 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       // echoing the body back — and `carrying` then puts back the one the
       // operator typed, which came in on this submission rather than out of
       // anything the wizard stored.
+      //
+      // Whether the mailbox claims the default is decided here again rather
+      // than read off the submission (#162): `stepFromEdit` lets every
+      // submitted field win over the defaults, and a submission without the
+      // hidden field reads as "not the default" — so a first mailbox would
+      // lose the flag, and a stale page could hand a later one the default.
       const password = stringField(body[SHARED_PASSWORD_FIELD]);
+      const decided = await mailboxDefaults();
       await sendStep(
-        stepFromEdit({ fields: body, password, defaults: stepDefaults(), unsupported: carried }),
+        stepFromEdit({
+          fields: {
+            ...body,
+            [MAILBOX_FIELDS.isDefault]: decided[MAILBOX_FIELDS.isDefault] ?? "",
+          },
+          password,
+          defaults: decided,
+          unsupported: carried,
+        }),
         {
           // The press #186 is about. This sentence is about this submission and
           // the warning is about the address; they have a slot each now, and
@@ -1064,7 +1094,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         return renderMailboxStep({ ...links, values: {}, errors: {}, unavailable: true });
       }
       if (view === "manual") {
-        return renderMailboxStep({ ...links, values: {}, errors: {} });
+        return renderMailboxStep({ ...links, values: await firstFormValues(), errors: {} });
       }
       if (view === "providers") {
         // The table is the connector's (#126 / #141), so tier 2 is one more
@@ -1073,7 +1103,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         // answer to that is the tier below rather than an empty fieldset.
         const presets = await mailboxes.providers("");
         if (presets === null) {
-          return renderMailboxStep({ ...links, values: {}, errors: {} });
+          return renderMailboxStep({ ...links, values: await firstFormValues(), errors: {} });
         }
         return renderMailboxProviderStep(providerPageData(links, { providers: presets }));
       }
@@ -1109,10 +1139,37 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
   }> {
     return fetchConfiguredMailboxes(config.upstreamMcpUrl, log);
   }
+
+  /**
+   * Whether the connector already has a mailbox — step 2's question for #162,
+   * over the same `/health` read step 3's summary line makes.
+   *
+   * An unreachable connector reads as "no", so the mailbox claims the default as
+   * it always did: on an empty instance that is right, and the store's own rule
+   * (#139, `find(a => a.default) ?? accounts[0]`) keeps a first mailbox the
+   * default even when the flag is wrongly absent.
+   */
+  async function connectorHasMailbox(): Promise<boolean> {
+    const configured = await configuredMailboxes();
+    return configured.reachable && configured.mailboxes.length > 0;
+  }
+
+  /**
+   * The full form's values on a GET, before anything was submitted.
+   *
+   * The same first render an empty `values` used to give — the ports, `main`,
+   * TLS on — stated rather than implied, because whether the hidden `default`
+   * field is on the form now depends on what is in them (#162).
+   */
+  async function firstFormValues(): Promise<Record<string, string>> {
+    return { ...stepDefaults(await connectorHasMailbox()), ...emptyMailboxValues("") };
+  }
 }
 
 /**
- * Which mailboxes the connector has, for step 3's summary line.
+ * Which mailboxes the connector has, for step 3's summary line — and for step
+ * 2, which asks the same question to decide whether a mailbox claims the
+ * default (#162).
  *
  * Step 2 leaves the wizard in the same state whether it saved a mailbox or was
  * skipped — the same 303, the same recorded progress — so step 3 asks rather
@@ -1153,7 +1210,7 @@ async function fetchConfiguredMailboxes(
         .map((account) => ({ id: account.id, label: account.label })),
     };
   } catch (err) {
-    log("warn", "setup step 3 could not ask the connector which mailboxes exist", {
+    log("warn", "setup could not ask the connector which mailboxes exist", {
       error: err instanceof Error ? err.message : "failed",
     });
     return { reachable: false, mailboxes: [] };
@@ -1296,13 +1353,20 @@ function providerPageData(
  * What step 2's mailbox starts out as, before a lookup or a preset fills it in.
  *
  * This is the wizard's half of the one thing the two entry points genuinely
- * disagree about. Its mailbox is the *first* one — `main`, and the account the
- * mail tools reach for when none is named — where the connector's *Add mailbox*
- * page derives an id from the address and makes it the default only on an empty
- * instance. Everything else about the cascade is the same code (#141).
+ * disagree about. Its mailbox is meant to be the *first* one — `main` — where
+ * the connector's *Add mailbox* page derives an id from the address.
+ * Everything else about the cascade is the same code (#141).
+ *
+ * The default is the one thing they agree on (#162): a mailbox claims it only
+ * when the connector has none yet. Step 2 is re-enterable through Back, and a
+ * second mailbox added that way used to take the default over from the first.
+ * The other half of this rule is `newMailboxDefaults` in the connector's
+ * `src/settings-routes.ts`; change one, change both.
  */
-function stepDefaults(): Record<string, string> {
-  return { ...MAILBOX_DEFAULTS, [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON };
+function stepDefaults(connectorHasMailbox: boolean): Record<string, string> {
+  return connectorHasMailbox
+    ? { ...MAILBOX_DEFAULTS }
+    : { ...MAILBOX_DEFAULTS, [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON };
 }
 
 /** What the full form says when a provider preset has just filled it in. */
