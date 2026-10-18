@@ -1,0 +1,388 @@
+/**
+ * The edit of one VEVENT, which every writer of a stored object uses for
+ * whichever VEVENT it changes (#234, out of src/ical-edit.ts): the patch and
+ * what a writer is handed beside it, the text and the time written in place
+ * ({@link patchText}, {@link patchTimes}, and under both {@link writeTimeProp}),
+ * the revision stamped ({@link stampRevision}), a generated VTIMEZONE covered
+ * again ({@link coverGenerated}), and what the write answers
+ * ({@link EditResult}, {@link mayNotifyOf}).
+ *
+ * The writers are src/ical-edit.ts (the main event),
+ * src/ical-occurrence-edit.ts (one occurrence) and src/ical-series-shift.ts
+ * (a whole series). They import from here, and this module from none of
+ * them. The rules in src/ical-edit.ts's header hold here too: the stored
+ * object is edited in place, never rebuilt, and every refusal ends in the
+ * caller's `nothingDone`.
+ */
+
+import ICAL from "ical.js";
+import { mayNotifyAbout, type AttendeePatch, type AttendeeResult } from "./ical-attendees.js";
+import { calendarDate, dateMs, isoDate, timedBound } from "./ical-input.js";
+import type { Series } from "./ical-parse.js";
+import { sequenceOf } from "./ical-series.js";
+import {
+  coverGeneratedVtimezone,
+  hasOffset,
+  storedInstant,
+  UnreadableTimezone,
+  UTC_ZONE,
+  writeZoneOf,
+  writtenTime,
+  type WriteZone,
+} from "./ical-zones.js";
+import { ToolRefusal } from "./tool-refusal.js";
+
+/**
+ * The fields `update_event` can change. Everything else is left alone. The
+ * guest list (#205) is {@link AttendeePatch}'s, in src/ical-attendees.ts.
+ */
+export interface EventPatch extends AttendeePatch {
+  summary?: string;
+  /** `""` removes the property. */
+  description?: string;
+  /** `""` removes the property. */
+  location?: string;
+  /** ISO 8601 with offset, or `YYYY-MM-DD` for an all-day event. */
+  start?: string;
+  end?: string;
+  allDay?: boolean;
+}
+
+/**
+ * What every writer of a stored object is handed besides the patch (the
+ * code-health review of PR #230 replaced the positional parameters that kept
+ * growing): the sentence its refusals end with, the time its revision is
+ * stamped with, and the account's own calendar user addresses.
+ */
+export interface EditContext {
+  /** "Nothing was changed." and the like: what a refusal says was not done. */
+  nothingDone: string;
+  /** DTSTAMP and LAST-MODIFIED of every VEVENT the write changes. */
+  now: Date;
+  /**
+   * The account's calendar user addresses (`ownAddresses` in
+   * src/caldav-client.ts), which an attendee change needs to tell the
+   * account's own meeting from someone else's and to write its ORGANIZER,
+   * and every write to an event the server schedules to say whom it may
+   * mail ({@link mayNotifyOf}). No default: a writer handed none has been
+   * told the account has none, and an attendee change is then refused.
+   */
+  own: readonly string[];
+}
+
+/**
+ * What a write made, for the read-back that follows it: the new object's
+ * text, and the {@link WriteMark} by which that version is told from one
+ * written since.
+ */
+export interface EditResult {
+  ics: string;
+  /** Null when the write left no VEVENT it changed to know it by (see `excludeOccurrence` in src/ical-occurrence-edit.ts). */
+  mark: WriteMark | null;
+  /**
+   * Whom the calendar server may now email about the event, which
+   * `update_event` and `delete_event` answer as `may_notify`
+   * ({@link mayNotifyOf}): for a write that changed the guest list (#205),
+   * `AttendeeResult.mayNotify` in src/ical-attendees.ts; for any other write
+   * to an event the server schedules, its attendees or, on someone else's
+   * meeting, its organizer (milestone review of v0.7.4). Absent for an event
+   * the server does not schedule.
+   */
+  mayNotify?: string[];
+}
+
+/**
+ * Which VEVENT a write changed and the SEQUENCE it left there. `CalDavClient`
+ * reads the object back when the server's answer to a PUT carried no ETag
+ * (Nextcloud), and hands that ETag out only if the object still says this
+ * (`writtenBy` in src/ical-edit.ts): the same VEVENT at the same SEQUENCE.
+ */
+export interface WriteMark {
+  uid: string;
+  sequence: number;
+  /**
+   * The occurrence whose override the write changed, by `keyOf`
+   * (src/ical-series.ts) of its RECURRENCE-ID; absent for the main VEVENT.
+   */
+  override?: string;
+}
+
+/**
+ * The bookkeeping every edit of a VEVENT ends with (spec 2026-09-28 §4.4,
+ * kept in v0.7.4 §4): SEQUENCE raised by one — read through
+ * {@link sequenceOf} — and DTSTAMP and LAST-MODIFIED set to `now`. Returns
+ * the new SEQUENCE.
+ */
+export function stampRevision(vevent: ICAL.Component, now: Date): number {
+  const sequence = sequenceOf(vevent) + 1;
+  vevent.updatePropertyWithValue("sequence", sequence);
+  const stamp = ICAL.Time.fromJSDate(now, true);
+  vevent.updatePropertyWithValue("dtstamp", stamp);
+  vevent.updatePropertyWithValue("last-modified", stamp);
+  return sequence;
+}
+
+/**
+ * Write `time` into `ve`'s property `name`, with `TZID` as `tzid` says: set
+ * when given, removed when null — for UTC, a floating time and a date. The
+ * one writer of a time value and its TZID (#234); four functions did it by
+ * hand until then. `place` says which property is written:
+ *
+ *   - `"replace"`: the one `ve` has, in place — so it keeps its position and
+ *     every parameter but TZID — or, when it has none, a new one added. A
+ *     DTSTART or DTEND a new time is written into.
+ *   - `"add"`: a new one beside any `ve` has, for a property that may occur
+ *     more than once: an EXDATE, or a RECURRENCE-ID the caller has just
+ *     removed every other of.
+ *
+ * Which TZID is the caller's to decide, and the callers decide it three
+ * ways, each kept as it was: from the zone the time is actually written in
+ * ({@link tzidOf} of `writtenTime`'s zone, src/ical-zones.ts), which for the
+ * second pass through an autumn overlap is UTC whatever the event's zone;
+ * from the master's DTSTART, for an occurrence's RECURRENCE-ID or EXDATE and
+ * a new override's DTEND (`originalStart` in src/ical-occurrence-edit.ts);
+ * and from an override's own DTSTART, for its DTEND (`placeOverride` there).
+ * A DATE value is written as one by ical.js itself, `VALUE=DATE` included.
+ * Returns the property written.
+ */
+export function writeTimeProp(
+  ve: ICAL.Component,
+  name: string,
+  time: ICAL.Time,
+  tzid: string | null,
+  place: "replace" | "add" = "replace"
+): ICAL.Property {
+  let prop = place === "replace" ? ve.getFirstProperty(name) : null;
+  if (prop === null) {
+    prop = new ICAL.Property(name);
+    if (place === "replace") ve.addProperty(prop);
+  }
+  prop.setValue(time);
+  if (tzid !== null) prop.setParameter("tzid", tzid);
+  else prop.removeParameter("tzid");
+  if (place === "add") ve.addProperty(prop);
+  return prop;
+}
+
+/** The TZID a time written in `zone` carries: the zone's for a zoned one, none (null) for UTC, a floating time, or a date (no zone at all). */
+export function tzidOf(zone: WriteZone | null): string | null {
+  return zone?.kind === "zoned" ? zone.tzid : null;
+}
+
+/**
+ * After a write moved times in `zones`: the VTIMEZONE this connector
+ * generated for any of them (`create_event`'s, marked as ours) is regenerated
+ * to cover the object's times again (`coverGeneratedVtimezone` in
+ * src/ical-zones.ts), since outside its span it would read the zone wrong.
+ * Any other VTIMEZONE is left byte for byte (review of #224). `vcal` is the
+ * VCALENDAR the written VEVENT sits in; null for a VEVENT outside one, which
+ * has no block to cover.
+ */
+export function coverGenerated(vcal: ICAL.Component | null, zones: Iterable<WriteZone>): void {
+  if (vcal === null) return;
+  for (const zone of new Set(zones)) {
+    if (zone.kind === "zoned" && zone.generated === true) coverGeneratedVtimezone(vcal, zone.tzid);
+  }
+}
+
+/** How a timed bound is shown in a refusal: clock time for a floating one, an instant otherwise. */
+export function shown(ms: number, zone: WriteZone): string {
+  const iso = new Date(ms).toISOString();
+  return zone.kind === "floating" ? iso.slice(0, 19) : iso;
+}
+
+/** Set, or with `""` remove, the text fields the patch names on `vevent`. */
+export function patchText(vevent: ICAL.Component, patch: EventPatch): void {
+  if (patch.summary !== undefined) vevent.updatePropertyWithValue("summary", patch.summary);
+  for (const name of ["description", "location"] as const) {
+    const value = patch[name];
+    if (value === undefined) continue;
+    if (value === "") vevent.removeAllProperties(name);
+    else vevent.updatePropertyWithValue(name, value);
+  }
+}
+
+/**
+ * Run one writer's `edit` of a parsed object, and turn a VTIMEZONE whose
+ * observance rules this connector will not walk (`UnreadableTimezone` from
+ * src/ical-zones.ts) into the refusal ending in `nothingDone` (milestone
+ * review of v0.7.4). Every entry point that edits a stored object —
+ * `applyEventPatch`, `shiftSeries`, `applyOccurrencePatch` and
+ * `excludeOccurrence` — runs its edit through here, so any time it places in
+ * such a zone, by its own arithmetic or by ical.js's, ends in an answer and
+ * not in a connector that no longer answers anyone. The edit works on the
+ * caller's parse in memory, so a refusal from the middle of it has written
+ * nothing.
+ */
+export function withReadableZones<T>(nothingDone: string, edit: () => T): T {
+  try {
+    return edit();
+  } catch (err) {
+    if (err instanceof UnreadableTimezone) {
+      throw new ToolRefusal(
+        `This event's time zone definition could not be read: ${err.message}, so its times cannot be placed. ${nothingDone}`
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * Stamp the revision of every VEVENT an attendee change wrote besides
+ * `stamped`, which the writer stamps itself — each once, however many of
+ * the change's steps reached it (the ORGANIZER, a SCHEDULE-AGENT, the guest
+ * list).
+ */
+export function stampOthers(guests: AttendeeResult | null, stamped: ICAL.Component, now: Date): void {
+  for (const vevent of guests?.changed ?? []) if (vevent !== stamped) stampRevision(vevent, now);
+}
+
+/**
+ * The {@link EditResult.mayNotify} of a write to `vevents` — every VEVENT of
+ * the UID — whose attendee change answered `guests` (spec 2026-09-29 §2.1):
+ * that change's own answer when it made one, which also names anyone it
+ * removed; otherwise, for a write to an event the server schedules, whom it
+ * may email about any write (`mayNotifyAbout` in src/ical-attendees.ts, by
+ * `own`), and nothing for one it does not. Every writer answers by this
+ * since the milestone review of v0.7.4: a new title or time on a meeting, a
+ * series moved, one occurrence changed or cancelled may each make the server
+ * mail someone, and until then only a guest-list change said whom.
+ */
+export function mayNotifyOf(
+  guests: AttendeeResult | null,
+  vevents: readonly ICAL.Component[],
+  own: readonly string[]
+): Pick<EditResult, "mayNotify"> {
+  const mayNotify = guests?.mayNotify ?? mayNotifyAbout(vevents, own);
+  return mayNotify === undefined ? {} : { mayNotify };
+}
+
+/** Every VEVENT `series` holds, its master first: what one scheduling object is, for {@link mayNotifyOf}. */
+export function everyVevent({ master, overrides }: Series): ICAL.Component[] {
+  return [...(master === undefined ? [] : [master]), ...overrides];
+}
+
+/**
+ * Write the time `patch` asks for into `vevent` — a main VEVENT or an
+ * override, the same rules for either — in the zone the event was stored in
+ * (spec 2026-09-29 §2.5, #208, #209): TZID local time for a zoned event —
+ * the object's VTIMEZONE left byte for byte, and none added where it had
+ * none — UTC for a UTC one, a date for an all-day one, and clock time for a
+ * floating one. A switch from all-day to timed is written in UTC, as before.
+ * DURATION gives way to DTEND.
+ *
+ * Three refinements from the review of #224. A wall time in the gap or the
+ * overlap is read by RFC 5545 §3.3.5's rule whether the zone comes from the
+ * object's VTIMEZONE or from `Intl`, so the two write the same times. A bound
+ * that lands on the second pass through an autumn overlap, which no wall
+ * time names, is written in UTC rather than as a wall time that means an
+ * hour earlier. And the one VTIMEZONE whose bytes may change is the one this
+ * connector generated for `create_event`: it is regenerated to cover the new
+ * times, since outside its span it would read the zone wrong. That block is
+ * found through `vevent.parent`, the VCALENDAR the VEVENT sits in.
+ *
+ * Throws {@link ToolRefusal} ending in `nothingDone` for a patch that cannot
+ * be applied as asked — an end that is not after the start, an all-day switch
+ * without both bounds, a date it cannot read, an offset for a floating event,
+ * or a one-sided time change on an event whose TZID nothing can place.
+ * Extracted from `applyEventPatch` (src/ical-edit.ts; code-health review of
+ * PR 3) so that one occurrence's override gets exactly the time logic the
+ * main event does.
+ */
+export function patchTimes(vevent: ICAL.Component, patch: EventPatch, nothingDone: string): void {
+  const event = new ICAL.Event(vevent);
+  const wasAllDay = Boolean(event.startDate.isDate);
+  const allDay = patch.allDay ?? wasAllDay;
+  if (allDay !== wasAllDay && (patch.start === undefined || patch.end === undefined)) {
+    throw new ToolRefusal(
+      `Switching an event between all-day and timed needs both start and end. ${nothingDone}`
+    );
+  }
+
+  if (allDay) {
+    const oldStart = event.startDate.toString().slice(0, 10);
+    const oldEnd = event.endDate.toString().slice(0, 10);
+    const start = patch.start !== undefined ? calendarDate("start", patch.start, nothingDone) : oldStart;
+    const end =
+      patch.end !== undefined
+        ? calendarDate("end", patch.end, nothingDone)
+        : patch.start !== undefined
+          ? isoDate(dateMs(start) + (dateMs(oldEnd) - dateMs(oldStart)))
+          : oldEnd;
+    if (dateMs(end) <= dateMs(start)) {
+      throw new ToolRefusal(
+        `The event would end (${end}) on or before it starts (${start}). For an all-day event the end date is exclusive. ${nothingDone}`
+      );
+    }
+    writeTimeProp(vevent, "dtstart", ICAL.Time.fromDateString(start), null);
+    writeTimeProp(vevent, "dtend", ICAL.Time.fromDateString(end), null);
+  } else {
+    const startProp = vevent.getFirstProperty("dtstart");
+    const endProp = vevent.getFirstProperty("dtend");
+    // Each bound goes back in its own zone; a DTEND the event did not have
+    // (it had a DURATION, or nothing) takes the start's. A switch from
+    // all-day has no zone to keep and is written in UTC, as before v0.7.4.
+    const storedStart = wasAllDay || startProp === null ? UTC_ZONE : writeZoneOf(startProp);
+    const storedEnd = wasAllDay || endProp === null ? storedStart : writeZoneOf(endProp);
+
+    // A result that keeps one of the old bounds needs that bound as an
+    // instant, and a TZID nothing can place has none: ical.js reads it as
+    // the process's local time, and writing that back would move the event
+    // by hours while reporting success (final review of #152; #209 keeps
+    // this refusal for exactly this case).
+    const keepsOldBound = patch.start === undefined || patch.end === undefined;
+    for (const stored of [storedStart, storedEnd]) {
+      if (stored.kind !== "unresolved") continue;
+      if (keepsOldBound) {
+        throw new ToolRefusal(
+          `This event's time is stored in the time zone "${stored.tzid}", which has no VTIMEZONE in the event and is not an IANA time zone, so this connector cannot tell what instant it is, and changing only one end of it could shift it by hours. ${nothingDone} Pass both start and end, with an offset, to set its time outright.`
+        );
+      }
+      for (const [field, value] of [["start", patch.start], ["end", patch.end]] as const) {
+        if (value !== undefined && !hasOffset(value)) {
+          throw new ToolRefusal(
+            `This event's time zone "${stored.tzid}" cannot be placed, so ${field} "${value}" needs an offset, like 2026-10-01T09:00:00+02:00, to say which instant it means. ${nothingDone}`
+          );
+        }
+      }
+    }
+    // Both bounds given for a zone nothing can place: written in UTC, which
+    // needs neither old time.
+    const startZone: WriteZone = storedStart.kind === "unresolved" ? UTC_ZONE : storedStart;
+    const endZone: WriteZone = storedEnd.kind === "unresolved" ? UTC_ZONE : storedEnd;
+
+    // RFC 5545 §3.6.1: a timed event with neither DTEND nor DURATION has no
+    // length. Moving it keeps it that way rather than inventing an end —
+    // and rather than refusing because the "old length" is zero.
+    const hadNoEnd = !wasAllDay && endProp === null && !vevent.hasProperty("duration");
+    // The old bounds are read by the rule the new ones are (review of
+    // #224): ical.js's own reading of a VTIMEZONE puts a wall time in the
+    // overlap on its second pass, and a length measured from there moved
+    // the end by an hour.
+    const oldStart = storedInstant(event.startDate, startZone);
+    const startMs = patch.start !== undefined ? timedBound("start", patch.start, startZone, nothingDone) : oldStart;
+    let endMs: number | undefined;
+    if (patch.end !== undefined) endMs = timedBound("end", patch.end, endZone, nothingDone);
+    else if (hadNoEnd) endMs = undefined;
+    else {
+      const oldEnd = storedInstant(event.endDate, endZone);
+      endMs = patch.start !== undefined ? startMs + (oldEnd - oldStart) : oldEnd;
+    }
+    if (endMs !== undefined && endMs <= startMs) {
+      throw new ToolRefusal(
+        `The event would end (${shown(endMs, endZone)}) at or before it starts (${shown(startMs, startZone)}). ${nothingDone}`
+      );
+    }
+    // Each bound in its zone, or in UTC for an instant no wall time there
+    // names: see `writtenTime`.
+    const start = writtenTime(startMs, startZone);
+    writeTimeProp(vevent, "dtstart", start.time, tzidOf(start.zone));
+    if (endMs === undefined) vevent.removeAllProperties("dtend");
+    else {
+      const end = writtenTime(endMs, endZone);
+      writeTimeProp(vevent, "dtend", end.time, tzidOf(end.zone));
+    }
+    coverGenerated(vevent.parent, [startZone, endZone]);
+  }
+  vevent.removeAllProperties("duration");
+}

@@ -9,7 +9,7 @@
 import type { DAVCalendar } from "tsdav";
 import type { FreeSlot, WorkingHours } from "./free-slots.js";
 import type { NewEventFields } from "./ical-build.js";
-import type { EventPatch } from "./ical-edit.js";
+import type { EventPatch } from "./ical-edit-kit.js";
 import type { CalendarEvent, StoredObject } from "./ical-expand.js";
 import type { ParsedCalendar } from "./ical-parse.js";
 import type { Logger } from "../shared/log.js";

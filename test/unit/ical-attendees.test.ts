@@ -30,7 +30,8 @@ import {
   schedulingObject,
   touchesAttendees,
 } from "../../src/ical-attendees.js";
-import { applyEventPatch, changesSomething, type EventPatch } from "../../src/ical-edit.js";
+import { applyEventPatch, changesSomething } from "../../src/ical-edit.js";
+import type { EventPatch } from "../../src/ical-edit-kit.js";
 import { applyOccurrencePatch, excludeOccurrence } from "../../src/ical-occurrence-edit.js";
 import { parseCalendar, seriesFor } from "../../src/ical-parse.js";
 import { shiftSeries } from "../../src/ical-series-shift.js";

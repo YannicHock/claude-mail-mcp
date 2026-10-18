@@ -45,16 +45,8 @@ import {
   schedulingObject,
   touchesAttendees,
 } from "./ical-attendees.js";
-import {
-  applyEventPatch,
-  changesSomething,
-  describeSeries,
-  everyVevent,
-  touchesTime,
-  writtenBy,
-  type EditResult,
-  type WriteMark,
-} from "./ical-edit.js";
+import { applyEventPatch, changesSomething, describeSeries, touchesTime, writtenBy } from "./ical-edit.js";
+import { everyVevent, type EditResult, type WriteMark } from "./ical-edit-kit.js";
 import { applyOccurrencePatch, excludeOccurrence } from "./ical-occurrence-edit.js";
 import { shiftSeries } from "./ical-series-shift.js";
 import {

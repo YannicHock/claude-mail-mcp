@@ -11,7 +11,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { buildIcs } from "../../src/ical-build.js";
-import { writtenBy, type EventPatch } from "../../src/ical-edit.js";
+import { writtenBy } from "../../src/ical-edit.js";
+import type { EventPatch } from "../../src/ical-edit-kit.js";
 import { expandObject, findOccurrence } from "../../src/ical-expand.js";
 import { applyOccurrencePatch, excludeOccurrence } from "../../src/ical-occurrence-edit.js";
 import { parseCalendar } from "../../src/ical-parse.js";

@@ -18,8 +18,8 @@ import {
   describeSeries,
   touchesTime,
   writtenBy,
-  type EventPatch,
 } from "../../src/ical-edit.js";
+import type { EventPatch } from "../../src/ical-edit-kit.js";
 import { ToolRefusal } from "../../src/tool-errors.js";
 import { buildIcs } from "../../src/ical-build.js";
 import { parseCalendar, seriesFor } from "../../src/ical-parse.js";
