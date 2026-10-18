@@ -1231,7 +1231,44 @@ test("an unreadable or refused answer saves nothing, rather than assuming it pas
     stubConnector(harness, { createStatus: 401 });
     res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
     assert.equal(res.status, 502);
-    assert.match(await res.text(), /HTTP 401/);
+    const html = await res.text();
+    assert.match(html, /HTTP 401/);
+    assert.match(html, /signing key and auth token/, "a 401 is the secrets, and says so");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a connector that fails on its own side is not blamed on the secrets", async () => {
+  // #219: a full disk or a permission problem writing accounts.json answers 500
+  // now, not 400. Both the save and Test connection must say the connector
+  // failed and that its log has why, and not send the operator off to compare a
+  // signing key and an auth token that are fine.
+  const harness = await startHarness({ unbootstrapped: true, dataDir: dataDir() });
+  try {
+    await reachStep2(harness);
+
+    stubConnector(harness, {
+      createStatus: 500,
+      createBody: { error: "internal_error", message: "x" },
+    });
+    let res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "save" });
+    assert.equal(res.status, 502);
+    let html = await res.text();
+    assert.match(html, /failed while handling the request \(HTTP 500\)/);
+    assert.match(html, /nothing was saved/);
+    assert.match(html, /Its log has the details/);
+    assert.equal(/signing key/.test(html), false, "the save's notice names no secret");
+
+    stubConnector(harness, {
+      probeStatus: 500,
+      probeBody: { error: "internal_error", message: "x" },
+    });
+    res = await postSetupForm(harness, "/mailbox", { ...mailboxFields(), _action: "test" });
+    assert.equal(res.status, 502);
+    html = await res.text();
+    assert.match(html, /failed while handling the request \(HTTP 500\)/);
+    assert.equal(/signing key/.test(html), false, "the test's notice names no secret");
   } finally {
     await harness.close();
   }

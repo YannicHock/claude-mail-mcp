@@ -40,7 +40,23 @@ export class StaleStampError extends Error {
   }
 }
 
-export async function writeAccountsFile(path: string, file: AccountsFile): Promise<void> {
+export interface WriteOptions {
+  /**
+   * Asked before each retry of the rename; resolves false when the file on disk
+   * is no longer the one the caller read. The store passes its stamp check, so a
+   * hand edit saved while a busy file was being waited out is refused with
+   * {@link StaleStampError} rather than overwritten by the retry.
+   */
+  stillCurrent?: () => Promise<boolean>;
+  /** The rename itself. A seam for tests; production always uses fs.rename. */
+  rename?: typeof rename;
+}
+
+export async function writeAccountsFile(
+  path: string,
+  file: AccountsFile,
+  options: WriteOptions = {}
+): Promise<void> {
   const serialised = `${JSON.stringify(file, null, 2)}\n`;
 
   // The round trip. If this throws, nothing has touched the real file yet.
@@ -58,9 +74,65 @@ export async function writeAccountsFile(path: string, file: AccountsFile): Promi
     } finally {
       await handle.close();
     }
-    await rename(temp, path);
+    const { stillCurrent } = options;
+    await renameWithRetry(temp, path, {
+      attempt: options.rename,
+      beforeRetry: stillCurrent
+        ? async () => {
+            if (!(await stillCurrent())) throw new StaleStampError();
+          }
+        : undefined,
+    });
   } catch (err) {
     await unlink(temp).catch(() => {});
     throw err;
+  }
+}
+
+/**
+ * The waits between rename attempts, in milliseconds (#219).
+ *
+ * Windows refuses to rename over a file another handle holds open, and answers
+ * EPERM, EACCES or EBUSY rather than waiting. The likeliest holder is the
+ * store's own reload of the previous write, a readFile of a few kilobytes that
+ * lets go within milliseconds; an antivirus scan of the fresh file is the next
+ * likeliest and takes somewhat longer. graceful-fs retries the same three codes
+ * for up to a minute, which suits a build tool and not a form submit. Five
+ * doubling waits come to 310 ms: past anything our own reader holds, long
+ * enough for a scanner's usual look, and short enough that a save that was
+ * never going to work still answers inside a third of a second.
+ *
+ * All platforms, not only win32. On Linux these codes from rename mean a real
+ * permission problem, which the retries cannot fix and only delay by those
+ * 310 ms. One code path also means CI exercises the one a Windows user runs.
+ */
+export const RENAME_RETRY_DELAYS_MS: readonly number[] = [10, 20, 40, 80, 160];
+
+const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/**
+ * rename(), retried over {@link RENAME_RETRY_DELAYS_MS} while the target is busy.
+ *
+ * `beforeRetry` runs after each wait and before the next try; whatever it
+ * throws ends the retries with that error instead.
+ */
+export async function renameWithRetry(
+  from: string,
+  to: string,
+  options: { attempt?: typeof rename; beforeRetry?: () => Promise<void> } = {}
+): Promise<void> {
+  const attempt = options.attempt ?? rename;
+  for (let tries = 0; ; tries++) {
+    try {
+      await attempt(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (tries >= RENAME_RETRY_DELAYS_MS.length || !code || !RETRYABLE_RENAME_CODES.has(code)) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, RENAME_RETRY_DELAYS_MS[tries]));
+      await options.beforeRetry?.();
+    }
   }
 }
