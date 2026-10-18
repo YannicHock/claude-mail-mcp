@@ -2,6 +2,12 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **One provider registry instead of two lists that had to agree by hand.** (#182) The presets and the password advice in `src/providers.ts` were two arrays naming the same fourteen providers, and five of them stated the same password rule in both, so an edit to one had to be copied into the other by hand. They are now one `PROVIDERS` list whose entries have an optional preset half and an optional advice half; the preset list and the advice list are read from it, so a provider in both has one id and one label, and each rule the form's note and the rejection's note share is one sentence used in both. Which providers have only one half is pinned in a test, and so is the summary table in `docs/PROVIDERS.md`, which a unit test now checks against the registry in both directions. To make that possible, the preset notes on the form for Gmail, Fastmail, iCloud and Posteo were reworded to the words their rejection notes already used, and Gmail's rejection note (`credentialNote`) was reworded too, so both say "Gmail needs an app password" and give the same sentence about IMAP being always on; nothing else an operator sees changes. The README's provider tables, which contradicted the presets (Gmail's SMTP port, iCloud's CalDAV URL, whether mailbox.org needs an app password), are replaced by a pointer to `docs/PROVIDERS.md`. `docs/PROVIDERS.md` no longer says mailcow's app-password rule belongs on a credential rejection: it lives on mailcow's preset note, on the form.
+
 ## [0.7.5] — 2026-10-18
 
 **What acceptance left.** Acceptance on Nextcloud showed it sends no cancellation to an attendee
