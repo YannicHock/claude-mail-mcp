@@ -56,7 +56,11 @@ type ToolHandler = (args: Record<string, unknown>) => Promise<unknown>;
  */
 async function withTools<T>(
   account: Account,
-  run: (ctx: { call: (tool: string, args?: Record<string, unknown>) => Promise<unknown>; lines: LogLine[] }) => Promise<T>
+  run: (ctx: {
+    call: (tool: string, args?: Record<string, unknown>) => Promise<unknown>;
+    lines: LogLine[];
+    pool: ClientPool;
+  }) => Promise<T>
 ): Promise<T> {
   const dir = await makeTmpDir();
   try {
@@ -87,6 +91,7 @@ async function withTools<T>(
           return handler(args);
         },
         lines,
+        pool,
       });
     } finally {
       await pool.closeAll().catch(() => {});
@@ -259,5 +264,23 @@ test("an account with no CalDAV configured is not logged as a mailbox failure", 
     const message = await failureMessage(call("list_calendars", { account: "gmail" }));
     assert.match(message, /CalDAV/);
     assert.equal(lines.filter((line) => line.level === "warn").length, 0);
+  });
+});
+
+test("create_draft: a message that cannot be composed names the account, in one warn line (F5)", async () => {
+  // create_draft built its message before reportingFailures(), so a
+  // composition error reached the client bare and left no line in the log.
+  await withTools(makeAccount({ id: "privat", default: true }), async ({ call, lines, pool }) => {
+    pool.for("privat").smtp.buildRawSource = async () => {
+      throw new Error("cannot compose this message");
+    };
+    const message = await failureMessage(
+      call("create_draft", { to: "bob@example.invalid", subject: "s", text: "t" })
+    );
+    assert.match(message, /Account "privat"/);
+    assert.match(message, /cannot compose this message/);
+    const warning = onlyWarning(lines);
+    assert.equal(warning.extra?.account, "privat");
+    assert.equal(warning.extra?.tool, "create_draft");
   });
 });

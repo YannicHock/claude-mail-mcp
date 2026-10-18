@@ -7,10 +7,22 @@
  *
  * Tool handlers stay thin: they call high-level methods here, get back
  * plain JSON-shaped objects, and don't see imapflow internals.
+ *
+ * v0.8: every operation on a selected mailbox goes through `withMailbox()`,
+ * the one place a mailbox is connected to and locked, so code outside this
+ * class (threads, attachments) can run its own FETCH under the same rule.
+ * Which parts a message has, which of them is its text and how large each is
+ * once decoded is src/mail-parts.ts's business, read from BODYSTRUCTURE.
  */
 
-import { ImapFlow, ImapFlowOptions, FetchMessageObject } from "imapflow";
-import { simpleParser, ParsedMail } from "mailparser";
+import {
+  ImapFlow,
+  ImapFlowOptions,
+  FetchMessageObject,
+  MessageStructureObject,
+} from "imapflow";
+import { simpleParser, MailParser, ParsedMail } from "mailparser";
+import { convert as htmlToText } from "html-to-text";
 
 import {
   imapTlsOptions,
@@ -19,6 +31,14 @@ import {
   type LocalAddressCheck,
   type MailTlsTestOptions,
 } from "./mail-tls.js";
+import {
+  attachmentParts,
+  bodyLeaves,
+  decodePart,
+  previewPart,
+  type Part,
+} from "./mail-parts.js";
+import { addrText, isoDate } from "./mail-envelope.js";
 
 export interface ImapAuth {
   host: string;
@@ -42,6 +62,7 @@ export interface MessageSummary {
   uid: number;
   seq: number;
   flags: string[];
+  /** The Date header, in every tool (F4, #242). */
   date: string | null;
   subject: string | null;
   from: string | null;
@@ -52,17 +73,36 @@ export interface MessageSummary {
 }
 
 export interface MessageDetail extends MessageSummary {
+  /**
+   * The server's INTERNALDATE: when the message arrived in this mailbox. `date`
+   * is the Date header, as in the list tools, and falls back to this when the
+   * message has none (F4, #242).
+   */
+  internalDate: string | null;
   messageId: string | null;
   inReplyTo: string | null;
   references: string[];
   bodyText: string | null;
   bodyHtml: string | null;
-  attachments: Array<{
-    filename: string | null;
-    contentType: string;
-    size: number;
-    contentId: string | null;
-  }>;
+  attachments: AttachmentSummary[];
+}
+
+/** One attachment of a message, from its BODYSTRUCTURE (spec §2.4, §3.1). */
+export interface AttachmentSummary {
+  filename: string | null;
+  contentType: string;
+  /**
+   * Decoded size in bytes, an upper-bound estimate from BODYSTRUCTURE
+   * (src/mail-parts.ts `decodedSize`): never below the real size, up to about
+   * 3 % above it for base64.
+   */
+  size: number;
+  contentId: string | null;
+  /**
+   * IMAP part id ("2", "1.2"): what an attachment download asks for. Null only
+   * when the server sent no BODYSTRUCTURE, and the list is mailparser's.
+   */
+  part: string | null;
 }
 
 export interface SearchCriteria {
@@ -75,6 +115,21 @@ export interface SearchCriteria {
   unread?: boolean;
   flagged?: boolean;
 }
+
+/**
+ * Above this size (RFC822.SIZE, the whole message) `get_message` reads a
+ * message by part, its header block and its body parts only, instead of
+ * downloading all of it to show its text (spec §3.1): a 40 MB message with one
+ * attachment no longer costs 40 MB.
+ */
+export const WHOLE_MESSAGE_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * How much of a body part a list preview fetches. A preview is 200
+ * characters; HTML gets more room because a style block can come first.
+ */
+const PREVIEW_FETCH_BYTES = { text: 4 * 1024, html: 16 * 1024 };
+const PREVIEW_CHARS = 200;
 
 /** What a call waiting on a connect is told when close() abandoned it. */
 export const CLOSED_WHILE_CONNECTING = "the IMAP connection was closed while it was being opened";
@@ -170,6 +225,25 @@ export class ImapClient {
     }
   }
 
+  /**
+   * Connect, lock `mailbox`, run `fn` with the connection, release the lock.
+   *
+   * Every operation on a selected mailbox goes through here, and code outside
+   * this class (threads, attachments) builds on it rather than on a second
+   * copy of the connect-and-lock rule. `fn` must not keep the client past its
+   * promise: the lock, and with it the selected mailbox, is gone once that
+   * settles.
+   */
+  async withMailbox<T>(mailbox: string, fn: (client: ImapFlow) => Promise<T>): Promise<T> {
+    const client = await this.ensureConnected();
+    const lock = await client.getMailboxLock(mailbox);
+    try {
+      return await fn(client);
+    } finally {
+      lock.release();
+    }
+  }
+
   async listMailboxes(): Promise<MailboxSummary[]> {
     const client = await this.ensureConnected();
     const list = await client.list();
@@ -188,30 +262,22 @@ export class ImapClient {
     mailbox: string,
     opts: { limit?: number; unreadOnly?: boolean } = {}
   ): Promise<MessageSummary[]> {
-    const client = await this.ensureConnected();
-    const lock = await client.getMailboxLock(mailbox);
-    try {
+    return this.withMailbox(mailbox, async (client) => {
       const status = await client.status(mailbox, { messages: true });
       const total = status.messages ?? 0;
       if (total === 0) return [];
       const limit = Math.min(opts.limit ?? 25, 200);
 
-      let uids: number[] = [];
       if (opts.unreadOnly) {
         const found = await client.search({ seen: false }, { uid: true });
-        const arr = Array.isArray(found) ? found : [];
-        uids = arr.slice(-limit).reverse();
-      } else {
-        // Fetch the newest `limit` by sequence number.
-        const from = Math.max(1, total - limit + 1);
-        const messages = await this.fetchRange(client, `${from}:*`, false);
-        return messages.reverse();
+        const uids = newestUids(found, limit);
+        if (uids.length === 0) return [];
+        return await this.fetchSummaries(client, uids.join(","), true);
       }
-      if (uids.length === 0) return [];
-      return await this.fetchRange(client, uids.join(","), true);
-    } finally {
-      lock.release();
-    }
+      // Fetch the newest `limit` by sequence number.
+      const from = Math.max(1, total - limit + 1);
+      return await this.fetchSummaries(client, `${from}:*`, false);
+    });
   }
 
   async searchMessages(
@@ -219,9 +285,7 @@ export class ImapClient {
     criteria: SearchCriteria,
     limit = 25
   ): Promise<MessageSummary[]> {
-    const client = await this.ensureConnected();
-    const lock = await client.getMailboxLock(mailbox);
-    try {
+    return this.withMailbox(mailbox, async (client) => {
       const query: Record<string, unknown> = {};
       if (criteria.from) query.from = criteria.from;
       if (criteria.to) query.to = criteria.to;
@@ -235,34 +299,38 @@ export class ImapClient {
       if (criteria.flagged === false) query.unflagged = true;
 
       const found = await client.search(query, { uid: true });
-      const uids = Array.isArray(found) ? found : [];
+      const uids = newestUids(found, Math.min(limit, 200));
       if (uids.length === 0) return [];
-      const slice = uids.slice(-Math.min(limit, 200)).reverse();
-      return await this.fetchRange(client, slice.join(","), true);
-    } finally {
-      lock.release();
-    }
+      return await this.fetchSummaries(client, uids.join(","), true);
+    });
   }
 
   async getMessage(mailbox: string, uid: number): Promise<MessageDetail> {
-    const client = await this.ensureConnected();
-    const lock = await client.getMailboxLock(mailbox);
-    try {
-      const msg = await client.fetchOne(
+    return this.withMailbox(mailbox, async (client) => {
+      const meta = await client.fetchOne(
         `${uid}`,
-        { source: true, envelope: true, flags: true, internalDate: true, size: true },
+        { envelope: true, flags: true, internalDate: true, size: true, bodyStructure: true },
         { uid: true }
       );
-      if (!msg) {
+      if (!meta) {
         throw new Error(`Message UID ${uid} not found in ${mailbox}`);
       }
-      const parsed: ParsedMail = await simpleParser(msg.source as Buffer);
+      const structure = meta.bodyStructure;
+      const size = meta.size ?? null;
+      const content =
+        structure && size !== null && size > WHOLE_MESSAGE_MAX_BYTES
+          ? await readByPart(client, uid, mailbox, structure)
+          : await readWhole(client, uid, mailbox);
+      const parsed = content.parsed;
+      const internalDate = isoDate(meta.internalDate);
+
       return {
-        uid: msg.uid as number,
-        seq: msg.seq as number,
-        flags: Array.from(msg.flags ?? []),
-        date:
-          (msg.internalDate as Date | undefined)?.toISOString() ?? null,
+        uid: meta.uid,
+        seq: meta.seq,
+        flags: Array.from(meta.flags ?? []),
+        // The Date header, as list_messages reports it (F4, #242).
+        date: isoDate(meta.envelope?.date) ?? internalDate,
+        internalDate,
         subject: parsed.subject ?? null,
         from: parsed.from?.text ?? null,
         to: Array.isArray(parsed.to)
@@ -271,8 +339,14 @@ export class ImapClient {
         cc: Array.isArray(parsed.cc)
           ? parsed.cc.map((a) => a.text).join(", ")
           : parsed.cc?.text ?? null,
-        size: (msg.size as number | undefined) ?? null,
-        preview: parsed.text ? parsed.text.slice(0, 200) : null,
+        size,
+        // Normalised as the list previews are, and like them taken from the
+        // HTML when the message has no text.
+        preview: content.bodyText
+          ? previewOf(content.bodyText)
+          : content.bodyHtml
+            ? previewOf(htmlToText(content.bodyHtml))
+            : null,
         messageId: parsed.messageId ?? null,
         inReplyTo: parsed.inReplyTo ?? null,
         references: Array.isArray(parsed.references)
@@ -280,18 +354,20 @@ export class ImapClient {
           : parsed.references
             ? [parsed.references]
             : [],
-        bodyText: parsed.text ?? null,
-        bodyHtml: typeof parsed.html === "string" ? parsed.html : null,
-        attachments: (parsed.attachments ?? []).map((a) => ({
-          filename: a.filename ?? null,
-          contentType: a.contentType,
-          size: a.size,
-          contentId: a.cid ?? null,
-        })),
+        bodyText: content.bodyText,
+        bodyHtml: content.bodyHtml,
+        attachments: structure
+          ? attachmentParts(structure).map(toAttachmentSummary)
+          : // No BODYSTRUCTURE from the server: mailparser's list, without part ids.
+            (parsed.attachments ?? []).map((a) => ({
+              filename: a.filename ?? null,
+              contentType: a.contentType,
+              size: a.size,
+              contentId: a.cid ?? null,
+              part: null,
+            })),
       };
-    } finally {
-      lock.release();
-    }
+    });
   }
 
   async markRead(
@@ -299,17 +375,13 @@ export class ImapClient {
     uid: number,
     read: boolean
   ): Promise<void> {
-    const client = await this.ensureConnected();
-    const lock = await client.getMailboxLock(mailbox);
-    try {
+    await this.withMailbox(mailbox, async (client) => {
       if (read) {
         await client.messageFlagsAdd(`${uid}`, ["\\Seen"], { uid: true });
       } else {
         await client.messageFlagsRemove(`${uid}`, ["\\Seen"], { uid: true });
       }
-    } finally {
-      lock.release();
-    }
+    });
   }
 
   async moveMessage(
@@ -317,28 +389,21 @@ export class ImapClient {
     uid: number,
     destinationMailbox: string
   ): Promise<void> {
-    const client = await this.ensureConnected();
-    const lock = await client.getMailboxLock(sourceMailbox);
-    try {
+    await this.withMailbox(sourceMailbox, async (client) => {
       await client.messageMove(`${uid}`, destinationMailbox, { uid: true });
-    } finally {
-      lock.release();
-    }
+    });
   }
 
   async deleteMessage(mailbox: string, uid: number): Promise<void> {
-    const client = await this.ensureConnected();
-    const lock = await client.getMailboxLock(mailbox);
-    try {
+    await this.withMailbox(mailbox, async (client) => {
       await client.messageDelete(`${uid}`, { uid: true });
-    } finally {
-      lock.release();
-    }
+    });
   }
 
   /**
    * Append a raw RFC 822 message to a folder — used for drafts and for
-   * keeping a copy of sent messages.
+   * keeping a copy of sent messages. APPEND needs no selected mailbox, so it
+   * takes no lock.
    */
   async append(
     mailbox: string,
@@ -349,69 +414,241 @@ export class ImapClient {
     await client.append(mailbox, raw, flags);
   }
 
-  private async fetchRange(
+  /**
+   * Summaries for `range`, newest first, with decoded previews.
+   *
+   * Two steps. The first FETCH reads the envelopes and BODYSTRUCTURE; the
+   * second reads the first few kilobytes of each message's text part (else its
+   * HTML), one FETCH per distinct part id, so a page of ordinary messages costs
+   * two or three round trips. The bytes are decoded here, transfer encoding
+   * and charset, because the server sends them as stored (F3, #241).
+   *
+   * Sorted by UID after the fetch: a server answers a FETCH in mailbox order,
+   * whatever order the UIDs were asked in (F2, #240).
+   */
+  private async fetchSummaries(
     client: ImapFlow,
     range: string,
     byUid: boolean
   ): Promise<MessageSummary[]> {
-    const out: MessageSummary[] = [];
+    const fetched: Array<{ msg: FetchMessageObject; part: Part | null }> = [];
     const fetchOpts = {
       envelope: true,
       flags: true,
       internalDate: true,
       size: true,
-      bodyParts: ["1"],
+      bodyStructure: true,
     };
     for await (const msg of client.fetch(range, fetchOpts, { uid: byUid })) {
-      out.push(summarize(msg));
+      fetched.push({ msg, part: msg.bodyStructure ? previewPart(msg.bodyStructure) : null });
     }
-    return out;
+
+    const groups = new Map<string, { part: string; maxLength: number; uids: number[] }>();
+    for (const { msg, part } of fetched) {
+      if (!part) continue;
+      const maxLength = part.type === "text/html" ? PREVIEW_FETCH_BYTES.html : PREVIEW_FETCH_BYTES.text;
+      const key = `${part.part}:${maxLength}`;
+      const group = groups.get(key) ?? { part: part.part, maxLength, uids: [] };
+      group.uids.push(msg.uid);
+      groups.set(key, group);
+    }
+    const raw = new Map<number, { bytes: Buffer; binary: boolean }>();
+    for (const group of groups.values()) {
+      const query = { bodyParts: [{ key: group.part, start: 0, maxLength: group.maxLength }] };
+      for await (const msg of client.fetch(group.uids.join(","), query, { uid: true })) {
+        const bytes = msg.bodyParts?.values().next().value;
+        if (!bytes) continue;
+        // A server that answered with FETCH BINARY has undone the transfer encoding.
+        raw.set(msg.uid, { bytes, binary: (msg.binaryParts?.size ?? 0) > 0 });
+      }
+    }
+
+    return fetched
+      .map(({ msg, part }) => {
+        const got = raw.get(msg.uid);
+        const preview =
+          part && got ? previewOf(asText(part, decodePart(part, got.bytes, { binary: got.binary, partial: true }))) : null;
+        return summarize(msg, preview);
+      })
+      .sort((a, b) => b.uid - a.uid);
   }
 }
 
-function addrText(
-  addr:
-    | { name?: string; address?: string }[]
-    | { name?: string; address?: string }
-    | undefined
-): string | null {
-  if (!addr) return null;
-  const list = Array.isArray(addr) ? addr : [addr];
-  return (
-    list
-      .map((a) => {
-        const name = a?.name?.trim();
-        const email = a?.address?.trim();
-        if (name && email) return `${name} <${email}>`;
-        return email ?? name ?? null;
-      })
-      .filter((v): v is string => Boolean(v))
-      .join(", ") || null
-  );
+/**
+ * The decoded text of each of `parts` of message `uid`, by part id, in one
+ * FETCH, each by its own transfer encoding and charset (src/mail-parts.ts
+ * `decodePart`). Runs inside {@link ImapClient.withMailbox}. `get_message`'s
+ * by-part read uses it for the bodies; the invitation reader can use it for a
+ * `text/calendar` leaf the same way on either path.
+ */
+export async function fetchPartTexts(
+  client: ImapFlow,
+  mailbox: string,
+  uid: number,
+  parts: Part[]
+): Promise<Map<string, string>> {
+  const texts = new Map<string, string>();
+  if (parts.length === 0) return texts;
+  const msg = await client.fetchOne(`${uid}`, { bodyParts: parts.map((p) => p.part) }, { uid: true });
+  if (!msg) throw new Error(`Message UID ${uid} not found in ${mailbox}`);
+  for (const part of parts) {
+    const bytes = partBytes(msg, part.part);
+    if (!bytes) continue;
+    texts.set(part.part, decodePart(part, bytes, { binary: msg.binaryParts?.has(part.part) ?? false }));
+  }
+  return texts;
 }
 
-function summarize(msg: FetchMessageObject): MessageSummary {
-  const env = msg.envelope;
-  // Try to grab a short text preview from bodyParts if present.
-  let preview: string | null = null;
-  const bodyParts = msg.bodyParts;
-  if (bodyParts && bodyParts.size > 0) {
-    const part = bodyParts.values().next().value;
-    if (part) {
-      const text = Buffer.isBuffer(part) ? part.toString("utf8") : String(part);
-      preview = text.replace(/\s+/g, " ").slice(0, 200);
+/** The newest `limit` of a SEARCH result, whatever order the server listed them in. */
+function newestUids(found: number[] | false | undefined, limit: number): number[] {
+  const uids = Array.isArray(found) ? [...found].sort((a, b) => a - b) : [];
+  return uids.slice(-limit);
+}
+
+/** A body part's text as a reader sees it: HTML reduced to text the way mailparser does it. */
+function asText(part: Part, text: string): string {
+  return part.type === "text/html" ? htmlToText(text) : text;
+}
+
+/** The 200-character, whitespace-collapsed preview every tool reports. */
+function previewOf(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, PREVIEW_CHARS);
+}
+
+function toAttachmentSummary(part: Part): AttachmentSummary {
+  return {
+    filename: part.filename,
+    contentType: part.type,
+    size: part.decodedSize,
+    contentId: part.contentId,
+    part: part.part,
+  };
+}
+
+interface MessageContent {
+  /** The headers (and, read whole, the attachments) as mailparser reads them, on both paths. */
+  parsed: ParsedMail;
+  bodyText: string | null;
+  bodyHtml: string | null;
+}
+
+/** The whole message, parsed: what get_message has always done. */
+async function readWhole(client: ImapFlow, uid: number, mailbox: string): Promise<MessageContent> {
+  const msg = await client.fetchOne(`${uid}`, { source: true }, { uid: true });
+  if (!msg || !msg.source) {
+    throw new Error(`Message UID ${uid} not found in ${mailbox}`);
+  }
+  const parsed = await simpleParser(msg.source);
+  return {
+    parsed,
+    bodyText: parsed.text ?? null,
+    bodyHtml: typeof parsed.html === "string" ? parsed.html : null,
+  };
+}
+
+/**
+ * A large message by part: its header block, and its body leaves, decoded by
+ * what BODYSTRUCTURE says of them (transfer encoding, charset). Attachments
+ * are never fetched; their sizes come from BODYSTRUCTURE.
+ *
+ * The bodies are assembled by mailparser's own rule (`getTextContent` in
+ * mailparser 3.9), so a message reads the same over and under
+ * WHOLE_MESSAGE_MAX_BYTES. Leaf by leaf, in document order, line ends as "\n":
+ * - plain text goes into the text; outside an alternative, and when the
+ *   message also has HTML, it goes into the HTML too, through mailparser's
+ *   own `textToHtml`;
+ * - HTML goes into the HTML; outside an alternative, and when the message also
+ *   has plain text, it goes into the text through `html-to-text` (the version
+ *   mailparser uses), as it does for a single-part HTML message;
+ * - text parts are joined with "\n", HTML parts with "<br/>\n".
+ *
+ * Two known differences from a message read whole: a `format=flowed` plain
+ * part is not unwrapped, and an inline `message/rfc822` is not descended into
+ * (src/mail-parts.ts `bodyLeaves`).
+ *
+ * Not imapflow's `download`: it learns a part's encoding from a second fetch
+ * of the part's MIME header, and GreenMail's answer to that left a
+ * quoted-printable body undecoded. BODYSTRUCTURE is already in hand.
+ */
+async function readByPart(
+  client: ImapFlow,
+  uid: number,
+  mailbox: string,
+  structure: MessageStructureObject
+): Promise<MessageContent> {
+  const head = await client.fetchOne(`${uid}`, { headers: true }, { uid: true });
+  if (!head) {
+    throw new Error(`Message UID ${uid} not found in ${mailbox}`);
+  }
+  const parsed = await simpleParser(Buffer.concat([head.headers ?? Buffer.alloc(0), Buffer.from("\r\n")]));
+  const leaves = bodyLeaves(structure);
+  const texts = await fetchPartTexts(client, mailbox, uid, leaves);
+
+  const singlePart = !structure.type.toLowerCase().startsWith("multipart/");
+  // Plain text and a delivery status read alike, as mailparser reads them.
+  const isHtml = (leaf: { type: string }) => leaf.type === "text/html";
+  const hasText = leaves.some((l) => !isHtml(l));
+  const hasHtml = leaves.some(isHtml);
+  // One renderer for the whole message, as mailparser has one per message:
+  // its link-finding budget is per instance, and a fresh one per part would
+  // let a message of many plain parts multiply it.
+  const renderer = hasHtml ? textToHtmlRenderer() : null;
+  const text: string[] = [];
+  const html: string[] = [];
+  for (const leaf of leaves) {
+    const raw = texts.get(leaf.part);
+    if (raw === undefined) continue;
+    const content = raw.replace(/\r?\n/g, "\n");
+    const inAlternative = leaf.alternative !== null;
+    if (!isHtml(leaf)) {
+      text.push(content);
+      if (!inAlternative && renderer) html.push(renderer(content));
+    } else {
+      if ((!inAlternative && hasText) || (singlePart && !hasText)) text.push(htmlToText(content));
+      html.push(content);
     }
   }
   return {
-    uid: msg.uid as number,
-    seq: msg.seq as number,
+    parsed,
+    bodyText: text.length > 0 ? text.join("\n") : null,
+    bodyHtml: html.length > 0 ? html.join("<br/>\n") : null,
+  };
+}
+
+/**
+ * A function rendering plain text as HTML exactly as mailparser does for a
+ * message read whole (links found, entities escaped). Its `textToHtml` is an
+ * instance method its types do not declare (test/unit/dependency-pins.test.ts
+ * checks it is still there); a MailParser that is never written to is only an
+ * idle stream. Make one per message and reuse it for every part.
+ */
+function textToHtmlRenderer(): (text: string) => string {
+  const parser = new MailParser() as unknown as { textToHtml(str: string): string };
+  return (text) => parser.textToHtml(text);
+}
+
+/** A fetched body part by id; imapflow keys the map by the section as the server echoed it. */
+function partBytes(msg: FetchMessageObject, part: string): Buffer | undefined {
+  if (!msg.bodyParts) return undefined;
+  const wanted = part.toLowerCase();
+  for (const [key, value] of msg.bodyParts) {
+    if (key.toLowerCase() === wanted) return value;
+  }
+  return undefined;
+}
+
+function summarize(msg: FetchMessageObject, preview: string | null): MessageSummary {
+  const env = msg.envelope;
+  return {
+    uid: msg.uid,
+    seq: msg.seq,
     flags: Array.from(msg.flags ?? []),
-    date: env?.date ? new Date(env.date).toISOString() : null,
+    date: isoDate(env?.date),
     subject: env?.subject ?? null,
     from: addrText(env?.from),
     to: addrText(env?.to),
     cc: addrText(env?.cc),
-    size: (msg.size as number | undefined) ?? null,
+    size: msg.size ?? null,
     preview,
   };
 }

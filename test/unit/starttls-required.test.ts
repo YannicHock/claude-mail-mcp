@@ -111,7 +111,7 @@ test("SmtpClient refuses a public server without STARTTLS before AUTH", async ()
   );
   try {
     await assert.rejects(
-      client.send({ to: "someone@example.invalid", subject: "s", text: "t" }),
+      client.sendAndCompose({ to: "someone@example.invalid", subject: "s", text: "t" }),
       { message: STARTTLS_REQUIRED_MESSAGE }
     );
     assert.equal(sentAuth(smtp.received), false, `SMTP saw: ${smtp.received.join(" | ")}`);
@@ -152,7 +152,7 @@ test("a server that advertises STARTTLS and refuses it, or refuses EHLO, is refu
       { localAddress: NOT_LOCAL }
     );
     await assert.rejects(
-      smtpClient.send({ to: "someone@example.invalid", subject: "s", text: "t" }),
+      smtpClient.sendAndCompose({ to: "someone@example.invalid", subject: "s", text: "t" }),
       { message: STARTTLS_REQUIRED_MESSAGE }
     );
     assert.equal(sentLogin(imap.received), false);

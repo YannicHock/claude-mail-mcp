@@ -164,7 +164,7 @@ export function registerMailTools(
     "get_message",
     {
       description:
-        "Fetch one message by UID. Returns headers, full text+HTML body, attachment metadata (filenames + content types, NOT raw bytes), and threading IDs (Message-ID, In-Reply-To, References) for replies.",
+        "Fetch one message by UID. Returns headers, full text+HTML body, attachment metadata (filenames + content types, NOT raw bytes), and threading IDs (Message-ID, In-Reply-To, References) for replies. `date` is the Date header and `internalDate` when the server received it; each attachment carries its IMAP `part` id and an upper-bound decoded `size` in bytes.",
       inputSchema: {
         mailbox: z.string().describe("IMAP folder the message lives in"),
         uid: z
@@ -223,8 +223,10 @@ export function registerMailTools(
         throw new Error("Provide at least one of `text` or `html`.");
       }
       const { smtp, imap, sentFolder, id } = pool.for(args.account);
-      const result = await reportingFailures(pool, "send_message", id, () =>
-        smtp.send({
+      // Composed once (F1, #239): the copy kept in Sent is the message that
+      // went out, with the same Message-ID and Date, plus its Bcc header.
+      const { result, raw } = await reportingFailures(pool, "send_message", id, () =>
+        smtp.sendAndCompose({
           to: args.to,
           cc: args.cc,
           bcc: args.bcc,
@@ -245,22 +247,6 @@ export function registerMailTools(
       let savedToSent = false;
       if (sentFolder) {
         try {
-          const raw = await smtp.buildRawSource({
-            to: args.to,
-            cc: args.cc,
-            bcc: args.bcc,
-            subject: args.subject,
-            text: args.text,
-            html: args.html,
-            replyTo: args.reply_to,
-            inReplyTo: args.in_reply_to,
-            references: args.references,
-            attachments: args.attachments?.map((a) => ({
-              filename: a.filename,
-              contentBase64: a.content_base64,
-              contentType: a.content_type,
-            })),
-          });
           await imap.append(sentFolder, raw, ["\\Seen"]);
           savedToSent = true;
         } catch (err) {
@@ -299,19 +285,22 @@ export function registerMailTools(
         throw new Error("Provide at least one of `text` or `html`.");
       }
       const { smtp, imap, draftsFolder, id } = pool.for(args.account);
-      const raw = await smtp.buildRawSource({
-        to: args.to,
-        cc: args.cc,
-        bcc: args.bcc,
-        subject: args.subject,
-        text: args.text,
-        html: args.html,
-        inReplyTo: args.in_reply_to,
-        references: args.references,
+      // Composing is inside reportingFailures too (F5, #242): a message that
+      // cannot be built is reported against the account like any other failure.
+      const raw = await reportingFailures(pool, "create_draft", id, async () => {
+        const source = await smtp.buildRawSource({
+          to: args.to,
+          cc: args.cc,
+          bcc: args.bcc,
+          subject: args.subject,
+          text: args.text,
+          html: args.html,
+          inReplyTo: args.in_reply_to,
+          references: args.references,
+        });
+        await imap.append(draftsFolder, source, ["\\Draft", "\\Seen"]);
+        return source;
       });
-      await reportingFailures(pool, "create_draft", id, () =>
-        imap.append(draftsFolder, raw, ["\\Draft", "\\Seen"])
-      );
       return asJson({
         success: true,
         folder: draftsFolder,
