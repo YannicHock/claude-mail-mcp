@@ -2,7 +2,12 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.3] — 2026-10-18
+
+**What the reviews found.** A Gmail mailbox added by address on a host that filters port 465,
+Hetzner's among them, now gets the submission port that actually answers from there. A saved
+mailbox whose calendar did not work says so in the wizard and survives a reload on the settings
+page, and a save that skipped the connection test is visible in the log.
 
 ### Changed
 
