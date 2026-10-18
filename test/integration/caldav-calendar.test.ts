@@ -1914,28 +1914,46 @@ describe("ORGANIZER and attendees (#204, #205, spec 2026-09-29 §2.1)", SKIP, ()
     assert.match(stored, /BEGIN:VALARM/);
     assert.match(stored, /X-KEEP-ME:yes/);
 
-    // Removal with false is refused until acceptance A2 is in (spec §2.1),
-    // even for an attendee carrying SCHEDULE-AGENT=CLIENT; nothing is written.
-    const etag = await etagOf(uid);
-    const message = await refusal(
-      client.updateEvent({ calendarUrl: cal.calendarUrl, uid, etag, removeAttendees: ["DAN@example.com"], notifyAttendees: false })
-    );
-    assert.match(message, /Leave them listed/);
-    assert.ok(message.endsWith("Nothing was changed, and no event was created."), message);
-    assert.equal(await etagOf(uid), etag);
-
+    // Removal with false is honoured for an attendee carrying
+    // SCHEDULE-AGENT=CLIENT, now that acceptance A2 has shown Nextcloud sends
+    // them no cancellation (spec §2.1, #236).
     const removed = await client.updateEvent({
       calendarUrl: cal.calendarUrl,
       uid,
-      etag,
+      etag: await etagOf(uid),
       removeAttendees: ["DAN@example.com"],
-      notifyAttendees: true,
+      notifyAttendees: false,
     });
     // Ben is marked CLIENT, and Dan was: no one left for the server to mail, and Dan was never scheduled.
     assert.deepEqual(removed.mayNotify, []);
     stored = await storedAs("attendees-add.ics");
     assert.doesNotMatch(stored, /dan@example\.com/);
     assert.match(stored, /PARTSTAT=ACCEPTED/);
+
+    // One the server was free to schedule is still refused with false, and nothing is written.
+    await client.updateEvent({
+      calendarUrl: cal.calendarUrl,
+      uid,
+      etag: await etagOf(uid),
+      addAttendees: ["eve@example.com"],
+      notifyAttendees: true,
+    });
+    const etag = await etagOf(uid);
+    const message = await refusal(
+      client.updateEvent({ calendarUrl: cal.calendarUrl, uid, etag, removeAttendees: ["eve@example.com"], notifyAttendees: false })
+    );
+    assert.match(message, /Leave them listed/);
+    assert.ok(message.endsWith("Nothing was changed, and no event was created."), message);
+    assert.equal(await etagOf(uid), etag);
+
+    const cancelled = await client.updateEvent({
+      calendarUrl: cal.calendarUrl,
+      uid,
+      etag,
+      removeAttendees: ["eve@example.com"],
+      notifyAttendees: true,
+    });
+    assert.deepEqual(cancelled.mayNotify, ["eve@example.com"]);
   });
 
   it("a failed lookup of the account's addresses is not taken for 'none': the attendee call is refused with nothing written, and the next one asks again (review of PR #230)", async () => {

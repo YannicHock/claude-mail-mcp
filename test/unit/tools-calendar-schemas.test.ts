@@ -327,15 +327,20 @@ describe("attendees on the calendar tools (#204, #205, spec 2026-09-29 §2.1)", 
     });
   });
 
-  it("notify_attendees and remove_attendees say removal with false is refused for now, and what to do instead: leave them listed first (spec §2.1, until acceptance A2)", async () => {
+  it("notify_attendees and remove_attendees say removal with false takes off only an attendee marked CLIENT or NONE, only asks, and refuses one listed plainly: leave them listed first (spec §2.1, #236)", async () => {
     await withCalendarTools(CLOSED, async (tools) => {
       const notify = schemaOf(tools, "update_event").notify_attendees?.description ?? "";
-      assert.match(notify, /[Rr]emoving attendees with false is refused for now/);
+      assert.match(notify, /[Rr]emoving attendees with false takes off only an attendee marked SCHEDULE-AGENT=CLIENT or NONE.*only asks/);
+      assert.match(notify, /removing an attendee listed plainly is refused/);
       assert.match(notify, /leave them listed.*true/);
-      assert.doesNotMatch(notify, /removing an attendee the server was free to notify is refused/);
       const remove = schemaOf(tools, "update_event").remove_attendees?.description ?? "";
       assert.match(remove, /notify_attendees: true/);
-      assert.match(remove, /false is refused/);
+      assert.match(remove, /SCHEDULE-AGENT=CLIENT or NONE/);
+      assert.match(remove, /only asks/);
+      assert.match(remove, /listed plainly is refused/);
+      assert.match(remove, /apply_to_series the mark must be on every occurrence that lists them/);
+      assert.match(remove, /[Cc]onfirm with the user/);
+      for (const text of [notify, remove]) assert.doesNotMatch(text, /no organizer\)|or on an event with no organizer/);
     });
   });
 
