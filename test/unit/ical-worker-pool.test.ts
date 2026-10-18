@@ -13,6 +13,7 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+import type { ExpandResult, ExpandWindow, StoredObject } from "../../src/ical-expand.js";
 import { ExpansionPool, reasonOf, startExpansionWorker, type ExpansionPoolOptions } from "../../src/ical-worker-pool.js";
 
 function ics(...lines: string[]): string {
@@ -63,9 +64,24 @@ after(async () => {
   await Promise.all(pools.map((p) => p.close()));
 });
 
+/**
+ * `expandObject` for each of `objects` in `p`'s workers, each under its own
+ * deadline, as one request taking turns with every other: `runOnEach` with
+ * the arguments `CalDavClient.listEvents` passes. An object that timed out —
+ * now or within `HANGING_REMEMBERED_MS` — or whose worker failed comes back
+ * with no instances and `reasonOf` in `skipped`. It was `ExpansionPool.expand()`
+ * until #234 moved it here, the only place it was used.
+ */
+async function expand(p: ExpansionPool, objects: StoredObject[], window: ExpandWindow): Promise<ExpandResult[]> {
+  const settled = await p.runOnEach(objects, "expand", (o) => [o.data, window, { url: o.url, etag: o.etag }]);
+  return settled.map((result) =>
+    result.status === "fulfilled" ? result.value : { instances: [], skipped: reasonOf(result.reason) }
+  );
+}
+
 describe("ExpansionPool", () => {
   it("expands in a worker to exactly what expandObject answers in-process", { timeout: 20_000 }, async () => {
-    const [good, weekly] = await pool({}).expand(
+    const [good, weekly] = await expand(pool({}), 
       [
         { url: "https://dav.example/cal/good.ics", etag: '"g"', data: GOOD },
         { url: "https://dav.example/cal/weekly.ics", etag: null, data: WEEKLY },
@@ -86,9 +102,9 @@ describe("ExpansionPool", () => {
   it("skips an object whose rule never returns once the deadline passes, and lists the ones around it", { timeout: 20_000 }, async () => {
     // One worker, so the object after the hang has to wait for its replacement.
     const p = pool({ size: 1, deadlineMs: 750 });
-    await p.expand([{ url: "warm", etag: null, data: GOOD }], OCTOBER);
+    await expand(p, [{ url: "warm", etag: null, data: GOOD }], OCTOBER);
     const started = Date.now();
-    const results = await p.expand(
+    const results = await expand(p, 
       [
         { url: "https://dav.example/cal/good.ics", etag: null, data: GOOD },
         { url: "https://dav.example/cal/hangs.ics", etag: null, data: HANGS },
@@ -112,7 +128,7 @@ describe("ExpansionPool", () => {
     let ticks = 0;
     const timer = setInterval(() => ticks++, 50);
     try {
-      const [hangs] = await p.expand([{ url: "hangs", etag: null, data: HANGS }], OCTOBER);
+      const [hangs] = await expand(p, [{ url: "hangs", etag: null, data: HANGS }], OCTOBER);
       assert.match(hangs.skipped ?? "", /did not finish/);
     } finally {
       clearInterval(timer);
@@ -122,8 +138,8 @@ describe("ExpansionPool", () => {
 
   it("answers again after a timeout, with a fresh worker", { timeout: 20_000 }, async () => {
     const p = pool({ size: 1, deadlineMs: 500 });
-    await p.expand([{ url: "hangs", etag: null, data: HANGS }], OCTOBER);
-    const [good] = await p.expand([{ url: "good", etag: null, data: GOOD }], OCTOBER);
+    await expand(p, [{ url: "hangs", etag: null, data: HANGS }], OCTOBER);
+    const [good] = await expand(p, [{ url: "good", etag: null, data: GOOD }], OCTOBER);
     assert.equal(good.instances.length, 1);
   });
 
@@ -138,7 +154,7 @@ describe("ExpansionPool", () => {
     );
     const object = { url: "https://dav.example/cal/rdate.ics", etag: null, data };
     const p = pool({});
-    const [listed] = await p.expand([object], OCTOBER);
+    const [listed] = await expand(p, [object], OCTOBER);
     assert.equal(listed.skipped, undefined);
     assert.deepEqual(
       listed.instances.map((e) => e.recurrenceId),
@@ -158,16 +174,16 @@ describe("ExpansionPool — one slow calendar does not stall the others (review 
     // at the real 3 s). Taken in turn, B waits for at most one.
     const deadlineMs = 1000;
     const p = pool({ size: 2, deadlineMs });
-    await p.expand([{ url: "warm-1", etag: null, data: GOOD }, { url: "warm-2", etag: null, data: GOOD }], OCTOBER);
+    await expand(p, [{ url: "warm-1", etag: null, data: GOOD }, { url: "warm-2", etag: null, data: GOOD }], OCTOBER);
     const hanging = Array.from({ length: 6 }, (_, i) => ({
       url: `https://a.example/cal/hangs-${i}.ics`,
       etag: `"h${i}"`,
       data: HANGS,
     }));
-    const slow = p.expand(hanging, OCTOBER);
+    const slow = expand(p, hanging, OCTOBER);
     await new Promise((resolve) => setTimeout(resolve, 50));
     const started = Date.now();
-    const [good] = await p.expand([{ url: "https://b.example/cal/good.ics", etag: '"g"', data: GOOD }], OCTOBER);
+    const [good] = await expand(p, [{ url: "https://b.example/cal/good.ics", etag: '"g"', data: GOOD }], OCTOBER);
     const waited = Date.now() - started;
     assert.equal(good.instances.length, 1);
     assert.ok(waited < 2 * deadlineMs, `B waited ${waited} ms behind A's hanging objects`);
@@ -184,7 +200,7 @@ describe("ExpansionPool — one slow calendar does not stall the others (review 
     // spinning long enough to slow the suite's timed tests.
     const deadlineMs = 600;
     const p = pool({ size: 2, deadlineMs });
-    await p.expand([{ url: "warm-1", etag: null, data: GOOD }, { url: "warm-2", etag: null, data: GOOD }], OCTOBER);
+    await expand(p, [{ url: "warm-1", etag: null, data: GOOD }, { url: "warm-2", etag: null, data: GOOD }], OCTOBER);
     const objects = [
       ...Array.from({ length: 5 }, (_, i) => ({ url: `https://a.example/cal/hangs-${i}.ics`, etag: `"h${i}"`, data: HANGS })),
       { url: "https://a.example/cal/good.ics", etag: '"g"', data: GOOD },
@@ -192,7 +208,7 @@ describe("ExpansionPool — one slow calendar does not stall the others (review 
     const slow = p.runOnEach(objects, "busyTimes", (o) => [o.data, OCTOBER, [], "UTC"]);
     await new Promise((resolve) => setTimeout(resolve, 50));
     const started = Date.now();
-    const [good] = await p.expand([{ url: "https://b.example/cal/good.ics", etag: '"g"', data: GOOD }], OCTOBER);
+    const [good] = await expand(p, [{ url: "https://b.example/cal/good.ics", etag: '"g"', data: GOOD }], OCTOBER);
     const waited = Date.now() - started;
     assert.equal(good.instances.length, 1);
     assert.ok(waited < 2 * deadlineMs, `B waited ${waited} ms behind A's hanging objects`);
@@ -208,18 +224,18 @@ describe("ExpansionPool — one slow calendar does not stall the others (review 
   it("skips an object that timed out before at once, with the same reason, until its ETag changes", { timeout: 30_000 }, async () => {
     const p = pool({ size: 1, deadlineMs: 750 });
     const object = { url: "https://a.example/cal/hangs.ics", etag: '"v1"', data: HANGS };
-    const [first] = await p.expand([object], OCTOBER);
+    const [first] = await expand(p, [object], OCTOBER);
     assert.match(first.skipped ?? "", /did not finish expanding within 0\.75 s/);
 
     const started = Date.now();
-    const [again] = await p.expand([object, { url: "good", etag: '"g"', data: GOOD }], OCTOBER);
+    const [again] = await expand(p, [object, { url: "good", etag: '"g"', data: GOOD }], OCTOBER);
     const waited = Date.now() - started;
     assert.equal(again.skipped, first.skipped);
     assert.ok(waited < 500, `the second call waited ${waited} ms for an object already known to hang`);
 
     // A new ETag is a new object, and gets its own try.
     const changed = Date.now();
-    const [edited] = await p.expand([{ ...object, etag: '"v2"' }], OCTOBER);
+    const [edited] = await expand(p, [{ ...object, etag: '"v2"' }], OCTOBER);
     assert.match(edited.skipped ?? "", /did not finish/);
     assert.ok(Date.now() - changed >= 700, "an edited object was skipped without being tried");
   });
@@ -240,7 +256,7 @@ describe("ExpansionPool — a worker that cannot start never takes the process d
         return startExpansionWorker();
       },
     });
-    const results = await p.expand(
+    const results = await expand(p, 
       [
         { url: "hangs", etag: null, data: HANGS },
         { url: "good", etag: null, data: GOOD },
@@ -252,7 +268,7 @@ describe("ExpansionPool — a worker that cannot start never takes the process d
     assert.match(results[1].skipped ?? "", /could not start.*EMFILE/);
 
     // Once workers can be created again, the pool answers again.
-    const [good] = await p.expand([{ url: "good", etag: null, data: GOOD }], OCTOBER);
+    const [good] = await expand(p, [{ url: "good", etag: null, data: GOOD }], OCTOBER);
     assert.equal(good.instances.length, 1);
   });
 });
