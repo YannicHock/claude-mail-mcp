@@ -7,7 +7,7 @@
  * that the client holds the requests and this file the rules.
  */
 
-import type { EventTarget } from "./caldav-client.js";
+import type { EventTarget } from "./caldav-types.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** An ETag's opaque part: without `W/` and without its quotes, so `abc`, `"abc"` and `W/"abc"` compare equal. */

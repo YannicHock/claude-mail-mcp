@@ -1,6 +1,6 @@
 /**
  * What a caller hands `create_event` and `update_event`, read into what an
- * iCalendar object holds: a date, an instant, a calendar user address. Each
+ * iCalendar object holds: a date, an instant, a zone. Each
  * reader refuses what it cannot read with a {@link ToolRefusal} ending in the
  * caller's `nothingDone`, so a mistyped date is a sentence for the model and
  * never a server failure in the operator's log (spec 2026-09-28 §4.5).
@@ -9,14 +9,15 @@
  * (src/ical-edit.ts and the modules beside it). The builder imported them
  * from the editor until the code-health review of PR #229, which would have
  * tied `create_event` to every module the editor grew; they live here now,
- * with nothing to import but the zone arithmetic.
+ * with nothing to import but the zone arithmetic. `find_free_slot`
+ * (src/free-slots.ts) reads its `timezone` here too.
  *
  * A calendar user address is read, normalised and compared in
  * src/ical-attendees.ts, beside the ORGANIZER and ATTENDEE lines it is
  * written into (code-health review of PR #230).
  */
 
-import { hasOffset, readDateTime, type WriteZone } from "./ical-zones.js";
+import { canonicalZone, hasOffset, readDateTime, type WriteZone } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** Midnight UTC of the date part, so all-day arithmetic counts whole days. */
@@ -70,4 +71,22 @@ export function timedBound(field: "start" | "end", value: string, zone: WriteZon
     );
   }
   return ms;
+}
+
+/**
+ * A caller's `timezone` in `Intl`'s spelling of the IANA name
+ * (`canonicalZone`, src/ical-zones.ts), or a refusal ending in `nothingDone`.
+ * `omitted` says what leaving it out uses instead: "the calendar's own" for
+ * `create_event`, "the calendars' own" for `find_free_slot`. The one refusal
+ * of a zone that is no IANA name, which the two wrote out separately until
+ * #234.
+ */
+export function zoneOrRefuse(name: string, omitted: string, nothingDone: string): string {
+  const zone = canonicalZone(name);
+  if (zone === null) {
+    throw new ToolRefusal(
+      `"${name}" is not an IANA time zone. Pass a name like Europe/Berlin or America/New_York, or omit timezone to use ${omitted}. ${nothingDone}`
+    );
+  }
+  return zone;
 }
