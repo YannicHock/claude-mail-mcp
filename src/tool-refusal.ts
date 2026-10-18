@@ -15,15 +15,18 @@
  *
  * It lives in a file of its own, importing nothing (#214). The pure modules
  * that decide what a write may do throw it — src/ical-edit.ts and the
- * writers beside it (src/ical-occurrence-edit.ts, src/ical-series-shift.ts,
- * src/ical-attendees.ts, src/ical-input.ts, src/ical-build.ts), and
- * src/caldav-etag.ts for a write's guards — as does src/caldav-client.ts,
- * and taking it from tool-errors.ts pulled shared/credential-failure and the
- * client pool's types in with them. The reader refuses nothing: src/ical-expand.ts
- * reports an object it cannot read in `skipped` instead, and src/ical-zones.ts
- * throws `UnreadableTimezone`, which a writer turns into a refusal
- * (`withReadableZones` in src/ical-edit.ts). tool-errors.ts re-exports it, so
- * `instanceof` holds whichever path a caller imported it by.
+ * writers beside it (src/ical-edit-kit.ts, src/ical-occurrence-edit.ts,
+ * src/ical-series-shift.ts, src/ical-attendees.ts, src/ical-input.ts,
+ * src/ical-build.ts), src/free-slots.ts for `find_free_slot`'s arguments,
+ * and src/caldav-etag.ts for a write's guards — as do src/caldav-client.ts
+ * and `move_event`'s src/caldav-move.ts, and taking it from tool-errors.ts
+ * pulled shared/credential-failure and the client pool's types in with them.
+ * The reader refuses nothing: src/ical-expand.ts reports an object it cannot
+ * read in `skipped` instead, and src/ical-zones.ts throws
+ * `UnreadableTimezone`, which a writer turns into a refusal
+ * (`withReadableZones` in src/ical-edit-kit.ts). Every module imports it
+ * from here: tool-errors.ts, which only checks for it, re-exported it until
+ * #234, so there was a second path to the same class.
  */
 export class ToolRefusal extends Error {
   override readonly name = "ToolRefusal";

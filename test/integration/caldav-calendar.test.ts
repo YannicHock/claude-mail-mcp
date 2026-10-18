@@ -22,7 +22,7 @@ import { AccountsStore } from "../../src/accounts.js";
 import { CalDavClient } from "../../src/caldav-client.js";
 import { ClientPool } from "../../src/client-pool.js";
 import { registerCalendarTools } from "../../src/tools-calendar.js";
-import { ToolRefusal } from "../../src/tool-errors.js";
+import { ToolRefusal } from "../../src/tool-refusal.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { cleanupTmpDir, makeAccount, makeAccountsFile, makeTmpDir } from "../helpers/fixtures.js";
 import { composeDown, composeUp, isDockerAvailable } from "../helpers/docker.js";

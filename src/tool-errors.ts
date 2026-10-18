@@ -40,14 +40,6 @@ import { ToolRefusal } from "./tool-refusal.js";
 export const TOOL_FAILURE_EVENT = "mail tool call failed";
 
 /**
- * An answer a tool gives on purpose, not a mailbox that failed; see
- * src/tool-refusal.ts. {@link reportingFailures} rethrows it unchanged, with no
- * log line. Re-exported here so every import that predates the move (#214)
- * still names the same class.
- */
-export { ToolRefusal };
-
-/**
  * Log one `warn` line for `err` and return the error to throw in its place.
  *
  * Split from {@link reportingFailures} for the one caller that must not

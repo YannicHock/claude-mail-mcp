@@ -20,7 +20,7 @@ import {
   writtenBy,
 } from "../../src/ical-edit.js";
 import type { EventPatch } from "../../src/ical-edit-kit.js";
-import { ToolRefusal } from "../../src/tool-errors.js";
+import { ToolRefusal } from "../../src/tool-refusal.js";
 import { buildIcs } from "../../src/ical-build.js";
 import { parseCalendar, seriesFor } from "../../src/ical-parse.js";
 import { keyOf, sequenceOf } from "../../src/ical-series.js";
