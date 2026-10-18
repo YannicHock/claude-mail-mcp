@@ -50,7 +50,7 @@ import { ToolRefusal } from "./tool-refusal.js";
 export const MAX_FREE_SLOT_RANGE_DAYS = 366;
 
 /** {@link MAX_FREE_SLOT_RANGE_DAYS} as a span of epoch milliseconds. */
-const MAX_FREE_SLOT_RANGE_MS =MAX_FREE_SLOT_RANGE_DAYS * DAY_MS;
+const MAX_FREE_SLOT_RANGE_MS = MAX_FREE_SLOT_RANGE_DAYS * DAY_MS;
 
 /**
  * The most slots `find_free_slot` reports: the earliest ones, with

@@ -33,9 +33,10 @@
  *     {@link WriteMark}, and {@link applyEventPatch}, the edit of a main
  *     event;
  *   - src/ical-edit-kit.ts (#234): the patch itself, and the edit of one
- *     VEVENT — `patchText`, `patchTimes`, `stampRevision`, and the one
- *     writer of a time property under them, `writeTimeProp` — that every
- *     writer here uses for whichever VEVENT it changes;
+ *     VEVENT — `patchText`, `patchTimes`, `stampRevision` — that every
+ *     writer here uses for whichever VEVENT it changes. A time property is
+ *     written by `writeTimeProp` and `addTimeProp` (src/ical-zones.ts), as
+ *     `create_event`'s builder writes one;
  *   - src/ical-attendees.ts (#204, #205, spec 2026-09-29 §2.1): a guest list
  *     changed, which every writer here calls the way it calls
  *     {@link patchText}. Those are the edits that decide whether a calendar
@@ -58,6 +59,7 @@ import {
   patchTimes,
   stampOthers,
   stampRevision,
+  touchesTime,
   withReadableZones,
   type EditContext,
   type EditResult,
@@ -78,11 +80,6 @@ interface StoredEventShape {
    * (#211.3, R3). `recurring` is true for it as well.
    */
   overrideOnly: boolean;
-}
-
-/** True when the patch touches the event's time, which a series refuses (§4.3). */
-export function touchesTime(patch: EventPatch): boolean {
-  return patch.start !== undefined || patch.end !== undefined || patch.allDay !== undefined;
 }
 
 /** True when the patch changes anything at all. */

@@ -81,7 +81,7 @@ async function expand(p: ExpansionPool, objects: StoredObject[], window: ExpandW
 
 describe("ExpansionPool", () => {
   it("expands in a worker to exactly what expandObject answers in-process", { timeout: 20_000 }, async () => {
-    const [good, weekly] = await expand(pool({}), 
+    const [good, weekly] = await expand(pool({}),
       [
         { url: "https://dav.example/cal/good.ics", etag: '"g"', data: GOOD },
         { url: "https://dav.example/cal/weekly.ics", etag: null, data: WEEKLY },
@@ -104,7 +104,7 @@ describe("ExpansionPool", () => {
     const p = pool({ size: 1, deadlineMs: 750 });
     await expand(p, [{ url: "warm", etag: null, data: GOOD }], OCTOBER);
     const started = Date.now();
-    const results = await expand(p, 
+    const results = await expand(p,
       [
         { url: "https://dav.example/cal/good.ics", etag: null, data: GOOD },
         { url: "https://dav.example/cal/hangs.ics", etag: null, data: HANGS },
@@ -256,7 +256,7 @@ describe("ExpansionPool — a worker that cannot start never takes the process d
         return startExpansionWorker();
       },
     });
-    const results = await expand(p, 
+    const results = await expand(p,
       [
         { url: "hangs", etag: null, data: HANGS },
         { url: "good", etag: null, data: GOOD },

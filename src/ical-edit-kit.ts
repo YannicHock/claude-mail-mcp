@@ -2,8 +2,7 @@
  * The edit of one VEVENT, which every writer of a stored object uses for
  * whichever VEVENT it changes (#234, out of src/ical-edit.ts): the patch and
  * what a writer is handed beside it, the text and the time written in place
- * ({@link patchText}, {@link patchTimes}, and under both {@link writeTimeProp}),
- * the revision stamped ({@link stampRevision}), a generated VTIMEZONE covered
+ * ({@link patchText}, {@link patchTimes}), the revision stamped ({@link stampRevision}), a generated VTIMEZONE covered
  * again ({@link coverGenerated}), and what the write answers
  * ({@link EditResult}, {@link mayNotifyOf}).
  *
@@ -25,7 +24,9 @@ import {
   hasOffset,
   storedInstant,
   UnreadableTimezone,
+  tzidOf,
   UTC_ZONE,
+  writeTimeProp,
   writeZoneOf,
   writtenTime,
   type WriteZone,
@@ -46,6 +47,11 @@ export interface EventPatch extends AttendeePatch {
   start?: string;
   end?: string;
   allDay?: boolean;
+}
+
+/** True when the patch touches the event's time, which a series refuses (§4.3). */
+export function touchesTime(patch: EventPatch): boolean {
+  return patch.start !== undefined || patch.end !== undefined || patch.allDay !== undefined;
 }
 
 /**
@@ -120,53 +126,6 @@ export function stampRevision(vevent: ICAL.Component, now: Date): number {
   vevent.updatePropertyWithValue("dtstamp", stamp);
   vevent.updatePropertyWithValue("last-modified", stamp);
   return sequence;
-}
-
-/**
- * Write `time` into `ve`'s property `name`, with `TZID` as `tzid` says: set
- * when given, removed when null — for UTC, a floating time and a date. The
- * one writer of a time value and its TZID (#234); four functions did it by
- * hand until then. `place` says which property is written:
- *
- *   - `"replace"`: the one `ve` has, in place — so it keeps its position and
- *     every parameter but TZID — or, when it has none, a new one added. A
- *     DTSTART or DTEND a new time is written into.
- *   - `"add"`: a new one beside any `ve` has, for a property that may occur
- *     more than once: an EXDATE, or a RECURRENCE-ID the caller has just
- *     removed every other of.
- *
- * Which TZID is the caller's to decide, and the callers decide it three
- * ways, each kept as it was: from the zone the time is actually written in
- * ({@link tzidOf} of `writtenTime`'s zone, src/ical-zones.ts), which for the
- * second pass through an autumn overlap is UTC whatever the event's zone;
- * from the master's DTSTART, for an occurrence's RECURRENCE-ID or EXDATE and
- * a new override's DTEND (`originalStart` in src/ical-occurrence-edit.ts);
- * and from an override's own DTSTART, for its DTEND (`placeOverride` there).
- * A DATE value is written as one by ical.js itself, `VALUE=DATE` included.
- * Returns the property written.
- */
-export function writeTimeProp(
-  ve: ICAL.Component,
-  name: string,
-  time: ICAL.Time,
-  tzid: string | null,
-  place: "replace" | "add" = "replace"
-): ICAL.Property {
-  let prop = place === "replace" ? ve.getFirstProperty(name) : null;
-  if (prop === null) {
-    prop = new ICAL.Property(name);
-    if (place === "replace") ve.addProperty(prop);
-  }
-  prop.setValue(time);
-  if (tzid !== null) prop.setParameter("tzid", tzid);
-  else prop.removeParameter("tzid");
-  if (place === "add") ve.addProperty(prop);
-  return prop;
-}
-
-/** The TZID a time written in `zone` carries: the zone's for a zoned one, none (null) for UTC, a floating time, or a date (no zone at all). */
-export function tzidOf(zone: WriteZone | null): string | null {
-  return zone?.kind === "zoned" ? zone.tzid : null;
 }
 
 /**

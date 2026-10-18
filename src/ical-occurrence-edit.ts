@@ -21,7 +21,6 @@
 
 import ICAL from "ical.js";
 import { applyAttendeePatch } from "./ical-attendees.js";
-import { touchesTime } from "./ical-edit.js";
 import {
   coverGenerated,
   everyVevent,
@@ -30,8 +29,8 @@ import {
   patchTimes,
   stampOthers,
   stampRevision,
+  touchesTime,
   withReadableZones,
-  writeTimeProp,
   type EditContext,
   type EditResult,
   type EventPatch,
@@ -39,7 +38,7 @@ import {
 import type { FoundOccurrence } from "./ical-expand.js";
 import { seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { allDaySeries, keyOf, modifiesFuture, sequenceOf } from "./ical-series.js";
-import { writeZoneOf, type WriteZone } from "./ical-zones.js";
+import { addTimeProp, writeTimeProp, writeZoneOf, type WriteZone } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /**
@@ -98,7 +97,7 @@ function overrideFrom(master: ICAL.Component, occurrence: FoundOccurrence): ICAL
   const { time, tzid } = originalStart(master, occurrence);
   const start = copy.getFirstProperty("dtstart") as ICAL.Property;
   start.setValue(time.clone());
-  writeTimeProp(copy, "recurrence-id", time.clone(), tzid, "add");
+  addTimeProp(copy, "recurrence-id", time.clone(), tzid);
   if (copy.hasProperty("dtend")) {
     const until = time.clone();
     until.addDuration(new ICAL.Event(master).duration);
@@ -147,7 +146,7 @@ function placeOverride(ve: ICAL.Component, start: ICAL.Time, end: ICAL.Time): vo
 /** `ve`'s RECURRENCE-ID replaced by one for `time` in `tzid`, with `RANGE=THISANDFUTURE` when `range` says so. */
 function setRecurrenceId(ve: ICAL.Component, time: ICAL.Time, tzid: string | null, range: boolean): void {
   ve.removeAllProperties("recurrence-id");
-  const prop = writeTimeProp(ve, "recurrence-id", time.clone(), tzid, "add");
+  const prop = addTimeProp(ve, "recurrence-id", time.clone(), tzid);
   if (range) prop.setParameter("range", "THISANDFUTURE");
 }
 
@@ -410,7 +409,7 @@ export function excludeOccurrence(
     const seriesEmpty = !occurrence.others;
     if (master === undefined) return { ics: vcal.toString(), mark: null, seriesEmpty, ...notified };
     const { time, tzid } = originalStart(master, occurrence);
-    const exdate = writeTimeProp(master, "exdate", time, tzid, "add");
+    const exdate = addTimeProp(master, "exdate", time, tzid);
     const range = seriesFor(vcal, uid).overrides.filter(modifiesFuture);
     coverGenerated(vcal, writtenZones([exdate, ...range.flatMap(timesOf)]));
     const sequence = stampRevision(master, now);

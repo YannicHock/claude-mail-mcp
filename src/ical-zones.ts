@@ -1,8 +1,8 @@
 /**
- * Time zones for stored iCalendar objects: which zone a time is in, and the
- * wall-clock arithmetic for an IANA zone (spec 2026-09-29 §2.5, #208, #209).
- * No network access, and no dependency beyond ical.js and the ICU data every
- * Node build carries for `Intl`.
+ * Time zones for stored iCalendar objects: which zone a time is in, read
+ * and written back (spec 2026-09-29 §2.5, #208, #209). No network access,
+ * and no dependency beyond ical.js and the ICU data every Node build carries
+ * for `Intl`.
  *
  * Two parts live beside it since #234: the `Intl` offset arithmetic, which
  * knows nothing of iCalendar objects, in src/ical-zones-intl.ts, and the
@@ -41,12 +41,10 @@
  * **The writing half** (plan Task 4a, #208, #209) keeps a time in the zone it
  * was stored in: {@link writeZoneOf} says which zone a stored time is written
  * back in, {@link readDateTime} reads a caller's time for it, and
- * {@link writtenTime} makes the value to write. A Berlin event moved stays
+ * {@link writtenTime} makes the value to write, which {@link writeTimeProp}
+ * and {@link addTimeProp} write. A Berlin event moved stays
  * `TZID=Europe/Berlin` local time, a UTC one stays UTC, a floating one stays
- * floating. The one VTIMEZONE the connector ever authors is
- * src/ical-vtimezone.ts's, for `create_event`'s `timezone` (spec §2.5 A):
- * generated from `Intl` transition by transition, so it is exact where the
- * rejected package was not.
+ * floating. The one VTIMEZONE the connector authors is src/ical-vtimezone.ts's.
  *
  * The review of #224 found three ways the writing half disagreed with itself,
  * and each has one answer here now:
@@ -188,7 +186,7 @@ export class UnreadableTimezone extends Error {
  * observances. A yearly rule that lists every hour of every day passes that
  * within its first year.
  */
-export const MAX_OBSERVANCE_STEPS = 20_000;
+const MAX_OBSERVANCE_STEPS = 20_000;
 
 /**
  * Why the observance rules of `vtimezone` cannot be walked to the end of
@@ -608,6 +606,64 @@ export function writtenTime(ms: number, zone: WriteZone): WrittenTime {
     if (wall !== null) return { time: ICAL.Time.fromData({ ...wall, isDate: false }, zone.zone), zone };
   }
   return { time: ICAL.Time.fromJSDate(new Date(whole), true), zone: UTC_ZONE };
+}
+
+/** The TZID a time written in `zone` carries: the zone's for a zoned one, none (null) for UTC, a floating time, or a date (no zone at all). */
+export function tzidOf(zone: WriteZone | null): string | null {
+  return zone?.kind === "zoned" ? zone.tzid : null;
+}
+
+/**
+ * Write `time` into `component`'s property `name`, in place when it has one —
+ * so the property keeps its position and every parameter but TZID — and as a
+ * new one added when it has none, with `TZID` as `tzid` says: set when
+ * given, removed when null, for UTC, a floating time and a date. A DTSTART
+ * or DTEND a new time is written into. {@link addTimeProp} is its twin for a
+ * property that may occur more than once.
+ *
+ * With {@link addTimeProp}, the one way a time value and its TZID are
+ * written (#234); `create_event`'s builder and four functions of the editors
+ * each did it by hand until then. The value of an override's DTSTART, set
+ * without touching its TZID (`overrideFrom` and `placeOverride` in
+ * src/ical-occurrence-edit.ts), is not such a write, and is not made here.
+ *
+ * Which TZID is the caller's to decide, and the callers decide it three
+ * ways: from the zone the time is actually written in ({@link tzidOf} of
+ * {@link writtenTime}'s zone), which for the second pass through an autumn
+ * overlap is UTC whatever the event's zone; from the master's DTSTART, for
+ * an occurrence's RECURRENCE-ID or EXDATE and a new override's DTEND
+ * (`originalStart` in src/ical-occurrence-edit.ts); and from an override's
+ * own DTSTART, for its DTEND (`placeOverride` there). A DATE is written as one by ical.js itself,
+ * `VALUE=DATE` included. Returns the property written.
+ */
+export function writeTimeProp(component: ICAL.Component, name: string, time: ICAL.Time, tzid: string | null): ICAL.Property {
+  let prop = component.getFirstProperty(name);
+  if (prop === null) {
+    prop = new ICAL.Property(name);
+    component.addProperty(prop);
+  }
+  setTimeValue(prop, time, tzid);
+  return prop;
+}
+
+/**
+ * {@link writeTimeProp} for a property that may occur more than once: always
+ * a new one, added beside any `component` has — an EXDATE, a RECURRENCE-ID
+ * the caller has just removed every other of, or a time of an event being
+ * built. Returns the property, already added.
+ */
+export function addTimeProp(component: ICAL.Component, name: string, time: ICAL.Time, tzid: string | null): ICAL.Property {
+  const prop = new ICAL.Property(name);
+  setTimeValue(prop, time, tzid);
+  component.addProperty(prop);
+  return prop;
+}
+
+/** `time` as `prop`'s value, with `TZID` set to `tzid`, or removed for null. */
+function setTimeValue(prop: ICAL.Property, time: ICAL.Time, tzid: string | null): void {
+  prop.setValue(time);
+  if (tzid !== null) prop.setParameter("tzid", tzid);
+  else prop.removeParameter("tzid");
 }
 
 /** True for the names that mean UTC itself, which is written as `…Z`, not as a TZID. */

@@ -16,7 +16,7 @@ function opaqueTag(etag: string): string {
 }
 
 /** True for a weak ETag, `W/"…"`, which `If-Match`'s strong comparison can never match (RFC 7232 §3.1). */
-export function isWeak(etag: string): boolean {
+function isWeak(etag: string): boolean {
   return /^W\//i.test(etag.trim());
 }
 

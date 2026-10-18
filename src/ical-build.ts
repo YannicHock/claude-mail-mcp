@@ -17,7 +17,7 @@ import { addAttendee, addOrganizer, distinctAddresses, notifyChoice, organizerOf
 import { calendarDate, timedBound } from "./ical-input.js";
 import { parseCalendar } from "./ical-parse.js";
 import { generatedVtimezone } from "./ical-vtimezone.js";
-import { writtenTime, zonedWriteZone, zoneNameOf } from "./ical-zones.js";
+import { addTimeProp, tzidOf, writtenTime, zonedWriteZone, zoneNameOf } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** What `create_event` is given for the event itself; `CalDavClient` adds the calendar and the zone. */
@@ -107,10 +107,7 @@ export function buildIcs(
     }
     for (const [name, ms] of [["dtstart", startMs], ["dtend", endMs]] as const) {
       const written = writtenTime(ms, target);
-      const prop = new ICAL.Property(name);
-      prop.setValue(written.time);
-      if (written.zone.kind === "zoned") prop.setParameter("tzid", written.zone.tzid);
-      vevent.addProperty(prop);
+      addTimeProp(vevent, name, written.time, tzidOf(written.zone));
     }
     if (target.kind === "zoned") cal.addSubcomponent(generatedVtimezone(zone, [startMs, endMs]));
   }
