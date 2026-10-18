@@ -553,7 +553,67 @@ function bodyLayouts(imageBytes: number): string[] {
     "--P1--",
     "",
   ].join("\r\n");
-  return [textPhotoText, appleHtml, htmlFooter, textHtmlText, htmlPhoto];
+  // A named inline text part (no disposition): body, and listed to be fetched.
+  const namedText = [
+    head(`named-text ${imageBytes} ${tag}`, 'multipart/mixed; boundary="N1"'),
+    "--N1",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "The message.",
+    "--N1",
+    'Content-Type: text/plain; charset=utf-8; name="notes.txt"',
+    "",
+    "Notes, named but inline.",
+    "--N1",
+    photo,
+    "--N1--",
+    "",
+  ].join("\r\n");
+  // A bounce.
+  const bounce = [
+    head(`bounce ${imageBytes} ${tag}`, 'multipart/report; report-type=delivery-status; boundary="R1"'),
+    "--R1",
+    "Content-Type: text/plain; charset=us-ascii",
+    "",
+    "Your message could not be delivered.",
+    "--R1",
+    "Content-Type: message/delivery-status",
+    "",
+    "Reporting-MTA: dns; mx.example.com",
+    "",
+    "Final-Recipient: rfc822; nobody@example.com",
+    "Action: failed",
+    "Status: 5.1.1",
+    "--R1",
+    "Content-Type: text/rfc822-headers",
+    "",
+    "Subject: the original",
+    "--R1",
+    photo,
+    "--R1--",
+    "",
+  ].join("\r\n");
+  // related [html, text]: every child of a related is walked too.
+  const relatedHtmlText = [
+    head(`related-html-text ${imageBytes} ${tag}`, 'multipart/mixed; boundary="X1"'),
+    "--X1",
+    'Content-Type: multipart/related; boundary="X2"',
+    "",
+    "--X2",
+    "Content-Type: text/html; charset=utf-8",
+    "",
+    "<p>Related HTML.</p>",
+    "--X2",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "Related text.",
+    "--X2--",
+    "--X1",
+    photo,
+    "--X1--",
+    "",
+  ].join("\r\n");
+  return [textPhotoText, appleHtml, htmlFooter, textHtmlText, htmlPhoto, namedText, bounce, relatedHtmlText];
 }
 
 test("every body part counts, after an inline image too, and reads the same whole and by part", SKIP, async () => {
@@ -572,7 +632,8 @@ test("every body part counts, after an inline image too, and reads the same whol
     return (await callTool("get_message", { mailbox: "Bodies", uid })) as Detail;
   };
 
-  for (const layout of ["text-photo-text", "apple-html", "html-footer", "text-html-text", "html-photo"]) {
+  const imageOnly = ["text-photo-text", "apple-html", "html-footer", "text-html-text", "html-photo"];
+  for (const layout of [...imageOnly, "named-text", "bounce", "related-html-text"]) {
     const whole = await detail(`${layout} 1024 ${tag}`);
     const byPart = await detail(`${layout} ${largeImage} ${tag}`);
     assert.equal(byPart.bodyText, whole.bodyText, `${layout}: bodyText differs between the two paths`);
@@ -582,10 +643,25 @@ test("every body part counts, after an inline image too, and reads the same whol
       byPart.attachments.map((a) => a.part),
       whole.attachments.map((a) => a.part)
     );
+    if (!imageOnly.includes(layout)) continue;
     // Only the image is an attachment; no body part is listed as one.
     assert.equal(whole.attachments.length, 1, `${layout}: ${JSON.stringify(whole.attachments)}`);
     assert.match(whole.attachments[0]!.filename ?? "", /^photo\./);
   }
+
+  // The named inline text is read as body and is still listed, to be fetched.
+  const named = await detail(`named-text 1024 ${tag}`);
+  assert.match(named.bodyText ?? "", /The message\.[\s\S]*Notes, named but inline\./);
+  assert.ok(named.attachments.some((a) => a.filename === "notes.txt" && a.part === "2"));
+  // No plain text: get_message's preview comes from the HTML, as the list's does.
+  for (const size of [1024, largeImage]) {
+    const htmlOnly = await detail(`html-photo ${size} ${tag}`);
+    const summary = list.messages.find((m) => m.subject === `html-photo ${size} ${tag}`)!;
+    assert.equal(htmlOnly.preview, "Only HTML here.");
+    assert.equal(htmlOnly.preview, summary.preview);
+  }
+  const bounce = await detail(`bounce 1024 ${tag}`);
+  assert.match(bounce.bodyText ?? "", /could not be delivered[\s\S]*Status: 5\.1\.1/);
 
   const textPhotoText = await detail(`text-photo-text 1024 ${tag}`);
   assert.match(textPhotoText.bodyText ?? "", /Erster Teil, Grüße\.[\s\S]*Second part, after the photo\./);

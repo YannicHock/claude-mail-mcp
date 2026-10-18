@@ -188,7 +188,7 @@ test("Apple HTML: the plain alternative and both HTML parts are body, the image 
   );
 });
 
-test("inside mixed, a text/calendar, an attachment-disposition text and a named text are not body", () => {
+test("mailparser's rule: a named inline text is body (and still listed, so it can be fetched); calendar, attachment and unknown dispositions are not", () => {
   const structure: MessageStructureObject = {
     type: "multipart/mixed",
     childNodes: [
@@ -204,12 +204,65 @@ test("inside mixed, a text/calendar, an attachment-disposition text and a named 
       { part: "3", type: "text/calendar", parameters: { method: "REQUEST" }, encoding: "7bit", size: 300 },
       { part: "4", type: "text/plain", encoding: "7bit", size: 10, disposition: "attachment" },
       { part: "5", type: "text/html", parameters: { name: "page.html" }, encoding: "7bit", size: 10 },
+      { part: "6", type: "text/plain", encoding: "7bit", size: 10, disposition: "x-unknown" },
     ],
   };
-  assert.deepEqual(bodyParts(structure), { text: ["2"], html: [] });
+  assert.deepEqual(bodyParts(structure), { text: ["1", "2"], html: ["5"] });
   assert.deepEqual(
     attachmentParts(structure).map((p) => p.part),
-    ["1", "3", "4", "5"]
+    ["1", "3", "4", "5", "6"]
+  );
+});
+
+test("every child of every multipart is walked: related [html, text] are both body", () => {
+  const structure: MessageStructureObject = {
+    type: "multipart/related",
+    childNodes: [
+      { part: "1", type: "text/html", encoding: "7bit", size: 10 },
+      { part: "2", type: "text/plain", encoding: "7bit", size: 10 },
+      { part: "3", type: "image/png", encoding: "base64", size: 78, id: "<logo@x>" },
+    ],
+  };
+  assert.deepEqual(
+    bodyLeaves(structure).map((p) => [p.part, p.alternative]),
+    [
+      ["1", null],
+      ["2", null],
+    ]
+  );
+  assert.deepEqual(
+    attachmentParts(structure).map((p) => p.part),
+    ["3"]
+  );
+});
+
+test("a bounce (multipart/report): the text and the delivery status are body, the returned headers and an attached message are not", () => {
+  const structure: MessageStructureObject = {
+    type: "multipart/report",
+    parameters: { "report-type": "delivery-status" },
+    childNodes: [
+      { part: "1", type: "text/plain", encoding: "7bit", size: 200 },
+      { part: "2", type: "message/delivery-status", encoding: "7bit", size: 300 },
+      { part: "3", type: "text/rfc822-headers", encoding: "7bit", size: 400 },
+      {
+        part: "4",
+        type: "message/rfc822",
+        size: 500,
+        childNodes: [{ part: "4", type: "text/plain", size: 100 }],
+      },
+    ],
+  };
+  assert.deepEqual(
+    bodyLeaves(structure).map((p) => [p.part, p.type]),
+    [
+      ["1", "text/plain"],
+      ["2", "message/delivery-status"],
+    ]
+  );
+  assert.deepEqual(bodyParts(structure), { text: ["1", "2"], html: [] });
+  assert.deepEqual(
+    attachmentParts(structure).map((p) => p.part),
+    ["3", "4"]
   );
 });
 

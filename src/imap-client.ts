@@ -340,8 +340,13 @@ export class ImapClient {
           ? parsed.cc.map((a) => a.text).join(", ")
           : parsed.cc?.text ?? null,
         size,
-        // Normalised as the list previews are.
-        preview: content.bodyText ? previewOf(content.bodyText) : null,
+        // Normalised as the list previews are, and like them taken from the
+        // HTML when the message has no text.
+        preview: content.bodyText
+          ? previewOf(content.bodyText)
+          : content.bodyHtml
+            ? previewOf(htmlToText(content.bodyHtml))
+            : null,
         messageId: parsed.messageId ?? null,
         inReplyTo: parsed.inReplyTo ?? null,
         references: Array.isArray(parsed.references)
@@ -557,6 +562,10 @@ async function readWhole(client: ImapFlow, uid: number, mailbox: string): Promis
  *   mailparser uses), as it does for a single-part HTML message;
  * - text parts are joined with "\n", HTML parts with "<br/>\n".
  *
+ * Two known differences from a message read whole: a `format=flowed` plain
+ * part is not unwrapped, and an inline `message/rfc822` is not descended into
+ * (src/mail-parts.ts `bodyLeaves`).
+ *
  * Not imapflow's `download`: it learns a part's encoding from a second fetch
  * of the part's MIME header, and GreenMail's answer to that left a
  * quoted-printable body undecoded. BODYSTRUCTURE is already in hand.
@@ -576,8 +585,14 @@ async function readByPart(
   const texts = await fetchPartTexts(client, mailbox, uid, leaves);
 
   const singlePart = !structure.type.toLowerCase().startsWith("multipart/");
-  const hasText = leaves.some((l) => l.type === "text/plain");
-  const hasHtml = leaves.some((l) => l.type === "text/html");
+  // Plain text and a delivery status read alike, as mailparser reads them.
+  const isHtml = (leaf: { type: string }) => leaf.type === "text/html";
+  const hasText = leaves.some((l) => !isHtml(l));
+  const hasHtml = leaves.some(isHtml);
+  // One renderer for the whole message, as mailparser has one per message:
+  // its link-finding budget is per instance, and a fresh one per part would
+  // let a message of many plain parts multiply it.
+  const renderer = hasHtml ? textToHtmlRenderer() : null;
   const text: string[] = [];
   const html: string[] = [];
   for (const leaf of leaves) {
@@ -585,9 +600,9 @@ async function readByPart(
     if (raw === undefined) continue;
     const content = raw.replace(/\r?\n/g, "\n");
     const inAlternative = leaf.alternative !== null;
-    if (leaf.type === "text/plain") {
+    if (!isHtml(leaf)) {
       text.push(content);
-      if (!inAlternative && hasHtml) html.push(textToHtml(content));
+      if (!inAlternative && renderer) html.push(renderer(content));
     } else {
       if ((!inAlternative && hasText) || (singlePart && !hasText)) text.push(htmlToText(content));
       html.push(content);
@@ -601,14 +616,15 @@ async function readByPart(
 }
 
 /**
- * Plain text as HTML, exactly as mailparser renders it for a message read
- * whole (links found, entities escaped). Its `textToHtml` is an instance
- * method its types do not declare; a MailParser that is never written to is
- * only an idle stream.
+ * A function rendering plain text as HTML exactly as mailparser does for a
+ * message read whole (links found, entities escaped). Its `textToHtml` is an
+ * instance method its types do not declare (test/unit/dependency-pins.test.ts
+ * checks it is still there); a MailParser that is never written to is only an
+ * idle stream. Make one per message and reuse it for every part.
  */
-function textToHtml(text: string): string {
+function textToHtmlRenderer(): (text: string) => string {
   const parser = new MailParser() as unknown as { textToHtml(str: string): string };
-  return parser.textToHtml(text);
+  return (text) => parser.textToHtml(text);
 }
 
 /** A fetched body part by id; imapflow keys the map by the section as the server echoed it. */

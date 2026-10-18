@@ -20,6 +20,14 @@ function manifest(path: string): { version?: string; dependencies?: Record<strin
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+test("mailparser still has the textToHtml instance method the by-part read borrows", async () => {
+  // src/imap-client.ts renders plain text as HTML with mailparser's own,
+  // undeclared `textToHtml`, so a message reads the same over and under 2 MB.
+  const { MailParser } = await import("mailparser");
+  const parser = new MailParser() as unknown as { textToHtml?: unknown };
+  assert.equal(typeof parser.textToHtml, "function");
+});
+
 test("html-to-text is pinned to exactly the version mailparser depends on", () => {
   const ours = manifest(require.resolve("../../package.json")).dependencies?.["html-to-text"];
   const mailparsers = manifest(require.resolve("mailparser/package.json")).dependencies?.["html-to-text"];

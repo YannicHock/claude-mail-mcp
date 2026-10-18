@@ -106,13 +106,16 @@ export function leafParts(structure: MessageStructureObject): Part[] {
   return out;
 }
 
-/** A `text/plain` or `text/html` leaf a reader shows inline: no attachment disposition, no name. */
+/** The types mailparser reads as text (with `keepDeliveryStatus` off, its default). */
+const BODY_TYPES = new Set(["text/plain", "text/html", "message/delivery-status"]);
+
+/**
+ * mailparser's rule for a leaf that is text, not an attachment: a body type
+ * with no disposition or `inline`. Any other disposition is an attachment; a
+ * file name does not matter.
+ */
 function isBodyLeaf(part: Part): boolean {
-  return (
-    (part.type === "text/plain" || part.type === "text/html") &&
-    part.disposition !== "attachment" &&
-    part.filename === null
-  );
+  return BODY_TYPES.has(part.type) && (part.disposition === null || part.disposition === "inline");
 }
 
 /** A body leaf, and the `multipart/alternative` it is one of the versions of. */
@@ -126,30 +129,28 @@ export interface BodyLeaf extends Part {
 }
 
 /**
- * The leaves a reader shows as the message's body, in document order.
+ * The leaves a reader shows as the message's body, in document order, by
+ * mailparser's rule, so `get_message` reads a message the same whole (through
+ * mailparser) and by part:
  *
- * - `multipart/alternative` and `multipart/mixed`: every branch is looked
- *   into, so the text after an inline photo (Apple Mail), or a mailing list's
- *   plain footer after an HTML post, is body, not an attachment.
- * - Any other multipart (`related`, `signed`, `report`, …): only its first
- *   part, its root; the rest is what that root refers to or is signed with.
- * - A leaf is body when it is `text/plain` or `text/html`, not an
- *   attachment by disposition, and carries no file name. A `text/calendar` is
- *   never body: the invitation reader reads it as a leaf of its own (M7).
+ * - every child of every multipart is walked, so the text after an inline
+ *   photo (Apple Mail), a mailing list's plain footer after an HTML post, and
+ *   a bounce's delivery status are body;
+ * - a leaf is body when it is `text/plain`, `text/html` or
+ *   `message/delivery-status` with no disposition or `inline`; any other
+ *   disposition makes it an attachment, and a file name does not matter.
+ *   A `text/calendar` is never body: the invitation reader reads it as a leaf
+ *   of its own (M7).
+ *
+ * One difference is kept on purpose: an attached `message/rfc822` is one leaf
+ * here, while mailparser descends into an inline one and shows its text.
  */
 export function bodyLeaves(structure: MessageStructureObject): BodyLeaf[] {
   const found: BodyLeaf[] = [];
   const walk = (node: MessageStructureObject, alternative: string | null): void => {
     if (isMultipart(node)) {
-      const children = node.childNodes ?? [];
-      const subtype = node.type.toLowerCase();
-      if (subtype === "multipart/alternative") {
-        for (const child of children) walk(child, node.part ?? "");
-      } else if (subtype === "multipart/mixed") {
-        for (const child of children) walk(child, alternative);
-      } else if (children[0]) {
-        walk(children[0], alternative);
-      }
+      const inner = node.type.toLowerCase() === "multipart/alternative" ? (node.part ?? "") : alternative;
+      for (const child of node.childNodes ?? []) walk(child, inner);
       return;
     }
     const part = toPart(node, "1");
@@ -159,23 +160,28 @@ export function bodyLeaves(structure: MessageStructureObject): BodyLeaf[] {
   return found;
 }
 
-/** The ids of {@link bodyLeaves}, split by type, each in document order. */
+/**
+ * The ids of {@link bodyLeaves}, split into HTML and the rest (plain text and
+ * delivery status, which read as text), each in document order.
+ */
 export function bodyParts(structure: MessageStructureObject): BodyPartIds {
   const found: BodyPartIds = { text: [], html: [] };
   for (const leaf of bodyLeaves(structure)) {
-    if (leaf.type === "text/plain") found.text.push(leaf.part);
-    else found.html.push(leaf.part);
+    if (leaf.type === "text/html") found.html.push(leaf.part);
+    else found.text.push(leaf.part);
   }
   return found;
 }
 
 /**
- * Every leaf that is not one of {@link bodyLeaves}: the message's attachments,
- * inline images and, for an invitation, the `text/calendar` alternative (M7).
+ * The leaves `get_message` lists as attachments: every leaf that is not body,
+ * which covers inline images and, for an invitation, the `text/calendar`
+ * alternative (M7); plus every body leaf with a file name, which is read as
+ * text and still listed so it can be fetched as the file it is.
  */
 export function attachmentParts(structure: MessageStructureObject): Part[] {
   const bodies = new Set(bodyLeaves(structure).map((leaf) => leaf.part));
-  return leafParts(structure).filter((p) => !bodies.has(p.part));
+  return leafParts(structure).filter((p) => !bodies.has(p.part) || p.filename !== null);
 }
 
 /**
