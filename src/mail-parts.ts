@@ -115,56 +115,81 @@ function isBodyLeaf(part: Part): boolean {
   );
 }
 
+/** A body leaf, and the `multipart/alternative` it is one of the versions of. */
+export interface BodyLeaf extends Part {
+  /**
+   * Part id of the nearest `multipart/alternative` above this leaf (`""` when
+   * that is the message's root), or null when the leaf is in none: then it is
+   * not a version of something else but a piece of the body in its own right.
+   */
+  alternative: string | null;
+}
+
 /**
- * The parts a reader shows as the message's text and HTML, in order.
+ * The leaves a reader shows as the message's body, in document order.
  *
  * - `multipart/alternative` and `multipart/mixed`: every branch is looked
- *   into, so the text after an inline photo (Apple Mail, mailing-list
- *   footers) is body, not an attachment.
+ *   into, so the text after an inline photo (Apple Mail), or a mailing list's
+ *   plain footer after an HTML post, is body, not an attachment.
  * - Any other multipart (`related`, `signed`, `report`, …): only its first
  *   part, its root; the rest is what that root refers to or is signed with.
  * - A leaf is body when it is `text/plain` or `text/html`, not an
  *   attachment by disposition, and carries no file name. A `text/calendar` is
  *   never body: the invitation reader reads it as a leaf of its own (M7).
  */
-export function bodyParts(structure: MessageStructureObject): BodyPartIds {
-  const found: BodyPartIds = { text: [], html: [] };
-  const walk = (node: MessageStructureObject): void => {
+export function bodyLeaves(structure: MessageStructureObject): BodyLeaf[] {
+  const found: BodyLeaf[] = [];
+  const walk = (node: MessageStructureObject, alternative: string | null): void => {
     if (isMultipart(node)) {
       const children = node.childNodes ?? [];
       const subtype = node.type.toLowerCase();
-      if (subtype === "multipart/alternative" || subtype === "multipart/mixed") {
-        for (const child of children) walk(child);
+      if (subtype === "multipart/alternative") {
+        for (const child of children) walk(child, node.part ?? "");
+      } else if (subtype === "multipart/mixed") {
+        for (const child of children) walk(child, alternative);
       } else if (children[0]) {
-        walk(children[0]);
+        walk(children[0], alternative);
       }
       return;
     }
     const part = toPart(node, "1");
-    if (!isBodyLeaf(part)) return;
-    if (part.type === "text/plain") found.text.push(part.part);
-    else found.html.push(part.part);
+    if (isBodyLeaf(part)) found.push({ ...part, alternative });
   };
-  walk(structure);
+  walk(structure, null);
+  return found;
+}
+
+/** The ids of {@link bodyLeaves}, split by type, each in document order. */
+export function bodyParts(structure: MessageStructureObject): BodyPartIds {
+  const found: BodyPartIds = { text: [], html: [] };
+  for (const leaf of bodyLeaves(structure)) {
+    if (leaf.type === "text/plain") found.text.push(leaf.part);
+    else found.html.push(leaf.part);
+  }
   return found;
 }
 
 /**
- * Every leaf that is not one of {@link bodyParts}: the message's attachments,
+ * Every leaf that is not one of {@link bodyLeaves}: the message's attachments,
  * inline images and, for an invitation, the `text/calendar` alternative (M7).
  */
 export function attachmentParts(structure: MessageStructureObject): Part[] {
-  const ids = bodyParts(structure);
-  const bodies = new Set([...ids.text, ...ids.html]);
+  const bodies = new Set(bodyLeaves(structure).map((leaf) => leaf.part));
   return leafParts(structure).filter((p) => !bodies.has(p.part));
 }
 
-/** The leaf a list preview reads: the first plain-text body part, else the first HTML one. */
+/**
+ * The leaf a list preview reads: the first body leaf in document order, so an
+ * HTML post with a plain footer previews the post. When that leaf is one
+ * version in an alternative, the plain-text version of the same alternative
+ * is preferred.
+ */
 export function previewPart(structure: MessageStructureObject): Part | null {
-  const ids = bodyParts(structure);
-  const id = ids.text[0] ?? ids.html[0];
-  if (!id) return null;
-  return leafParts(structure).find((p) => p.part === id) ?? null;
+  const leaves = bodyLeaves(structure);
+  const first = leaves[0];
+  if (!first) return null;
+  if (first.alternative === null || first.type === "text/plain") return first;
+  return leaves.find((l) => l.alternative === first.alternative && l.type === "text/plain") ?? first;
 }
 
 function decodeQuotedPrintable(input: string, partial: boolean): Buffer {
@@ -239,3 +264,4 @@ export function decodePart(
     partial: opts.partial,
   });
 }
+

@@ -12,6 +12,7 @@ import type { MessageStructureObject } from "imapflow";
 
 import {
   attachmentParts,
+  bodyLeaves,
   bodyParts,
   decodePart,
   decodeText,
@@ -311,4 +312,67 @@ test("decodePart: by the part's own encoding and charset, or as is when the serv
   assert.equal(decodePart(part, Buffer.from("Gr=FC=DFe")), "Grüße");
   assert.equal(decodePart(part, Buffer.from([0x47, 0x72, 0xfc, 0xdf, 0x65]), { binary: true }), "Grüße");
   assert.equal(decodePart(part, Buffer.from("Gr=FC=D"), { partial: true }), "Grü");
+});
+
+/** A Mailman footer on an HTML-only post: mixed [text/html, text/plain]. */
+const HTML_FOOTER: MessageStructureObject = {
+  type: "multipart/mixed",
+  childNodes: [
+    { part: "1", type: "text/html", parameters: { charset: "utf-8" }, encoding: "7bit", size: 200 },
+    { part: "2", type: "text/plain", parameters: { charset: "us-ascii" }, encoding: "7bit", size: 80 },
+  ],
+};
+
+test("mixed [html, text footer]: body leaves in document order, and the preview is the post, not the footer", () => {
+  assert.deepEqual(
+    bodyLeaves(HTML_FOOTER).map((p) => [p.part, p.type, p.alternative]),
+    [
+      ["1", "text/html", null],
+      ["2", "text/plain", null],
+    ]
+  );
+  assert.equal(previewPart(HTML_FOOTER)?.part, "1");
+});
+
+test("mixed [text, html, text]: the preview is the first leaf", () => {
+  const structure: MessageStructureObject = {
+    type: "multipart/mixed",
+    childNodes: [
+      { part: "1", type: "text/plain", encoding: "7bit", size: 10 },
+      { part: "2", type: "text/html", encoding: "7bit", size: 10 },
+      { part: "3", type: "text/plain", encoding: "7bit", size: 10 },
+    ],
+  };
+  assert.deepEqual(
+    bodyLeaves(structure).map((p) => p.part),
+    ["1", "2", "3"]
+  );
+  assert.equal(previewPart(structure)?.part, "1");
+});
+
+test("inside an alternative the preview still prefers the plain text, whatever its position", () => {
+  const structure: MessageStructureObject = {
+    type: "multipart/alternative",
+    childNodes: [
+      { part: "1", type: "text/html", encoding: "7bit", size: 10 },
+      { part: "2", type: "text/plain", encoding: "7bit", size: 10 },
+    ],
+  };
+  assert.deepEqual(
+    bodyLeaves(structure).map((p) => [p.part, p.alternative]),
+    [
+      ["1", ""],
+      ["2", ""],
+    ]
+  );
+  assert.equal(previewPart(structure)?.part, "2");
+  // Apple HTML: the leaves under the inner mixed still belong to the outer alternative.
+  assert.deepEqual(
+    bodyLeaves(APPLE_HTML).map((p) => [p.part, p.alternative]),
+    [
+      ["1", ""],
+      ["2.1", ""],
+      ["2.3", ""],
+    ]
+  );
 });

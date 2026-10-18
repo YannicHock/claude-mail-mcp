@@ -498,7 +498,62 @@ function bodyLayouts(imageBytes: number): string[] {
     "--A1--",
     "",
   ].join("\r\n");
-  return [textPhotoText, appleHtml];
+  const photo = [
+    "Content-Type: image/png; name=photo.png",
+    "Content-Disposition: attachment; filename=photo.png",
+    "Content-Transfer-Encoding: base64",
+    "",
+    image,
+  ].join("\r\n");
+  // A Mailman footer on an HTML-only post.
+  const htmlFooter = [
+    head(`html-footer ${imageBytes} ${tag}`, 'multipart/mixed; boundary="H1"'),
+    "--H1",
+    "Content-Type: text/html; charset=utf-8",
+    "",
+    "<html><body><h1>The post</h1><p>Some <b>HTML</b> text &amp; a <a href=\"https://example.com/\">link</a>.</p></body></html>",
+    "--H1",
+    "Content-Type: text/plain; charset=us-ascii",
+    "",
+    "-- ",
+    "list mailing list, https://lists.example.com/list",
+    "--H1",
+    photo,
+    "--H1--",
+    "",
+  ].join("\r\n");
+  const textHtmlText = [
+    head(`text-html-text ${imageBytes} ${tag}`, 'multipart/mixed; boundary="T1"'),
+    "--T1",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "Plain first, see https://example.com/a?b=1&c=2.",
+    "--T1",
+    "Content-Type: text/html; charset=utf-8",
+    "",
+    "<p>HTML in the middle</p>",
+    "--T1",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "Plain last <with> \"quotes\".",
+    "--T1",
+    photo,
+    "--T1--",
+    "",
+  ].join("\r\n");
+  // HTML and a photo, no plain text anywhere.
+  const htmlPhoto = [
+    head(`html-photo ${imageBytes} ${tag}`, 'multipart/mixed; boundary="P1"'),
+    "--P1",
+    "Content-Type: text/html; charset=utf-8",
+    "",
+    "<p>Only HTML here.</p>",
+    "--P1",
+    photo,
+    "--P1--",
+    "",
+  ].join("\r\n");
+  return [textPhotoText, appleHtml, htmlFooter, textHtmlText, htmlPhoto];
 }
 
 test("every body part counts, after an inline image too, and reads the same whole and by part", SKIP, async () => {
@@ -517,7 +572,7 @@ test("every body part counts, after an inline image too, and reads the same whol
     return (await callTool("get_message", { mailbox: "Bodies", uid })) as Detail;
   };
 
-  for (const layout of ["text-photo-text", "apple-html"]) {
+  for (const layout of ["text-photo-text", "apple-html", "html-footer", "text-html-text", "html-photo"]) {
     const whole = await detail(`${layout} 1024 ${tag}`);
     const byPart = await detail(`${layout} ${largeImage} ${tag}`);
     assert.equal(byPart.bodyText, whole.bodyText, `${layout}: bodyText differs between the two paths`);
@@ -537,4 +592,13 @@ test("every body part counts, after an inline image too, and reads the same whol
   const apple = await detail(`apple-html 1024 ${tag}`);
   assert.equal(apple.bodyText?.trim(), "Plain version.");
   assert.match(apple.bodyHtml ?? "", /Before the photo\.[\s\S]*After the photo\./);
+
+  // The Mailman footer: the text is the post, then the footer; the list
+  // preview is the post, not the footer.
+  const footer = await detail(`html-footer 1024 ${tag}`);
+  assert.match(footer.bodyText ?? "", /post[\s\S]*HTML[\s\S]*list mailing list/i);
+  for (const size of [1024, largeImage]) {
+    const summary = list.messages.find((m) => m.subject === `html-footer ${size} ${tag}`)!;
+    assert.match(summary.preview ?? "", /^the post/i, `list preview: ${summary.preview}`);
+  }
 });

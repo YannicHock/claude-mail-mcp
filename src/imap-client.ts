@@ -21,7 +21,7 @@ import {
   FetchMessageObject,
   MessageStructureObject,
 } from "imapflow";
-import { simpleParser, ParsedMail } from "mailparser";
+import { simpleParser, MailParser, ParsedMail } from "mailparser";
 import { convert as htmlToText } from "html-to-text";
 
 import {
@@ -33,9 +33,8 @@ import {
 } from "./mail-tls.js";
 import {
   attachmentParts,
-  bodyParts,
+  bodyLeaves,
   decodePart,
-  leafParts,
   previewPart,
   type Part,
 } from "./mail-parts.js";
@@ -479,13 +478,14 @@ export class ImapClient {
  */
 export async function fetchPartTexts(
   client: ImapFlow,
+  mailbox: string,
   uid: number,
   parts: Part[]
 ): Promise<Map<string, string>> {
   const texts = new Map<string, string>();
   if (parts.length === 0) return texts;
   const msg = await client.fetchOne(`${uid}`, { bodyParts: parts.map((p) => p.part) }, { uid: true });
-  if (!msg) throw new Error(`Message UID ${uid} not found`);
+  if (!msg) throw new Error(`Message UID ${uid} not found in ${mailbox}`);
   for (const part of parts) {
     const bytes = partBytes(msg, part.part);
     if (!bytes) continue;
@@ -542,12 +542,20 @@ async function readWhole(client: ImapFlow, uid: number, mailbox: string): Promis
 }
 
 /**
- * A large message by part: its header block, and its body parts, decoded by
- * what BODYSTRUCTURE says of them (transfer encoding, charset) and joined the
- * way mailparser joins them for a message read whole: text parts with "\n",
- * HTML parts with "<br/>\n", line ends as "\n", and the HTML reduced to text
- * by the same `html-to-text` when there is no plain text. Attachments are
- * never fetched; their sizes come from BODYSTRUCTURE.
+ * A large message by part: its header block, and its body leaves, decoded by
+ * what BODYSTRUCTURE says of them (transfer encoding, charset). Attachments
+ * are never fetched; their sizes come from BODYSTRUCTURE.
+ *
+ * The bodies are assembled by mailparser's own rule (`getTextContent` in
+ * mailparser 3.9), so a message reads the same over and under
+ * WHOLE_MESSAGE_MAX_BYTES. Leaf by leaf, in document order, line ends as "\n":
+ * - plain text goes into the text; outside an alternative, and when the
+ *   message also has HTML, it goes into the HTML too, through mailparser's
+ *   own `textToHtml`;
+ * - HTML goes into the HTML; outside an alternative, and when the message also
+ *   has plain text, it goes into the text through `html-to-text` (the version
+ *   mailparser uses), as it does for a single-part HTML message;
+ * - text parts are joined with "\n", HTML parts with "<br/>\n".
  *
  * Not imapflow's `download`: it learns a part's encoding from a second fetch
  * of the part's MIME header, and GreenMail's answer to that left a
@@ -564,22 +572,43 @@ async function readByPart(
     throw new Error(`Message UID ${uid} not found in ${mailbox}`);
   }
   const parsed = await simpleParser(Buffer.concat([head.headers ?? Buffer.alloc(0), Buffer.from("\r\n")]));
-  const ids = bodyParts(structure);
-  const leaves = leafParts(structure);
-  const wanted = [...ids.text, ...ids.html]
-    .map((id) => leaves.find((p) => p.part === id))
-    .filter((p): p is Part => p !== undefined);
-  const texts = await fetchPartTexts(client, uid, wanted);
-  const joined = (list: string[], separator: string): string | null => {
-    const found = list
-      .map((id) => texts.get(id))
-      .filter((t): t is string => t !== undefined)
-      .map((t) => t.replace(/\r?\n/g, "\n"));
-    return found.length > 0 ? found.join(separator) : null;
+  const leaves = bodyLeaves(structure);
+  const texts = await fetchPartTexts(client, mailbox, uid, leaves);
+
+  const singlePart = !structure.type.toLowerCase().startsWith("multipart/");
+  const hasText = leaves.some((l) => l.type === "text/plain");
+  const hasHtml = leaves.some((l) => l.type === "text/html");
+  const text: string[] = [];
+  const html: string[] = [];
+  for (const leaf of leaves) {
+    const raw = texts.get(leaf.part);
+    if (raw === undefined) continue;
+    const content = raw.replace(/\r?\n/g, "\n");
+    const inAlternative = leaf.alternative !== null;
+    if (leaf.type === "text/plain") {
+      text.push(content);
+      if (!inAlternative && hasHtml) html.push(textToHtml(content));
+    } else {
+      if ((!inAlternative && hasText) || (singlePart && !hasText)) text.push(htmlToText(content));
+      html.push(content);
+    }
+  }
+  return {
+    parsed,
+    bodyText: text.length > 0 ? text.join("\n") : null,
+    bodyHtml: html.length > 0 ? html.join("<br/>\n") : null,
   };
-  const bodyHtml = joined(ids.html, "<br/>\n");
-  const bodyText = joined(ids.text, "\n") ?? (bodyHtml !== null ? htmlToText(bodyHtml) : null);
-  return { parsed, bodyText, bodyHtml };
+}
+
+/**
+ * Plain text as HTML, exactly as mailparser renders it for a message read
+ * whole (links found, entities escaped). Its `textToHtml` is an instance
+ * method its types do not declare; a MailParser that is never written to is
+ * only an idle stream.
+ */
+function textToHtml(text: string): string {
+  const parser = new MailParser() as unknown as { textToHtml(str: string): string };
+  return parser.textToHtml(text);
 }
 
 /** A fetched body part by id; imapflow keys the map by the section as the server echoed it. */
