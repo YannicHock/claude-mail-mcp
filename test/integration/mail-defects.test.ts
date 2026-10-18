@@ -15,15 +15,23 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { ImapFlow, type FetchMessageObject } from "imapflow";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { makeAccount, makeAccountsFile, makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
 import { startMcpApp, type McpTestApp } from "../helpers/mcp-app.js";
 import { isDockerAvailable, composeUp, composeDown, waitForGreenmailReady } from "../helpers/docker.js";
 import { ensureMailboxes } from "../helpers/imap-setup.js";
+import {
+  GREENMAIL_HOST as HOST,
+  GREENMAIL_IMAP_PORT as IMAP_PORT,
+  GREENMAIL_SMTP_PORT as SMTP_PORT,
+  GREENMAIL_USERS as USERS,
+  appendRaw,
+  callTool as callToolOn,
+  connectMcpClient,
+  sourcesContaining,
+} from "../helpers/greenmail.js";
+import { WHOLE_MESSAGE_MAX_BYTES } from "../../src/imap-client.js";
 
 const DOCKER_AVAILABLE = isDockerAvailable();
 const SKIP: { skip: string } | Record<string, never> = DOCKER_AVAILABLE
@@ -31,78 +39,15 @@ const SKIP: { skip: string } | Record<string, never> = DOCKER_AVAILABLE
   : { skip: "Docker is not available — skipping integration tests against GreenMail" };
 
 const AUTH_TOKEN = "greenmail-defects-token";
-const HOST = "127.0.0.1";
-const IMAP_PORT = 3143;
-const SMTP_PORT = 3025;
 
-const USERS = {
-  alice: { user: "alice", pass: "pw1" },
-  bob: { user: "bob", pass: "pw2" },
-} as const;
-
-const FOLDERS = ["Drafts", "Sent", "F2", "F3", "F4", "M3", "Big"];
+const FOLDERS = ["Drafts", "Sent", "F2", "F3", "F4", "M3", "Big", "Bodies"];
 
 let dir: string | undefined;
 let app: McpTestApp | undefined;
 let client: Client | undefined;
 
-async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-  const result = (await client!.callTool({ name, arguments: args })) as CallToolResult;
-  if (result.isError) {
-    throw new Error(`Tool "${name}" returned an error result: ${JSON.stringify(result)}`);
-  }
-  const first = result.content[0];
-  if (!first || first.type !== "text") {
-    throw new Error(`Tool "${name}" returned no text content: ${JSON.stringify(result)}`);
-  }
-  return JSON.parse(first.text);
-}
-
-/** A short-lived IMAP session of the test's own, beside the connector's. */
-async function withImap<T>(who: keyof typeof USERS, run: (imap: ImapFlow) => Promise<T>): Promise<T> {
-  const imap = new ImapFlow({
-    host: HOST,
-    port: IMAP_PORT,
-    secure: false,
-    auth: USERS[who],
-    logger: false,
-  });
-  await imap.connect();
-  try {
-    return await run(imap);
-  } finally {
-    await imap.logout().catch(() => {});
-  }
-}
-
-async function appendRaw(
-  who: keyof typeof USERS,
-  mailbox: string,
-  raw: string | Buffer,
-  opts: { flags?: string[]; internalDate?: Date } = {}
-): Promise<void> {
-  await withImap(who, (imap) => imap.append(mailbox, raw, opts.flags ?? [], opts.internalDate));
-}
-
-/** Every message in `mailbox` whose source contains `needle`, raw. */
-async function sourcesContaining(
-  who: keyof typeof USERS,
-  mailbox: string,
-  needle: string
-): Promise<string[]> {
-  return withImap(who, async (imap) => {
-    const lock = await imap.getMailboxLock(mailbox);
-    try {
-      const out: string[] = [];
-      for await (const msg of imap.fetch("1:*", { source: true }) as AsyncIterable<FetchMessageObject>) {
-        const text = (msg.source as Buffer).toString("utf8");
-        if (text.includes(needle)) out.push(text);
-      }
-      return out;
-    } finally {
-      lock.release();
-    }
-  });
+function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  return callToolOn(client!, name, args);
 }
 
 /** The header block of a raw message, unfolded, as name → values. */
@@ -190,12 +135,7 @@ before(async () => {
     }),
   ]);
   app = await startMcpApp({ accountsFile, authToken: AUTH_TOKEN });
-
-  client = new Client({ name: "mail-defects-test-client", version: "1.0.0" });
-  const transport = new StreamableHTTPClientTransport(new URL(`${app.url}/mcp`), {
-    requestInit: { headers: { authorization: `Bearer ${AUTH_TOKEN}` } },
-  });
-  await client.connect(transport);
+  client = await connectMcpClient(app.url, AUTH_TOKEN, "mail-defects-test-client");
 });
 
 after(async () => {
@@ -410,17 +350,15 @@ test("get_message reports each attachment's part and its decoded size", SKIP, as
   assert.equal(byName.get("notes.txt")?.contentType, "text/plain");
   assert.equal(byName.get("blob.bin")?.part, "3");
   assert.equal(byName.get("blob.bin")?.contentType, "application/octet-stream");
-  // Decoded, not the 410,670 BODYSTRUCTURE reports. Not exactly 300,000 here:
-  // GreenMail counts the part's 144 bytes of MIME header into its size, which
-  // a server like Dovecot does not (test/unit/mail-parts.test.ts has the exact
-  // case). Within 0.1 %.
+  // Decoded, not the 410,670 BODYSTRUCTURE reports: an upper bound, never
+  // below 300,000, and within the 3 % the line breaks account for.
   const size = byName.get("blob.bin")!.size;
-  assert.ok(Math.abs(size - 300_000) <= 300, `blob.bin size ${size}, expected about 300,000`);
+  assert.ok(size >= 300_000 && size <= 309_000, `blob.bin size ${size}, expected 300,000 to 309,000`);
 });
 
 // Spec §3.1's last bullet: a large message is read by part.
 test("get_message reads a message over 2 MB by part, without downloading its attachment", SKIP, async () => {
-  const big = Buffer.alloc(3 * 1024 * 1024, 1);
+  const big = Buffer.alloc(WHOLE_MESSAGE_MAX_BYTES + 1024 * 1024, 1);
   await appendRaw(
     "alice",
     "Big",
@@ -479,9 +417,9 @@ test("get_message reads a message over 2 MB by part, without downloading its att
     assert.equal(detail.bodyHtml?.trim(), "<p>Grüße, the <b>HTML</b> of a large message.</p>");
     assert.equal(detail.attachments.length, 1);
     assert.equal(detail.attachments[0]!.filename, "big.bin");
-    // Decoded size; GreenMail's part size includes the part's MIME header (see the M3 test).
+    // Decoded size, an upper bound (see the M3 test).
     const size = detail.attachments[0]!.size;
-    assert.ok(Math.abs(size - big.length) <= 300, `big.bin size ${size}, expected about ${big.length}`);
+    assert.ok(size >= big.length && size <= big.length * 1.03, `big.bin size ${size}, expected about ${big.length}`);
     assert.ok(asked.length > 0, "the proxy saw no fetch at all");
     for (const query of asked) {
       assert.ok(
@@ -492,4 +430,111 @@ test("get_message reads a message over 2 MB by part, without downloading its att
   } finally {
     imap.withMailbox = original;
   }
+});
+
+/**
+ * Two layouts where the body is more than the first part, each built twice:
+ * with a small image (read whole, by mailparser) and with one that takes the
+ * message over WHOLE_MESSAGE_MAX_BYTES (read by part). Both must give the
+ * reader the same body.
+ */
+function bodyLayouts(imageBytes: number): string[] {
+  const image = Buffer.alloc(imageBytes, 5).toString("base64").replace(/.{76}/g, "$&\r\n");
+  const head = (subject: string, type: string) =>
+    [
+      "From: Carol <carol@example.com>",
+      "To: alice@example.com",
+      `Subject: ${subject}`,
+      `Date: ${new Date().toUTCString()}`,
+      `Message-ID: <${subject.replace(/\W+/g, "-")}@example.com>`,
+      "MIME-Version: 1.0",
+      `Content-Type: ${type}`,
+      "",
+    ].join("\r\n");
+  const textPhotoText = [
+    head(`text-photo-text ${imageBytes} ${tag}`, 'multipart/mixed; boundary="B1"'),
+    "--B1",
+    "Content-Type: text/plain; charset=utf-8",
+    "Content-Transfer-Encoding: quoted-printable",
+    "",
+    "Erster Teil, Gr=C3=BC=C3=9Fe.",
+    "--B1",
+    "Content-Type: image/jpeg; name=photo.jpg",
+    "Content-Disposition: inline; filename=photo.jpg",
+    "Content-Transfer-Encoding: base64",
+    "",
+    image,
+    "--B1",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "Second part, after the photo.",
+    "--B1--",
+    "",
+  ].join("\r\n");
+  const appleHtml = [
+    head(`apple-html ${imageBytes} ${tag}`, 'multipart/alternative; boundary="A1"'),
+    "--A1",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "Plain version.",
+    "--A1",
+    'Content-Type: multipart/mixed; boundary="M1"',
+    "",
+    "--M1",
+    "Content-Type: text/html; charset=utf-8",
+    "",
+    "<html><body><p>Before the photo.</p></body></html>",
+    "--M1",
+    "Content-Type: image/png; name=photo.png",
+    "Content-Disposition: inline; filename=photo.png",
+    "Content-Transfer-Encoding: base64",
+    "",
+    image,
+    "--M1",
+    "Content-Type: text/html; charset=utf-8",
+    "",
+    "<html><body><p>After the photo.</p></body></html>",
+    "--M1--",
+    "--A1--",
+    "",
+  ].join("\r\n");
+  return [textPhotoText, appleHtml];
+}
+
+test("every body part counts, after an inline image too, and reads the same whole and by part", SKIP, async () => {
+  const largeImage = WHOLE_MESSAGE_MAX_BYTES + 512 * 1024;
+  for (const raw of [...bodyLayouts(1024), ...bodyLayouts(largeImage)]) await appendRaw("alice", "Bodies", raw);
+
+  const list = (await callTool("list_messages", { mailbox: "Bodies" })) as { messages: Summary[] };
+  type Detail = {
+    bodyText: string | null;
+    bodyHtml: string | null;
+    preview: string | null;
+    attachments: Array<{ filename: string | null; part: string | null }>;
+  };
+  const detail = async (subject: string): Promise<Detail> => {
+    const uid = list.messages.find((m) => m.subject === subject)!.uid;
+    return (await callTool("get_message", { mailbox: "Bodies", uid })) as Detail;
+  };
+
+  for (const layout of ["text-photo-text", "apple-html"]) {
+    const whole = await detail(`${layout} 1024 ${tag}`);
+    const byPart = await detail(`${layout} ${largeImage} ${tag}`);
+    assert.equal(byPart.bodyText, whole.bodyText, `${layout}: bodyText differs between the two paths`);
+    assert.equal(byPart.bodyHtml, whole.bodyHtml, `${layout}: bodyHtml differs between the two paths`);
+    assert.equal(byPart.preview, whole.preview, `${layout}: preview differs between the two paths`);
+    assert.deepEqual(
+      byPart.attachments.map((a) => a.part),
+      whole.attachments.map((a) => a.part)
+    );
+    // Only the image is an attachment; no body part is listed as one.
+    assert.equal(whole.attachments.length, 1, `${layout}: ${JSON.stringify(whole.attachments)}`);
+    assert.match(whole.attachments[0]!.filename ?? "", /^photo\./);
+  }
+
+  const textPhotoText = await detail(`text-photo-text 1024 ${tag}`);
+  assert.match(textPhotoText.bodyText ?? "", /Erster Teil, Grüße\.[\s\S]*Second part, after the photo\./);
+  const apple = await detail(`apple-html 1024 ${tag}`);
+  assert.equal(apple.bodyText?.trim(), "Plain version.");
+  assert.match(apple.bodyHtml ?? "", /Before the photo\.[\s\S]*After the photo\./);
 });

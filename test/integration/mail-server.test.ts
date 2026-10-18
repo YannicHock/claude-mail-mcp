@@ -27,13 +27,18 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { makeAccount, makeAccountsFile, makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
 import { startMcpApp, type McpTestApp } from "../helpers/mcp-app.js";
 import { isDockerAvailable, composeUp, composeDown, waitForGreenmailReady } from "../helpers/docker.js";
 import { ensureMailboxes } from "../helpers/imap-setup.js";
+import {
+  GREENMAIL_HOST,
+  GREENMAIL_IMAP_PORT as IMAP_PORT,
+  GREENMAIL_SMTP_PORT as SMTP_PORT,
+  callTool as callToolOn,
+  connectMcpClient,
+} from "../helpers/greenmail.js";
 
 const DOCKER_AVAILABLE = isDockerAvailable();
 const SKIP: { skip: string } | Record<string, never> = DOCKER_AVAILABLE
@@ -41,9 +46,6 @@ const SKIP: { skip: string } | Record<string, never> = DOCKER_AVAILABLE
   : { skip: "Docker is not available — skipping integration tests against GreenMail" };
 
 const AUTH_TOKEN = "greenmail-test-token";
-const GREENMAIL_HOST = "127.0.0.1";
-const IMAP_PORT = 3143;
-const SMTP_PORT = 3025;
 
 function greenmailAccount(id: "alice" | "bob", label: string, isDefault: boolean) {
   const pass = id === "alice" ? "pw1" : "pw2";
@@ -61,16 +63,8 @@ let dir: string | undefined;
 let app: McpTestApp | undefined;
 let client: Client | undefined;
 
-async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-  const result = (await client!.callTool({ name, arguments: args })) as CallToolResult;
-  if (result.isError) {
-    throw new Error(`Tool "${name}" returned an error result: ${JSON.stringify(result)}`);
-  }
-  const first = result.content[0];
-  if (!first || first.type !== "text") {
-    throw new Error(`Tool "${name}" returned no text content: ${JSON.stringify(result)}`);
-  }
-  return JSON.parse(first.text);
+function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  return callToolOn(client!, name, args);
 }
 
 before(async () => {
@@ -95,11 +89,7 @@ before(async () => {
   ]);
   app = await startMcpApp({ accountsFile, authToken: AUTH_TOKEN });
 
-  client = new Client({ name: "integration-test-client", version: "1.0.0" });
-  const transport = new StreamableHTTPClientTransport(new URL(`${app.url}/mcp`), {
-    requestInit: { headers: { authorization: `Bearer ${AUTH_TOKEN}` } },
-  });
-  await client.connect(transport);
+  client = await connectMcpClient(app.url, AUTH_TOKEN, "integration-test-client");
 });
 
 after(async () => {
