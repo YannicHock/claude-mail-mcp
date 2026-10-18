@@ -67,8 +67,12 @@
  * change to the event, or its deletion, may still make the server mail any
  * attendee it is free to schedule, and the texts say so rather than let
  * `false` read as "no one is mailed" (milestone review of v0.7.4). Removing
- * attendees with `false` is refused until acceptance A2 shows a server
- * honours it (`REMOVE_WITHOUT_NOTIFY_HONOURED` in src/ical-attendees.ts).
+ * attendees with `false` is honoured for one the server was never asked to
+ * schedule — marked `SCHEDULE-AGENT=CLIENT`, or on an event with no
+ * organizer — since acceptance A2 showed Nextcloud sends such an attendee no
+ * cancellation (2026-10-18, #236), and it too only asks; removing one the
+ * server was free to schedule is still refused (`checkRemoval` in
+ * src/ical-attendees.ts).
  *
  * Every write's answer says whom the server may now email, as `may_notify`
  * ({@link MAY_NOTIFY_ANSWER}): an ORGANIZER written by a call changes whom
@@ -185,7 +189,8 @@ const applyToSeriesSchema = z
 /**
  * What every tool that can make the calendar server mail attendees says
  * (spec 2026-09-29 §2.1): conditional throughout, since what a server sends is
- * acceptance A1/A2's to record, not this text's to promise.
+ * acceptance A1/A2's to record, not this text's to promise — and A2, run on
+ * Nextcloud, says what one server did, not what every server does.
  */
 const SERVER_MAY_MAIL =
   "This connector sends no mail itself. However, your calendar server may: Nextcloud, for example, may email the attendees of an event you organize when it is created, changed or deleted, and that mail cannot be recalled. Confirm with the user before creating, changing or deleting an event that has attendees.";
@@ -220,7 +225,7 @@ const notifyAttendeesSchema = z
   .boolean()
   .optional()
   .describe(
-    "Required whenever attendees are added or removed (create_event's attendees, update_event's add_attendees or remove_attendees): this is where real people may get mail, so ask the user which they want and confirm with the user before the call. true: the attendees are written plainly, and the calendar server may then email them an invitation, update or cancellation on its own; that mail cannot be recalled. false: each attendee this call adds is marked SCHEDULE-AGENT=CLIENT, which only asks the calendar server to send them nothing; the event lists them, and whether the server honours the request is up to the server. It covers only the attendees this call marks: a later change to the event, or deleting it or one of its occurrences, may still make the server email any attendee it is free to schedule. Removing attendees with false is refused for now, since the server may send them a cancellation regardless: leave them listed, or confirm with the user that they may be emailed and pass true. On an event that has attendees but no organizer yet, the account becomes its organizer, and the attendees already listed are treated like the ones added: with true, the server may email them too. The answer's may_notify lists everyone the calendar server may now email about the event."
+    "Required whenever attendees are added or removed (create_event's attendees, update_event's add_attendees or remove_attendees): this is where real people may get mail, so ask the user which they want and confirm with the user before the call. true: the attendees are written plainly, and the calendar server may then email them an invitation, update or cancellation on its own; that mail cannot be recalled. false: each attendee this call adds is marked SCHEDULE-AGENT=CLIENT, which only asks the calendar server to send them nothing; the event lists them, and whether the server honours the request is up to the server. It covers only the attendees this call marks: a later change to the event, or deleting it or one of its occurrences, may still make the server email any attendee it is free to schedule. Removing attendees with false is allowed only for an attendee the server was never asked to schedule (one marked SCHEDULE-AGENT=CLIENT, or any attendee of an event with no organizer yet), and it too only asks the server to send them nothing; removing an attendee the server was free to notify is refused, since the server may send them a cancellation regardless: leave them listed, or confirm with the user that they may be emailed and pass true. On an event that has attendees but no organizer yet, the account becomes its organizer, and the attendees already listed are treated like the ones added: with true, the server may email them too. The answer's may_notify lists everyone the calendar server may now email about the event."
   );
 
 /**
@@ -408,7 +413,7 @@ export function registerCalendarTools(
           .array(z.string().email())
           .optional()
           .describe(
-            "Email addresses to take off the guest list; every other attendee keeps their reply. Needs notify_attendees: true, and the calendar server may then email them a cancellation; for now removal with false is refused. An address that is not an attendee (of any occurrence, with apply_to_series) is refused, and nothing is changed."
+            "Email addresses to take off the guest list; every other attendee keeps their reply. Needs notify_attendees, and confirm with the user first. With notify_attendees: true the calendar server may then email them a cancellation. With false, only an attendee the server was never asked to schedule (marked SCHEDULE-AGENT=CLIENT, or on an event with no organizer) can be taken off, which only asks the server to send them nothing; any other is refused. An address that is not an attendee (of any occurrence, with apply_to_series) is refused, and nothing is changed."
           ),
         notify_attendees: notifyAttendeesSchema,
         recurrence_id: recurrenceIdSchema,

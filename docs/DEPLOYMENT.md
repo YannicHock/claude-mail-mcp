@@ -963,8 +963,10 @@ So the tools make the choice explicit rather than leaving it to the server:
   `remove_attendees`, cannot be called without `notify_attendees`. `true` writes
   the attendees plainly and the server may email them; `false` marks the ones
   added `SCHEDULE-AGENT=CLIENT`, which asks the server to send them nothing.
-  Removing attendees with `false` is refused until the acceptance run shows the
-  server honours it.
+  Removing attendees with `false` is allowed for an attendee who carries that
+  mark (or any attendee of an event with no `ORGANIZER` yet), and refused for
+  one listed plainly, whom the server may send a cancellation whatever the call
+  says: leave them listed, or remove them with `true`.
 - With attendees, the account is written as the event's `ORGANIZER`: the first
   `mailto:` its CalDAV principal lists, or the mailbox's sender address where it
   lists none. On Nextcloud that is the address the server recognises as "you
@@ -982,8 +984,11 @@ So the tools make the choice explicit rather than leaving it to the server:
 `notify_attendees: false` does not mean no one is mailed. It marks only the
 attendees that call adds `SCHEDULE-AGENT=CLIENT` (and, when the call is the one
 that makes the account the event's `ORGANIZER`, the attendees already listed),
-and that only asks the server to send them nothing: whether Nextcloud honours it
-is what acceptance point A2 has to show, and it has not been run yet. An
+and that only asks the server to send them nothing. Acceptance point A2 has
+been run on Nextcloud (2026-10-18): taking an attendee marked
+`SCHEDULE-AGENT=CLIENT` off a meeting sent them no cancellation, which is why
+removal with `false` is allowed for them. That is what one Nextcloud did, not a
+promise for every server. An
 attendee listed plainly, without that mark, stays one the server may mail: a
 later change to the meeting, or deleting it or one of its occurrences, may send
 them an update or a cancellation whatever an earlier call said. If you would
