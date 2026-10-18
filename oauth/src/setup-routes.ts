@@ -665,14 +665,21 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         return;
       }
 
-      const decided = stepFromProvider({
+      const resolved = stepFromProvider({
         email,
         password,
         chosen,
         presets,
-        defaults: stepDefaults(await laterMailboxIdentity(email)),
+        defaults: stepDefaults(),
         unsupported: carried,
       });
+      // A later mailbox's id goes on the full form only, once the choice has
+      // resolved to it: a choice sent back to the list (no address, an unknown
+      // id) shows no id, so it does not ask the connector for one.
+      const decided: MailboxSetupStep =
+        resolved.view === "manual"
+          ? { ...resolved, values: { ...resolved.values, ...(await laterMailboxIdentity(email)) } }
+          : resolved;
       if (decided.view === "manual" && decided.preset !== null) {
         log("info", "setup step 2: a provider preset was chosen", { provider: decided.preset.id });
       }

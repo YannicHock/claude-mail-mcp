@@ -59,7 +59,6 @@ import {
   stepFromLookup,
   stepFromProvider,
   stringField,
-  RESERVED_MAILBOX_IDS,
   suggestedIdentity,
   withSharedPassword,
   type MailboxDraft,
@@ -68,7 +67,6 @@ import {
   type ProviderPreset,
 } from "../../shared/settings-api.js";
 import { renderMailboxForm } from "../../src/settings-pages.js";
-import { RESERVED_IDS } from "../../src/accounts.js";
 
 function submittedForm(overrides: Record<string, string> = {}): Record<string, string> {
   return {
@@ -1101,11 +1099,5 @@ describe("suggestedIdentity — the id and label a later mailbox is offered", ()
   it("falls back to `mailbox` when the address leaves nothing to build on", () => {
     assert.equal(suggestedIdentity("", []).id, "mailbox");
     assert.equal(suggestedIdentity("...@example.com", []).id, "mailbox");
-  });
-
-  it("knows the same reserved ids the store refuses", () => {
-    // The store's set is in src/accounts.ts, which the OAuth layer cannot
-    // import; this is what keeps the copy in shared/ from drifting from it.
-    assert.deepEqual([...RESERVED_MAILBOX_IDS].sort(), [...RESERVED_IDS].sort());
   });
 });

@@ -1202,10 +1202,10 @@ export function formValues(draft: MailboxDraft): Record<string, string> {
  * /settings/mailboxes/new` and `POST /settings/mailboxes/test` would shadow an
  * account named either.
  *
- * The store's own set is `RESERVED_IDS` in the connector's `src/accounts.ts`,
- * which is what refuses them; this copy is here because the setup wizard cannot
- * import that module and {@link suggestedIdentity} must not offer one. A unit
- * test in the connector (test/unit/settings-api.test.ts) holds the two equal.
+ * The one list: the connector's store refuses these through `RESERVED_IDS` in
+ * `src/accounts.ts`, which is this set, and {@link suggestedIdentity} — which
+ * the setup wizard calls too, and which cannot import the connector — never
+ * offers one.
  */
 export const RESERVED_MAILBOX_IDS: ReadonlySet<string> = new Set(["new", "test"]);
 
