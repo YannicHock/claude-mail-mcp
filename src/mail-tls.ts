@@ -18,14 +18,11 @@
  *
  * ## Which hosts are local
  *
- * The rule has to hold against an attacker who can alter traffic, and DNS is
- * traffic. So the host *as configured* decides first, and resolution can only
- * ever make the answer stricter:
+ * The host *as configured* decides first, and resolution can only ever make
+ * the answer stricter:
  *
- *   1. An address literal is local when it is not public, by the same
- *      {@link isPublicIp} the #194 lookup uses to refuse connecting anywhere
- *      internal: loopback, RFC 1918, link-local, unique local, CGNAT. No
- *      lookup; there is nothing to look up.
+ *   1. An address literal is local when it is loopback, private or
+ *      link-local — {@link isLocalIp}, an allow-list. No lookup.
  *   2. A name can only be local when no public DNS name has its shape:
  *      a single label (`localhost`, a Docker service such as
  *      `protonmail-bridge`), or one under a suffix reserved for local use —
@@ -35,34 +32,40 @@
  *      STARTTLS and is never resolved here, so no DNS answer, forged or not,
  *      can let a public server's name fall back to plaintext.
  *   3. Such a name is then resolved, and is local only when it has at least
- *      one address and every address is not public. That catches the one
- *      honest way a short name reaches the internet: a search domain that
- *      turns `mail` into `mail.example.com`. A name that does not resolve is
- *      not local, which costs nothing, since the connection would fail too.
+ *      one address and every address is local. That catches the honest way a
+ *      short name reaches the internet: a search domain that turns `mail` into
+ *      `mail.example.com`. A name that does not resolve is not local.
+ *
+ * What step 3 does *not* do is make a name of that shape safe against an
+ * attacker who can forge its resolution. Such a name is local only by its DNS
+ * answer, and whoever forges that answer can point it at an address of their
+ * own that passes, then read the plaintext login. A `.local` name is answered
+ * by multicast DNS, so that is any peer on the LAN. For a bridge, configure an
+ * address literal or a Docker service name (Docker's resolver is inside the
+ * host); for anything on the internet, configure its dotted public name, which
+ * step 2 never lets fall back.
  *
  * ## The checked address is the one connected to
  *
  * A name allowed plaintext by step 3 is connected to at the address that was
  * checked, never by name. Were the library left to resolve the name again, a
  * resolver that answered the check with a private address and the connect
- * with a public one would get a plaintext `LOGIN` to a public host — the very
- * downgrade this module exists to stop. So {@link imapTlsOptions} and
- * {@link smtpTlsOptions} hand back the host to connect to: the checked address
- * with the configured name kept as `servername`, for SNI and the certificate
- * check if the server does offer STARTTLS. One address is pinned, IPv4 first
- * when there is one, since a pinned connection has no second family to fall
- * back to. A name that requires STARTTLS is connected to by name, as before:
- * there, a forged answer only reaches a server that has to present a
- * certificate for that name.
+ * with a public one would get a plaintext `LOGIN` to a public host. So
+ * {@link imapTlsOptions} and {@link smtpTlsOptions} hand back the host to
+ * connect to: the checked address, with the configured name as `servername`
+ * for SNI and the certificate check if the server does offer STARTTLS. One
+ * address is pinned, IPv4 first when there is one, since a pinned connection
+ * has no second family to fall back to. A name that requires STARTTLS is
+ * connected to by name: there, a forged answer only reaches a server that has
+ * to present a certificate for that name.
  *
  * The #194 rival-port check (`src/lookup-reachability.ts`) is not affected:
  * it connects and reads a greeting, and never logs in.
  */
 
-import dns from "node:dns/promises";
 import net from "node:net";
 
-import { isPublicIp } from "./autoconfig.js";
+import { isLocalIp, resolveAddresses } from "./net-address.js";
 
 /** The one thing classification does that leaves the process. Injectable for tests. */
 export interface MailTlsDeps {
@@ -70,40 +73,54 @@ export interface MailTlsDeps {
   resolveAddresses(hostname: string): Promise<string[]>;
 }
 
-export const defaultMailTlsDeps: MailTlsDeps = {
-  async resolveAddresses(hostname) {
-    const entries = await dns.lookup(hostname, { all: true, verbatim: true });
-    return entries.map((entry) => entry.address);
-  },
-};
+const defaultMailTlsDeps: MailTlsDeps = { resolveAddresses };
+
+/** Where a local host is reached in plaintext: the checked address, and the name it was checked for. */
+export interface LocalAddress {
+  address: string;
+  /** The configured name, normalised; absent when the host was an address literal. */
+  name?: string;
+}
 
 /**
- * The seam every connection builder takes: the address to connect to in
- * plaintext when `host` is local, `null` when it is not and `tls: false` must
- * be STARTTLS. {@link localMailAddress} in production; the tests inject `null`
- * to point a public-server code path at a fake server on loopback.
+ * The seam every connection builder takes: where to connect in plaintext when
+ * `host` is local, `null` when it is not and `tls: false` must be STARTTLS.
+ * {@link localMailAddress} in production; the tests inject `null` to point a
+ * public-server code path at a fake server on loopback.
  */
-export type LocalAddressCheck = (host: string) => Promise<string | null>;
+export type LocalAddressCheck = (host: string) => Promise<LocalAddress | null>;
 
-/** Suffixes no public DNS name can have. See step 2 in the module header. */
+/** The seam, as the probe and both clients take it. Tests only. */
+export interface MailTlsTestOptions {
+  localAddress?: LocalAddressCheck;
+}
+
+/**
+ * Suffixes no public DNS name can have. See step 2 in the module header; keep
+ * the list there, `docs/HARDENING.md` and the CHANGELOG entry in step with it.
+ */
 const LOCAL_SUFFIXES = [".localhost", ".local", ".home.arpa", ".internal"];
 
+/** `[::1]` is how an IPv6 literal is written in a URL, and may be typed so. */
+function unbracket(host: string): string {
+  return host.trim().replace(/^\[(.*)\]$/, "$1");
+}
+
 /**
- * The address `host` is reached at when it is loopback or private, by the
- * three steps in the module header, or `null`. Resolves a name at most once,
- * and the address it returns is the one that was checked. Never rejects: a
- * lookup that fails is "not local".
+ * Where `host` is reached when it is loopback or private, by the three steps
+ * in the module header, or `null`. Resolves a name at most once, and the
+ * address it returns is the one that was checked. Never rejects: a lookup
+ * that fails is "not local".
  */
 export async function localMailAddress(
   host: string,
   deps: MailTlsDeps = defaultMailTlsDeps
-): Promise<string | null> {
-  // `[::1]` is how an IPv6 literal is written in a URL, and may be typed so.
-  const unbracketed = host.trim().replace(/^\[(.*)\]$/, "$1");
-  if (net.isIP(unbracketed) !== 0) return isPublicIp(unbracketed) ? null : unbracketed;
+): Promise<LocalAddress | null> {
+  const literal = unbracket(host);
+  if (net.isIP(literal) !== 0) return isLocalIp(literal) ? { address: literal } : null;
 
   // `localhost.` and `localhost` are one name; the trailing dot only says so.
-  const name = unbracketed.toLowerCase().replace(/\.$/, "");
+  const name = literal.toLowerCase().replace(/\.$/, "");
   if (name === "") return null;
   const localByForm = !name.includes(".") || LOCAL_SUFFIXES.some((suffix) => name.endsWith(suffix));
   if (!localByForm) return null;
@@ -114,61 +131,58 @@ export async function localMailAddress(
   } catch {
     return null;
   }
-  if (addresses.length === 0 || addresses.some((address) => isPublicIp(address))) return null;
-  return addresses.find((address) => net.isIPv4(address)) ?? addresses[0]!;
+  if (addresses.length === 0 || !addresses.every((address) => isLocalIp(address))) return null;
+  return { address: addresses.find((address) => net.isIPv4(address)) ?? addresses[0]!, name };
 }
 
-/** Where to connect, for a `tls: false` account. */
-interface Endpoint {
+/** The host and TLS half of an `ImapFlow` options object. */
+export interface ImapTlsOptions {
   host: string;
-  /** The configured name, when `host` is the address it was checked at. */
+  secure: boolean;
+  doSTARTTLS?: true;
   servername?: string;
 }
 
-/**
- * `null` when `tls: false` must mean STARTTLS for `host`; otherwise where to
- * connect in opportunistic mode. Never asks about a `tls: true` account:
- * implicit TLS has nothing to fall back from, and is connected to by name.
- */
-async function plaintextEndpoint(host: string, check: LocalAddressCheck): Promise<Endpoint | null> {
-  const address = await check(host);
-  if (address === null) return null;
-  // A literal comes back as itself (unbracketed); only a resolved name needs
-  // its name carried beside the address.
-  return address === host.trim().replace(/^\[(.*)\]$/, "$1")
-    ? { host: address }
-    : { host: address, servername: host };
+/** The host and TLS half of a nodemailer SMTP transport's options. */
+export interface SmtpTlsOptions {
+  host: string;
+  secure: boolean;
+  requireTLS?: true;
+  servername?: string;
+}
+
+/** Where to connect in opportunistic mode, as either library spells it. */
+function pinned(local: LocalAddress): { host: string; servername?: string } {
+  return local.name === undefined ? { host: local.address } : { host: local.address, servername: local.name };
 }
 
 /**
- * The host and TLS half of an `ImapFlow` options object. `doSTARTTLS` is left
- * unset rather than `false` on a local host: unset is imapflow's opportunistic
- * mode, which still upgrades when the server offers it; `false` would never
- * upgrade.
+ * `doSTARTTLS` is left unset rather than `false` on a local host: unset is
+ * imapflow's opportunistic mode, which still upgrades when the server offers
+ * it; `false` would never upgrade. A `tls: true` account is not classified.
  */
 export async function imapTlsOptions(
   host: string,
   tls: boolean,
   check: LocalAddressCheck = localMailAddress
-): Promise<{ host: string; secure: boolean; doSTARTTLS?: true; servername?: string }> {
+): Promise<ImapTlsOptions> {
   if (tls) return { host, secure: true };
-  const local = await plaintextEndpoint(host, check);
-  return local === null ? { host, secure: false, doSTARTTLS: true } : { ...local, secure: false };
+  const local = await check(host);
+  return local === null ? { host, secure: false, doSTARTTLS: true } : { ...pinned(local), secure: false };
 }
 
 /**
- * The host and TLS half of a nodemailer SMTP transport's options. On a local
- * host nodemailer's default stands, which upgrades when the server offers
- * STARTTLS.
+ * On a local host nodemailer's default stands, which upgrades when the server
+ * offers STARTTLS. A `tls: true` account is not classified.
  */
 export async function smtpTlsOptions(
   host: string,
   tls: boolean,
   check: LocalAddressCheck = localMailAddress
-): Promise<{ host: string; secure: boolean; requireTLS?: true; servername?: string }> {
+): Promise<SmtpTlsOptions> {
   if (tls) return { host, secure: true };
-  const local = await plaintextEndpoint(host, check);
-  return local === null ? { host, secure: false, requireTLS: true } : { ...local, secure: false };
+  const local = await check(host);
+  return local === null ? { host, secure: false, requireTLS: true } : { ...pinned(local), secure: false };
 }
 
 /**
@@ -204,4 +218,13 @@ export function isStartTlsUnavailable(err: unknown): boolean {
   }
   // nodemailer's `_actionEHLO()`: no EHLO, and HELO has no STARTTLS at all.
   return err.message.startsWith("EHLO failed but HELO does not support required STARTTLS");
+}
+
+/**
+ * The error to pass on for `err`: {@link STARTTLS_REQUIRED_MESSAGE}, with the
+ * library's own error as its `cause`, when it is a STARTTLS refusal; `err`
+ * itself otherwise. The one rewording the probe and both clients share.
+ */
+export function startTlsError(err: unknown): unknown {
+  return isStartTlsUnavailable(err) ? new Error(STARTTLS_REQUIRED_MESSAGE, { cause: err }) : err;
 }

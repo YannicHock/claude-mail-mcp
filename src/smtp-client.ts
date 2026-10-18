@@ -10,9 +10,9 @@ import nodemailer, { Transporter, SendMailOptions } from "nodemailer";
 import {
   smtpTlsOptions,
   localMailAddress,
-  isStartTlsUnavailable,
-  STARTTLS_REQUIRED_MESSAGE,
+  startTlsError,
   type LocalAddressCheck,
+  type MailTlsTestOptions,
 } from "./mail-tls.js";
 
 export interface SmtpAuth {
@@ -61,28 +61,20 @@ export interface SendResult {
   response?: string;
 }
 
-export interface SmtpClientOptions {
-  /** Where a local host is reached in plaintext, or null (#220). Tests only. */
-  localAddress?: LocalAddressCheck;
-}
-
 export class SmtpClient {
   private readonly auth: SmtpAuth;
   private readonly defaults: SmtpDefaults;
   private readonly localAddress: LocalAddressCheck;
 
-  constructor(auth: SmtpAuth, defaults: SmtpDefaults, options: SmtpClientOptions = {}) {
+  constructor(auth: SmtpAuth, defaults: SmtpDefaults, options: MailTlsTestOptions = {}) {
     this.auth = auth;
     this.defaults = defaults;
     this.localAddress = options.localAddress ?? localMailAddress;
   }
 
   /**
-   * A transport per send. The plain (non-pooled) transport opens a connection
-   * per message anyway, so nothing is lost, and what `secure: false` means is
-   * decided at the moment the password would be sent: STARTTLS or nothing on
-   * a host that is not local (#220, src/mail-tls.ts). `tls` carries the host
-   * too: a local name is connected to at the address it was checked at.
+   * A transport per send: the plain (non-pooled) transport opens a connection
+   * per message anyway. Host and TLS by src/mail-tls.ts (#220).
    */
   private async transporter(): Promise<Transporter> {
     const tls = await smtpTlsOptions(this.auth.host, this.auth.secure, this.localAddress);
@@ -105,8 +97,7 @@ export class SmtpClient {
         response: info.response,
       };
     } catch (err) {
-      // nodemailer's own "Error upgrading connection with STARTTLS" says what, not why.
-      throw isStartTlsUnavailable(err) ? new Error(STARTTLS_REQUIRED_MESSAGE) : err;
+      throw startTlsError(err);
     } finally {
       transporter.close();
     }

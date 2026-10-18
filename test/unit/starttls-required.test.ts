@@ -14,14 +14,19 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { probeAccount, CREDENTIAL_REJECTION_MESSAGE } from "../../src/probe.js";
-import { STARTTLS_REQUIRED_MESSAGE, localMailAddress, type MailTlsDeps } from "../../src/mail-tls.js";
+import {
+  STARTTLS_REQUIRED_MESSAGE,
+  localMailAddress,
+  type LocalAddress,
+  type MailTlsDeps,
+} from "../../src/mail-tls.js";
 import { ImapClient } from "../../src/imap-client.js";
 import { SmtpClient } from "../../src/smtp-client.js";
 import type { ImapCreds, SmtpCreds } from "../../src/accounts.js";
-import { startRejectingImapServer } from "../helpers/fake-imap.js";
+import { startRejectingImapServer, startStartTlsRefusingImapServer } from "../helpers/fake-imap.js";
 import { startNoStartTlsSmtpServer } from "../helpers/fake-smtp.js";
 
-const NOT_LOCAL = async (): Promise<string | null> => null;
+const NOT_LOCAL = async (): Promise<LocalAddress | null> => null;
 const BOUNDS = { perProbeMs: 3000, totalMs: 6000 };
 
 function creds(port: number): ImapCreds & SmtpCreds {
@@ -31,6 +36,7 @@ function creds(port: number): ImapCreds & SmtpCreds {
 const sentLogin = (lines: readonly string[]): boolean =>
   lines.some((line) => /^\S+ (LOGIN|AUTHENTICATE)\b/i.test(line));
 const sentAuth = (lines: readonly string[]): boolean => lines.some((line) => /^AUTH\b/i.test(line));
+const sentMail = (lines: readonly string[]): boolean => lines.some((line) => /^MAIL FROM/i.test(line));
 
 test("the probe refuses a public server without STARTTLS, and never sends the password", async () => {
   const imap = await startRejectingImapServer();
@@ -105,13 +111,79 @@ test("SmtpClient refuses a public server without STARTTLS before AUTH", async ()
       { message: STARTTLS_REQUIRED_MESSAGE }
     );
     assert.equal(sentAuth(smtp.received), false, `SMTP saw: ${smtp.received.join(" | ")}`);
-    assert.equal(
-      smtp.received.some((line) => /^MAIL FROM/i.test(line)),
-      false,
-      "nothing of the message was sent either"
-    );
+    assert.equal(sentMail(smtp.received), false, "nothing of the message was sent either");
   } finally {
     await smtp.close();
+  }
+});
+
+test("a server that advertises STARTTLS and refuses it, or refuses EHLO, is refused too", async () => {
+  // The two other ways to keep a client off TLS: leave STARTTLS in the
+  // capabilities and answer it NO, or answer EHLO with an error so the client
+  // falls back to HELO, which has no STARTTLS at all.
+  const imap = await startStartTlsRefusingImapServer();
+  const smtp = await startNoStartTlsSmtpServer({ ehlo: "refused" });
+  try {
+    const report = await probeAccount(
+      { imap: creds(imap.port), smtp: creds(smtp.port) },
+      { ...BOUNDS, localAddress: NOT_LOCAL }
+    );
+    const refused = { ok: false, message: STARTTLS_REQUIRED_MESSAGE, credentialRejection: false };
+    assert.deepEqual(report.imap, refused);
+    assert.deepEqual(report.smtp, refused);
+    assert.ok(imap.received.some((line) => /^\S+ STARTTLS$/i.test(line)), "STARTTLS was asked for");
+    assert.equal(sentLogin(imap.received), false, `IMAP saw: ${imap.received.join(" | ")}`);
+    assert.equal(sentAuth(smtp.received), false, `SMTP saw: ${smtp.received.join(" | ")}`);
+    assert.equal(sentMail(smtp.received), false);
+
+    const imapClient = new ImapClient(
+      { host: "127.0.0.1", port: imap.port, user: "u", pass: "test-secret", secure: false },
+      { localAddress: NOT_LOCAL }
+    );
+    await assert.rejects(imapClient.listMailboxes(), { message: STARTTLS_REQUIRED_MESSAGE });
+    await imapClient.close();
+    const smtpClient = new SmtpClient(
+      { host: "127.0.0.1", port: smtp.port, user: "u", pass: "test-secret", secure: false },
+      { from: "u@example.invalid" },
+      { localAddress: NOT_LOCAL }
+    );
+    await assert.rejects(
+      smtpClient.send({ to: "someone@example.invalid", subject: "s", text: "t" }),
+      { message: STARTTLS_REQUIRED_MESSAGE }
+    );
+    assert.equal(sentLogin(imap.received), false);
+    assert.equal(sentAuth(smtp.received), false);
+    assert.equal(sentMail(smtp.received), false);
+  } finally {
+    await imap.close();
+    await smtp.close();
+  }
+});
+
+test("ImapClient connects again after a connect that failed, rather than repeating its failure", async () => {
+  // The first connect is refused for STARTTLS; the second is classified local
+  // and reaches LOGIN. Before the fix the second call got the first one's
+  // rejected promise back, without a connection, and so did every call after.
+  const imap = await startRejectingImapServer();
+  let calls = 0;
+  const client = new ImapClient(
+    { host: "127.0.0.1", port: imap.port, user: "u", pass: "test-secret", secure: false },
+    {
+      localAddress: async (host) => {
+        calls += 1;
+        return calls === 1 ? null : { address: host };
+      },
+    }
+  );
+  try {
+    await assert.rejects(client.listMailboxes(), { message: STARTTLS_REQUIRED_MESSAGE });
+    assert.equal(sentLogin(imap.received), false);
+    await assert.rejects(client.listMailboxes(), (err: Error) => err.message !== STARTTLS_REQUIRED_MESSAGE);
+    assert.equal(calls, 2, "the second call connected again");
+    assert.equal(sentLogin(imap.received), true);
+  } finally {
+    await client.close();
+    await imap.close();
   }
 });
 

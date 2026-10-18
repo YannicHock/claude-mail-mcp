@@ -14,6 +14,9 @@ import {
   imapTlsOptions,
   smtpTlsOptions,
   isStartTlsUnavailable,
+  startTlsError,
+  STARTTLS_REQUIRED_MESSAGE,
+  type LocalAddress,
   type MailTlsDeps,
 } from "../../src/mail-tls.js";
 
@@ -33,22 +36,43 @@ function resolver(table: Record<string, string[]>): MailTlsDeps & { asked: strin
 
 const NOWHERE = resolver({});
 
-test("loopback and private address literals are local, as themselves, without a lookup", async () => {
+test("loopback, private and link-local literals are local, as themselves, without a lookup", async () => {
   for (const [host, address] of [
     ["127.0.0.1", "127.0.0.1"],
     ["127.10.0.3", "127.10.0.3"],
     ["::1", "::1"],
     ["[::1]", "::1"],
-    ["10.0.0.5", "10.0.0.5"],
+    [" 10.0.0.5 ", "10.0.0.5"],
     ["172.17.0.2", "172.17.0.2"],
     ["192.168.1.20", "192.168.1.20"],
+    ["169.254.10.1", "169.254.10.1"],
     ["fd00::1", "fd00::1"],
     ["fe80::1", "fe80::1"],
     ["::ffff:127.0.0.1", "::ffff:127.0.0.1"],
+    ["::ffff:192.168.0.4", "::ffff:192.168.0.4"],
   ] as const) {
-    assert.equal(await localMailAddress(host, NOWHERE), address, host);
+    assert.deepEqual(await localMailAddress(host, NOWHERE), { address }, host);
   }
   assert.deepEqual(NOWHERE.asked, []);
+});
+
+test("a literal that is neither public nor local is not local: the rule is an allow-list", async () => {
+  // Each of these is "not public" to the lookup's SSRF guard, which refuses by
+  // default. Here, being allowed is what costs a password in cleartext.
+  for (const host of [
+    "0.0.0.0", // this network
+    "::", // unspecified
+    "100.64.0.1", // CGNAT, RFC 6598
+    "198.18.0.1", // benchmarking, RFC 2544
+    "240.0.0.1", // reserved
+    "255.255.255.255", // broadcast
+    "224.0.0.251", // multicast
+    "ff02::fb", // multicast
+    "fec0::1", // site-local, deprecated
+    "::ffff:100.64.0.1",
+  ]) {
+    assert.equal(await localMailAddress(host, NOWHERE), null, host);
+  }
 });
 
 test("a public address literal is not local", async () => {
@@ -72,7 +96,7 @@ test("a name that could be a public DNS name is never local, and is never looked
   assert.deepEqual(dns.asked, []);
 });
 
-test("a single-label or special-use name is local at the address it resolved to", async () => {
+test("a single-label or special-use name is local at the address it resolved to, under its normalised name", async () => {
   const dns = resolver({
     localhost: ["::1", "127.0.0.1"],
     "protonmail-bridge": ["172.18.0.4"],
@@ -81,26 +105,30 @@ test("a single-label or special-use name is local at the address it resolved to"
     "nas.local": ["192.168.1.30"],
     "mail.home.arpa": ["fd12::3"],
   });
+  const expect = async (host: string, local: LocalAddress): Promise<void> =>
+    assert.deepEqual(await localMailAddress(host, dns), local, host);
   // IPv4 first when there is one: a pinned connection has no other family to fall back to.
-  assert.equal(await localMailAddress("localhost", dns), "127.0.0.1");
-  assert.equal(await localMailAddress("LOCALHOST", dns), "127.0.0.1");
-  assert.equal(await localMailAddress("protonmail-bridge", dns), "172.18.0.4");
-  assert.equal(await localMailAddress("bridge.localhost", dns), "127.0.0.1");
-  assert.equal(await localMailAddress("host.docker.internal", dns), "192.168.65.254");
-  assert.equal(await localMailAddress("nas.local", dns), "192.168.1.30");
-  assert.equal(await localMailAddress("mail.home.arpa", dns), "fd12::3");
+  await expect("localhost", { address: "127.0.0.1", name: "localhost" });
+  await expect(" LOCALHOST. ", { address: "127.0.0.1", name: "localhost" });
+  await expect("protonmail-bridge", { address: "172.18.0.4", name: "protonmail-bridge" });
+  await expect("bridge.localhost", { address: "127.0.0.1", name: "bridge.localhost" });
+  await expect("host.docker.internal", { address: "192.168.65.254", name: "host.docker.internal" });
+  await expect("nas.local", { address: "192.168.1.30", name: "nas.local" });
+  await expect("mail.home.arpa", { address: "fd12::3", name: "mail.home.arpa" });
 });
 
-test("a single-label name that resolves anywhere public is not local", async () => {
+test("a single-label name that resolves anywhere but a local address is not local", async () => {
   // A search domain can turn `mail` into `mail.example.com`: then it is a
-  // public server, typed short.
+  // public server, typed short. CGNAT is not local either.
   const dns = resolver({
     mail: ["203.0.113.7"],
     mixed: ["10.0.0.2", "203.0.113.7"],
+    tailnet: ["100.101.102.103"],
     empty: [],
   });
   assert.equal(await localMailAddress("mail", dns), null);
   assert.equal(await localMailAddress("mixed", dns), null);
+  assert.equal(await localMailAddress("tailnet", dns), null);
   assert.equal(await localMailAddress("empty", dns), null);
 });
 
@@ -122,7 +150,7 @@ test("a plaintext connection goes to the address that was checked, and the name 
   };
   const check = (host: string) => localMailAddress(host, flipping);
 
-  assert.deepEqual(await imapTlsOptions("mailhost", false, check), {
+  assert.deepEqual(await imapTlsOptions("Mailhost.", false, check), {
     host: "10.0.0.9",
     servername: "mailhost",
     secure: false,
@@ -138,10 +166,10 @@ test("a plaintext connection goes to the address that was checked, and the name 
   assert.equal(calls, 1);
 });
 
-const PUBLIC = async (): Promise<string | null> => null;
+const PUBLIC = async (): Promise<LocalAddress | null> => null;
 
 test("tls: true is implicit TLS by name, wherever the host is, and the host is not classified", async () => {
-  const never = async (): Promise<string | null> => {
+  const never = async (): Promise<LocalAddress | null> => {
     throw new Error("a tls: true account has nothing to classify");
   };
   assert.deepEqual(await imapTlsOptions("imap.gmail.com", true, never), {
@@ -202,4 +230,15 @@ test("the two libraries' STARTTLS refusals are recognised, and nothing else is",
   assert.equal(isStartTlsUnavailable(imapHandshake), false);
   assert.equal(isStartTlsUnavailable(new Error("connect ECONNREFUSED")), false);
   assert.equal(isStartTlsUnavailable("Server does not support STARTTLS"), false);
+});
+
+test("startTlsError rewords a STARTTLS refusal, keeps the library's error as its cause, and passes anything else on", () => {
+  const imap = Object.assign(new Error("Server does not support STARTTLS"), { tlsFailed: true });
+  const reworded = startTlsError(imap);
+  assert.ok(reworded instanceof Error);
+  assert.equal(reworded.message, STARTTLS_REQUIRED_MESSAGE);
+  assert.equal(reworded.cause, imap);
+
+  const other = new Error("connect ECONNREFUSED");
+  assert.equal(startTlsError(other), other);
 });

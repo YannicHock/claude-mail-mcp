@@ -24,8 +24,14 @@ export interface FakeSmtpServer {
 /**
  * Start the server on an ephemeral loopback port. Resolves once it is
  * listening; call `close()` to stop it and drop any live sockets.
+ *
+ * `ehlo: "refused"` answers EHLO with `500` as well, the server an attacker
+ * presents to push a client down to HELO, which has no STARTTLS at all.
  */
-export async function startNoStartTlsSmtpServer(): Promise<FakeSmtpServer> {
+export async function startNoStartTlsSmtpServer(
+  options: { ehlo?: "ok" | "refused" } = {}
+): Promise<FakeSmtpServer> {
+  const ehloRefused = options.ehlo === "refused";
   const sockets = new Set<Socket>();
   const received: string[] = [];
 
@@ -47,7 +53,11 @@ export async function startNoStartTlsSmtpServer(): Promise<FakeSmtpServer> {
         const verb = line.split(" ", 1)[0]!.toUpperCase();
         switch (verb) {
           case "EHLO":
-            socket.write("250-fake-smtp\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n");
+            socket.write(
+              ehloRefused
+                ? "500 5.5.1 EHLO not understood\r\n"
+                : "250-fake-smtp\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n"
+            );
             break;
           case "STARTTLS":
             socket.write("502 5.5.1 STARTTLS not available\r\n");

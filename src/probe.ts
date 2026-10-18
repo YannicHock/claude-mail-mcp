@@ -21,9 +21,11 @@ import {
   imapTlsOptions,
   smtpTlsOptions,
   localMailAddress,
-  isStartTlsUnavailable,
-  STARTTLS_REQUIRED_MESSAGE,
+  startTlsError,
+  type ImapTlsOptions,
   type LocalAddressCheck,
+  type MailTlsTestOptions,
+  type SmtpTlsOptions,
 } from "./mail-tls.js";
 import {
   classifyFailure,
@@ -90,13 +92,9 @@ export interface ProbeReport {
  * login or was never reached. Nothing here re-derives that from a message.
  */
 function toFailure(err: unknown): ProbeResult {
-  // A server refused for not offering STARTTLS (#220) answered, and was never
-  // sent the credentials: not a rejection, and its library's wording says what
-  // happened without saying why that is a failure. src/mail-tls.ts says both.
-  if (isStartTlsUnavailable(err)) {
-    return { ok: false, message: STARTTLS_REQUIRED_MESSAGE, credentialRejection: false };
-  }
-  const { credentialRejection, reason } = classifyFailure(err);
+  // A STARTTLS refusal (#220) is reworded by src/mail-tls.ts first; it was
+  // never sent the credentials, so it is no rejection either.
+  const { credentialRejection, reason } = classifyFailure(startTlsError(err));
   return { ok: false, message: reason, credentialRejection };
 }
 
@@ -138,11 +136,8 @@ async function probeImap(
   perProbeMs: number,
   localAddress: LocalAddressCheck
 ): Promise<ProbeResult> {
-  // STARTTLS or nothing for `tls: false` on a host that is not local (#220);
-  // a local name is connected to at the address it was checked at, which
-  // `tls` carries as `host`. The lookup this may take is bounded by the same
-  // per-probe deadline.
-  let tls: Awaited<ReturnType<typeof imapTlsOptions>>;
+  // Host and TLS by src/mail-tls.ts (#220), its lookup inside the same deadline.
+  let tls: ImapTlsOptions;
   try {
     tls = await withTimeout(imapTlsOptions(creds.host, creds.tls, localAddress), perProbeMs, "IMAP");
   } catch (err) {
@@ -201,8 +196,8 @@ async function probeSmtp(
   perProbeMs: number,
   localAddress: LocalAddressCheck
 ): Promise<ProbeResult> {
-  // As in probeImap(): `requireTLS` for `tls: false` on a host that is not local.
-  let tls: Awaited<ReturnType<typeof smtpTlsOptions>>;
+  // Host and TLS by src/mail-tls.ts (#220), its lookup inside the same deadline.
+  let tls: SmtpTlsOptions;
   try {
     tls = await withTimeout(smtpTlsOptions(creds.host, creds.tls, localAddress), perProbeMs, "SMTP");
   } catch (err) {
@@ -421,12 +416,7 @@ async function probeCalDav(creds: CalDavCreds, perProbeMs: number): Promise<Prob
  */
 export async function probeAccount(
   input: ProbeInput,
-  opts: {
-    perProbeMs?: number;
-    totalMs?: number;
-    /** Where a local host is reached in plaintext, or null (#220). Tests only. */
-    localAddress?: LocalAddressCheck;
-  } = {}
+  opts: { perProbeMs?: number; totalMs?: number } & MailTlsTestOptions = {}
 ): Promise<ProbeReport> {
   const perProbeMs = opts.perProbeMs ?? PER_PROBE_TIMEOUT_MS;
   const totalMs = opts.totalMs ?? TOTAL_TIMEOUT_MS;

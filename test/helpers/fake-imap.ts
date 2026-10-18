@@ -40,7 +40,10 @@ type LineHandler = (socket: Socket, line: string) => void;
  * line through `handleLine`. Resolves once it is listening; call `close()` to
  * stop it and drop any live sockets.
  */
-async function startFakeImapServer(handleLine: LineHandler): Promise<FakeImapServer> {
+async function startFakeImapServer(
+  handleLine: LineHandler,
+  capabilities = "IMAP4rev1"
+): Promise<FakeImapServer> {
   const sockets = new Set<Socket>();
   const received: string[] = [];
 
@@ -50,7 +53,8 @@ async function startFakeImapServer(handleLine: LineHandler): Promise<FakeImapSer
     // A client that goes away mid-command must not take the process with it.
     socket.on("error", () => {});
 
-    socket.write("* OK [CAPABILITY IMAP4rev1] fake-imap ready\r\n");
+    // imapflow takes the greeting's capabilities and does not ask again.
+    socket.write(`* OK [CAPABILITY ${capabilities}] fake-imap ready\r\n`);
 
     let buffer = "";
     socket.on("data", (chunk) => {
@@ -109,6 +113,30 @@ export async function startRejectingImapServer(): Promise<FakeImapServer> {
  */
 export async function startMidLoginDropImapServer(): Promise<FakeImapServer> {
   return startFakeImapServer(handleMidLoginDropLine);
+}
+
+/**
+ * A server that advertises STARTTLS and then answers it `NO` (#220): an
+ * on-path attacker who leaves the capability in place and refuses the command
+ * instead. `LOGIN` is answered as the rejecting server does, so a client that
+ * carried on regardless shows up in `received`.
+ */
+export async function startStartTlsRefusingImapServer(): Promise<FakeImapServer> {
+  return startFakeImapServer((socket, line) => {
+    const parsed = parseCommand(line);
+    if (!parsed) return;
+    switch (parsed.command) {
+      case "CAPABILITY":
+        socket.write("* CAPABILITY IMAP4rev1 STARTTLS\r\n");
+        socket.write(`${parsed.tag} OK CAPABILITY completed\r\n`);
+        return;
+      case "STARTTLS":
+        socket.write(`${parsed.tag} NO STARTTLS not available\r\n`);
+        return;
+      default:
+        handleRejectingLine(socket, line);
+    }
+  }, "IMAP4rev1 STARTTLS");
 }
 
 /**
