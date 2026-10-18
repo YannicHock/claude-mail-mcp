@@ -479,7 +479,9 @@ test("get_message reads a message over 2 MB by part, without downloading its att
     assert.equal(detail.bodyHtml?.trim(), "<p>Grüße, the <b>HTML</b> of a large message.</p>");
     assert.equal(detail.attachments.length, 1);
     assert.equal(detail.attachments[0]!.filename, "big.bin");
-    assert.equal(detail.attachments[0]!.size, big.length);
+    // Decoded size; GreenMail's part size includes the part's MIME header (see the M3 test).
+    const size = detail.attachments[0]!.size;
+    assert.ok(Math.abs(size - big.length) <= 300, `big.bin size ${size}, expected about ${big.length}`);
     assert.ok(asked.length > 0, "the proxy saw no fetch at all");
     for (const query of asked) {
       assert.ok(
