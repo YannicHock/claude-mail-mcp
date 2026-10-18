@@ -17,6 +17,8 @@ import { existsSync } from "node:fs";
 
 import express, { type NextFunction, type Request, type Response } from "express";
 
+import { clientErrorStatus } from "../../shared/http-error.js";
+
 import { ASSERTION_HEADER, signAssertion } from "./assertion.js";
 import { type Bootstrap, operatorSeed, parseSetupPath } from "./bootstrap.js";
 import { registerClient } from "./clients.js";
@@ -863,17 +865,37 @@ export function createApp(opts: CreateAppOptions): OAuthApp {
   app.use(sendNotFound);
 
   // Express 5 forwards async rejections here. Without it a thrown error in a
-  // handler would hang the request until the client's own timeout.
+  // handler would hang the request until the client's own timeout. The body
+  // parsers end up here too, on a form over 64 KB or one that does not parse:
+  // that is the client's mistake and answers its own 4xx at `warn`, by the rule
+  // the connector's handler uses (shared/http-error.ts, #219). Everything else
+  // is this service's failure.
   app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
-    log("error", "unhandled request error", {
-      path: req.path,
-      error: err.message,
-    });
+    const status = clientErrorStatus(err);
+    if (status === undefined) {
+      log("error", "unhandled request error", {
+        path: req.path,
+        error: err.message,
+      });
+    } else {
+      log("warn", "rejected malformed request body", {
+        path: req.path,
+        status,
+        error: err.message,
+      });
+    }
     if (res.headersSent) {
       res.destroy();
       return;
     }
-    res.status(500).json({ error: "server_error" });
+    if (status === undefined) {
+      res.status(500).json({ error: "server_error" });
+      return;
+    }
+    res.status(status).json({
+      error: "invalid_request",
+      error_description: "The request body could not be read: malformed or oversized.",
+    });
   });
 
   return { app, store };

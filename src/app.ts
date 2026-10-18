@@ -28,6 +28,7 @@ import express, { NextFunction, Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
+import { clientErrorStatus } from "../shared/http-error.js";
 import type { Logger } from "../shared/log.js";
 import { AccountsStore, reservedIdAccounts, reservedIdNotice } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
@@ -230,19 +231,11 @@ export function createApp(opts: CreateAppOptions): express.Express {
     });
   });
 
-  // App-wide rather than router-only: the /mcp parser above and the settings
-  // router's own express.json()/express.urlencoded() pair all call next(err)
-  // on a malformed or oversized body, and none is a route handler that can
-  // catch that itself — it never reaches one. Without this, such an error
-  // falls through to Express 5's default handler, which renders an HTML page
-  // (including a stack trace unless NODE_ENV=production, which nothing here
-  // sets) instead of this app's otherwise-consistent JSON error shape. This
-  // sits after the 404 handler, not before it: the 404 handler always sends a
-  // response itself rather than calling next(), so ordering the two doesn't
-  // matter for correctness, but an error handler reads better last. It leaves
-  // the /mcp handler's own try/catch above alone — that one only ever sees
-  // errors from mcp.connect()/handleRequest() *after* the body already parsed
-  // successfully, so the two paths cannot both fire for the same request.
+  // App-wide rather than router-only: the body parsers call next(err) on what
+  // they refuse, and the settings routes rethrow what they do not handle
+  // themselves. Without this, either falls through to Express 5's default
+  // handler, which renders an HTML page with a stack trace instead of this
+  // app's JSON error shape.
   app.use(requestErrorHandler(log));
 
   return app;
@@ -256,7 +249,8 @@ export function createApp(opts: CreateAppOptions): express.Express {
  * that throws. It used to answer everything as a malformed body (#219): the
  * settings routes rethrow what they do not handle themselves, so a failed write
  * of accounts.json (ENOSPC, EACCES, EPERM) reached the operator as "your request
- * was malformed" and the log as a client error at `warn`.
+ * was malformed" and the log as a client error at `warn`. Which errors are the
+ * client's is decided by shared/http-error.ts, as in the OAuth layer's handler.
  */
 export function requestErrorHandler(log: Logger) {
   return (err: unknown, req: Request, res: Response, next: NextFunction): void => {
@@ -289,13 +283,4 @@ export function requestErrorHandler(log: Logger) {
       message: "The request could not be processed: malformed or oversized body.",
     });
   };
-}
-
-/** Body-parser errors (body-parser/raw-body) set `.status`/`.statusCode` to a
- * real 4xx (413 too large, 400 malformed, etc.). Anything without one, or with
- * a 5xx, is not the client's doing and gets `undefined`. */
-function clientErrorStatus(err: unknown): number | undefined {
-  const candidate =
-    (err as { status?: unknown } | null)?.status ?? (err as { statusCode?: unknown } | null)?.statusCode;
-  return typeof candidate === "number" && candidate >= 400 && candidate < 500 ? candidate : undefined;
 }

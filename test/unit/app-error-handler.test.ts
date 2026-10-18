@@ -33,6 +33,14 @@ function appWithHandler(lines: LogLine[]): express.Express {
       code: "ENOSPC",
     });
   });
+  app.post("/status-code", () => {
+    // Only `statusCode`, the spelling some middleware uses instead of `status`.
+    throw Object.assign(new Error("unsupported charset"), { statusCode: 415 });
+  });
+  app.post("/unavailable", () => {
+    // An HTTP error that is the server's own: a 5xx is never the client's doing.
+    throw Object.assign(new Error("upstream unavailable"), { status: 503 });
+  });
   app.post("/parse", express.json({ limit: "1kb" }), (_req, res) => {
     res.json({ ok: true });
   });
@@ -59,6 +67,32 @@ describe("requestErrorHandler", () => {
     assert.ok(!lines[0].message.includes("malformed"), lines[0].message);
     assert.equal(lines[0].extra?.path, "/write");
     assert.equal(lines[0].extra?.code, "ENOSPC");
+  });
+
+  it("keeps a 4xx carried only as statusCode", async () => {
+    const lines: LogLine[] = [];
+    await withServer(appWithHandler(lines), async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/status-code`, { method: "POST" });
+      assert.equal(res.status, 415);
+      assert.equal((await res.json()).error, "bad_request");
+    });
+    assert.deepEqual(
+      lines.map((line) => line.level),
+      ["warn"]
+    );
+  });
+
+  it("answers an error carrying a 5xx status with 500, logged at error", async () => {
+    const lines: LogLine[] = [];
+    await withServer(appWithHandler(lines), async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/unavailable`, { method: "POST" });
+      assert.equal(res.status, 500);
+      assert.equal((await res.json()).error, "internal_error");
+    });
+    assert.deepEqual(
+      lines.map((line) => [line.level, line.message]),
+      [["error", "request failed"]]
+    );
   });
 
   it("still answers a body the parser refused with the parser's own 4xx", async () => {
