@@ -243,12 +243,42 @@ export function createApp(opts: CreateAppOptions): express.Express {
   // the /mcp handler's own try/catch above alone — that one only ever sees
   // errors from mcp.connect()/handleRequest() *after* the body already parsed
   // successfully, so the two paths cannot both fire for the same request.
-  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+  app.use(requestErrorHandler(log));
+
+  return app;
+}
+
+/**
+ * The app-wide error handler: a body the parser refused gets its own 4xx, and
+ * anything else is the server's failure.
+ *
+ * Exported so test/unit/app-error-handler.test.ts can mount it behind a route
+ * that throws. It used to answer everything as a malformed body (#219): the
+ * settings routes rethrow what they do not handle themselves, so a failed write
+ * of accounts.json (ENOSPC, EACCES, EPERM) reached the operator as "your request
+ * was malformed" and the log as a client error at `warn`.
+ */
+export function requestErrorHandler(log: Logger) {
+  return (err: unknown, req: Request, res: Response, next: NextFunction): void => {
     if (res.headersSent) {
       next(err);
       return;
     }
-    const status = errorStatus(err);
+    const status = clientErrorStatus(err);
+    if (status === undefined) {
+      // The message and code only: an errno message names the path that failed,
+      // which is the operator's to see, and never carries the request body.
+      log("error", "request failed", {
+        path: req.path,
+        error: err instanceof Error ? err.message : String(err),
+        code: (err as NodeJS.ErrnoException | null)?.code,
+      });
+      res.status(500).json({
+        error: "internal_error",
+        message: "The server could not complete the request. The log has the details.",
+      });
+      return;
+    }
     log("warn", "rejected malformed request body", {
       path: req.path,
       status,
@@ -258,17 +288,14 @@ export function createApp(opts: CreateAppOptions): express.Express {
       error: "bad_request",
       message: "The request could not be processed: malformed or oversized body.",
     });
-  });
-
-  return app;
+  };
 }
 
 /** Body-parser errors (body-parser/raw-body) set `.status`/`.statusCode` to a
- * real 4xx (413 too large, 400 malformed, etc.); anything else defaults to 400
- * rather than assuming a 500 for what is, in every case this handler is
- * reached, a request the client sent wrong. */
-function errorStatus(err: unknown): number {
+ * real 4xx (413 too large, 400 malformed, etc.). Anything without one, or with
+ * a 5xx, is not the client's doing and gets `undefined`. */
+function clientErrorStatus(err: unknown): number | undefined {
   const candidate =
     (err as { status?: unknown } | null)?.status ?? (err as { statusCode?: unknown } | null)?.statusCode;
-  return typeof candidate === "number" && candidate >= 400 && candidate < 600 ? candidate : 400;
+  return typeof candidate === "number" && candidate >= 400 && candidate < 500 ? candidate : undefined;
 }

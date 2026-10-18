@@ -1,9 +1,14 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { AccountsStore, type Account } from "../../src/accounts.js";
+import {
+  RENAME_RETRY_DELAYS_MS,
+  renameWithRetry,
+  writeAccountsFile,
+} from "../../src/accounts-writer.js";
 import { makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
 
 // accounts-writer.test.ts creates a fresh AccountsStore per test (several per
@@ -330,4 +335,62 @@ test("onChange fires exactly once for a successful mutation, and not at all for 
   } finally {
     store.stop();
   }
+});
+
+// #219: on Windows a rename over a file another handle holds open fails with
+// EPERM, and the likeliest holder is the store's own reload of the previous
+// write. The rename is injected here so a busy file can be failed on demand
+// instead of raced for.
+
+/** An errno-shaped error, as fs/promises rejects with. */
+function errno(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(`${code}: rename failed`), { code });
+}
+
+test("a rename refused with EPERM a few times is retried until it lands", async () => {
+  let calls = 0;
+  await renameWithRetry("from", "to", async () => {
+    calls++;
+    if (calls <= 3) throw errno(calls === 2 ? "EBUSY" : "EPERM");
+  });
+  assert.equal(calls, 4, "three refusals, then the rename that succeeded");
+});
+
+test("a rename still refused when the budget runs out rethrows the last error", async () => {
+  let calls = 0;
+  const started = Date.now();
+  await assert.rejects(
+    renameWithRetry("from", "to", async () => {
+      calls++;
+      throw errno("EACCES");
+    }),
+    { code: "EACCES" }
+  );
+  assert.equal(calls, RENAME_RETRY_DELAYS_MS.length + 1, "one try plus one per delay");
+  const budget = RENAME_RETRY_DELAYS_MS.reduce((sum, ms) => sum + ms, 0);
+  assert.ok(budget < 1000, `the whole budget stays under a second, was ${budget} ms`);
+  // A few ms of slack: timers on Windows can fire a tick early.
+  assert.ok(Date.now() - started >= budget - 20, "the delays were actually waited");
+});
+
+test("a rename failing for any other reason is not retried", async () => {
+  let calls = 0;
+  await assert.rejects(
+    renameWithRetry("from", "to", async () => {
+      calls++;
+      throw errno("ENOENT");
+    }),
+    { code: "ENOENT" }
+  );
+  assert.equal(calls, 1);
+});
+
+test("a rename that never lands leaves no temp file behind", async () => {
+  const path = await tempAccounts();
+  // A directory where the file should go: rename refuses it on every platform
+  // (EISDIR on Linux, EPERM on Windows, which also walks the retries).
+  await mkdir(path);
+  await assert.rejects(writeAccountsFile(path, { version: 1, accounts: [] }));
+  const left = (await readdir(dirname(path))).filter((name) => name.endsWith(".tmp"));
+  assert.deepEqual(left, []);
 });
