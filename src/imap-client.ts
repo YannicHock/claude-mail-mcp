@@ -8,11 +8,11 @@
  * Tool handlers stay thin: they call high-level methods here, get back
  * plain JSON-shaped objects, and don't see imapflow internals.
  *
- * v0.8: `withMailbox()` is the one place a mailbox is connected to and locked,
- * so code outside this class (threads, attachments) can run its own FETCH
- * under the same rule. Which parts a message has, which of them is its text
- * and how large each is once decoded is src/mail-parts.ts's business, read
- * from BODYSTRUCTURE.
+ * v0.8: every operation on a selected mailbox goes through `withMailbox()`,
+ * the one place a mailbox is connected to and locked, so code outside this
+ * class (threads, attachments) can run its own FETCH under the same rule.
+ * Which parts a message has, which of them is its text and how large each is
+ * once decoded is src/mail-parts.ts's business, read from BODYSTRUCTURE.
  */
 
 import {
@@ -22,6 +22,7 @@ import {
   MessageStructureObject,
 } from "imapflow";
 import { simpleParser, ParsedMail } from "mailparser";
+import { convert as htmlToText } from "html-to-text";
 
 import {
   imapTlsOptions,
@@ -33,12 +34,12 @@ import {
 import {
   attachmentParts,
   bodyParts,
-  decodeText,
-  htmlToText,
+  decodePart,
   leafParts,
   previewPart,
   type Part,
 } from "./mail-parts.js";
+import { addrText, isoDate } from "./mail-envelope.js";
 
 export interface ImapAuth {
   host: string;
@@ -91,11 +92,18 @@ export interface MessageDetail extends MessageSummary {
 export interface AttachmentSummary {
   filename: string | null;
   contentType: string;
-  /** Decoded size, estimated from BODYSTRUCTURE (src/mail-parts.ts `decodedSize`). */
+  /**
+   * Decoded size in bytes, an upper-bound estimate from BODYSTRUCTURE
+   * (src/mail-parts.ts `decodedSize`): never below the real size, up to about
+   * 3 % above it for base64.
+   */
   size: number;
   contentId: string | null;
-  /** IMAP part id ("2", "1.2"): what an attachment download asks for. */
-  part: string;
+  /**
+   * IMAP part id ("2", "1.2"): what an attachment download asks for. Null only
+   * when the server sent no BODYSTRUCTURE, and the list is mailparser's.
+   */
+  part: string | null;
 }
 
 export interface SearchCriteria {
@@ -110,10 +118,10 @@ export interface SearchCriteria {
 }
 
 /**
- * Above this size (RFC822.SIZE) `get_message` reads a message by part, its
- * header block and its text and HTML only, instead of downloading all of it to
- * show its text (spec §3.1): a 40 MB message with one attachment no longer
- * costs 40 MB.
+ * Above this size (RFC822.SIZE, the whole message) `get_message` reads a
+ * message by part, its header block and its body parts only, instead of
+ * downloading all of it to show its text (spec §3.1): a 40 MB message with one
+ * attachment no longer costs 40 MB.
  */
 export const WHOLE_MESSAGE_MAX_BYTES = 2 * 1024 * 1024;
 
@@ -221,10 +229,11 @@ export class ImapClient {
   /**
    * Connect, lock `mailbox`, run `fn` with the connection, release the lock.
    *
-   * Every mailbox operation goes through here, and code outside this class
-   * (threads, attachments) builds on it rather than on a second copy of the
-   * connect-and-lock rule. `fn` must not keep the client past its promise: the
-   * lock, and with it the selected mailbox, is gone once that settles.
+   * Every operation on a selected mailbox goes through here, and code outside
+   * this class (threads, attachments) builds on it rather than on a second
+   * copy of the connect-and-lock rule. `fn` must not keep the client past its
+   * promise: the lock, and with it the selected mailbox, is gone once that
+   * settles.
    */
   async withMailbox<T>(mailbox: string, fn: (client: ImapFlow) => Promise<T>): Promise<T> {
     const client = await this.ensureConnected();
@@ -311,7 +320,7 @@ export class ImapClient {
       const size = meta.size ?? null;
       const content =
         structure && size !== null && size > WHOLE_MESSAGE_MAX_BYTES
-          ? await readByPart(client, uid, structure)
+          ? await readByPart(client, uid, mailbox, structure)
           : await readWhole(client, uid, mailbox);
       const parsed = content.parsed;
       const internalDate = isoDate(meta.internalDate);
@@ -332,7 +341,8 @@ export class ImapClient {
           ? parsed.cc.map((a) => a.text).join(", ")
           : parsed.cc?.text ?? null,
         size,
-        preview: content.bodyText ? content.bodyText.slice(0, PREVIEW_CHARS) : null,
+        // Normalised as the list previews are.
+        preview: content.bodyText ? previewOf(content.bodyText) : null,
         messageId: parsed.messageId ?? null,
         inReplyTo: parsed.inReplyTo ?? null,
         references: Array.isArray(parsed.references)
@@ -342,7 +352,16 @@ export class ImapClient {
             : [],
         bodyText: content.bodyText,
         bodyHtml: content.bodyHtml,
-        attachments: structure ? attachmentParts(structure).map(toAttachmentSummary) : [],
+        attachments: structure
+          ? attachmentParts(structure).map(toAttachmentSummary)
+          : // No BODYSTRUCTURE from the server: mailparser's list, without part ids.
+            (parsed.attachments ?? []).map((a) => ({
+              filename: a.filename ?? null,
+              contentType: a.contentType,
+              size: a.size,
+              contentId: a.cid ?? null,
+              part: null,
+            })),
       };
     });
   }
@@ -379,7 +398,8 @@ export class ImapClient {
 
   /**
    * Append a raw RFC 822 message to a folder — used for drafts and for
-   * keeping a copy of sent messages.
+   * keeping a copy of sent messages. APPEND needs no selected mailbox, so it
+   * takes no lock.
    */
   async append(
     mailbox: string,
@@ -442,10 +462,36 @@ export class ImapClient {
     return fetched
       .map(({ msg, part }) => {
         const got = raw.get(msg.uid);
-        return summarize(msg, part && got ? previewText(part, got.bytes, got.binary) : null);
+        const preview =
+          part && got ? previewOf(asText(part, decodePart(part, got.bytes, { binary: got.binary, partial: true }))) : null;
+        return summarize(msg, preview);
       })
       .sort((a, b) => b.uid - a.uid);
   }
+}
+
+/**
+ * The decoded text of each of `parts` of message `uid`, by part id, in one
+ * FETCH, each by its own transfer encoding and charset (src/mail-parts.ts
+ * `decodePart`). Runs inside {@link ImapClient.withMailbox}. `get_message`'s
+ * by-part read uses it for the bodies; the invitation reader can use it for a
+ * `text/calendar` leaf the same way on either path.
+ */
+export async function fetchPartTexts(
+  client: ImapFlow,
+  uid: number,
+  parts: Part[]
+): Promise<Map<string, string>> {
+  const texts = new Map<string, string>();
+  if (parts.length === 0) return texts;
+  const msg = await client.fetchOne(`${uid}`, { bodyParts: parts.map((p) => p.part) }, { uid: true });
+  if (!msg) throw new Error(`Message UID ${uid} not found`);
+  for (const part of parts) {
+    const bytes = partBytes(msg, part.part);
+    if (!bytes) continue;
+    texts.set(part.part, decodePart(part, bytes, { binary: msg.binaryParts?.has(part.part) ?? false }));
+  }
+  return texts;
 }
 
 /** The newest `limit` of a SEARCH result, whatever order the server listed them in. */
@@ -454,16 +500,14 @@ function newestUids(found: number[] | false | undefined, limit: number): number[
   return uids.slice(-limit);
 }
 
-function previewText(part: Part, bytes: Buffer, binary: boolean): string {
-  const text = decodeText(bytes, binary ? "binary" : part.encoding, part.params.charset);
-  const plain = part.type === "text/html" ? htmlToText(text) : text;
-  return plain.replace(/\s+/g, " ").trim().slice(0, PREVIEW_CHARS);
+/** A body part's text as a reader sees it: HTML reduced to text the way mailparser does it. */
+function asText(part: Part, text: string): string {
+  return part.type === "text/html" ? htmlToText(text) : text;
 }
 
-function isoDate(value: Date | string | undefined): string | null {
-  if (value === undefined) return null;
-  const date = value instanceof Date ? value : new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+/** The 200-character, whitespace-collapsed preview every tool reports. */
+function previewOf(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, PREVIEW_CHARS);
 }
 
 function toAttachmentSummary(part: Part): AttachmentSummary {
@@ -477,7 +521,7 @@ function toAttachmentSummary(part: Part): AttachmentSummary {
 }
 
 interface MessageContent {
-  /** The headers, parsed by mailparser on both paths, so both read them alike. */
+  /** The headers (and, read whole, the attachments) as mailparser reads them, on both paths. */
   parsed: ParsedMail;
   bodyText: string | null;
   bodyHtml: string | null;
@@ -498,9 +542,12 @@ async function readWhole(client: ImapFlow, uid: number, mailbox: string): Promis
 }
 
 /**
- * A large message by part: its header block, and its text and HTML parts,
- * decoded by what BODYSTRUCTURE says of them (transfer encoding, charset).
- * Its attachments are never fetched; their sizes come from BODYSTRUCTURE.
+ * A large message by part: its header block, and its body parts, decoded by
+ * what BODYSTRUCTURE says of them (transfer encoding, charset) and joined the
+ * way mailparser joins them for a message read whole: text parts with "\n",
+ * HTML parts with "<br/>\n", line ends as "\n", and the HTML reduced to text
+ * by the same `html-to-text` when there is no plain text. Attachments are
+ * never fetched; their sizes come from BODYSTRUCTURE.
  *
  * Not imapflow's `download`: it learns a part's encoding from a second fetch
  * of the part's MIME header, and GreenMail's answer to that left a
@@ -509,27 +556,29 @@ async function readWhole(client: ImapFlow, uid: number, mailbox: string): Promis
 async function readByPart(
   client: ImapFlow,
   uid: number,
+  mailbox: string,
   structure: MessageStructureObject
 ): Promise<MessageContent> {
+  const head = await client.fetchOne(`${uid}`, { headers: true }, { uid: true });
+  if (!head) {
+    throw new Error(`Message UID ${uid} not found in ${mailbox}`);
+  }
+  const parsed = await simpleParser(Buffer.concat([head.headers ?? Buffer.alloc(0), Buffer.from("\r\n")]));
   const ids = bodyParts(structure);
-  const leaves = leafParts(structure).filter((p) => p.part === ids.text || p.part === ids.html);
-  const msg = await client.fetchOne(
-    `${uid}`,
-    { headers: true, bodyParts: leaves.map((p) => p.part) },
-    { uid: true }
-  );
-  const headerBlock = msg && msg.headers ? msg.headers : Buffer.alloc(0);
-  const parsed = await simpleParser(Buffer.concat([headerBlock, Buffer.from("\r\n")]));
-  const textOf = (id: string | undefined): string | null => {
-    const part = leaves.find((p) => p.part === id);
-    const bytes = part && msg ? partBytes(msg, part.part) : undefined;
-    if (!part || !bytes) return null;
-    // A server that answered with FETCH BINARY has undone the transfer encoding.
-    const binary = msg ? (msg.binaryParts?.has(part.part) ?? false) : false;
-    return decodeText(bytes, binary ? "binary" : part.encoding, part.params.charset);
+  const leaves = leafParts(structure);
+  const wanted = [...ids.text, ...ids.html]
+    .map((id) => leaves.find((p) => p.part === id))
+    .filter((p): p is Part => p !== undefined);
+  const texts = await fetchPartTexts(client, uid, wanted);
+  const joined = (list: string[], separator: string): string | null => {
+    const found = list
+      .map((id) => texts.get(id))
+      .filter((t): t is string => t !== undefined)
+      .map((t) => t.replace(/\r?\n/g, "\n"));
+    return found.length > 0 ? found.join(separator) : null;
   };
-  const bodyHtml = textOf(ids.html);
-  const bodyText = textOf(ids.text) ?? (bodyHtml !== null ? htmlToText(bodyHtml) : null);
+  const bodyHtml = joined(ids.html, "<br/>\n");
+  const bodyText = joined(ids.text, "\n") ?? (bodyHtml !== null ? htmlToText(bodyHtml) : null);
   return { parsed, bodyText, bodyHtml };
 }
 
@@ -541,27 +590,6 @@ function partBytes(msg: FetchMessageObject, part: string): Buffer | undefined {
     if (key.toLowerCase() === wanted) return value;
   }
   return undefined;
-}
-
-function addrText(
-  addr:
-    | { name?: string; address?: string }[]
-    | { name?: string; address?: string }
-    | undefined
-): string | null {
-  if (!addr) return null;
-  const list = Array.isArray(addr) ? addr : [addr];
-  return (
-    list
-      .map((a) => {
-        const name = a?.name?.trim();
-        const email = a?.address?.trim();
-        if (name && email) return `${name} <${email}>`;
-        return email ?? name ?? null;
-      })
-      .filter((v): v is string => Boolean(v))
-      .join(", ") || null
-  );
 }
 
 function summarize(msg: FetchMessageObject, preview: string | null): MessageSummary {

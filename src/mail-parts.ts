@@ -8,9 +8,8 @@
  * text, and how large each one is once decoded. Those answers live here, over
  * imapflow's `MessageStructureObject`, so no network class carries them.
  *
- * Also here, because the previews need them and they are just as pure: decoding
- * a (possibly cut-off) transfer-encoded text part into a string, and reducing
- * HTML to text.
+ * Also here, because every reader of a part needs it and it is just as pure:
+ * turning a part's raw (transfer-encoded) bytes into its text.
  */
 
 import type { MessageStructureObject } from "imapflow";
@@ -33,40 +32,38 @@ export interface Part {
   encoding: string;
   /** Size on the wire, as BODYSTRUCTURE reports it (M3: the encoded size). */
   encodedSize: number;
-  /** Estimated size once the transfer encoding is undone; see {@link decodedSize}. */
+  /** Upper bound of the size once the transfer encoding is undone; see {@link decodedSize}. */
   decodedSize: number;
 }
 
-/** The part ids a reader shows as the message's text and its HTML. */
+/**
+ * The part ids a reader shows as the message's text and its HTML, each in the
+ * order the message carries them. Usually one of each at most; Apple Mail's
+ * "text, photo, text" has two text parts, and its HTML version two HTML parts.
+ */
 export interface BodyPartIds {
-  text?: string;
-  html?: string;
+  text: string[];
+  html: string[];
 }
 
-/** RFC 2045 §6.8: encoded lines are at most 76 characters, plus CRLF. */
-const BASE64_LINE = 76 + 2;
-
 /**
- * Estimated decoded size of a part whose BODYSTRUCTURE size is `encodedSize`.
+ * Upper bound of the decoded size of a part whose BODYSTRUCTURE size is
+ * `encodedSize`.
  *
- * Base64: the line breaks taken off, then × 3/4, rounded down. Lines of the
- * RFC 2045 maximum, 76 characters, are assumed, which is what composers write:
- * nodemailer encodes 300,000 bytes as 400,000 characters in 5,264 lines, 5,263
- * CRLFs between them (the one before the boundary belongs to the boundary),
- * 410,526 bytes in all. Base64 written without line breaks comes out up to
- * 2.5 % low, and padding is not visible from the structure, so the result can
- * be two bytes high. Every other encoding is reported as it is:
- * quoted-printable only ever shrinks when decoded, so its encoded size is an
- * upper bound, which is what a size check needs.
+ * Base64: × 3/4, rounded up, line breaks and all. That overshoots by the line
+ * breaks, about 2.5 % for the usual 76-character lines (nodemailer writes
+ * 300,000 bytes as 410,526, which gives 307,895), but it never undershoots,
+ * which is what a size check ahead of a truncating download needs (spec §2.6,
+ * M4). Every other encoding is reported as it is: quoted-printable only ever
+ * shrinks when decoded, so its encoded size is an upper bound too.
  *
  * GreenMail counts a part's own MIME header into its size (410,670 for the
- * part above), so against it the estimate is about a hundred bytes high.
+ * part above); that only makes the bound looser.
  */
 export function decodedSize(encodedSize: number, encoding: string): number {
   if (encodedSize <= 0) return 0;
   if (encoding.toLowerCase() !== "base64") return encodedSize;
-  const breaks = Math.floor(encodedSize / BASE64_LINE);
-  return Math.floor(((encodedSize - 2 * breaks) * 3) / 4);
+  return Math.ceil((encodedSize * 3) / 4);
 }
 
 function isMultipart(node: MessageStructureObject): boolean {
@@ -109,19 +106,34 @@ export function leafParts(structure: MessageStructureObject): Part[] {
   return out;
 }
 
+/** A `text/plain` or `text/html` leaf a reader shows inline: no attachment disposition, no name. */
+function isBodyLeaf(part: Part): boolean {
+  return (
+    (part.type === "text/plain" || part.type === "text/html") &&
+    part.disposition !== "attachment" &&
+    part.filename === null
+  );
+}
+
 /**
- * The parts a reader shows as the message's text and HTML: the first
- * `text/plain` and the first `text/html` that are not attachments, looking into
- * every branch of a `multipart/alternative` but only into the first part of any
- * other multipart (the root of `related`, the body of `mixed`). The rest of a
- * `mixed` message is what was attached to it.
+ * The parts a reader shows as the message's text and HTML, in order.
+ *
+ * - `multipart/alternative` and `multipart/mixed`: every branch is looked
+ *   into, so the text after an inline photo (Apple Mail, mailing-list
+ *   footers) is body, not an attachment.
+ * - Any other multipart (`related`, `signed`, `report`, …): only its first
+ *   part, its root; the rest is what that root refers to or is signed with.
+ * - A leaf is body when it is `text/plain` or `text/html`, not an
+ *   attachment by disposition, and carries no file name. A `text/calendar` is
+ *   never body: the invitation reader reads it as a leaf of its own (M7).
  */
 export function bodyParts(structure: MessageStructureObject): BodyPartIds {
-  const found: BodyPartIds = {};
+  const found: BodyPartIds = { text: [], html: [] };
   const walk = (node: MessageStructureObject): void => {
     if (isMultipart(node)) {
       const children = node.childNodes ?? [];
-      if (node.type.toLowerCase() === "multipart/alternative") {
+      const subtype = node.type.toLowerCase();
+      if (subtype === "multipart/alternative" || subtype === "multipart/mixed") {
         for (const child of children) walk(child);
       } else if (children[0]) {
         walk(children[0]);
@@ -129,9 +141,9 @@ export function bodyParts(structure: MessageStructureObject): BodyPartIds {
       return;
     }
     const part = toPart(node, "1");
-    if (part.disposition === "attachment") return;
-    if (part.type === "text/plain" && !found.text) found.text = part.part;
-    else if (part.type === "text/html" && !found.html) found.html = part.part;
+    if (!isBodyLeaf(part)) return;
+    if (part.type === "text/plain") found.text.push(part.part);
+    else found.html.push(part.part);
   };
   walk(structure);
   return found;
@@ -142,21 +154,24 @@ export function bodyParts(structure: MessageStructureObject): BodyPartIds {
  * inline images and, for an invitation, the `text/calendar` alternative (M7).
  */
 export function attachmentParts(structure: MessageStructureObject): Part[] {
-  const bodies = new Set(Object.values(bodyParts(structure)));
+  const ids = bodyParts(structure);
+  const bodies = new Set([...ids.text, ...ids.html]);
   return leafParts(structure).filter((p) => !bodies.has(p.part));
 }
 
-/** The leaf a list preview reads: the plain text, else the HTML. */
+/** The leaf a list preview reads: the first plain-text body part, else the first HTML one. */
 export function previewPart(structure: MessageStructureObject): Part | null {
   const ids = bodyParts(structure);
-  const id = ids.text ?? ids.html;
+  const id = ids.text[0] ?? ids.html[0];
   if (!id) return null;
   return leafParts(structure).find((p) => p.part === id) ?? null;
 }
 
-function decodeQuotedPrintable(input: string): Buffer {
-  // Soft line breaks go first; a cut-off escape at the very end is dropped.
-  const text = input.replace(/=\r?\n/g, "").replace(/=[0-9A-Fa-f]?$/, "");
+function decodeQuotedPrintable(input: string, partial: boolean): Buffer {
+  // Soft line breaks go first; a cut-off escape at the very end of a partial
+  // fetch is dropped.
+  let text = input.replace(/=\r?\n/g, "");
+  if (partial) text = text.replace(/=[0-9A-Fa-f]?$/, "");
   const bytes: number[] = [];
   for (let i = 0; i < text.length; i++) {
     const ch = text.charCodeAt(i);
@@ -179,16 +194,23 @@ function decodeBase64(input: string): Buffer {
 /**
  * The text of a part from its raw (transfer-encoded) bytes, in its charset.
  *
- * Built for previews, which fetch only the first few kilobytes of a part: an
- * escape or a multi-byte character cut off at the end is dropped rather than
- * shown as `=C3` or U+FFFD. A charset Node does not know is read as UTF-8,
- * so an odd label costs accuracy in one preview, not the whole list.
+ * `partial` is for a fetch cut off after a few kilobytes (the list previews):
+ * an escape or a multi-byte character cut in two at the end is dropped rather
+ * than shown as `=C3` or U+FFFD. A complete part keeps every byte it has. A
+ * charset Node does not know is read as UTF-8, so an odd label costs accuracy
+ * in one text, not the whole call.
  */
-export function decodeText(raw: Buffer, encoding: string, charset: string | undefined): string {
+export function decodeText(
+  raw: Buffer,
+  encoding: string,
+  charset: string | undefined,
+  opts: { partial?: boolean } = {}
+): string {
+  const partial = opts.partial ?? false;
   const transfer = encoding.toLowerCase();
   const bytes =
     transfer === "quoted-printable"
-      ? decodeQuotedPrintable(raw.toString("latin1"))
+      ? decodeQuotedPrintable(raw.toString("latin1"), partial)
       : transfer === "base64"
         ? decodeBase64(raw.toString("latin1"))
         : raw;
@@ -198,65 +220,22 @@ export function decodeText(raw: Buffer, encoding: string, charset: string | unde
   } catch {
     decoder = new TextDecoder("utf-8");
   }
-  return decoder.decode(bytes).replace(/�+$/, "");
-}
-
-const NAMED_ENTITIES: Record<string, string> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-  nbsp: " ",
-  auml: "ä",
-  ouml: "ö",
-  uuml: "ü",
-  Auml: "Ä",
-  Ouml: "Ö",
-  Uuml: "Ü",
-  szlig: "ß",
-  eacute: "é",
-  egrave: "è",
-  agrave: "à",
-  ccedil: "ç",
-  ndash: "–",
-  mdash: "—",
-  hellip: "…",
-  laquo: "«",
-  raquo: "»",
-  bdquo: "„",
-  ldquo: "“",
-  rdquo: "”",
-  lsquo: "‘",
-  rsquo: "’",
-  euro: "€",
-  copy: "©",
-  reg: "®",
-};
-
-function decodeEntities(text: string): string {
-  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, body: string) => {
-    if (body[0] === "#") {
-      const code = body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
-      try {
-        return String.fromCodePoint(code);
-      } catch {
-        return whole;
-      }
-    }
-    return NAMED_ENTITIES[body] ?? whole;
-  });
+  const text = decoder.decode(bytes);
+  return partial ? text.replace(/�+$/, "") : text;
 }
 
 /**
- * HTML reduced to its text, whitespace collapsed: enough for a preview, not a
- * renderer. Style, script and head are dropped with their contents; so is a
- * tag or block cut off at the end of a partial fetch.
+ * The text of `part` from the bytes a FETCH returned for it, by the part's own
+ * transfer encoding and charset. `binary`: the server answered with FETCH
+ * BINARY and has already undone the transfer encoding. `partial`: the bytes are
+ * the start of the part only (see {@link decodeText}).
  */
-export function htmlToText(html: string): string {
-  const text = html
-    .replace(/<!--[\s\S]*?(-->|$)/g, " ")
-    .replace(/<(style|script|head|title)\b[\s\S]*?(<\/\1\s*>|$)/gi, " ")
-    .replace(/<[^>]*(>|$)/g, " ");
-  return decodeEntities(text).replace(/\s+/g, " ").trim();
+export function decodePart(
+  part: Part,
+  bytes: Buffer,
+  opts: { binary?: boolean; partial?: boolean } = {}
+): string {
+  return decodeText(bytes, opts.binary ? "binary" : part.encoding, part.params.charset, {
+    partial: opts.partial,
+  });
 }

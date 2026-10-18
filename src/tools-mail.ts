@@ -164,7 +164,7 @@ export function registerMailTools(
     "get_message",
     {
       description:
-        "Fetch one message by UID. Returns headers, full text+HTML body, attachment metadata (filenames + content types, NOT raw bytes), and threading IDs (Message-ID, In-Reply-To, References) for replies.",
+        "Fetch one message by UID. Returns headers, full text+HTML body, attachment metadata (filenames + content types, NOT raw bytes), and threading IDs (Message-ID, In-Reply-To, References) for replies. `date` is the Date header and `internalDate` when the server received it; each attachment carries its IMAP `part` id and an upper-bound decoded `size` in bytes.",
       inputSchema: {
         mailbox: z.string().describe("IMAP folder the message lives in"),
         uid: z
