@@ -133,6 +133,7 @@ import {
   stepFromLookup,
   stringField,
   stepFromProvider,
+  suggestedIdentity,
   UNSUPPORTED_FIELD,
   UNSUPPORTED_FOR_FIELD,
   withSharedPassword,
@@ -707,38 +708,6 @@ function viewOf(req: Request): "address" | "providers" | "manual" {
   return "address";
 }
 
-/**
- * An id and a label for a mailbox that is not the first one.
- *
- * The setup wizard has no need of this: its mailbox is `main`, there is nothing
- * on disk to collide with, and it says so on the screen. Every mailbox added
- * afterwards needs an id of its own, and one derived from the address is the
- * obvious guess — so it is offered as a *filled-in box* on the confirmation
- * screen rather than applied, which is the same rule the derived server settings
- * beside it follow. Deriving it here rather than letting the operator meet
- * "Mailbox 'anna' already exists." after pressing Save is the whole point.
- *
- * It has to satisfy {@link ID_PATTERN}, so it is built to: lowercased, anything
- * outside the allowed set folded to `-`, a leading non-alphanumeric trimmed, and
- * short enough that the collision suffix still fits.
- */
-function suggestedIdentity(email: string, taken: readonly string[]): { id: string; label: string } {
-  const at = email.lastIndexOf("@");
-  const localPart = at <= 0 ? email : email.slice(0, at);
-  const stem =
-    localPart
-      .toLowerCase()
-      .replace(/[^a-z0-9_-]+/g, "-")
-      .replace(/^[^a-z0-9]+/, "")
-      .slice(0, 32) || "mailbox";
-
-  let id = stem;
-  for (let n = 2; taken.includes(id) || RESERVED_IDS.has(id); n += 1) {
-    id = `${stem.slice(0, 28)}-${n}`;
-  }
-  return { id, label: email };
-}
-
 function assertionOf(res: Response): VerifiedAssertion {
   // Safe: every route below runs `requireSettingsAssertion` first, which is the
   // only place that ever sets `res.locals.assertion`.
@@ -981,11 +950,16 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   /**
    * What a new mailbox starts out as, before a lookup or a preset fills it in.
    *
-   * The wizard's equivalent is a four-entry constant; this one has to look at
-   * the store, because a *second* mailbox needs an id nothing else has taken and
-   * because whether it should be the default depends on whether there is
-   * anything else. Everything in here is shown to the operator in a box they can
-   * change before anything is written.
+   * This has to look at the store, because a *second* mailbox needs an id
+   * nothing else has taken and because whether it should be the default depends
+   * on whether there is anything else. Everything in here is shown to the
+   * operator in a box they can change before anything is written.
+   *
+   * The setup wizard's equivalent is `stepDefaults` in
+   * oauth/src/setup-routes.ts, which asks the same of the connector's `/health`:
+   * `main` for a first mailbox, the same {@link suggestedIdentity} for a later
+   * one. It differs on the default (#162): the wizard shows no box for it, so it
+   * decides the flag when the mailbox is saved rather than here.
    */
   function newMailboxDefaults(email: string): Record<string, string> {
     const existing = store.list();
@@ -998,7 +972,9 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
       [MAILBOX_FIELDS.label]: identity.label,
       // The first mailbox on a fresh instance is the one the mail tools reach
       // for when none is named; a further one is not, unless the operator says
-      // so on the full form.
+      // so on the full form. The setup wizard keeps the same rule at its save
+      // (`savedDefault` in oauth/src/setup-routes.ts, #162): change one,
+      // change both.
       [MAILBOX_FIELDS.isDefault]: existing.length === 0 ? CHECKBOX_ON : "",
       [MAILBOX_FIELDS.imapPort]: "993",
       [MAILBOX_FIELDS.smtpPort]: "465",

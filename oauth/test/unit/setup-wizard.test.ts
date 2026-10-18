@@ -571,9 +571,27 @@ describe("the step 2 screen", () => {
       // screen's: they are left at their stored defaults and the operator
       // changes them from the settings UI once setup is finished.
       if (name.startsWith("mail.") && name !== "mail.defaultFrom") continue;
+      // `default` is decided when the mailbox is saved, from what the connector
+      // already has (#162): see the case below.
+      if (name === MAILBOX_FIELDS.isDefault) continue;
       assert.ok(html.includes(`name="${name}"`), `step 2's form has no box named ${name}`);
     }
     assert.equal(/<script/i.test(html), false);
+  });
+
+  it("carries no `default` field, whatever the values say (#162)", () => {
+    // The wizard offers no control for it, so a hidden field could only carry
+    // an earlier answer — the one a page from before the first save would
+    // still post after it. The save decides instead.
+    const cases: Array<Record<string, string>> = [{}, { [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON }];
+    for (const values of cases) {
+      const html = mailboxPage({ values });
+      assert.equal(
+        html.includes(`name="${MAILBOX_FIELDS.isDefault}"`),
+        false,
+        `a default field from ${JSON.stringify(values)}`
+      );
+    }
   });
 
   it("offers a way past it that does not need mail credentials to hand", () => {

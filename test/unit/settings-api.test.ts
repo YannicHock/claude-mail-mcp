@@ -59,6 +59,7 @@ import {
   stepFromLookup,
   stepFromProvider,
   stringField,
+  suggestedIdentity,
   withSharedPassword,
   type MailboxDraft,
   type MailboxProbeReport,
@@ -1074,5 +1075,29 @@ describe("stringField — the coercion this module owns", () => {
     // coercion as its own closure, 630 lines above the module-private one.
     const draft = draftFromFields({ [MAILBOX_FIELDS.imapHost]: ["a", "b"] });
     assert.equal(draft.imap.host, "");
+  });
+});
+
+describe("suggestedIdentity — the id and label a later mailbox is offered", () => {
+  // Shared since #162: the connector's Add mailbox form and the setup wizard's
+  // second pass both offer it, and a second copy in the wizard is how the two
+  // would start offering different ids for the same address.
+  it("derives the id from the local part and labels the mailbox with the address", () => {
+    assert.deepEqual(suggestedIdentity("Anna.Smith+news@example.com", []), {
+      id: "anna-smith-news",
+      label: "Anna.Smith+news@example.com",
+    });
+  });
+
+  it("steps past an id that is taken, and past a reserved one", () => {
+    assert.equal(suggestedIdentity("anna@example.com", ["anna"]).id, "anna-2");
+    assert.equal(suggestedIdentity("anna@example.com", ["anna", "anna-2"]).id, "anna-3");
+    assert.equal(suggestedIdentity("new@example.com", []).id, "new-2");
+    assert.equal(suggestedIdentity("test@example.com", []).id, "test-2");
+  });
+
+  it("falls back to `mailbox` when the address leaves nothing to build on", () => {
+    assert.equal(suggestedIdentity("", []).id, "mailbox");
+    assert.equal(suggestedIdentity("...@example.com", []).id, "mailbox");
   });
 });

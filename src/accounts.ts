@@ -37,6 +37,7 @@ import { watch, FSWatcher } from "node:fs";
 import path from "node:path";
 
 import { readStamp, writeAccountsFile, StaleStampError } from "./accounts-writer.js";
+import { RESERVED_MAILBOX_IDS } from "../shared/settings-api.js";
 
 export interface ImapCreds {
   host: string;
@@ -107,8 +108,12 @@ const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
  * {@link reservedIdNotice} are how that operator is told, rather than left to
  * discover it from a Save button that does nothing: the server warns once at
  * startup, and the mailbox list page repeats it on the affected row.
+ *
+ * The set itself is `RESERVED_MAILBOX_IDS` in shared/settings-api.ts, so the id
+ * a new mailbox is offered (`suggestedIdentity`, in the settings UI and the
+ * setup wizard alike) and the ids this store refuses are one list (#162).
  */
-export const RESERVED_IDS = new Set(["new", "test"]);
+export const RESERVED_IDS: ReadonlySet<string> = RESERVED_MAILBOX_IDS;
 
 /**
  * What is actually broken, per reserved id — the two collide in different

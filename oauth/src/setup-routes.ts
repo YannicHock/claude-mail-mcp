@@ -118,7 +118,6 @@ import {
   ADDRESS_FIELD,
   caldavFailureNotice,
   carrying,
-  CHECKBOX_ON,
   CONNECTOR_AUTOCONFIG_BUDGET_MS,
   CONNECTOR_PROBE_BUDGET_MS,
   domainOf,
@@ -142,6 +141,7 @@ import {
   stepFromLookup,
   stepFromProvider,
   stringField,
+  suggestedIdentity,
   UNSUPPORTED_FIELD,
   UNSUPPORTED_FOR_FIELD,
   withSharedPassword,
@@ -563,7 +563,13 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
             // "found nothing, here is the manual form" and lose the sentence on
             // the way, which is the shape #180 says to watch for.
             page(200, {
-              values: carrying(emptyMailboxValues(decided.email), decided.password),
+              values: carrying(
+                {
+                  ...emptyMailboxValues(decided.email),
+                  ...(await laterMailboxIdentity(decided.email)),
+                },
+                decided.password
+              ),
             });
             return;
           }
@@ -628,7 +634,9 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
           email,
           password,
           found,
-          defaults: stepDefaults(),
+          // Only a found suggestion shows an id; a miss leads to the provider
+          // list, which has none, so it does not ask.
+          defaults: stepDefaults(found === null ? {} : await laterMailboxIdentity(email)),
           unsupported: carried,
         })
       );
@@ -648,11 +656,16 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         // nothing to resolve the chosen id against, and the form is where the
         // operator was heading anyway. `page` puts the carried warning back on
         // it, so this path drops nothing either.
-        page(200, { values: carrying(emptyMailboxValues(email), password) });
+        page(200, {
+          values: carrying(
+            { ...emptyMailboxValues(email), ...(await laterMailboxIdentity(email)) },
+            password
+          ),
+        });
         return;
       }
 
-      const decided = stepFromProvider({
+      const resolved = stepFromProvider({
         email,
         password,
         chosen,
@@ -660,6 +673,13 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         defaults: stepDefaults(),
         unsupported: carried,
       });
+      // A later mailbox's id goes on the full form only, once the choice has
+      // resolved to it: a choice sent back to the list (no address, an unknown
+      // id) shows no id, so it does not ask the connector for one.
+      const decided: MailboxSetupStep =
+        resolved.view === "manual"
+          ? { ...resolved, values: { ...resolved.values, ...(await laterMailboxIdentity(email)) } }
+          : resolved;
       if (decided.view === "manual" && decided.preset !== null) {
         log("info", "setup step 2: a provider preset was chosen", { provider: decided.preset.id });
       }
@@ -811,7 +831,13 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
       return;
     }
 
-    const created = await mailboxes.create(draft, stamp, saveAnyway);
+    // Whether this mailbox becomes the default is decided here, at the write,
+    // and never read off the form (#162). The wizard shows no control for it,
+    // so anything the form carried would only be an earlier answer — and a page
+    // from before the first save (a Back, a second tab, a refused save's
+    // re-render) would still post it once a first mailbox exists.
+    const toSave: MailboxDraft = { ...draft, default: await savedDefault() };
+    const created = await mailboxes.create(toSave, stamp, saveAnyway);
     if (created.kind === "unreachable") {
       // The one call in this step whose outcome no answer settles. `Test
       // connection` can say "nothing was tested and nothing was saved" because
@@ -1064,7 +1090,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         return renderMailboxStep({ ...links, values: {}, errors: {}, unavailable: true });
       }
       if (view === "manual") {
-        return renderMailboxStep({ ...links, values: {}, errors: {} });
+        return renderMailboxStep({ ...links, values: await blankFormValues(), errors: {} });
       }
       if (view === "providers") {
         // The table is the connector's (#126 / #141), so tier 2 is one more
@@ -1073,7 +1099,7 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
         // answer to that is the tier below rather than an empty fieldset.
         const presets = await mailboxes.providers("");
         if (presets === null) {
-          return renderMailboxStep({ ...links, values: {}, errors: {} });
+          return renderMailboxStep({ ...links, values: await blankFormValues(), errors: {} });
         }
         return renderMailboxProviderStep(providerPageData(links, { providers: presets }));
       }
@@ -1108,6 +1134,59 @@ export function createSetupWizard(deps: SetupWizardDeps): SetupWizard {
     mailboxes: ConfiguredMailbox[];
   }> {
     return fetchConfiguredMailboxes(config.upstreamMcpUrl, log);
+  }
+
+  /**
+   * Whether the mailbox being saved becomes the default (#162): yes exactly
+   * when the connector has none yet, asked over the same `/health` read step
+   * 3's summary line makes, at the moment of the write.
+   *
+   * The other half of this rule is `newMailboxDefaults` in the connector's
+   * `src/settings-routes.ts`, which pre-ticks its *Default account* box on the
+   * same condition; change one, change both. An unreachable connector reads as
+   * "none", so the flag is sent as it always was: on an empty instance that is
+   * right, and the store's own rule (#139, `find(a => a.default) ??
+   * accounts[0]`) keeps a first mailbox the default either way.
+   */
+  async function savedDefault(): Promise<boolean> {
+    const configured = await configuredMailboxes();
+    return !(configured.reachable && configured.mailboxes.length > 0);
+  }
+
+  /**
+   * The id and label a *later* mailbox is offered, or nothing for the first.
+   *
+   * A second pass through step 2 after a Back (A11) offered `main` again, which
+   * the connector can only refuse as a taken id. So once the connector has a
+   * mailbox, the screens offer what its own *Add mailbox* page does — the same
+   * shared {@link suggestedIdentity}, clear of the ids it lists. These are
+   * visible, editable boxes rather than a decision the save trusts: a stale
+   * page posting a taken id is refused by the connector and says so.
+   *
+   * Empty for the first mailbox and for a connector that cannot be asked, so
+   * {@link MAILBOX_DEFAULTS}' `main` stands, as before.
+   */
+  async function laterMailboxIdentity(email: string): Promise<Record<string, string>> {
+    const configured = await configuredMailboxes();
+    if (!configured.reachable || configured.mailboxes.length === 0) return {};
+    const identity = suggestedIdentity(
+      email,
+      configured.mailboxes.map((mailbox) => mailbox.id)
+    );
+    return { [MAILBOX_FIELDS.id]: identity.id, [MAILBOX_FIELDS.label]: identity.label };
+  }
+
+  /**
+   * The full form's values on a GET: nothing for a first mailbox, which is the
+   * first render `renderMailboxStep` has always drawn, and a later one's id
+   * stated over the same blanks — TLS stated on as well, because the form reads
+   * any non-empty values as a submission.
+   */
+  async function blankFormValues(): Promise<Record<string, string>> {
+    const identity = await laterMailboxIdentity("");
+    return Object.keys(identity).length === 0
+      ? {}
+      : { ...MAILBOX_DEFAULTS, ...emptyMailboxValues(""), ...identity };
   }
 }
 
@@ -1295,14 +1374,18 @@ function providerPageData(
 /**
  * What step 2's mailbox starts out as, before a lookup or a preset fills it in.
  *
- * This is the wizard's half of the one thing the two entry points genuinely
- * disagree about. Its mailbox is the *first* one — `main`, and the account the
- * mail tools reach for when none is named — where the connector's *Add mailbox*
- * page derives an id from the address and makes it the default only on an empty
- * instance. Everything else about the cascade is the same code (#141).
+ * The ports, and the id and label: `main` for the first mailbox, or the
+ * `laterIdentity` a second pass through step 2 is offered — the same
+ * `suggestedIdentity` the connector's *Add mailbox* page (`newMailboxDefaults`
+ * in `src/settings-routes.ts`) offers. Everything else about the cascade is the
+ * same code (#141).
+ *
+ * No `default` flag (#162). The connector's page pre-ticks a box for it; the
+ * wizard shows none, and decides the flag at the write instead — see
+ * `savedDefault`.
  */
-function stepDefaults(): Record<string, string> {
-  return { ...MAILBOX_DEFAULTS, [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON };
+function stepDefaults(laterIdentity: Record<string, string> = {}): Record<string, string> {
+  return { ...MAILBOX_DEFAULTS, ...laterIdentity };
 }
 
 /** What the full form says when a provider preset has just filled it in. */
