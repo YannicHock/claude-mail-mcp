@@ -22,6 +22,8 @@ import {
   findProvider,
   MAIL_PROVIDERS,
   PROVIDER_ADVICE,
+  PROVIDERS,
+  SHARED_PASSWORD_CLAUSES,
   unsupportedNoticeFor,
 } from "../../src/providers.js";
 import {
@@ -39,7 +41,6 @@ describe("the advice table's own shape", () => {
         `${entry.id} has nothing to say and should not be an entry`
       );
       assert.match(entry.source, /^https:\/\//, `${entry.id} has no source URL`);
-      assert.notEqual(entry.label, "", `${entry.id} has no label`);
     }
   });
 
@@ -61,6 +62,92 @@ describe("the advice table's own shape", () => {
     for (const entry of PROVIDER_ADVICE) {
       if (entry.unsupported === undefined) continue;
       assert.equal(entry.credentialNote, undefined, `${entry.id} says both things at once`);
+    }
+  });
+});
+
+describe("one registry, two views (#182)", () => {
+  // `MAIL_PROVIDERS` is keyed on a chosen preset id and `PROVIDER_ADVICE` on the
+  // address's domain, and the two sets genuinely differ. Both are views of one
+  // `PROVIDERS` list now, so a shared id cannot drift between them — but which
+  // ids are one-sided is a decision, and a decision is pinned here as literals,
+  // the way the presets' ids are pinned next door.
+
+  it("holds the advice ids in this order", () => {
+    assert.deepEqual(
+      PROVIDER_ADVICE.map((entry) => entry.id),
+      ["gmail", "mailbox-org", "zoho", "fastmail", "icloud", "yahoo", "aol", "posteo", "microsoft", "proton"]
+    );
+  });
+
+  it("has a preset and no advice for exactly the providers with no domain to recognise", () => {
+    // Self-hosted (mailcow, iRedMail) or on the customer's own domain (Migadu,
+    // Hetzner): an address never says it is one of them.
+    const advised = new Set(PROVIDER_ADVICE.map((entry) => entry.id));
+    assert.deepEqual(
+      MAIL_PROVIDERS.map((provider) => provider.id).filter((id) => !advised.has(id)),
+      ["migadu", "hetzner-webhosting", "mailcow", "iredmail"]
+    );
+  });
+
+  it("has advice and no preset for exactly the providers with nothing safe to preset", () => {
+    // Zoho's IMAP host depends on the account type, Yahoo and AOL are one
+    // platform under two names, Microsoft and Proton have nothing to dial.
+    const preset = new Set(MAIL_PROVIDERS.map((provider) => provider.id));
+    assert.deepEqual(
+      PROVIDER_ADVICE.map((entry) => entry.id).filter((id) => !preset.has(id)),
+      ["zoho", "yahoo", "aol", "microsoft", "proton"]
+    );
+  });
+
+  it("derives both views from the registry, and every registry entry is in one", () => {
+    assert.deepEqual(
+      MAIL_PROVIDERS.map((provider) => provider.id),
+      PROVIDERS.filter((provider) => provider.preset !== undefined).map((provider) => provider.id)
+    );
+    assert.deepEqual(
+      PROVIDER_ADVICE.map((entry) => entry.id),
+      PROVIDERS.filter((provider) => provider.advice !== undefined).map((provider) => provider.id)
+    );
+    const ids = PROVIDERS.map((provider) => provider.id);
+    assert.equal(new Set(ids).size, ids.length, "an id is in the registry twice");
+    for (const provider of PROVIDERS) {
+      assert.ok(
+        provider.preset !== undefined || provider.advice !== undefined,
+        `${provider.id} is in neither view`
+      );
+      assert.notEqual(provider.label, "", `${provider.id} has no label`);
+    }
+  });
+
+  it("says iCloud's two usernames in one sentence, on the form and on a rejection", () => {
+    // #150 reworded iCloud's note and had to hand-edit the advice entry to keep
+    // the two saying the same thing. It is one string now.
+    const clause = "The IMAP username is the part before the @; the SMTP username is the whole address.";
+    assert.ok(SHARED_PASSWORD_CLAUSES.icloud?.includes(clause));
+    assert.ok(findProvider("icloud")?.note.includes(clause));
+    assert.ok(credentialNoteFor("anna@icloud.com")?.includes(clause));
+  });
+
+  it("composes every shared password clause into both the note and the credential note", () => {
+    assert.deepEqual(Object.keys(SHARED_PASSWORD_CLAUSES).sort(), [
+      "fastmail",
+      "gmail",
+      "icloud",
+      "mailbox-org",
+      "posteo",
+    ]);
+    for (const [id, clauses] of Object.entries(SHARED_PASSWORD_CLAUSES)) {
+      const provider = PROVIDERS.find((entry) => entry.id === id);
+      assert.ok(provider, id);
+      assert.ok(clauses.length > 0, `${id} shares nothing`);
+      for (const clause of clauses) {
+        assert.ok(provider.preset?.note.includes(clause), `${id}'s note lacks: ${clause}`);
+        assert.ok(
+          provider.advice?.credentialNote?.includes(clause),
+          `${id}'s credential note lacks: ${clause}`
+        );
+      }
     }
   });
 });

@@ -41,9 +41,11 @@ Four categories:
 
 ## Summary
 
-`src/providers.ts` holds two tables, and the column below says which of them an
-entry is in. **Preset** is `MAIL_PROVIDERS`: hosts, ports and TLS, offered as a
-choice on the provider screen. **Advice** is `PROVIDER_ADVICE`: what to say about
+`src/providers.ts` holds one registry, `PROVIDERS`, whose entries each have an
+optional preset half and an optional advice half, and the column below says which
+halves an entry has. **Preset** is the `MAIL_PROVIDERS` view: hosts, ports and TLS,
+offered as a choice on the provider screen. **Advice** is the `PROVIDER_ADVICE`
+view: what to say about
 a password, matched against the domain the operator's address ends in, and shown
 when it is relevant — a `credentialNote` when a server has just rejected the
 password (#148), and an `unsupported` warning from the moment the address is
@@ -58,21 +60,26 @@ IMAP host depends on the account type, Microsoft and Proton have nothing to dial
 — gets advice and no preset, because a possibly-wrong host in a required box is
 the failure mode `src/providers.ts` exists to avoid.
 
+The first two columns restate the registry, and `test/unit/providers-doc.test.ts`
+checks them against it in both directions: each provider is named by its registry
+label, and a row whose second column disagrees with the code fails the unit suite.
+The third column and everything below it is the research, written by hand.
+
 | Provider | In `src/providers.ts` | What the password must be |
 | --- | --- | --- |
 | [Gmail](#gmail) | preset + advice | App password when 2FA is on |
 | [mailbox.org](#mailboxorg) | preset + advice | App password when 2FA is on |
 | [Zoho Mail](#zoho-mail) | advice only | App password when 2FA is on |
-| [mailcow](#mailcow-self-hosted) | preset (`note`) | App password when 2FA is on |
+| [mailcow (self-hosted)](#mailcow-self-hosted) | preset (`note`) | App password when 2FA is on |
 | [Fastmail](#fastmail) | preset + advice | **App password always** |
 | [iCloud Mail](#icloud-mail) | preset + advice | **App password always** |
 | [Yahoo Mail](#yahoo-mail) | advice only | **App password always** |
 | [AOL Mail](#aol-mail) | advice only | **App password always** |
 | [Posteo](#posteo) | preset + advice | App password (see the entry — Posteo documents it as *the* credential) |
 | [Migadu](#migadu) | preset | Password |
-| [Hetzner Web Hosting](#hetzner-web-hosting--managed-server) | preset | Password |
-| [iRedMail](#iredmail-self-hosted) | preset | Password |
-| [Outlook.com / Microsoft 365](#outlookcom-and-microsoft-365) | advice (`unsupported`) | **Cannot be served** |
+| [Hetzner Web Hosting / Managed Server](#hetzner-web-hosting--managed-server) | preset | Password |
+| [iRedMail (self-hosted)](#iredmail-self-hosted) | preset | Password |
+| [Outlook.com and Microsoft 365](#outlookcom-and-microsoft-365) | advice (`unsupported`) | **Cannot be served** |
 | [Proton Mail](#proton-mail) | advice (`unsupported`) | **Cannot be served without the Bridge** |
 
 ---
@@ -80,9 +87,13 @@ the failure mode `src/providers.ts` exists to avoid.
 ## Providers that need an app password when 2FA is on
 
 For all four, an account **without** two-factor authentication takes the ordinary
-password, and turning 2FA on is what changes the answer. That is why the note
-belongs on a credential rejection rather than on the form: most operators of these
-providers have no problem, and the ones who do have exactly this one.
+password, and turning 2FA on is what changes the answer. That is why, for Gmail,
+mailbox.org and Zoho, the note belongs on a credential rejection rather than on the
+form: most operators of these providers have no problem, and the ones who do have
+exactly this one. mailcow is the exception. It is self-hosted, so no address can be
+recognised as a mailcow one and there is no rejection the note could be matched
+to; its rule lives on its preset's `note`, on the form, because the provider screen
+is the only place that knows it is mailcow.
 
 ### Gmail
 
@@ -428,11 +439,16 @@ current** documentation, put the URL in the entry, and if the documentation does
 answer the question, leave the note out. A provider with no verifiable note simply
 has none — the field is optional, and an entry without one is valid.
 
-Decide which table it belongs in, and it may be both. A `MAIL_PROVIDERS` preset
-needs documented hosts and ports that are the same for every customer of that
-provider; anything less than that is a wrong preset, which is worse than none. A
-`PROVIDER_ADVICE` entry needs domains its customers' addresses actually end in —
+Add one entry to `PROVIDERS` and decide which halves it gets; it may be both. A
+`preset` half needs documented hosts and ports that are the same for every customer
+of that provider; anything less than that is a wrong preset, which is worse than
+none. An `advice` half needs domains its customers' addresses actually end in —
 keep that list short, because a domain missing from it costs an operator a
 sentence, while a domain wrongly in it tells them something untrue. `credentialNote`
 and `unsupported` are mutually exclusive in practice: a provider that cannot be
-served has no app password to recommend.
+served has no app password to recommend. A password rule the preset `note` and the
+`credentialNote` both state is one constant composed into both, never two copies.
+
+Then add its row to the [summary](#summary), named by its `label`, and add its id to
+the pinned lists in `test/unit/providers.test.ts` and
+`test/unit/provider-advice.test.ts`. The unit suite fails until all three agree.
