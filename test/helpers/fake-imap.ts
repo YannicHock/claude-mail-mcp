@@ -116,6 +116,36 @@ export async function startMidLoginDropImapServer(): Promise<FakeImapServer> {
 }
 
 /**
+ * A server that accepts any `LOGIN`, once `loginGate` has settled, and answers
+ * `LIST` with no mailboxes. The gate holds a connect in flight for as long as a
+ * test needs: what `ImapClient.close()` does to a connect it overtakes is the
+ * case it exists for.
+ */
+export async function startAcceptingImapServer(
+  loginGate: Promise<void> = Promise.resolve()
+): Promise<FakeImapServer> {
+  return startFakeImapServer((socket, line) => {
+    const parsed = parseCommand(line);
+    if (!parsed) return;
+    switch (parsed.command) {
+      case "CAPABILITY":
+        writeCapability(socket, parsed.tag);
+        return;
+      case "LOGIN":
+        void loginGate.then(() => {
+          if (!socket.destroyed) socket.write(`${parsed.tag} OK LOGIN completed\r\n`);
+        });
+        return;
+      case "LIST":
+        socket.write(`${parsed.tag} OK LIST completed\r\n`);
+        return;
+      default:
+        handleRejectingLine(socket, line);
+    }
+  });
+}
+
+/**
  * A server that advertises STARTTLS and then answers it `NO` (#220): an
  * on-path attacker who leaves the capability in place and refuses the command
  * instead. `LOGIN` is answered as the rejecting server does, so a client that

@@ -76,9 +76,14 @@ export interface SearchCriteria {
   flagged?: boolean;
 }
 
+/** What a call waiting on a connect is told when close() abandoned it. */
+export const CLOSED_WHILE_CONNECTING = "the IMAP connection was closed while it was being opened";
+
 export class ImapClient {
   private client: ImapFlow | null = null;
   private connecting: Promise<ImapFlow> | null = null;
+  /** Bumped by close(), so a connect that outlives it knows not to be kept. */
+  private generation = 0;
   private readonly host: string;
   private readonly secure: boolean;
   /** Everything but the host and TLS, which src/mail-tls.ts decides per connect. */
@@ -116,8 +121,10 @@ export class ImapClient {
   }
 
   private async connect(): Promise<ImapFlow> {
+    const generation = this.generation;
     // Host and TLS per connect, by src/mail-tls.ts (#220).
     const tls = await imapTlsOptions(this.host, this.secure, this.localAddress);
+    if (this.generation !== generation) throw new Error(CLOSED_WHILE_CONNECTING);
     const client = new ImapFlow({ ...this.opts, ...tls });
     client.on("error", () => {
       // Mark unusable so next call reconnects.
@@ -131,11 +138,27 @@ export class ImapClient {
       client.close();
       throw startTlsError(err);
     }
+    if (this.generation !== generation) {
+      // close() was called while this connect was in flight. Keeping the
+      // connection would hand the next call one its owner closed, or leak it.
+      try {
+        await client.logout();
+      } catch {
+        // best effort
+      }
+      throw new Error(CLOSED_WHILE_CONNECTING);
+    }
     this.client = client;
     return client;
   }
 
+  /**
+   * Also abandons a connect still in flight: it finds the generation changed
+   * when it completes, and logs out instead of becoming the connection.
+   */
   async close(): Promise<void> {
+    this.generation += 1;
+    this.connecting = null;
     if (this.client) {
       const c = this.client;
       this.client = null;

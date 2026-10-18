@@ -20,10 +20,14 @@ import {
   type LocalAddress,
   type MailTlsDeps,
 } from "../../src/mail-tls.js";
-import { ImapClient } from "../../src/imap-client.js";
+import { ImapClient, CLOSED_WHILE_CONNECTING } from "../../src/imap-client.js";
 import { SmtpClient } from "../../src/smtp-client.js";
 import type { ImapCreds, SmtpCreds } from "../../src/accounts.js";
-import { startRejectingImapServer, startStartTlsRefusingImapServer } from "../helpers/fake-imap.js";
+import {
+  startAcceptingImapServer,
+  startRejectingImapServer,
+  startStartTlsRefusingImapServer,
+} from "../helpers/fake-imap.js";
 import { startNoStartTlsSmtpServer } from "../helpers/fake-smtp.js";
 
 const NOT_LOCAL = async (): Promise<LocalAddress | null> => null;
@@ -220,5 +224,36 @@ test("a local name is logged in to at the address it was checked at, not looked 
   } finally {
     await imap.close();
     await smtp.close();
+  }
+});
+
+test("ImapClient.close() during a connect: the connect is not kept, and the next call connects afresh", async () => {
+  // LOGIN is held until close() has run, so the connect completes after its
+  // owner closed the client. It must log out rather than become the client's
+  // connection, and the call waiting on it is told why.
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const imap = await startAcceptingImapServer(gate);
+  const client = new ImapClient(
+    { host: "127.0.0.1", port: imap.port, user: "u", pass: "test-secret", secure: false }
+  );
+  const logins = (): number => imap.received.filter((line) => /^\S+ LOGIN\b/i.test(line)).length;
+  try {
+    const pending = client.listMailboxes();
+    const settled = assert.rejects(pending, { message: CLOSED_WHILE_CONNECTING });
+    while (logins() === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+    await client.close();
+    release();
+    await settled;
+    // The abandoned connection logged out of its own accord.
+    while (!imap.received.some((line) => /^\S+ LOGOUT$/i.test(line))) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.deepEqual(await client.listMailboxes(), []);
+    assert.equal(logins(), 2, "the next call connected again");
+  } finally {
+    await client.close();
+    await imap.close();
   }
 });

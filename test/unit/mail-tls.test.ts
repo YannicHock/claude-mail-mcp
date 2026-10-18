@@ -70,6 +70,10 @@ test("a literal that is neither public nor local is not local: the rule is an al
     "ff02::fb", // multicast
     "fec0::1", // site-local, deprecated
     "::ffff:100.64.0.1",
+    // IPv4-compatible (deprecated): real IPv6 destinations, whatever v4 address they spell.
+    "::10.0.0.1",
+    "::7f00:1",
+    "::c0a8:1",
   ]) {
     assert.equal(await localMailAddress(host, NOWHERE), null, host);
   }

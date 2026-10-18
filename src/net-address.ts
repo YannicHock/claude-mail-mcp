@@ -49,7 +49,7 @@ export function isLocalIp(address: string): boolean {
   if (!net.isIPv6(address)) return false;
   const groups = expandIpv6(address);
   if (!groups) return false;
-  const v4 = mappedIpv4(groups);
+  const v4 = mappedIpv4(groups, false);
   if (v4 !== null) return isLocalIpv4(v4);
   const first = groups[0]!;
   if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return true; // ::1
@@ -101,7 +101,7 @@ function isPublicIpv6(address: string): boolean {
   // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible addresses reach the v4
   // internet, so they are judged by the v4 rules — otherwise ::ffff:127.0.0.1
   // walks straight past a v6-only check.
-  const v4 = mappedIpv4(groups);
+  const v4 = mappedIpv4(groups, true);
   if (v4 !== null) return isPublicIpv4(v4);
 
   const first = groups[0]!;
@@ -115,12 +115,19 @@ function isPublicIpv6(address: string): boolean {
 }
 
 /**
- * The IPv4 address an IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible
- * (`::a.b.c.d`, not `::` or `::1`) address carries, or null.
+ * The IPv4 address an IPv4-mapped (`::ffff:a.b.c.d`) address carries, or
+ * null; with `compatible`, an IPv4-compatible one (`::a.b.c.d`, not `::` or
+ * `::1`) too.
+ *
+ * {@link isPublicIp} takes both, refusing either by its v4 rules. {@link
+ * isLocalIp} takes the mapped form only: the deprecated compatible form is a
+ * real IPv6 destination that leaves by the v6 default route, so `::10.0.0.1`
+ * is no private address, whatever v4 address it spells.
  */
-function mappedIpv4(groups: number[]): string | null {
+function mappedIpv4(groups: number[], compatible: boolean): string | null {
   const isMapped = groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff;
   const isCompat =
+    compatible &&
     groups.slice(0, 6).every((g) => g === 0) &&
     (groups[6] !== 0 || groups[7] !== 0) &&
     !(groups[6] === 0 && groups[7] === 1);
