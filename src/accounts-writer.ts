@@ -40,7 +40,23 @@ export class StaleStampError extends Error {
   }
 }
 
-export async function writeAccountsFile(path: string, file: AccountsFile): Promise<void> {
+export interface WriteOptions {
+  /**
+   * Asked before each retry of the rename; resolves false when the file on disk
+   * is no longer the one the caller read. The store passes its stamp check, so a
+   * hand edit saved while a busy file was being waited out is refused with
+   * {@link StaleStampError} rather than overwritten by the retry.
+   */
+  stillCurrent?: () => Promise<boolean>;
+  /** The rename itself. A seam for tests; production always uses fs.rename. */
+  rename?: typeof rename;
+}
+
+export async function writeAccountsFile(
+  path: string,
+  file: AccountsFile,
+  options: WriteOptions = {}
+): Promise<void> {
   const serialised = `${JSON.stringify(file, null, 2)}\n`;
 
   // The round trip. If this throws, nothing has touched the real file yet.
@@ -58,7 +74,15 @@ export async function writeAccountsFile(path: string, file: AccountsFile): Promi
     } finally {
       await handle.close();
     }
-    await renameWithRetry(temp, path);
+    const { stillCurrent } = options;
+    await renameWithRetry(temp, path, {
+      attempt: options.rename,
+      beforeRetry: stillCurrent
+        ? async () => {
+            if (!(await stillCurrent())) throw new StaleStampError();
+          }
+        : undefined,
+    });
   } catch (err) {
     await unlink(temp).catch(() => {});
     throw err;
@@ -86,12 +110,18 @@ export const RENAME_RETRY_DELAYS_MS: readonly number[] = [10, 20, 40, 80, 160];
 
 const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 
-/** rename(), retried over {@link RENAME_RETRY_DELAYS_MS} while the target is busy. */
+/**
+ * rename(), retried over {@link RENAME_RETRY_DELAYS_MS} while the target is busy.
+ *
+ * `beforeRetry` runs after each wait and before the next try; whatever it
+ * throws ends the retries with that error instead.
+ */
 export async function renameWithRetry(
   from: string,
   to: string,
-  attempt: (from: string, to: string) => Promise<void> = rename
+  options: { attempt?: typeof rename; beforeRetry?: () => Promise<void> } = {}
 ): Promise<void> {
+  const attempt = options.attempt ?? rename;
   for (let tries = 0; ; tries++) {
     try {
       await attempt(from, to);
@@ -102,6 +132,7 @@ export async function renameWithRetry(
         throw err;
       }
       await new Promise((resolve) => setTimeout(resolve, RENAME_RETRY_DELAYS_MS[tries]));
+      await options.beforeRetry?.();
     }
   }
 }

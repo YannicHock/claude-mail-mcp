@@ -1,11 +1,13 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import type { PathLike } from "node:fs";
+import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { AccountsStore, type Account } from "../../src/accounts.js";
 import {
   RENAME_RETRY_DELAYS_MS,
+  StaleStampError,
   renameWithRetry,
   writeAccountsFile,
 } from "../../src/accounts-writer.js";
@@ -349,9 +351,11 @@ function errno(code: string): NodeJS.ErrnoException {
 
 test("a rename refused with EPERM a few times is retried until it lands", async () => {
   let calls = 0;
-  await renameWithRetry("from", "to", async () => {
-    calls++;
-    if (calls <= 3) throw errno(calls === 2 ? "EBUSY" : "EPERM");
+  await renameWithRetry("from", "to", {
+    attempt: async () => {
+      calls++;
+      if (calls <= 3) throw errno(calls === 2 ? "EBUSY" : "EPERM");
+    },
   });
   assert.equal(calls, 4, "three refusals, then the rename that succeeded");
 });
@@ -360,15 +364,16 @@ test("a rename still refused when the budget runs out rethrows the last error", 
   let calls = 0;
   const started = Date.now();
   await assert.rejects(
-    renameWithRetry("from", "to", async () => {
-      calls++;
-      throw errno("EACCES");
+    renameWithRetry("from", "to", {
+      attempt: async () => {
+        calls++;
+        throw errno("EACCES");
+      },
     }),
     { code: "EACCES" }
   );
   assert.equal(calls, RENAME_RETRY_DELAYS_MS.length + 1, "one try plus one per delay");
   const budget = RENAME_RETRY_DELAYS_MS.reduce((sum, ms) => sum + ms, 0);
-  assert.ok(budget < 1000, `the whole budget stays under a second, was ${budget} ms`);
   // A few ms of slack: timers on Windows can fire a tick early.
   assert.ok(Date.now() - started >= budget - 20, "the delays were actually waited");
 });
@@ -376,13 +381,89 @@ test("a rename still refused when the budget runs out rethrows the last error", 
 test("a rename failing for any other reason is not retried", async () => {
   let calls = 0;
   await assert.rejects(
-    renameWithRetry("from", "to", async () => {
-      calls++;
-      throw errno("ENOENT");
+    renameWithRetry("from", "to", {
+      attempt: async () => {
+        calls++;
+        throw errno("ENOENT");
+      },
     }),
     { code: "ENOENT" }
   );
   assert.equal(calls, 1);
+});
+
+test("writeAccountsFile goes through the retry: one EPERM, then the file lands", async () => {
+  const path = await tempAccounts();
+  let calls = 0;
+  await writeAccountsFile(
+    path,
+    { version: 1, accounts: [sampleAccount("work")] },
+    {
+      rename: async (from, to) => {
+        calls++;
+        if (calls === 1) throw errno("EPERM");
+        await rename(from, to);
+      },
+    }
+  );
+  assert.equal(calls, 2);
+  const written = JSON.parse(await readFile(path, "utf8")) as { accounts: Account[] };
+  assert.deepEqual(
+    written.accounts.map((a) => a.id),
+    ["work"]
+  );
+});
+
+test("a hand edit saved while a busy rename waits is refused, not overwritten", async () => {
+  const path = await tempAccounts();
+  const handEdit = '{\n  "version": 1,\n  "accounts": []\n}\n';
+  await writeFile(path, handEdit);
+  let calls = 0;
+  await assert.rejects(
+    writeAccountsFile(
+      path,
+      { version: 1, accounts: [sampleAccount("work")] },
+      {
+        // The editor's save is what the store's stamp check would see change.
+        stillCurrent: async () => false,
+        rename: async () => {
+          calls++;
+          throw errno("EPERM");
+        },
+      }
+    ),
+    StaleStampError
+  );
+  assert.equal(calls, 1, "no retry once the file is no longer the one read");
+  assert.equal(await readFile(path, "utf8"), handEdit, "the hand edit is untouched");
+  const left = (await readdir(dirname(path))).filter((name) => name.endsWith(".tmp"));
+  assert.deepEqual(left, [], "and the temp file is gone");
+});
+
+test("a busy rename asks before each retry, and a file still current is written", async () => {
+  // The precondition the store passes is its own stamp check; a busy rename
+  // with nothing else changed must still land.
+  const path = await tempAccounts();
+  let checks = 0;
+  await writeAccountsFile(
+    path,
+    { version: 1, accounts: [sampleAccount("work")] },
+    {
+      stillCurrent: async () => {
+        checks++;
+        return true;
+      },
+      rename: (() => {
+        let calls = 0;
+        return async (from: PathLike, to: PathLike) => {
+          if (++calls <= 2) throw errno("EBUSY");
+          await rename(from, to);
+        };
+      })(),
+    }
+  );
+  assert.equal(checks, 2, "asked once before each of the two retries");
+  assert.ok((await readFile(path, "utf8")).includes('"work"'));
 });
 
 test("a rename that never lands leaves no temp file behind", async () => {

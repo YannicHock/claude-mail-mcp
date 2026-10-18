@@ -423,8 +423,12 @@ export class AccountsStore {
     const file: AccountsFile = { version: 1, accounts: next };
 
     // Only after the rename returns does memory move — a failed write must
-    // leave both the file and the in-memory list untouched.
-    await writeAccountsFile(this.filePath, file);
+    // leave both the file and the in-memory list untouched. The stamp is asked
+    // again before any retry of a busy rename (#219), so an editor's save that
+    // lands while the retry waits is refused, not overwritten.
+    await writeAccountsFile(this.filePath, file, {
+      stillCurrent: async () => (await readStamp(this.filePath)) === stamp,
+    });
 
     this.accounts = next;
     this.byId = new Map(next.map((a) => [a.id, a]));
