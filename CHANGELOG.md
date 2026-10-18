@@ -2,7 +2,16 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.5] — 2026-10-18
+
+**What acceptance left.** Acceptance on Nextcloud showed it sends no cancellation to an attendee
+marked `SCHEDULE-AGENT=CLIENT`, so taking such an attendee off a meeting with
+`notify_attendees: false` now works. Anyone listed plainly is still refused, because the server
+may mail them whatever the call says. `"tls": false` no longer means "STARTTLS if the server offers
+it": on any host that is not loopback or private, STARTTLS is required before the password is
+sent, so an attacker on the path can no longer strip it and read the login. A failed settings save
+says the server failed rather than blaming the request, and one failed IMAP connect no longer takes
+an account's mail tools down until a restart.
 
 ### Changed
 
