@@ -871,6 +871,19 @@ private network itself can still read plaintext to a literal there, which is wha
 plaintext on a private network always meant. A certificate the connector does not
 trust still fails the STARTTLS handshake, as before.
 
+**An `http://` CalDAV URL.** CalDAV sends the account's Basic credentials with every
+request, so an `http://` URL is the same exposure, typed by the operator rather than
+forced by an attacker. Since #247 it is allowed only to a host that is local by the
+three steps above; `https://` always is. The settings form, its JSON route and the
+setup wizard refuse any other `http://` URL, and say to use `https://`, before the
+connection test runs. An `accounts.json` that already holds one still loads, logs one
+`warn` for that account at start, and every calendar tool on that account is refused
+without a request to the server; its mail tools are not affected. Unlike IMAP and
+SMTP, a CalDAV request is not pinned to the checked address: it is checked again
+before every calendar tool call, but `fetch` resolves the name itself. The residual
+risk above applies, and a local CalDAV server is best configured as an address
+literal or a Docker service name.
+
 **A compromised MCP client.** It holds an access token and can call every tool that
 token's scope allows, against every configured mailbox. Revoke it from
 `/settings/clients`; the access token dies with the session on the next request,

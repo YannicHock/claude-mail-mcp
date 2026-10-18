@@ -113,6 +113,20 @@ export function createApp(opts: CreateAppOptions): express.Express {
     });
   }
 
+  // #247: a CalDAV URL that is http:// to a host that is not local. Loaded all
+  // the same, so an upgrade still starts (#155), and its calendar tools are
+  // refused — said once here, by the same reasoning as the warning above, and
+  // not on every refused call.
+  for (const account of store.list()) {
+    const notice = store.caldavProblem(account.id);
+    if (notice === null) continue;
+    log("warn", "mailbox's CalDAV URL would send its password unencrypted; its calendar tools are refused", {
+      account: account.id,
+      label: account.label,
+      notice,
+    });
+  }
+
   const mcp = new McpServer({
     name: SERVER_NAME,
     version: VERSION,

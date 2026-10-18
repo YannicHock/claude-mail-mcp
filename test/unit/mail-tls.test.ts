@@ -10,6 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  caldavUrlProblem,
   localMailAddress,
   imapTlsOptions,
   smtpTlsOptions,
@@ -245,4 +246,62 @@ test("startTlsError rewords a STARTTLS refusal, keeps the library's error as its
 
   const other = new Error("connect ECONNREFUSED");
   assert.equal(startTlsError(other), other);
+});
+
+// #247: an `http://` CalDAV URL sends the account's Basic credentials in
+// cleartext, so it is allowed only to a host that is local by the rule above.
+
+test("an https:// CalDAV URL is fine wherever it points, without a lookup", async () => {
+  const dns = resolver({});
+  for (const url of ["https://cloud.example.com/dav/", "https://8.8.8.8/", "https://radicale:5232/"]) {
+    assert.equal(await caldavUrlProblem(url, dns), null, url);
+  }
+  assert.deepEqual(dns.asked, []);
+});
+
+test("an http:// CalDAV URL to a loopback or private literal is fine, without a lookup", async () => {
+  const dns = resolver({});
+  for (const url of [
+    "http://127.0.0.1:5232/",
+    "http://[::1]:5232/dav/",
+    "http://192.168.1.20/radicale/",
+    "http://10.0.0.5/",
+  ]) {
+    assert.equal(await caldavUrlProblem(url, dns), null, url);
+  }
+  assert.deepEqual(dns.asked, []);
+});
+
+test("an http:// CalDAV URL to a local-form name that resolves only privately is fine", async () => {
+  const dns = resolver({
+    radicale: ["172.18.0.3"],
+    "nas.home.arpa": ["192.168.1.9", "fd00::9"],
+    localhost: ["127.0.0.1", "::1"],
+  });
+  assert.equal(await caldavUrlProblem("http://radicale:5232/", dns), null);
+  assert.equal(await caldavUrlProblem("http://nas.home.arpa/dav/", dns), null);
+  assert.equal(await caldavUrlProblem("http://localhost:5232/", dns), null);
+});
+
+test("an http:// CalDAV URL to a public host is refused with a message that says to use https://", async () => {
+  const dns = resolver({});
+  for (const url of ["http://cloud.example.com/", "http://8.8.8.8/dav/", "HTTP://Cloud.Example.com/"]) {
+    const problem = await caldavUrlProblem(url, dns);
+    assert.ok(problem !== null, url);
+    assert.match(problem, /https:\/\//, url);
+  }
+  // A dotted public name is never resolved: no DNS answer can make it local.
+  assert.deepEqual(dns.asked, []);
+});
+
+test("an http:// CalDAV URL to a local-form name that resolves publicly, partly publicly, or not at all is refused", async () => {
+  const dns = resolver({ mail: ["203.0.113.5"], mixed: ["192.168.1.2", "203.0.113.5"] });
+  assert.notEqual(await caldavUrlProblem("http://mail/dav/", dns), null);
+  assert.notEqual(await caldavUrlProblem("http://mixed/dav/", dns), null);
+  assert.notEqual(await caldavUrlProblem("http://gone.local/dav/", dns), null);
+});
+
+test("a CalDAV URL in another scheme is refused the same way; an unparseable one is not this check's to judge", async () => {
+  assert.notEqual(await caldavUrlProblem("ftp://127.0.0.1/", NOWHERE), null);
+  assert.equal(await caldavUrlProblem("not a url", NOWHERE), null);
 });

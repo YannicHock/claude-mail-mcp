@@ -37,6 +37,7 @@ import { watch, FSWatcher } from "node:fs";
 import path from "node:path";
 
 import { readStamp, writeAccountsFile, StaleStampError } from "./accounts-writer.js";
+import { caldavUrlProblem } from "./mail-tls.js";
 
 export interface ImapCreds {
   host: string;
@@ -162,6 +163,8 @@ export class NoSuchAccountError extends Error {
 export class AccountsStore {
   private accounts: Account[] = [];
   private byId: Map<string, Account> = new Map();
+  /** {@link caldavProblem}'s answers, by account id, for the accounts in memory. */
+  private caldavProblems: Map<string, string> = new Map();
   private watcher: FSWatcher | null = null;
   private readonly filePath: string;
   private onChange?: (next: Account[], prev: Account[]) => void;
@@ -202,8 +205,10 @@ export class AccountsStore {
   async reload(): Promise<void> {
     const prev = this.accounts;
     const { accounts: next, present } = await this.readFromDisk();
+    const problems = await AccountsStore.caldavProblemsOf(next);
     this.accounts = next;
     this.byId = new Map(next.map((a) => [a.id, a]));
+    this.caldavProblems = problems;
     // reload()'s own dispatch contract, unchanged from before: fire whenever
     // the file was actually present and parsed (even if content is
     // unchanged — the fs.watch debounce path relies on that), and also on a
@@ -421,6 +426,7 @@ export class AccountsStore {
 
     const next = change(prev);
     const file: AccountsFile = { version: 1, accounts: next };
+    const problems = await AccountsStore.caldavProblemsOf(next);
 
     // Only after the rename returns does memory move — a failed write must
     // leave both the file and the in-memory list untouched. The stamp is asked
@@ -432,9 +438,33 @@ export class AccountsStore {
 
     this.accounts = next;
     this.byId = new Map(next.map((a) => [a.id, a]));
+    this.caldavProblems = problems;
     if (this.onChange) {
       this.onChange(next, prev);
     }
+  }
+
+  /**
+   * Why the calendar tools on `id` are refused, or `null` (#247): its CalDAV
+   * URL is `http://` to a host that is not local, by `caldavUrlProblem` in
+   * src/mail-tls.ts. Worked out whenever the accounts are loaded or written,
+   * because the check may resolve a name and this has to answer at once — for
+   * the start-up warning in src/app.ts, and as the first thing the client pool
+   * asks before a calendar call.
+   *
+   * A mark, not a refusal to load: an accounts.json written before v0.8 may
+   * hold such a URL, and an upgrade must not refuse to start over it (#155).
+   * The settings routes refuse to save one.
+   */
+  caldavProblem(id: string): string | null {
+    return this.caldavProblems.get(id) ?? null;
+  }
+
+  private static async caldavProblemsOf(accounts: Account[]): Promise<Map<string, string>> {
+    const marked = await Promise.all(
+      accounts.map(async (a) => [a.id, a.caldav ? await caldavUrlProblem(a.caldav.url) : null] as const)
+    );
+    return new Map(marked.filter((entry): entry is readonly [string, string] => entry[1] !== null));
   }
 
   private watchFile(): void {

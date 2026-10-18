@@ -109,6 +109,7 @@ import {
   type CalDavCreds,
 } from "./accounts.js";
 import { StaleStampError } from "./accounts-writer.js";
+import { caldavUrlProblem } from "./mail-tls.js";
 import { createNoticeFlash, type NoticeFlash } from "./notice-flash.js";
 import { probeAccount, type ProbeReport } from "./probe.js";
 import { credentialNoteFor, providerPresets, unsupportedNoticeFor } from "./providers.js";
@@ -406,6 +407,29 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
       caldav,
     },
   };
+}
+
+/**
+ * {@link parseAccountForm}, and then the one check it cannot make, since it
+ * may resolve a name (#247): a CalDAV URL that is `http://` to a host that is
+ * not local is refused on its own field, with a message that says to use
+ * `https://`. Every route that probes or stores a submitted mailbox parses it
+ * through here — the form's create, edit and both *Test connection* routes,
+ * and the JSON create and probe the setup wizard saves through — so the
+ * refusal comes before the probe, which would itself send the CalDAV
+ * credentials over http. *Save anyway* skips the probe, not this.
+ *
+ * Checked whatever else is wrong with the form, so one round trip shows every
+ * error; a URL the CalDAV block will not keep ("Remove CalDAV" ticked) is not
+ * checked.
+ */
+async function parseCheckedAccountForm(body: FormBody, existing: Account | null): Promise<ParsedForm> {
+  const parsed = parseAccountForm(body, existing);
+  const url = raw(body, MAILBOX_FIELDS.caldavUrl);
+  if (checkbox(body, "remove_caldav") || url.trim() === "") return parsed;
+  const problem = await caldavUrlProblem(url);
+  if (problem === null) return parsed;
+  return { errors: { ...parsed.errors, [MAILBOX_FIELDS.caldavUrl]: problem } };
 }
 
 /** `ProbeReport` (probe.ts) and `ProbeReportView` (settings-pages.ts) declare
@@ -1390,7 +1414,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
           carry: fields,
         });
 
-      const parsed = parseAccountForm(fields, null);
+      const parsed = await parseCheckedAccountForm(fields, null);
       if (parsed.errors) {
         rejected(400, parsed.errors, submittedStamp);
         return;
@@ -1461,7 +1485,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         return;
       }
 
-      const parsed = parseAccountForm(fields, null);
+      const parsed = await parseCheckedAccountForm(fields, null);
       if (parsed.errors) {
         // The same refusal the create route gives, because it is the same
         // refusal: this route is that one without the write (#130).
@@ -1606,7 +1630,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     // no second caller — so the only branch `sendDraftRefusal` ever takes here
     // is the page one. It is used anyway so that the form a rejected edit comes
     // back on is assembled in exactly one place.
-    const parsed = parseAccountForm(body, existing);
+    const parsed = await parseCheckedAccountForm(body, existing);
     if (parsed.errors) {
       sendDraftRefusal(res, false, {
         status: 400,
@@ -1685,7 +1709,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     const body = req.body as FormBody;
     const assertion = assertionOf(res);
     const submittedStamp = raw(body, "_stamp");
-    const parsed = parseAccountForm(body, existing);
+    const parsed = await parseCheckedAccountForm(body, existing);
     if (parsed.errors) {
       sendDraftRefusal(res, false, {
         status: 400,
