@@ -47,6 +47,44 @@ test("composeForSending: the copy is the submitted message plus its Bcc header, 
   assert.match(headerBlock(submitted), new RegExp(`^Message-ID: ${messageId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\r?$`, "m"));
 });
 
+test("composeForSending: a folded Bcc of 30, an attachment and a calendar: still one composition, built twice", async () => {
+  // This holds nodemailer to what the one-send-path design relies on: a MimeNode
+  // fixes its Date, Message-ID and boundaries once, and building it again only
+  // adds the Bcc header. A nodemailer that regenerated any of them per build
+  // fails here, not in someone's Sent folder.
+  const bcc = Array.from({ length: 30 }, (_, i) => `blind-recipient-${i}@example.invalid`);
+  const ics = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//test//EN",
+    "METHOD:REQUEST",
+    "BEGIN:VEVENT",
+    "UID:fold-1@example.invalid",
+    "DTSTAMP:20261018T100000Z",
+    "DTSTART:20261020T100000Z",
+    "SUMMARY:Meeting",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+  const { submitted, copy, envelope } = await smtp.composeForSending({
+    to: "carol@example.invalid",
+    bcc,
+    subject: "folded",
+    text: "Body.",
+    attachments: [{ filename: "a.bin", contentBase64: Buffer.alloc(3000, 2).toString("base64") }],
+    calendar: { method: "REQUEST", content: ics },
+  });
+
+  const folded = /^Bcc:[^\r\n]*\r\n(?:[ \t][^\r\n]*\r\n)+/m;
+  const copyText = copy.toString("latin1");
+  const match = folded.exec(copyText);
+  assert.ok(match, "the copy's Bcc header is not folded over several lines");
+  for (const address of bcc) assert.ok(match[0].includes(address), `${address} missing from the copy's Bcc`);
+  assert.equal(copyText.replace(folded, ""), submitted.toString("latin1"));
+  assert.doesNotMatch(headerBlock(submitted), /^bcc\s*:/im);
+  assert.deepEqual(envelope.to, ["carol@example.invalid", ...bcc]);
+});
+
 test("buildRawSource: a draft carries no Bcc header", async () => {
   const raw = await smtp.buildRawSource({
     to: "carol@example.invalid",
