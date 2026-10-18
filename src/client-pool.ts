@@ -11,7 +11,6 @@ import { ImapClient } from "./imap-client.js";
 import { SmtpClient } from "./smtp-client.js";
 import { CalDavClient } from "./caldav-client.js";
 import { Account, AccountsStore } from "./accounts.js";
-import { caldavUrlProblem } from "./mail-tls.js";
 import type { Logger } from "../shared/log.js";
 
 export interface AccountClients {
@@ -26,6 +25,8 @@ export interface AccountClients {
   imap: ImapClient;
   smtp: SmtpClient;
   caldav: CalDavClient | null;
+  /** The configured CalDAV URL, checked before every calendar call (#247, src/caldav-url.ts). */
+  caldavUrl: string | null;
   draftsFolder: string;
   sentFolder: string | null;
 }
@@ -62,25 +63,6 @@ export class ClientPool {
     const clients = this.build(account);
     this.pool.set(account.id, clients);
     return clients;
-  }
-
-  /**
-   * Why a calendar call on `id` must not be made, or `null` (#247): its CalDAV
-   * URL is `http://` to a host that is not local, so the call would send the
-   * account's credentials in cleartext.
-   *
-   * The store's mark from load comes first, and then the URL is checked again,
-   * here, before every call: a local-form name is local only by what it
-   * resolves to now, and a name that started resolving publicly since the file
-   * was loaded must not get the password. An `https://` URL and an address
-   * literal are answered without a lookup. See the module header of
-   * src/mail-tls.ts for what this check still cannot close.
-   */
-  async caldavProblem(id: string): Promise<string | null> {
-    const marked = this.store.caldavProblem(id);
-    if (marked !== null) return marked;
-    const url = this.store.resolve(id).caldav?.url;
-    return url === undefined ? null : caldavUrlProblem(url);
   }
 
   /**
@@ -138,6 +120,7 @@ export class ClientPool {
       imap,
       smtp,
       caldav,
+      caldavUrl: account.caldav?.url ?? null,
       draftsFolder: account.mail.draftsFolder,
       sentFolder: account.mail.sentFolder,
     };

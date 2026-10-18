@@ -220,4 +220,9 @@ export interface CalDavClientOptions {
    * principal lists none (R13). See `CalDavClient.ownAddresses`.
    */
   address?: string;
+  /**
+   * The fetch the client's guard hands its requests to (`guardedCaldavFetch`
+   * in src/caldav-url.ts). The platform's unless a test passes a fake.
+   */
+  fetch?: typeof fetch;
 }

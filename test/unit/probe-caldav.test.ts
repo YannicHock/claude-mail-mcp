@@ -90,7 +90,8 @@ test("an unreachable CalDAV host is not reported as a credential rejection", asy
     {
       imap: closedPort(),
       smtp: closedPort(),
-      caldav: { url: "http://192.0.2.1/dav", user: "u", pass: "p" },
+      // https: http:// to a public address is refused before any request (#247).
+      caldav: { url: "https://192.0.2.1/dav", user: "u", pass: "p" },
     },
     { perProbeMs: 1500, totalMs: 5000 }
   );

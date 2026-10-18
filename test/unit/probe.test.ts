@@ -200,7 +200,8 @@ test("an unresponsive CalDAV host fails within the per-probe timeout via an abor
     {
       imap: creds({ port: 1 }),
       smtp: creds({ port: 1 }),
-      caldav: { url: "http://192.0.2.1/dav", user: "u", pass: "p" },
+      // https: http:// to a public address is refused before any request (#247).
+      caldav: { url: "https://192.0.2.1/dav", user: "u", pass: "p" },
     },
     { perProbeMs: 1500, totalMs: 5000 }
   );

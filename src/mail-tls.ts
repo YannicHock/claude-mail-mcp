@@ -62,24 +62,8 @@
  * The #194 rival-port check (`src/lookup-reachability.ts`) is not affected:
  * it connects and reads a greeting, and never logs in.
  *
- * ## An `http://` CalDAV URL (#247)
- *
- * CalDAV sends the account's Basic credentials with every request, so an
- * `http://` URL is the same exposure, chosen by the operator rather than
- * forced by an attacker. The owner's decision (spec 2026-10-18 §2.14, A) is
- * the same rule: {@link caldavUrlProblem} allows `http://` only to a host
- * {@link localMailAddress} calls local, and `https://` always. The settings
- * form, its JSON route and the wizard refuse anything else before the probe
- * runs; a stored file that holds one still loads (#155), is warned about once
- * at start, and its calendar tools are refused (`src/client-pool.ts`).
- *
- * Unlike IMAP and SMTP, the CalDAV connection is *not* pinned to the checked
- * address: tsdav and the client's own requests go through `fetch`, which
- * resolves the name again. The check is repeated before every calendar tool
- * call, which narrows the gap to milliseconds but does not close it. What is
- * left is a resolver that answers the check privately and the connect
- * publicly, for a name of local form — the same attacker step 3 above already
- * concedes can point such a name at a LAN address of their own.
+ * {@link localMailAddress} also decides which `http://` CalDAV URLs may carry
+ * the credentials (#247): see `caldavUrlProblem` in src/caldav-url.ts.
  */
 
 import net from "node:net";
@@ -152,38 +136,6 @@ export async function localMailAddress(
   }
   if (addresses.length === 0 || !addresses.every((address) => isLocalIp(address))) return null;
   return { address: addresses.find((address) => net.isIPv4(address)) ?? addresses[0]!, name };
-}
-
-/**
- * What a save is refused with, and what a calendar tool on a stored account
- * is refused with, when its CalDAV URL is {@link caldavUrlProblem}'s problem.
- */
-export const CALDAV_HTTP_MESSAGE =
-  "This CalDAV URL is not https:// and its host is not local, so the CalDAV password would cross " +
-  "the network unencrypted. Use the server's https:// URL; http:// is only accepted for a " +
-  "loopback or private host, such as a Radicale on the same machine.";
-
-/**
- * Why a CalDAV URL must not be used, or `null` when it may (#247): `https://`
- * always may; `http://` may when its host is local by {@link localMailAddress}
- * — an allow-listed literal, or a local-form name that resolves only to local
- * addresses; anything else may not. Never rejects: a lookup that fails is
- * "not local". A string that is no URL at all is not this check's to judge,
- * and is `null`.
- */
-export async function caldavUrlProblem(
-  url: string,
-  deps: MailTlsDeps = defaultMailTlsDeps
-): Promise<string | null> {
-  let parsed: URL;
-  try {
-    parsed = new URL(url.trim());
-  } catch {
-    return null;
-  }
-  if (parsed.protocol === "https:") return null;
-  if (parsed.protocol === "http:" && (await localMailAddress(parsed.hostname, deps)) !== null) return null;
-  return CALDAV_HTTP_MESSAGE;
 }
 
 /** The host and TLS half of an `ImapFlow` options object. */

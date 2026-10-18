@@ -33,6 +33,10 @@ import {
   CREDENTIAL_REJECTION_MESSAGE,
 } from "../shared/credential-failure.js";
 import { CONNECTOR_PROBE_BUDGET_MS } from "../shared/settings-api.js";
+import { guardedCaldavFetch } from "./caldav-url.js";
+
+/** Every CalDAV request the probe makes, refused to a URL the credentials must not go to (#247). */
+const caldavFetch = guardedCaldavFetch();
 
 export const PER_PROBE_TIMEOUT_MS = 10_000;
 
@@ -286,7 +290,7 @@ async function caldavPreflight(
   signal: AbortSignal
 ): Promise<ProbeResult | null> {
   const basic = Buffer.from(`${creds.user}:${creds.pass}`, "utf8").toString("base64");
-  const response = await fetch(creds.url, {
+  const response = await caldavFetch(creds.url, {
     method: "GET",
     headers: { Authorization: `Basic ${basic}` },
     signal,
@@ -372,6 +376,7 @@ async function probeCalDav(creds: CalDavCreds, perProbeMs: number): Promise<Prob
             authMethod: "Basic",
             defaultAccountType: "caldav",
             fetchOptions: { signal: controller.signal },
+            fetch: caldavFetch,
           });
           await client.fetchCalendars();
         } catch (err) {

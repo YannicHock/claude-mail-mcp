@@ -2686,6 +2686,26 @@ test("an http:// CalDAV URL to a public host is refused by the form's create, te
   }
 });
 
+test("the mailbox list says on the row which stored mailbox's CalDAV URL is refused, beside a reserved-id notice (#247)", async () => {
+  const caldav = (url: string) => ({ url, user: "dav-user", pass: "dav-secret" });
+  const { url, close } = await startConnector([
+    makeAccount({ id: "work", label: "Work", caldav: caldav(PUBLIC_HTTP_CALDAV) }),
+    makeAccount({ id: "test", label: "Old test mailbox", caldav: caldav(PUBLIC_HTTP_CALDAV) }),
+    makeAccount({ id: "home", label: "Home", caldav: caldav("http://127.0.0.1:5232/") }),
+  ]);
+  try {
+    const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    const notices = [...html.matchAll(/<tr class="row-notice"><td colspan="4">([^<]*)<\/td><\/tr>/g)].map((m) => m[1]!);
+    assert.equal(notices.length, 2, "one row notice for each affected mailbox, none for the loopback one");
+    assert.ok(notices.every((n) => /calendar tools are refused/.test(n) && /https:\/\//.test(n)), notices.join("\n"));
+    assert.equal(notices.filter((n) => /reserved id/.test(n)).length, 1, "the reserved-id sentence is merged, not a row of its own");
+  } finally {
+    await close();
+  }
+});
+
 test("an http:// CalDAV URL to a loopback host, as a local Radicale has, is still saved (#247)", async () => {
   const { url, accountsPath, close } = await startConnector();
   try {

@@ -871,18 +871,39 @@ private network itself can still read plaintext to a literal there, which is wha
 plaintext on a private network always meant. A certificate the connector does not
 trust still fails the STARTTLS handshake, as before.
 
-**An `http://` CalDAV URL.** CalDAV sends the account's Basic credentials with every
-request, so an `http://` URL is the same exposure, typed by the operator rather than
-forced by an attacker. Since #247 it is allowed only to a host that is local by the
-three steps above; `https://` always is. The settings form, its JSON route and the
-setup wizard refuse any other `http://` URL, and say to use `https://`, before the
-connection test runs. An `accounts.json` that already holds one still loads, logs one
-`warn` for that account at start, and every calendar tool on that account is refused
-without a request to the server; its mail tools are not affected. Unlike IMAP and
-SMTP, a CalDAV request is not pinned to the checked address: it is checked again
-before every calendar tool call, but `fetch` resolves the name itself. The residual
-risk above applies, and a local CalDAV server is best configured as an address
-literal or a Docker service name.
+**CalDAV over `http://`.** CalDAV sends the account's Basic credentials with every
+request, so a request to an `http://` URL is the same exposure. Since #247 the
+credentials go to `http://` only on a host that is local by the three steps above (a
+name written with a trailing dot is not, since it resolves without the search
+domain); `https://` is always allowed. `src/caldav-url.ts` holds the rule and applies
+it at three points:
+
+- **Saving.** The settings form, its JSON route and the setup wizard refuse any other
+  `http://` URL on its field, before the connection test runs, and say to use
+  `https://`. A local-form name that does not resolve is refused with its own message
+  ("could not be resolved to a local address"). *Save anyway* does not skip this.
+- **Every calendar tool call.** An `accounts.json` that already holds such a URL still
+  loads. One `warn` per account is logged at start, and again when a hand edit
+  introduces one. The mailbox list says so on the account's row, and every calendar
+  tool on that account is refused before any request is made. The account's mail
+  tools are not affected. The check runs on every call rather than at load, so a
+  Radicale that was down when the connector started is used once its name resolves
+  again.
+- **Every request.** A server configured as `https://` can still send the client to
+  `http://`: a `/.well-known/caldav` redirect with an explicit scheme (a Nextcloud
+  behind a TLS proxy), or an absolute `http://` href in a PROPFIND answer. tsdav
+  follows both with the credentials. Every CalDAV request the connector makes goes
+  through one guarded `fetch`: tsdav's, the client's own, and the connection test's.
+  That `fetch` refuses such a request before sending it. Redirects that `fetch`
+  follows by itself need no check, because it drops `Authorization` on a cross-origin
+  redirect.
+
+**Residual risk:** unlike IMAP and SMTP, a CalDAV request is not pinned to the
+address that was checked, because `fetch` resolves the name again. A resolver that
+answers the check with a private address and the connection with a public one, for a
+local-form name, still gets the credentials. Pinning is tracked as a follow-up issue.
+Until it lands, configure a local CalDAV server as an address literal (no lookup at
+all) or a Docker service name.
 
 **A compromised MCP client.** It holds an access token and can call every tool that
 token's scope allows, against every configured mailbox. Revoke it from

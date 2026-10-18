@@ -84,7 +84,7 @@ import type {
   UpdatedEvent,
   WriteTarget,
 } from "./caldav-types.js";
-import { objectName, objectUrl, sameCollection } from "./caldav-url.js";
+import { guardedCaldavFetch, objectName, objectUrl, sameCollection } from "./caldav-url.js";
 import { ToolRefusal } from "./tool-refusal.js";
 import { classifyFailure } from "../shared/credential-failure.js";
 import type { Logger } from "../shared/log.js";
@@ -106,6 +106,12 @@ export class CalDavClient {
   private readonly authorization: string;
   /** `move_event`'s move (src/caldav-move.ts), reaching the server through this client's own requests. */
   private readonly mover: CalDavMove;
+  /**
+   * Every request this client makes, tsdav's included: {@link guardedCaldavFetch},
+   * which refuses one to a URL the credentials must not go to (#247) — a
+   * redirect or an href that leads from https:// to http://, say.
+   */
+  private readonly fetch: typeof fetch;
 
   constructor(auth: CalDavAuth, options: CalDavClientOptions = {}) {
     this.auth = auth;
@@ -113,6 +119,7 @@ export class CalDavClient {
     this.log = options.log ?? (() => {});
     this.accountId = options.accountId;
     this.address = options.address;
+    this.fetch = guardedCaldavFetch(options.fetch);
     this.mover = new CalDavMove({
       davFetch: (method, url, headers, body) => this.davFetch(method, url, headers, body),
       lookUp: (calendar, uid) => this.lookUp(calendar, uid),
@@ -135,6 +142,7 @@ export class CalDavClient {
         },
         authMethod: "Basic",
         defaultAccountType: "caldav",
+        fetch: this.fetch,
       });
       this.client = client;
       this.connecting = null;
@@ -615,7 +623,7 @@ export class CalDavClient {
    * other tools write through tsdav.
    */
   private async davFetch(method: string, url: string, headers: Record<string, string> = {}, body?: string): Promise<Response> {
-    return fetch(url, { method, headers: { authorization: this.authorization, ...headers }, ...(body === undefined ? {} : { body }) });
+    return this.fetch(url, { method, headers: { authorization: this.authorization, ...headers }, ...(body === undefined ? {} : { body }) });
   }
 
   /**
@@ -878,7 +886,7 @@ export class CalDavClient {
     }) => Promise<string[]>;
     let status: number | undefined;
     const recording: typeof fetch = async (input, init) => {
-      const res = await fetch(input, init);
+      const res = await this.fetch(input, init);
       status = res.status;
       return res;
     };

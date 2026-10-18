@@ -109,7 +109,7 @@ import {
   type CalDavCreds,
 } from "./accounts.js";
 import { StaleStampError } from "./accounts-writer.js";
-import { caldavUrlProblem } from "./mail-tls.js";
+import { caldavUrlProblem } from "./caldav-url.js";
 import { createNoticeFlash, type NoticeFlash } from "./notice-flash.js";
 import { probeAccount, type ProbeReport } from "./probe.js";
 import { credentialNoteFor, providerPresets, unsupportedNoticeFor } from "./providers.js";
@@ -292,7 +292,7 @@ type ParsedForm = { account: Account; errors?: undefined } | { account?: undefin
  * collected by field name rather than the parse stopping at the first one, so
  * a resubmission can fix everything at once instead of one field per round trip.
  */
-function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm {
+function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm & { keptCaldavUrl: string | null } {
   const errors: Record<string, string> = {};
 
   function requireStr(key: string): string {
@@ -367,6 +367,9 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
   const caldavUser = raw(body, MAILBOX_FIELDS.caldavUser);
 
   let caldav: CalDavCreds | undefined;
+  // The URL the CalDAV block would be stored with, whatever else is wrong with
+  // the form: what #247's check in parseCheckedAccountForm looks at.
+  let keptCaldavUrl: string | null = null;
   if (removeCaldav) {
     // Explicit removal — caldav stays undefined below.
   } else if (caldavUrl.trim() === "") {
@@ -385,13 +388,15 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
     }
     const caldavPass = password(MAILBOX_FIELDS.caldavPass, existing?.caldav?.pass);
     caldav = { url: caldavUrl, user: caldavUser, pass: caldavPass };
+    keptCaldavUrl = caldavUrl;
   }
 
   if (Object.keys(errors).length > 0) {
-    return { errors };
+    return { errors, keptCaldavUrl };
   }
 
   return {
+    keptCaldavUrl,
     account: {
       id,
       label,
@@ -410,25 +415,15 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
 }
 
 /**
- * {@link parseAccountForm}, and then the one check it cannot make, since it
- * may resolve a name (#247): a CalDAV URL that is `http://` to a host that is
- * not local is refused on its own field, with a message that says to use
- * `https://`. Every route that probes or stores a submitted mailbox parses it
- * through here — the form's create, edit and both *Test connection* routes,
- * and the JSON create and probe the setup wizard saves through — so the
- * refusal comes before the probe, which would itself send the CalDAV
- * credentials over http. *Save anyway* skips the probe, not this.
- *
- * Checked whatever else is wrong with the form, so one round trip shows every
- * error; a URL the CalDAV block will not keep ("Remove CalDAV" ticked) is not
- * checked.
+ * {@link parseAccountForm}, and then #247's check of the CalDAV URL it would
+ * keep (`caldavUrlProblem` in src/caldav-url.ts), on its own field. Every
+ * route that probes or stores a submitted mailbox parses through here, so the
+ * refusal comes before the probe; *Save anyway* skips the probe, not this.
  */
 async function parseCheckedAccountForm(body: FormBody, existing: Account | null): Promise<ParsedForm> {
-  const parsed = parseAccountForm(body, existing);
-  const url = raw(body, MAILBOX_FIELDS.caldavUrl);
-  if (checkbox(body, "remove_caldav") || url.trim() === "") return parsed;
-  const problem = await caldavUrlProblem(url);
-  if (problem === null) return parsed;
+  const { keptCaldavUrl, ...parsed } = parseAccountForm(body, existing);
+  const problem = keptCaldavUrl === null ? null : await caldavUrlProblem(keptCaldavUrl);
+  if (problem === null) return parsed as ParsedForm;
   return { errors: { ...parsed.errors, [MAILBOX_FIELDS.caldavUrl]: problem } };
 }
 
@@ -1147,6 +1142,19 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     // The one thing a save's 303 carries. An unknown or expired token is no
     // notice, not an error: a bookmarked URL is not a fault.
     const notice = notices.get(req.query.notice);
+    // A row's notices, one sentence each: the reserved-id one below, and #247's
+    // CalDAV URL the calendar tools refuse to use (src/caldav-url.ts), worked
+    // out here rather than at load because it may resolve a name.
+    const rowNotices = new Map<string, string[]>(
+      reservedIdAccounts(accounts).map((a) => [a.id, [reservedIdNotice(a.id)]])
+    );
+    await Promise.all(
+      accounts.map(async (a) => {
+        const problem = a.caldav ? await caldavUrlProblem(a.caldav.url) : null;
+        if (problem === null) return;
+        rowNotices.set(a.id, [...(rowNotices.get(a.id) ?? []), `Its calendar tools are refused. ${problem}`]);
+      })
+    );
     sendHtml(
       res,
       200,
@@ -1160,7 +1168,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         // the one place its operator is certain to look. See RESERVED_IDS in
         // accounts.ts for why the file is still loaded rather than refused.
         rowNotices: Object.fromEntries(
-          reservedIdAccounts(accounts).map((a) => [a.id, reservedIdNotice(a.id)])
+          [...rowNotices].map(([id, sentences]) => [id, sentences.join(" ")])
         ),
       })
     );

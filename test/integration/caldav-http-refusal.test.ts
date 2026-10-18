@@ -6,7 +6,7 @@
  * refused before a single request leaves the process — its Basic credentials
  * never cross the network in cleartext — and the mail tools on the very same
  * account go on working, against GreenMail, through a real MCP session. The
- * offline half (the mark, the one start-up `warn`, every calendar tool) is
+ * offline half (the one start-up `warn`, every calendar tool) is
  * test/unit/caldav-http-refusal.test.ts.
  *
  * "No request" is watched at `globalThis.fetch`, which tsdav and the CalDAV
@@ -91,11 +91,6 @@ after(async () => {
   globalThis.fetch = originalFetch;
   if (dir) await cleanupTmpDir(dir);
   if (DOCKER_AVAILABLE) composeDown();
-});
-
-test("the connector starts on such a file and still lists the account", SKIP, async () => {
-  assert.deepEqual(app!.store.ids(), ["alice"]);
-  assert.match(app!.store.caldavProblem("alice") ?? "", /https:\/\//);
 });
 
 test("list_events on that account is refused, and no request reaches the CalDAV server", SKIP, async () => {

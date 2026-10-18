@@ -116,6 +116,7 @@ import { CalDavClient } from "./caldav-client.js";
 import { MAX_FREE_SLOT_RANGE_DAYS, MAX_FREE_SLOTS } from "./free-slots.js";
 import { reportingFailures } from "./tool-errors.js";
 import { ToolRefusal } from "./tool-refusal.js";
+import { caldavUrlProblem } from "./caldav-url.js";
 
 function asJson(value: unknown): { content: { type: "text"; text: string }[] } {
   return {
@@ -273,23 +274,21 @@ const recurrenceIdSchema = z
  * id rather than the argument, so a caller who omitted `account` is told which
  * mailbox it landed on instead of the unhelpful `(default)`.
  *
- * The third (#247) is a `ToolRefusal`: an account whose CalDAV URL is
- * `http://` to a host that is not local. Every calendar tool comes through
- * here before its client makes a request, so this is where the account's
- * credentials are kept from crossing the network in cleartext. An answer, not
- * a failure: no log line per call — the start-up already warned once.
+ * The third is a `ToolRefusal`, with no log line: a CalDAV URL the
+ * credentials must not be sent to (#247, `caldavUrlProblem` in
+ * src/caldav-url.ts), checked on every call before any request.
  */
 async function requireCaldav(
   pool: ClientPool,
   accountId?: string
 ): Promise<{ caldav: CalDavClient; id: string }> {
   const clients = pool.for(accountId);
-  if (!clients.caldav) {
+  if (!clients.caldav || clients.caldavUrl === null) {
     throw new Error(
       `Account "${clients.id}" has no CalDAV configured. Add a CalDAV URL under /settings/mailboxes on this deployment's public URL.`
     );
   }
-  const problem = await pool.caldavProblem(clients.id);
+  const problem = await caldavUrlProblem(clients.caldavUrl);
   if (problem !== null) {
     throw new ToolRefusal(`Account "${clients.id}": ${problem} Nothing was read or changed.`);
   }

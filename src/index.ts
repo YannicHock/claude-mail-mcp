@@ -22,7 +22,7 @@ import { dirname } from "node:path";
 import { config } from "./config.js";
 import { AccountsStore } from "./accounts.js";
 import { ClientPool } from "./client-pool.js";
-import { createApp, VERSION } from "./app.js";
+import { createApp, VERSION, warnAboutCaldavUrls } from "./app.js";
 import { expansionPool } from "./ical-worker-pool.js";
 import { canCreateFilesIn, dataDirectoryAdvice, logSecretReport } from "../shared/secrets.js";
 
@@ -92,17 +92,22 @@ async function main(): Promise<void> {
   // every failure into a bare `catch {}` and the only line this process ever
   // logged about a broken mailbox was the "accounts.json changed" above it.
   const pool = new ClientPool(store, log);
+  // The first load's accounts are warned about by createApp(); after it, a
+  // reload warns about a refused CalDAV URL a hand edit introduced (#247).
+  let loaded = false;
   await store.start((next, prev) => {
     log("info", "accounts.json changed", {
       previous: prev.map((a) => a.id),
       current: next.map((a) => a.id),
     });
+    if (loaded) void warnAboutCaldavUrls(log, next, prev);
     pool.resetAll().catch((err) =>
       log("warn", "client pool reset failed", {
         error: err instanceof Error ? err.message : String(err),
       })
     );
   });
+  loaded = true;
   log("info", "accounts loaded", {
     file: config.accountsFile,
     count: store.list().length,
