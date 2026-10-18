@@ -563,10 +563,7 @@ describe("the step 2 screen", () => {
     // missing on the way to the other, and the connector then reported
     // "Required." for a box the operator had filled in. There is one table of
     // names now, and this is what says this form renders all of it.
-    //
-    // With the flag in the values, because since #162 `default` is on the form
-    // only when the route decided this mailbox claims it — see the case below.
-    const html = mailboxPage({ values: { [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON } });
+    const html = mailboxPage();
 
     assert.match(html, /Step 2 of 3 · Add your first mailbox/);
     for (const name of MAILBOX_FIELD_NAMES) {
@@ -574,9 +571,27 @@ describe("the step 2 screen", () => {
       // screen's: they are left at their stored defaults and the operator
       // changes them from the settings UI once setup is finished.
       if (name.startsWith("mail.") && name !== "mail.defaultFrom") continue;
+      // `default` is decided when the mailbox is saved, from what the connector
+      // already has (#162): see the case below.
+      if (name === MAILBOX_FIELDS.isDefault) continue;
       assert.ok(html.includes(`name="${name}"`), `step 2's form has no box named ${name}`);
     }
     assert.equal(/<script/i.test(html), false);
+  });
+
+  it("carries no `default` field, whatever the values say (#162)", () => {
+    // The wizard offers no control for it, so a hidden field could only carry
+    // an earlier answer — the one a page from before the first save would
+    // still post after it. The save decides instead.
+    const cases: Array<Record<string, string>> = [{}, { [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON }];
+    for (const values of cases) {
+      const html = mailboxPage({ values });
+      assert.equal(
+        html.includes(`name="${MAILBOX_FIELDS.isDefault}"`),
+        false,
+        `a default field from ${JSON.stringify(values)}`
+      );
+    }
   });
 
   it("offers a way past it that does not need mail credentials to hand", () => {
@@ -656,29 +671,6 @@ describe("the step 2 screen", () => {
   it("escapes a carried password rather than rendering it", () => {
     const html = mailboxPage({ values: { "imap.pass": '"><script>alert(1)</script>' } });
     assert.equal(html.includes("<script>alert(1)</script>"), false);
-  });
-
-  it("claims the default only when the values it was handed carry the flag (#162)", () => {
-    // The route decides — the first mailbox claims the default, a later one
-    // does not — and this screen renders what it decided rather than always
-    // writing the hidden field in, which is what made a second wizard mailbox
-    // take the default over.
-    const hiddenDefault = `<input type="hidden" name="${MAILBOX_FIELDS.isDefault}" value="${CHECKBOX_ON}">`;
-    assert.ok(mailboxPage({ values: { [MAILBOX_FIELDS.isDefault]: CHECKBOX_ON } }).includes(hiddenDefault));
-
-    const unclaimed: Array<Record<string, string>> = [
-      {},
-      { [MAILBOX_FIELDS.isDefault]: "" },
-      { "imap.host": "imap.example.com" },
-    ];
-    for (const values of unclaimed) {
-      const html = mailboxPage({ values });
-      assert.equal(
-        html.includes(`name="${MAILBOX_FIELDS.isDefault}"`),
-        false,
-        `a default was claimed from ${JSON.stringify(values)}`
-      );
-    }
   });
 
   it("offers only the way onward when the connector cannot be reached at all", () => {

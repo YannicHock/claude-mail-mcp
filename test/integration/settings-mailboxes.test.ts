@@ -897,7 +897,7 @@ test("a JSON create stores the account and answers 201 with the id and the new s
 
 test("a second JSON create without `default` leaves the first mailbox the default (#162)", async () => {
   // The wizard's half of #162 is to send `default` only for the first mailbox
-  // (oauth/src/setup-routes.ts, `stepDefaults`). This is the store's half,
+  // (oauth/src/setup-routes.ts, `savedDefault`). This is the store's half,
   // pinned from the side the wizard talks to: the #139 rule moves the flag only
   // when a create carries it, so a create that does not leaves it alone.
   const { url, accountsPath, close } = await startConnector();

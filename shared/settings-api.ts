@@ -1198,13 +1198,65 @@ export function formValues(draft: MailboxDraft): Record<string, string> {
 }
 
 /**
+ * Mailbox ids the connector's routes keep for themselves: `GET
+ * /settings/mailboxes/new` and `POST /settings/mailboxes/test` would shadow an
+ * account named either.
+ *
+ * The store's own set is `RESERVED_IDS` in the connector's `src/accounts.ts`,
+ * which is what refuses them; this copy is here because the setup wizard cannot
+ * import that module and {@link suggestedIdentity} must not offer one. A unit
+ * test in the connector (test/unit/settings-api.test.ts) holds the two equal.
+ */
+export const RESERVED_MAILBOX_IDS: ReadonlySet<string> = new Set(["new", "test"]);
+
+/**
+ * An id and a label for a mailbox that is not the first one.
+ *
+ * The first mailbox is `main`, with nothing on disk to collide with. Every
+ * mailbox added afterwards — from the connector's *Add mailbox* page, or by a
+ * second pass through the setup wizard's step 2 (#162) — needs an id of its
+ * own, and one derived from the address is the obvious guess. It is offered as
+ * a *filled-in box* rather than applied, which is the same rule the derived
+ * server settings beside it follow; deriving it rather than letting the
+ * operator meet "Mailbox 'anna' already exists." after pressing Save is the
+ * whole point.
+ *
+ * `taken` is the ids already in use. It has to satisfy the connector's id
+ * pattern, so it is built to: lowercased, anything outside the allowed set
+ * folded to `-`, a leading non-alphanumeric trimmed, and short enough that the
+ * collision suffix still fits. Moved here from the connector's
+ * settings-routes.ts so the two callers cannot offer different ids.
+ */
+export function suggestedIdentity(
+  email: string,
+  taken: readonly string[]
+): { id: string; label: string } {
+  const at = email.lastIndexOf("@");
+  const localPart = at <= 0 ? email : email.slice(0, at);
+  const stem =
+    localPart
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^[^a-z0-9]+/, "")
+      .slice(0, 32) || "mailbox";
+
+  let id = stem;
+  for (let n = 2; taken.includes(id) || RESERVED_MAILBOX_IDS.has(id); n += 1) {
+    id = `${stem.slice(0, 28)}-${n}`;
+  }
+  return { id, label: email };
+}
+
+/**
  * A suggestion, as the values a confirmation screen shows and submits.
  *
  * Under {@link MAILBOX_FIELDS} names, because that is the only vocabulary that
  * reaches the connector's parser, and over `defaults` the caller supplies — the
- * wizard's first mailbox is `main` and is the default account, and a second
- * mailbox added from the settings UI is neither, which is the whole of the
- * difference between the two callers here.
+ * id and label a mailbox is offered (`main` for the first, a
+ * {@link suggestedIdentity} for any later one) and the ports. The connector's
+ * *Add mailbox* page also puts the `default` flag in on an instance with no
+ * mailbox yet; the setup wizard leaves it out and decides it when the mailbox
+ * is saved, from what the connector has at that moment (#162).
  *
  * There is no password in it, and nowhere in a {@link MailboxSuggestion} for one
  * to come from. The one the operator typed is carried beside these rather than

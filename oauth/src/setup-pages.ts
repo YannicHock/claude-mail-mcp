@@ -529,21 +529,6 @@ function carriedWarning(warning: string | undefined, email: string): string {
 }
 
 /**
- * The hidden `default` field, when — and only when — the values carry it (#162).
- *
- * Whether this mailbox claims the default is the route's decision, not this
- * screen's: `stepDefaults` in setup-routes.ts puts the flag in for the first
- * mailbox and leaves it out once the connector already has one. This field used
- * to be written in unconditionally, so a second mailbox added through the wizard
- * after a Back took the default over from the first. There is no box to untick:
- * the full settings form is where a later mailbox is made the default.
- */
-function claimedDefault(values: Record<string, string>): string {
-  if (values[MAILBOX_FIELDS.isDefault] !== CHECKBOX_ON) return "";
-  return `<input type="hidden" name="${MAILBOX_FIELDS.isDefault}" value="${CHECKBOX_ON}">`;
-}
-
-/**
  * Step 2 — the first mailbox, verified before it is stored.
  *
  * The field names come from `MAILBOX_FIELDS` in settings-api.ts, which the
@@ -553,6 +538,11 @@ function claimedDefault(values: Record<string, string>): string {
  * collects becomes a `MailboxDraft` for the same `/settings/mailboxes` routes
  * the settings UI posts to, and nothing about a mailbox is validated, probed or
  * written on this side of that hop.
+ *
+ * There is no `default` field, hidden or otherwise (#162). Whether the mailbox
+ * becomes the default is decided when it is saved, from what the connector has
+ * at that moment: a field here could only carry an earlier answer, and a page
+ * from before the first save — a Back, a second tab — would still post it.
  *
  * Skip carries `formnovalidate` on purpose. Every credential field is
  * `required`, which is what catches an incomplete form in the browser rather
@@ -593,7 +583,6 @@ export function renderMailboxStep(data: MailboxPageData): string {
   ${probeSection(data.probe)}
   <form method="post" action="${escapeHtml(data.action)}" autocomplete="off">
     ${carriedWarning(data.warning, values[MAILBOX_FIELDS.mailDefaultFrom] ?? "")}
-    ${claimedDefault(values)}
     ${textInput({
       id: "label",
       name: MAILBOX_FIELDS.label,
