@@ -243,7 +243,11 @@ export interface AttendeeResult {
    * not the account itself — and anyone this call removed with `true` whom
    * it was free to schedule before, who may be sent a cancellation. It names
    * more than the attendees the call added: an ORGANIZER this call writes
-   * turns every plain attendee already listed into one the server schedules.
+   * turns every plain attendee already listed into one the server schedules
+   * — and with `false`, which marks them `CLIENT` as it writes it, they are
+   * named all the same: Sabre compares the object before and after, and an
+   * attendee who leaves the set it schedules may be sent a cancellation
+   * (review of PR #243).
    */
   mayNotify: string[];
 }
@@ -263,6 +267,11 @@ function everyVeventOf(vevent: ICAL.Component): ICAL.Component[] {
 function clientScheduled(prop: ICAL.Property): boolean {
   const agent = prop.getParameter("schedule-agent");
   return typeof agent === "string" && ["CLIENT", "NONE"].includes(agent.toUpperCase());
+}
+
+/** True when any line of the attendee `key` names, on any of `vevents`, is listed plainly: one the server is free to schedule. */
+function scheduledOn(vevents: readonly ICAL.Component[], key: string): boolean {
+  return vevents.some((ve) => (attendeesOf(ve).get(key) ?? []).some((prop) => !clientScheduled(prop)));
 }
 
 /**
@@ -302,36 +311,31 @@ function foreignOrganizer(vevents: readonly ICAL.Component[], own: readonly stri
 
 /**
  * Refuse, ending in `nothingDone`, removing with `notify: false` an attendee
- * the server was free to schedule (spec §2.1: removal with `false` honoured
- * only if acceptance A2 shows Nextcloud sends no cancellation for an
- * attendee who carried `SCHEDULE-AGENT=CLIENT`, "otherwise refused").
+ * listed plainly on any of `targets` (spec §2.1). Removal with `false` takes
+ * off only an attendee whose every line, on every one of `targets`, is
+ * marked `SCHEDULE-AGENT=CLIENT` or `NONE`: one the server was never asked
+ * to schedule. An attendee listed plainly is one it was free to schedule,
+ * and taking them off may make it send a cancellation whatever this call
+ * says, which nothing written here can stop. That holds on an event with no
+ * ORGANIZER yet too: the one this call writes makes Sabre compare the
+ * object before and after (review of PR #243). With `notify: true` the
+ * caller has accepted it.
  *
- * A2 passed on Nextcloud (owner, 2026-10-18, #236): taking off an attendee
- * marked `SCHEDULE-AGENT=CLIENT` sent them no cancellation. So a removal
- * with `false` is honoured for an attendee the server was never asked to
- * schedule — the object has no ORGANIZER yet, or every line of theirs on
- * `targets` carries `SCHEDULE-AGENT=CLIENT` or `NONE` — and still refused for
- * one it was free to schedule: taking them off may make it send a
- * cancellation whatever this call says, and nothing written here can stop
- * that. With `notify: true` the caller has accepted it. Until A2 was in,
- * every removal with `false` was refused.
+ * The evidence is acceptance A2 on Nextcloud (2026-10-18, #236): taking off
+ * an attendee of the account's own meeting marked `SCHEDULE-AGENT=CLIENT`
+ * sent them no cancellation. A2 tested `CLIENT`; RFC 6638 §7.1 gives `NONE`
+ * the same meaning, that the server sends them nothing.
  *
  * What to do instead comes before what was not done, and leaving them
  * listed first of all.
  */
-function checkRemoval(
-  targets: readonly ICAL.Component[],
-  organized: boolean,
-  call: AttendeeCall,
-  nothingDone: string
-): void {
-  if (call.notify || call.remove.length === 0 || !organized) return;
+function checkRemoval(targets: readonly ICAL.Component[], call: AttendeeCall, nothingDone: string): void {
+  if (call.notify) return;
   const instead = "Leave them listed, or confirm with the user that they may be emailed and pass notify_attendees: true.";
   for (const address of call.remove) {
-    const key = addressKey(address);
-    if (targets.some((ve) => (attendeesOf(ve).get(key) ?? []).some((prop) => !clientScheduled(prop)))) {
+    if (scheduledOn(targets, addressKey(address))) {
       throw new ToolRefusal(
-        `${address} is on this event without SCHEDULE-AGENT=CLIENT, so the calendar server may already have told them about it, and removing them may make it email them a cancellation whatever notify_attendees says; this connector cannot prevent that. ${instead} ${nothingDone}`
+        `${address} is listed plainly on this event, without SCHEDULE-AGENT=CLIENT or NONE, so the calendar server is free to email them, and removing them may make it send them a cancellation whatever notify_attendees says; this connector cannot prevent that. ${instead} ${nothingDone}`
       );
     }
   }
@@ -366,19 +370,19 @@ function checkGuestList(
 
 /**
  * The bare addresses the server may schedule on `vevents`, as
- * {@link AttendeeResult.mayNotify} describes, starting from `removed` — the
- * ones this call took off with `true` — and never one of `own`. What
- * `create_event` answers as `may_notify`, over the event it built, with no
- * one removed.
+ * {@link AttendeeResult.mayNotify} describes, starting from `leaving` — the
+ * ones this call took off with `true`, or marked `CLIENT` as it wrote the
+ * ORGANIZER — and never one of `own`. What `create_event` answers as
+ * `may_notify`, over the event it built, with no one leaving.
  */
-export function schedulable(vevents: readonly ICAL.Component[], removed: readonly string[], own: readonly string[]): string[] {
+export function schedulable(vevents: readonly ICAL.Component[], leaving: readonly string[], own: readonly string[]): string[] {
   const skip = new Set(own.map(addressKey));
   const named = new Map<string, string>();
   const note = (address: string): void => {
     const key = addressKey(address);
     if (!skip.has(key) && !named.has(key)) named.set(key, address.trim().replace(MAILTO, ""));
   };
-  for (const address of removed) note(address);
+  for (const address of leaving) note(address);
   for (const vevent of vevents) {
     for (const prop of vevent.getAllProperties("attendee")) {
       if (!clientScheduled(prop)) note(String(prop.getFirstValue()));
@@ -513,19 +517,19 @@ function changeGuestList(
   const organizer = organizerOf(own, nothingDone);
   const vevents = everyVeventOf(strict);
   checkOrganizer(vevents, own, nothingDone);
-  const organized = vevents.some((ve) => ve.hasProperty("organizer"));
   const targets = [strict, ...lenient];
-  checkRemoval(targets, organized, call, nothingDone);
+  checkRemoval(targets, call, nothingDone);
   checkGuestList(strict, lenient, call, nothingDone);
-  // Removed with true, from a line the server was free to schedule (once
-  // there is an ORGANIZER): they may be sent a cancellation.
-  const cancelled = call.notify
-    ? call.remove.filter((address) =>
-        targets.some((ve) => (attendeesOf(ve).get(addressKey(address)) ?? []).some((prop) => !clientScheduled(prop)))
-      )
-    : [];
+  // Removed with true, from a line the server was free to schedule: they
+  // may be sent a cancellation.
+  const cancelled = call.notify ? call.remove.filter((address) => scheduledOn(targets, addressKey(address))) : [];
+  // Listed plainly before an ORGANIZER this call writes with false, which
+  // marks them CLIENT: they leave the set the server schedules, and may be
+  // sent a cancellation as they do (review of PR #243).
+  const organized = vevents.some((ve) => ve.hasProperty("organizer"));
+  const marked = organized || call.notify ? [] : schedulable(vevents, [], own);
   const changed = writeGuestList(vevents, strict, lenient, call, organizer);
-  return { changed, mayNotify: schedulable(vevents, cancelled, own) };
+  return { changed, mayNotify: schedulable(vevents, [...cancelled, ...marked], own) };
 }
 
 /**
@@ -538,9 +542,8 @@ function changeGuestList(
  * Refused, ending in `nothingDone`, with the object left as it was:
  * `notifyAttendees` missing, one address named twice, an account with no
  * address, someone else's meeting ({@link checkOrganizer}), a removal with
- * `false` of an attendee the server was free to schedule
- * ({@link checkRemoval}), an attendee added who already is one or removed
- * who is not.
+ * `false` of an attendee listed plainly ({@link checkRemoval}), an attendee
+ * added who already is one or removed who is not.
  * What is written, on `vevent` and on any other VEVENT of its UID, is
  * {@link writeGuestList}'s. On one occurrence this changes that occurrence's
  * guest list alone, which RFC 5545 allows an override to have.

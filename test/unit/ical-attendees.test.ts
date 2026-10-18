@@ -268,19 +268,41 @@ describe("update_event's add_attendees and remove_attendees (#205, spec §2.1)",
     assert.deepEqual(attendees(text), [CARA]);
   });
 
-  // Spec §2.1: removal with `false` is honoured only if the Hetzner run (A2)
-  // shows Nextcloud sends no cancellation for an attendee who carried
-  // SCHEDULE-AGENT=CLIENT, "otherwise refused". A2 passed on Nextcloud
-  // (2026-10-18, #236): taking such an attendee off sent them nothing.
-  describe("remove_attendees with notify_attendees: false, now that acceptance A2 has shown Nextcloud sends no cancellation for SCHEDULE-AGENT=CLIENT", () => {
-    it("removes an attendee the server was told nothing about (SCHEDULE-AGENT=CLIENT)", () => {
-      const text = patched(mine(), { removeAttendees: ["cara@example.com"], notifyAttendees: false });
+  // Spec §2.1: removal with `false` takes off only an attendee marked
+  // SCHEDULE-AGENT=CLIENT or NONE on every line of theirs, and refuses anyone
+  // listed plainly, organizer or not. The evidence: acceptance A2 on
+  // Nextcloud (2026-10-18, #236), where taking off an attendee marked CLIENT
+  // sent them no cancellation.
+  describe("remove_attendees with notify_attendees: false", () => {
+    const shape = SHAPES.find((s) => s.name === "UTC");
+    assert.ok(shape);
+    const CY_PLAIN = "ATTENDEE;CN=Cy;PARTSTAT=ACCEPTED:mailto:cy@example.com";
+    const CY_CLIENT = "ATTENDEE;CN=Cy;PARTSTAT=ACCEPTED;SCHEDULE-AGENT=CLIENT:mailto:cy@example.com";
+    const MOVED = ["RECURRENCE-ID:20261015T090000Z", "DTSTART:20261015T110000Z", "DTEND:20261015T120000Z", "SUMMARY:Weekly (moved)", "SEQUENCE:1"];
+    /** Weekly, organized by the account: `onMaster` on the master, `onMoved` on the 10-15 override. */
+    const organized = (onMaster: string, onMoved: string): string =>
+      seriesOf(shape, "20261001", "FREQ=WEEKLY;COUNT=5", ["ORGANIZER:mailto:me@cloud.example", onMaster], [[...MOVED, onMoved]]);
+    const CTX = { nothingDone: CHANGED, now: NOW, own: OWN };
+
+    it("removes an attendee marked SCHEDULE-AGENT=CLIENT, and may_notify still names whoever is listed plainly", () => {
+      const edit = applyEventPatch(parseCalendar(mine()), MEETING, { removeAttendees: ["cara@example.com"], notifyAttendees: false }, CTX);
+      assert.deepEqual(attendees(unfold(edit.ics)), [BEN]);
+      assert.deepEqual(edit.mayNotify, ["ben@example.com"]);
+    });
+
+    it("removes an attendee marked SCHEDULE-AGENT=NONE, which asks the server for the same silence", () => {
+      const text = patched(mine().replace(";SCHEDULE-AGENT=CLIENT:", ";SCHEDULE-AGENT=NONE:"), { removeAttendees: ["cara@example.com"], notifyAttendees: false });
       assert.deepEqual(attendees(text), [BEN]);
     });
 
-    it("removes an attendee from an event with no organizer, where nothing was ever scheduled", () => {
-      const text = patched(NO_ORGANIZER, { removeAttendees: ["ben@example.com"], notifyAttendees: false });
-      assert.doesNotMatch(text, /ben@example\.com/);
+    it("refuses an attendee listed plainly on an event with no organizer yet, and changes nothing: the ORGANIZER this call would write lets the server send them a cancellation (review of PR #243)", () => {
+      const parsed = parseCalendar(NO_ORGANIZER);
+      const before = parsed.vcal.toString();
+      const message = refused(() =>
+        applyEventPatch(parsed, MEETING, { removeAttendees: ["ben@example.com"], notifyAttendees: false }, CTX)
+      );
+      assert.equal(parsed.vcal.toString(), before);
+      assert.match(message, /ben@example\.com/);
     });
 
     it("still refuses to remove an attendee the server was free to notify, and changes nothing: it may send a cancellation whatever this says", () => {
@@ -305,9 +327,54 @@ describe("update_event's add_attendees and remove_attendees (#205, spec §2.1)",
       assert.equal(parsed.vcal.toString(), before);
     });
 
-    it("the ORGANIZER a removal adds does not make the server notify the attendees left either", () => {
-      const text = patched(NO_ORGANIZER, { removeAttendees: ["ben@example.com"], addAttendees: ["dan@example.com"], notifyAttendees: false });
-      assert.deepEqual(attendees(text), ["ATTENDEE;SCHEDULE-AGENT=CLIENT:mailto:dan@example.com"]);
+    it("on an event with no organizer yet, the ORGANIZER a removal adds marks the attendees left CLIENT, and may_notify names them as they leave the server's set", () => {
+      const text = NO_ORGANIZER.replace("END:VEVENT", `${CARA}\r\nEND:VEVENT`);
+      const edit = applyEventPatch(parseCalendar(text), MEETING, { removeAttendees: ["cara@example.com"], addAttendees: ["dan@example.com"], notifyAttendees: false }, CTX);
+      assert.deepEqual(attendees(unfold(edit.ics)), [
+        "ATTENDEE;CN=Ben;PARTSTAT=ACCEPTED;SCHEDULE-AGENT=CLIENT:mailto:ben@example.com",
+        "ATTENDEE;SCHEDULE-AGENT=CLIENT:mailto:dan@example.com",
+      ]);
+      assert.deepEqual(edit.mayNotify, ["ben@example.com"]);
+    });
+
+    it("with apply_to_series, refuses an attendee marked CLIENT on the master but listed plainly on an override, and the reverse, changing nothing", () => {
+      for (const [onMaster, onMoved] of [
+        [CY_CLIENT, CY_PLAIN],
+        [CY_PLAIN, CY_CLIENT],
+      ]) {
+        const parsed = parseCalendar(organized(onMaster, onMoved));
+        const before = parsed.vcal.toString();
+        const message = refused(() => applyEventPatch(parsed, UID, { removeAttendees: ["cy@example.com"], notifyAttendees: false }, CTX));
+        assert.equal(parsed.vcal.toString(), before);
+        assert.match(message, /cy@example\.com/);
+      }
+    });
+
+    it("with apply_to_series, removes an attendee marked CLIENT on every occurrence that lists them", () => {
+      const text = patched(organized(CY_CLIENT, CY_CLIENT), { removeAttendees: ["cy@example.com"], notifyAttendees: false }, UID);
+      assert.doesNotMatch(text, /cy@example\.com/);
+    });
+
+    it("on one occurrence, removes an attendee marked CLIENT there, from an override already stored and from a new one copied from the master", () => {
+      const stored = organized(CY_PLAIN, CY_CLIENT);
+      const moved = unfold(
+        applyOccurrencePatch(parseCalendar(stored), UID, occurrence(stored, "2026-10-15T09:00:00.000Z"), { removeAttendees: ["cy@example.com"], notifyAttendees: false }, CTX).ics
+      );
+      assert.doesNotMatch(block(moved, "RECURRENCE-ID:20261015T090000Z"), /cy@example\.com/);
+      const copied = organized(CY_CLIENT, CY_CLIENT);
+      const fresh = unfold(
+        applyOccurrencePatch(parseCalendar(copied), UID, occurrence(copied, "2026-10-08T09:00:00.000Z"), { removeAttendees: ["cy@example.com"], notifyAttendees: false }, CTX).ics
+      );
+      assert.doesNotMatch(block(fresh, "RECURRENCE-ID:20261008T090000Z"), /cy@example\.com/);
+      assert.match(block(fresh, null), /SCHEDULE-AGENT=CLIENT:mailto:cy@example\.com/, "the master keeps them");
+    });
+
+    it("on one occurrence, refuses an attendee a new override would copy plainly from the master", () => {
+      const text = organized(CY_PLAIN, CY_CLIENT);
+      const message = refused(() =>
+        applyOccurrencePatch(parseCalendar(text), UID, occurrence(text, "2026-10-08T09:00:00.000Z"), { removeAttendees: ["cy@example.com"], notifyAttendees: false }, CTX)
+      );
+      assert.match(message, /cy@example\.com/);
     });
   });
 
@@ -478,7 +545,7 @@ describe("a series with no ORGANIZER yet: the organizer and notify_attendees: fa
   assert.ok(shape);
   const ANN = "ATTENDEE;CN=Ann;PARTSTAT=ACCEPTED:mailto:ann@example.com";
   const BEN_S = "ATTENDEE;CN=Ben;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT:mailto:ben@example.com";
-  const CY = "ATTENDEE;CN=Cy;PARTSTAT=NEEDS-ACTION:mailto:cy@example.com";
+  const CY = "ATTENDEE;CN=Cy;PARTSTAT=NEEDS-ACTION;SCHEDULE-AGENT=CLIENT:mailto:cy@example.com";
   const MOVED = ["RECURRENCE-ID:20261015T090000Z", "DTSTART:20261015T110000Z", "DTEND:20261015T120000Z", "SUMMARY:Weekly (moved)", "SEQUENCE:1"];
   /** Weekly, no ORGANIZER anywhere: Ann and Ben (and `extra`) on the master, `onMoved` on the 10-15 override. */
   const unorganized = (extra: string[] = [], onMoved: string[] = [ANN, BEN_S]): string =>
@@ -508,7 +575,7 @@ describe("a series with no ORGANIZER yet: the organizer and notify_attendees: fa
     assert.doesNotMatch(block(written, null), /dan@example\.com/);
   });
 
-  it("(b) apply_to_series removing someone the master lists, with false: the untouched override's attendees are marked too", () => {
+  it("(b) apply_to_series removing, with false, someone the master marks CLIENT: the untouched override's attendees are marked too", () => {
     const { vcal } = parseCalendar(unorganized([CY]));
     const { master, overrides } = seriesFor(vcal, UID);
     assert.ok(master);
@@ -585,8 +652,12 @@ describe("mayNotify: whom the calendar server may now email about the event (rev
     assert.deepEqual(mayNotify(NO_ORGANIZER, { addAttendees: ["dan@example.com"], notifyAttendees: true }), ["ben@example.com", "dan@example.com"]);
   });
 
-  it("is empty when false reaches everyone", () => {
-    assert.deepEqual(mayNotify(NO_ORGANIZER, { addAttendees: ["dan@example.com"], notifyAttendees: false }), []);
+  it("names the attendees already listed that an ORGANIZER written with false marks CLIENT: they leave the set the server schedules, and may be sent a cancellation (review of PR #243)", () => {
+    assert.deepEqual(mayNotify(NO_ORGANIZER, { addAttendees: ["dan@example.com"], notifyAttendees: false }), ["ben@example.com"]);
+  });
+
+  it("names an attendee listed plainly after a removal with false, never the one removed", () => {
+    assert.deepEqual(mayNotify(mine(), { removeAttendees: ["cara@example.com"], notifyAttendees: false }), ["ben@example.com"]);
   });
 
   it("names the attendees already scheduled, who may be told of the change, and never one marked CLIENT", () => {
