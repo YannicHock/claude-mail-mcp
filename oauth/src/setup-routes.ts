@@ -1197,12 +1197,36 @@ function withCarriedPasswords(draft: MailboxDraft): Record<string, string> {
   return values;
 }
 
+/**
+ * What to tell the operator when the connector answered with a status the
+ * wizard has no form errors for.
+ *
+ * Only a 401 or 403 points at the signing key and the auth token: that is the
+ * connector refusing who asked. A 5xx is the connector failing on its own side
+ * (#219: a full disk or a permission problem writing accounts.json answers
+ * 500), and sending the operator to compare two secrets that are fine would
+ * cost them the time it takes to find that out.
+ */
 function refusedNotice(status: number): { kind: "error"; message: string } {
+  if (status === 401 || status === 403) {
+    return {
+      kind: "error",
+      message:
+        `The connector refused the request (HTTP ${status}), so nothing was saved. ` +
+        "Check that both services share the same settings signing key and auth token.",
+    };
+  }
+  if (status >= 500) {
+    return {
+      kind: "error",
+      message:
+        `The connector failed while handling the request (HTTP ${status}), so nothing ` +
+        "was saved. Its log has the details.",
+    };
+  }
   return {
     kind: "error",
-    message:
-      `The connector refused the request (HTTP ${status}), so nothing was saved. ` +
-      "Check that both services share the same settings signing key and auth token.",
+    message: `The connector refused the request (HTTP ${status}), so nothing was saved.`,
   };
 }
 
