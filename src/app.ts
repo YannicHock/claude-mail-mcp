@@ -30,7 +30,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 import { clientErrorStatus } from "../shared/http-error.js";
 import type { Logger } from "../shared/log.js";
-import { AccountsStore, reservedIdAccounts, reservedIdNotice } from "./accounts.js";
+import { AccountsStore, reservedIdAccounts, reservedIdNotice, type Account } from "./accounts.js";
+import { caldavUrlProblem } from "./caldav-url.js";
 import { ClientPool } from "./client-pool.js";
 import { registerMailTools } from "./tools-mail.js";
 import { registerCalendarTools } from "./tools-calendar.js";
@@ -90,6 +91,30 @@ export interface CreateAppOptions {
 }
 
 /**
+ * One `warn` per account in `next` whose CalDAV URL the calendar tools refuse
+ * to use (#247, `caldavUrlProblem` in src/caldav-url.ts), counting only an
+ * account whose URL is new since `prev`: everything at start, and on a reload
+ * only what a hand edit just introduced. Each line is logged as its check
+ * settles; the promise is for a caller that wants to wait for all of them.
+ */
+export async function warnAboutCaldavUrls(log: Logger, next: Account[], prev: Account[] = []): Promise<void> {
+  const before = new Map(prev.map((a) => [a.id, a.caldav?.url]));
+  await Promise.all(
+    next.map(async (account) => {
+      const url = account.caldav?.url;
+      if (url === undefined || before.get(account.id) === url) return;
+      const notice = await caldavUrlProblem(url);
+      if (notice === null) return;
+      log("warn", "mailbox's CalDAV URL is refused; its calendar tools will not use it", {
+        account: account.id,
+        label: account.label,
+        notice,
+      });
+    })
+  );
+}
+
+/**
  * Build the Express app. Does not listen — the caller owns the socket, which
  * is what lets a test bind port 0 and close it deterministically afterwards.
  */
@@ -112,6 +137,10 @@ export function createApp(opts: CreateAppOptions): express.Express {
       notice: reservedIdNotice(account.id),
     });
   }
+
+  // #247, said once here for the same reason, and not on every refused call.
+  // Not awaited: the check may resolve a name, and createApp is synchronous.
+  void warnAboutCaldavUrls(log, store.list());
 
   const mcp = new McpServer({
     name: SERVER_NAME,

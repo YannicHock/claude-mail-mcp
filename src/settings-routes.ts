@@ -109,6 +109,7 @@ import {
   type CalDavCreds,
 } from "./accounts.js";
 import { StaleStampError } from "./accounts-writer.js";
+import { caldavUrlProblem } from "./caldav-url.js";
 import { createNoticeFlash, type NoticeFlash } from "./notice-flash.js";
 import { probeAccount, type ProbeReport } from "./probe.js";
 import { credentialNoteFor, providerPresets, unsupportedNoticeFor } from "./providers.js";
@@ -291,7 +292,7 @@ type ParsedForm = { account: Account; errors?: undefined } | { account?: undefin
  * collected by field name rather than the parse stopping at the first one, so
  * a resubmission can fix everything at once instead of one field per round trip.
  */
-function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm {
+function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm & { keptCaldavUrl: string | null } {
   const errors: Record<string, string> = {};
 
   function requireStr(key: string): string {
@@ -366,6 +367,9 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
   const caldavUser = raw(body, MAILBOX_FIELDS.caldavUser);
 
   let caldav: CalDavCreds | undefined;
+  // The URL the CalDAV block would be stored with, whatever else is wrong with
+  // the form: what #247's check in parseCheckedAccountForm looks at.
+  let keptCaldavUrl: string | null = null;
   if (removeCaldav) {
     // Explicit removal — caldav stays undefined below.
   } else if (caldavUrl.trim() === "") {
@@ -384,13 +388,15 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
     }
     const caldavPass = password(MAILBOX_FIELDS.caldavPass, existing?.caldav?.pass);
     caldav = { url: caldavUrl, user: caldavUser, pass: caldavPass };
+    keptCaldavUrl = caldavUrl;
   }
 
   if (Object.keys(errors).length > 0) {
-    return { errors };
+    return { errors, keptCaldavUrl };
   }
 
   return {
+    keptCaldavUrl,
     account: {
       id,
       label,
@@ -406,6 +412,19 @@ function parseAccountForm(body: FormBody, existing: Account | null): ParsedForm 
       caldav,
     },
   };
+}
+
+/**
+ * {@link parseAccountForm}, and then #247's check of the CalDAV URL it would
+ * keep (`caldavUrlProblem` in src/caldav-url.ts), on its own field. Every
+ * route that probes or stores a submitted mailbox parses through here, so the
+ * refusal comes before the probe; *Save anyway* skips the probe, not this.
+ */
+async function parseCheckedAccountForm(body: FormBody, existing: Account | null): Promise<ParsedForm> {
+  const { keptCaldavUrl, ...parsed } = parseAccountForm(body, existing);
+  const problem = keptCaldavUrl === null ? null : await caldavUrlProblem(keptCaldavUrl);
+  if (problem === null) return parsed as ParsedForm;
+  return { errors: { ...parsed.errors, [MAILBOX_FIELDS.caldavUrl]: problem } };
 }
 
 /** `ProbeReport` (probe.ts) and `ProbeReportView` (settings-pages.ts) declare
@@ -1123,6 +1142,19 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     // The one thing a save's 303 carries. An unknown or expired token is no
     // notice, not an error: a bookmarked URL is not a fault.
     const notice = notices.get(req.query.notice);
+    // A row's notices, one sentence each: the reserved-id one below, and #247's
+    // CalDAV URL the calendar tools refuse to use (src/caldav-url.ts), worked
+    // out here rather than at load because it may resolve a name.
+    const rowNotices = new Map<string, string[]>(
+      reservedIdAccounts(accounts).map((a) => [a.id, [reservedIdNotice(a.id)]])
+    );
+    await Promise.all(
+      accounts.map(async (a) => {
+        const problem = a.caldav ? await caldavUrlProblem(a.caldav.url) : null;
+        if (problem === null) return;
+        rowNotices.set(a.id, [...(rowNotices.get(a.id) ?? []), `Its calendar tools are refused. ${problem}`]);
+      })
+    );
     sendHtml(
       res,
       200,
@@ -1136,7 +1168,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         // the one place its operator is certain to look. See RESERVED_IDS in
         // accounts.ts for why the file is still loaded rather than refused.
         rowNotices: Object.fromEntries(
-          reservedIdAccounts(accounts).map((a) => [a.id, reservedIdNotice(a.id)])
+          [...rowNotices].map(([id, sentences]) => [id, sentences.join(" ")])
         ),
       })
     );
@@ -1390,7 +1422,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
           carry: fields,
         });
 
-      const parsed = parseAccountForm(fields, null);
+      const parsed = await parseCheckedAccountForm(fields, null);
       if (parsed.errors) {
         rejected(400, parsed.errors, submittedStamp);
         return;
@@ -1461,7 +1493,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
         return;
       }
 
-      const parsed = parseAccountForm(fields, null);
+      const parsed = await parseCheckedAccountForm(fields, null);
       if (parsed.errors) {
         // The same refusal the create route gives, because it is the same
         // refusal: this route is that one without the write (#130).
@@ -1606,7 +1638,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     // no second caller — so the only branch `sendDraftRefusal` ever takes here
     // is the page one. It is used anyway so that the form a rejected edit comes
     // back on is assembled in exactly one place.
-    const parsed = parseAccountForm(body, existing);
+    const parsed = await parseCheckedAccountForm(body, existing);
     if (parsed.errors) {
       sendDraftRefusal(res, false, {
         status: 400,
@@ -1685,7 +1717,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     const body = req.body as FormBody;
     const assertion = assertionOf(res);
     const submittedStamp = raw(body, "_stamp");
-    const parsed = parseAccountForm(body, existing);
+    const parsed = await parseCheckedAccountForm(body, existing);
     if (parsed.errors) {
       sendDraftRefusal(res, false, {
         status: 400,

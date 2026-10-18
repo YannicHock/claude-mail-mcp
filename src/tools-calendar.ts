@@ -115,6 +115,8 @@ import { ClientPool } from "./client-pool.js";
 import { CalDavClient } from "./caldav-client.js";
 import { MAX_FREE_SLOT_RANGE_DAYS, MAX_FREE_SLOTS } from "./free-slots.js";
 import { reportingFailures } from "./tool-errors.js";
+import { ToolRefusal } from "./tool-refusal.js";
+import { caldavUrlProblem } from "./caldav-url.js";
 
 function asJson(value: unknown): { content: { type: "text"; text: string }[] } {
   return {
@@ -271,16 +273,24 @@ const recurrenceIdSchema = z
  * blame a host nothing ever contacted. The second message names the *resolved*
  * id rather than the argument, so a caller who omitted `account` is told which
  * mailbox it landed on instead of the unhelpful `(default)`.
+ *
+ * The third is a `ToolRefusal`, with no log line: a CalDAV URL the
+ * credentials must not be sent to (#247, `caldavUrlProblem` in
+ * src/caldav-url.ts), checked on every call before any request.
  */
-function requireCaldav(
+async function requireCaldav(
   pool: ClientPool,
   accountId?: string
-): { caldav: CalDavClient; id: string } {
+): Promise<{ caldav: CalDavClient; id: string }> {
   const clients = pool.for(accountId);
-  if (!clients.caldav) {
+  if (!clients.caldav || clients.caldavUrl === null) {
     throw new Error(
       `Account "${clients.id}" has no CalDAV configured. Add a CalDAV URL under /settings/mailboxes on this deployment's public URL.`
     );
+  }
+  const problem = await caldavUrlProblem(clients.caldavUrl);
+  if (problem !== null) {
+    throw new ToolRefusal(`Account "${clients.id}": ${problem} Nothing was read or changed.`);
   }
   return { caldav: clients.caldav, id: clients.id };
 }
@@ -299,7 +309,7 @@ export function registerCalendarTools(
       },
     },
     async ({ account }) => {
-      const { caldav, id } = requireCaldav(pool, account);
+      const { caldav, id } = await requireCaldav(pool, account);
       return asJson(
         await reportingFailures(pool, "list_calendars", id, () => caldav.listCalendars())
       );
@@ -319,7 +329,7 @@ export function registerCalendarTools(
       },
     },
     async ({ calendar_url, start, end, account }) => {
-      const { caldav, id } = requireCaldav(pool, account);
+      const { caldav, id } = await requireCaldav(pool, account);
       const { events, skipped } = await reportingFailures(pool, "list_events", id, () =>
         caldav.listEvents(calendar_url, start, end)
       );
@@ -358,7 +368,7 @@ export function registerCalendarTools(
       }).superRefine(notifyRequired((args) => [args.attendees])),
     },
     async (args) => {
-      const { caldav, id } = requireCaldav(pool, args.account);
+      const { caldav, id } = await requireCaldav(pool, args.account);
       const result = await reportingFailures(pool, "create_event", id, () =>
         caldav.createEvent({
           calendarUrl: args.calendar_url,
@@ -418,7 +428,7 @@ export function registerCalendarTools(
       }).superRefine(notifyRequired((args) => [args.add_attendees, args.remove_attendees])),
     },
     async (args) => {
-      const { caldav, id } = requireCaldav(pool, args.account);
+      const { caldav, id } = await requireCaldav(pool, args.account);
       const result = await reportingFailures(pool, "update_event", id, () =>
         caldav.updateEvent({
           calendarUrl: args.calendar_url,
@@ -456,7 +466,7 @@ export function registerCalendarTools(
       },
     },
     async (args) => {
-      const { caldav, id } = requireCaldav(pool, args.account);
+      const { caldav, id } = await requireCaldav(pool, args.account);
       const result = await reportingFailures(pool, "delete_event", id, () =>
         caldav.deleteEvent({
           calendarUrl: args.calendar_url,
@@ -490,7 +500,7 @@ export function registerCalendarTools(
       },
     },
     async (args) => {
-      const { caldav, id } = requireCaldav(pool, args.account);
+      const { caldav, id } = await requireCaldav(pool, args.account);
       const result = await reportingFailures(pool, "move_event", id, () =>
         caldav.moveEvent({
           calendarUrl: args.calendar_url,
@@ -546,7 +556,7 @@ export function registerCalendarTools(
       },
     },
     async (args) => {
-      const { caldav, id } = requireCaldav(pool, args.account);
+      const { caldav, id } = await requireCaldav(pool, args.account);
       const { timezone, slots, truncated, skipped, addressesKnown } = await reportingFailures(pool, "find_free_slot", id, () =>
         caldav.findFreeSlots({
           calendarUrls: args.calendar_urls,

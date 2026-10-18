@@ -34,7 +34,7 @@ import {
   type MailboxDraft,
   type MailboxProbeReport,
 } from "../../shared/settings-api.js";
-import { startRejectingImapServer } from "../helpers/fake-imap.js";
+import { startAcceptingImapServer, startRejectingImapServer } from "../helpers/fake-imap.js";
 import {
   AUTH_TOKEN,
   CSRF,
@@ -2597,6 +2597,127 @@ test("an ordinary address picks up no warning anywhere in the cascade", async ()
     const html = await res.text();
     assert.equal(/no password will connect/.test(html), false, html);
     assert.match(html, /Nothing has been saved/);
+  } finally {
+    await close();
+  }
+});
+
+// ---- #247: an http:// CalDAV URL only for a local host ----------------------
+//
+// An `http://` CalDAV URL sends the account's Basic credentials in cleartext,
+// so a save naming one for a host that is not local is refused — on the field,
+// before the probe, whichever route it comes by. The probe would itself send
+// those credentials over http, so "no probe ran" is the half that matters: the
+// IMAP server the draft points at is a real one on loopback that records what
+// it is sent, and it must be sent nothing. The wizard saves through the JSON
+// routes, so the JSON case is its case too.
+
+const PUBLIC_HTTP_CALDAV = "http://cloud.example.com/dav/";
+
+test("an http:// CalDAV URL to a public host is refused by the JSON save and probe, before any probe runs (#247)", async () => {
+  const imap = await startAcceptingImapServer();
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const before = await stampOf(accountsPath);
+    const mailbox = validDraft({
+      imap: { host: "127.0.0.1", port: String(imap.port), user: "u", pass: "imap-secret", tls: false },
+      caldav: { url: PUBLIC_HTTP_CALDAV, user: "dav-user", pass: "dav-secret" },
+    });
+    for (const [route, saveAnyway] of [
+      ["/settings/mailboxes", false],
+      // *Save anyway* skips the probe, not this: it is a refusal of the URL itself.
+      ["/settings/mailboxes", true],
+      ["/settings/mailboxes/test", false],
+    ] as const) {
+      const res = await postJson(url, route, {
+        _csrf: CSRF,
+        _stamp: before,
+        mailbox,
+        ...(saveAnyway ? { [SAVE_ANYWAY_FIELD]: true } : {}),
+      });
+      assert.equal(res.status, 400, route);
+      const answer = parseErrorAnswer(await res.json());
+      assert.match(answer.errors[MAILBOX_FIELDS.caldavUrl] ?? "", /https:\/\//, route);
+      assert.equal(answer.probe, undefined, `${route}: nothing was probed, so there is no report`);
+    }
+    assert.deepEqual(imap.received, [], "no probe reached the IMAP server");
+    assert.deepEqual(JSON.parse(await readFile(accountsPath, "utf8")).accounts, []);
+    assert.equal(await stampOf(accountsPath), before, "nothing was written");
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("an http:// CalDAV URL to a public host is refused by the form's create, test and edit routes (#247)", async () => {
+  const imap = await startAcceptingImapServer();
+  const { url, accountsPath, close } = await startConnector([makeAccount({ id: "work", label: "Work" })]);
+  try {
+    const fields = validForm({
+      id: "home",
+      "imap.host": "127.0.0.1",
+      "imap.port": String(imap.port),
+      "imap.tls": "",
+      "caldav.url": PUBLIC_HTTP_CALDAV,
+      "caldav.user": "dav-user",
+      "caldav.pass": "dav-secret",
+    });
+    for (const route of [
+      "/settings/mailboxes",
+      "/settings/mailboxes/test",
+      "/settings/mailboxes/work",
+      "/settings/mailboxes/work/test",
+    ]) {
+      const res = await post(url, route, await withStampProbed(accountsPath, fields));
+      assert.equal(res.status, 400, route);
+      // On the CalDAV URL's own field, under its box.
+      assert.match(await res.text(), /name="caldav\.url"[^>]*>\s*<p class="field-error">[^<]*https:\/\//, route);
+    }
+    assert.deepEqual(imap.received, [], "no probe reached the IMAP server");
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")).accounts as Account[];
+    assert.deepEqual(
+      stored.map((a) => a.id),
+      ["work"]
+    );
+    assert.equal(stored[0]?.caldav, undefined, "the edit wrote nothing");
+  } finally {
+    await close();
+    await imap.close();
+  }
+});
+
+test("the mailbox list says on the row which stored mailbox's CalDAV URL is refused, beside a reserved-id notice (#247)", async () => {
+  const caldav = (url: string) => ({ url, user: "dav-user", pass: "dav-secret" });
+  const { url, close } = await startConnector([
+    makeAccount({ id: "work", label: "Work", caldav: caldav(PUBLIC_HTTP_CALDAV) }),
+    makeAccount({ id: "test", label: "Old test mailbox", caldav: caldav(PUBLIC_HTTP_CALDAV) }),
+    makeAccount({ id: "home", label: "Home", caldav: caldav("http://127.0.0.1:5232/") }),
+  ]);
+  try {
+    const res = await get(url, "/settings/mailboxes", mint("GET", "/settings/mailboxes"));
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    const notices = [...html.matchAll(/<tr class="row-notice"><td colspan="4">([^<]*)<\/td><\/tr>/g)].map((m) => m[1]!);
+    assert.equal(notices.length, 2, "one row notice for each affected mailbox, none for the loopback one");
+    assert.ok(notices.every((n) => /calendar tools are refused/.test(n) && /https:\/\//.test(n)), notices.join("\n"));
+    assert.equal(notices.filter((n) => /reserved id/.test(n)).length, 1, "the reserved-id sentence is merged, not a row of its own");
+  } finally {
+    await close();
+  }
+});
+
+test("an http:// CalDAV URL to a loopback host, as a local Radicale has, is still saved (#247)", async () => {
+  const { url, accountsPath, close } = await startConnector();
+  try {
+    const res = await postJson(url, "/settings/mailboxes", {
+      _csrf: CSRF,
+      _stamp: await stampOf(accountsPath),
+      mailbox: validDraft({ caldav: { url: "http://127.0.0.1:5232/", user: "dav-user", pass: "dav-secret" } }),
+      [SAVE_ANYWAY_FIELD]: true,
+    });
+    assert.equal(res.status, 201);
+    const stored = JSON.parse(await readFile(accountsPath, "utf8")).accounts[0] as Account;
+    assert.equal(stored.caldav?.url, "http://127.0.0.1:5232/");
   } finally {
     await close();
   }

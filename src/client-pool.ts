@@ -25,6 +25,8 @@ export interface AccountClients {
   imap: ImapClient;
   smtp: SmtpClient;
   caldav: CalDavClient | null;
+  /** The configured CalDAV URL, checked before every calendar call (#247, src/caldav-url.ts). */
+  caldavUrl: string | null;
   draftsFolder: string;
   sentFolder: string | null;
 }
@@ -118,6 +120,7 @@ export class ClientPool {
       imap,
       smtp,
       caldav,
+      caldavUrl: account.caldav?.url ?? null,
       draftsFolder: account.mail.draftsFolder,
       sentFolder: account.mail.sentFolder,
     };

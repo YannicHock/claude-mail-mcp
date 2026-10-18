@@ -61,6 +61,9 @@
  *
  * The #194 rival-port check (`src/lookup-reachability.ts`) is not affected:
  * it connects and reads a greeting, and never logs in.
+ *
+ * {@link localMailAddress} also decides which `http://` CalDAV URLs may carry
+ * the credentials (#247): see `caldavUrlProblem` in src/caldav-url.ts.
  */
 
 import net from "node:net";
