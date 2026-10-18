@@ -7,16 +7,16 @@
  * that the client holds the requests and this file the rules.
  */
 
-import type { EventTarget } from "./caldav-client.js";
+import type { EventTarget } from "./caldav-types.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** An ETag's opaque part: without `W/` and without its quotes, so `abc`, `"abc"` and `W/"abc"` compare equal. */
-export function opaqueTag(etag: string): string {
+function opaqueTag(etag: string): string {
   return etag.trim().replace(/^W\//i, "").replace(/^"(.*)"$/, "$1");
 }
 
 /** True for a weak ETag, `W/"…"`, which `If-Match`'s strong comparison can never match (RFC 7232 §3.1). */
-export function isWeak(etag: string): boolean {
+function isWeak(etag: string): boolean {
   return /^W\//i.test(etag.trim());
 }
 

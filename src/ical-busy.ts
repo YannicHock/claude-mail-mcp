@@ -68,7 +68,7 @@ import { instantOf } from "./ical-series.js";
 import { instantAt, isFloating, wallOf, zonedWriteZone, type WriteZone } from "./ical-zones.js";
 
 /** One object's busy time, as the worker hands it back. */
-export interface BusyResult {
+interface BusyResult {
   /** Start inclusive and end exclusive, in the order the occurrences start; a zero-length one blocks nothing. */
   busy: BusyInterval[];
   /**

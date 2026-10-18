@@ -74,7 +74,8 @@ import {
   modifiesFuture,
   type Override,
 } from "./ical-series.js";
-import { DAY_MS, hasOffset, isFloating, wallAt, wallOf, writeZoneOf, zoneNameOf, type ZonedWall } from "./ical-zones.js";
+import { hasOffset, isFloating, wallAt, wallOf, writeZoneOf, zoneNameOf } from "./ical-zones.js";
+import { DAY_MS, type ZonedWall } from "./ical-zones-intl.js";
 
 // Where its unit tests have always found it; it lives in src/ical-series.ts
 // since the milestone review of v0.7.4, so that src/ical-zones.ts can refuse
@@ -148,7 +149,7 @@ export interface ExpandWindow {
   end: number;
 }
 
-export interface ExpandOptions {
+interface ExpandOptions {
   /** The object's URL, copied onto every instance. */
   url: string;
   etag: string | null;
@@ -479,7 +480,7 @@ export interface FoundOccurrence {
 }
 
 /** The occurrence after a {@link FoundOccurrence}: plain data, as that is. */
-export interface NextOccurrence {
+interface NextOccurrence {
   /** Its original start's clock fields in the zone of the master's DTSTART, as {@link FoundOccurrence.wall}. */
   wall: ZonedWall;
   /** True when it has an override of its own. */

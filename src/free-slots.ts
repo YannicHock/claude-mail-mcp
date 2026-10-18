@@ -36,7 +36,10 @@
  * stops at its `limit` rather than walking the rest of the range.
  */
 
-import { addToWall, calendarZone, DAY_MS, instantAt, utcMs, wallAt, zonedWriteZone, type WriteZone, type ZonedWall } from "./ical-zones.js";
+import { zoneOrRefuse } from "./ical-input.js";
+import { addToWall, calendarZone, hasOffset, instantAt, wallAt, zonedWriteZone, type WriteZone } from "./ical-zones.js";
+import { DAY_MS, utcMs, type ZonedWall } from "./ical-zones-intl.js";
+import { ToolRefusal } from "./tool-refusal.js";
 
 /**
  * The longest range `find_free_slot` searches, in days of 24 hours: a year,
@@ -47,7 +50,7 @@ import { addToWall, calendarZone, DAY_MS, instantAt, utcMs, wallAt, zonedWriteZo
 export const MAX_FREE_SLOT_RANGE_DAYS = 366;
 
 /** {@link MAX_FREE_SLOT_RANGE_DAYS} as a span of epoch milliseconds. */
-export const MAX_FREE_SLOT_RANGE_MS = MAX_FREE_SLOT_RANGE_DAYS * DAY_MS;
+const MAX_FREE_SLOT_RANGE_MS = MAX_FREE_SLOT_RANGE_DAYS * DAY_MS;
 
 /**
  * The most slots `find_free_slot` reports: the earliest ones, with
@@ -74,7 +77,7 @@ export interface WorkingHours {
   endHour: number;
 }
 
-export interface FreeSlotOptions {
+interface FreeSlotOptions {
   /** Absent: the whole range is searched, nights and all. */
   workingHours?: WorkingHours;
   /**
@@ -89,6 +92,59 @@ export interface FreeSlotOptions {
    * more.
    */
   limit?: number;
+}
+
+/**
+ * `find_free_slot`'s arguments, checked before any request and read: the
+ * zone the caller named, in `Intl`'s spelling, or null to take the
+ * calendars' own ({@link workingZone}); and the range in epoch ms. Refused,
+ * each ending in `nothingDone` (review of PR #232):
+ *
+ *   - a `timezone` that is no IANA name;
+ *   - working hours that end at or before they start;
+ *   - a range that is not two date-times with an offset, the first before
+ *     the second ({@link rangeBound});
+ *   - a range longer than {@link MAX_FREE_SLOT_RANGE_DAYS} days, whose
+ *     per-day work runs on the connector's own thread.
+ *
+ * Moved here out of src/caldav-client.ts (#234), beside the limits it
+ * enforces.
+ */
+export function freeSlotSearch(
+  query: { rangeStart: string; rangeEnd: string; workingHours?: WorkingHours; timezone?: string },
+  nothingDone: string
+): { zone: string | null; range: BusyInterval } {
+  const zone = query.timezone === undefined ? null : zoneOrRefuse(query.timezone, "the calendars' own", nothingDone);
+  const hours = query.workingHours;
+  if (hours !== undefined && hours.endHour <= hours.startHour) {
+    throw new ToolRefusal(
+      `working_hours.end_hour (${hours.endHour}) must be after start_hour (${hours.startHour}): working hours are one span within each day. ${nothingDone}`
+    );
+  }
+  const range = { start: rangeBound(query.rangeStart), end: rangeBound(query.rangeEnd) };
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end) || range.end <= range.start) {
+    throw new ToolRefusal(
+      `range_start and range_end must be ISO 8601 date-times with an offset, like 2026-10-05T09:00:00+02:00 or 2026-10-05T07:00:00Z, range_start the earlier. ${nothingDone}`
+    );
+  }
+  if (range.end - range.start > MAX_FREE_SLOT_RANGE_MS) {
+    throw new ToolRefusal(
+      `The range from range_start to range_end is longer than ${MAX_FREE_SLOT_RANGE_DAYS} days, the most find_free_slot searches at once. Ask for a shorter range, or for one range after another. ${nothingDone}`
+    );
+  }
+  return { zone, range };
+}
+
+/**
+ * A `find_free_slot` range bound in epoch ms, or NaN for anything but an
+ * ISO 8601 date-time that says its offset ({@link hasOffset}). Without one,
+ * `Date.parse` reads `2026-10-05T09:00` in the zone this process runs in — a
+ * server's, not the user's — which the refusal already claimed was not
+ * accepted (review of PR #232). `timedBound` (src/ical-input.ts) reads a
+ * bare clock time in an event's zone instead; a search range has none.
+ */
+function rangeBound(value: string): number {
+  return hasOffset(value) ? Date.parse(value) : NaN;
 }
 
 /**

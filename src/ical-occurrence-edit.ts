@@ -8,10 +8,10 @@
  *
  * The rules of src/ical-edit.ts hold here too — the stored object is edited
  * in place, never rebuilt; every refusal ends in the caller's `nothingDone`;
- * a written VEVENT has its revision stamped — and its `patchText`,
- * `patchTimes` and `stampRevision`, with `applyAttendeePatch` from
- * src/ical-attendees.ts, are what change an override, exactly as they change
- * a main event.
+ * a written VEVENT has its revision stamped — and the `patchText`,
+ * `patchTimes` and `stampRevision` of src/ical-edit-kit.ts, with
+ * `applyAttendeePatch` from src/ical-attendees.ts, are what change an
+ * override, exactly as they change a main event.
  *
  * Split out of src/ical-edit.ts in the code-health review of PR #229, which
  * also found the one-occurrence writes ignoring `RANGE=THISANDFUTURE`: the
@@ -34,11 +34,11 @@ import {
   type EditContext,
   type EditResult,
   type EventPatch,
-} from "./ical-edit.js";
+} from "./ical-edit-kit.js";
 import type { FoundOccurrence } from "./ical-expand.js";
 import { seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { allDaySeries, keyOf, modifiesFuture, sequenceOf } from "./ical-series.js";
-import { writeZoneOf, type WriteZone } from "./ical-zones.js";
+import { addTimeProp, writeTimeProp, writeZoneOf, type WriteZone } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /**
@@ -79,14 +79,6 @@ function copyOf(ve: ICAL.Component): ICAL.Component {
   return copy;
 }
 
-/** A property `name` holding `time`, with `tzid` when it has one. */
-function timeProperty(name: string, time: ICAL.Time, tzid: string | null): ICAL.Property {
-  const prop = new ICAL.Property(name);
-  prop.setValue(time);
-  if (tzid !== null) prop.setParameter("tzid", tzid);
-  return prop;
-}
-
 /**
  * A new override VEVENT for `occurrence`, made from `master` (spec §2.3): a
  * copy of it — so VALARM, ATTENDEE with its parameters, ORGANIZER and every
@@ -105,14 +97,11 @@ function overrideFrom(master: ICAL.Component, occurrence: FoundOccurrence): ICAL
   const { time, tzid } = originalStart(master, occurrence);
   const start = copy.getFirstProperty("dtstart") as ICAL.Property;
   start.setValue(time.clone());
-  copy.addProperty(timeProperty("recurrence-id", time.clone(), tzid));
-  const end = copy.getFirstProperty("dtend");
-  if (end !== null) {
+  addTimeProp(copy, "recurrence-id", time.clone(), tzid);
+  if (copy.hasProperty("dtend")) {
     const until = time.clone();
     until.addDuration(new ICAL.Event(master).duration);
-    end.setValue(until);
-    if (tzid === null) end.removeParameter("tzid");
-    else end.setParameter("tzid", tzid);
+    writeTimeProp(copy, "dtend", until, tzid);
   }
   copy.updatePropertyWithValue("sequence", sequenceOf(master));
   return copy;
@@ -149,20 +138,16 @@ function rangeShifted(range: ICAL.Component, occurrenceStart: ICAL.Time): { star
 function placeOverride(ve: ICAL.Component, start: ICAL.Time, end: ICAL.Time): void {
   const startProp = ve.getFirstProperty("dtstart") as ICAL.Property;
   startProp.setValue(start.clone());
-  const endProp = ve.getFirstProperty("dtend");
-  if (endProp === null) return;
-  endProp.setValue(end.clone());
+  if (!ve.hasProperty("dtend")) return;
   const tzid = startProp.getParameter("tzid");
-  if (tzid === undefined || start.isDate) endProp.removeParameter("tzid");
-  else endProp.setParameter("tzid", String(tzid));
+  writeTimeProp(ve, "dtend", end.clone(), tzid === undefined || start.isDate ? null : String(tzid));
 }
 
 /** `ve`'s RECURRENCE-ID replaced by one for `time` in `tzid`, with `RANGE=THISANDFUTURE` when `range` says so. */
 function setRecurrenceId(ve: ICAL.Component, time: ICAL.Time, tzid: string | null, range: boolean): void {
   ve.removeAllProperties("recurrence-id");
-  const prop = timeProperty("recurrence-id", time.clone(), tzid);
+  const prop = addTimeProp(ve, "recurrence-id", time.clone(), tzid);
   if (range) prop.setParameter("range", "THISANDFUTURE");
-  ve.addProperty(prop);
 }
 
 /**
@@ -239,7 +224,7 @@ function detachRangeAnchor(
 /**
  * The zones of every time `props` hold — a DTSTART, DTEND, RECURRENCE-ID or
  * EXDATE a one-occurrence write has just put in the object — for
- * `coverGenerated` (src/ical-edit.ts), which regenerates the VTIMEZONE this
+ * `coverGenerated` (src/ical-edit-kit.ts), which regenerates the VTIMEZONE this
  * connector generated for any of them to cover them. A zone nothing can
  * place has no block of this connector's, and is passed over.
  *
@@ -309,13 +294,13 @@ function overrideAt(vcal: ICAL.Component, uid: string, index: number): ICAL.Comp
  * and timed — it keeps the form of its series, whose RECURRENCE-ID must
  * match the master's — whatever {@link applyAttendeePatch} refuses, and
  * whatever {@link patchTimes} refuses, and a VTIMEZONE whose observance rules
- * this connector will not walk (`withReadableZones` in src/ical-edit.ts).
+ * this connector will not walk (`withReadableZones` in src/ical-edit-kit.ts).
  *
  * Every time the write leaves on the override — its RECURRENCE-ID and
  * DTSTART when it was just made, a new time — is covered by the VTIMEZONE
  * this connector generated for its zone, if it has one ({@link writtenZones};
  * milestone review of v0.7.4). The answer's `mayNotify` is `mayNotifyOf`'s
- * (src/ical-edit.ts): for a meeting, whom the server may email about the
+ * (src/ical-edit-kit.ts): for a meeting, whom the server may email about the
  * change, not only when the guest list changed.
  */
 export function applyOccurrencePatch(
@@ -374,7 +359,7 @@ export function applyOccurrencePatch(
  *
  * The EXDATE is covered by the VTIMEZONE this connector generated for its
  * zone, if it has one ({@link writtenZones}; milestone review of v0.7.4). The
- * answer's `mayNotify` is `mayNotifyOf`'s (src/ical-edit.ts), read before
+ * answer's `mayNotify` is `mayNotifyOf`'s (src/ical-edit-kit.ts), read before
  * anything is removed, by `ctx.own`: for the account's own meeting, its
  * attendees — one only the removed override listed among them — who may be
  * sent a cancellation; for someone else's, its organizer, who may be sent a
@@ -424,7 +409,7 @@ export function excludeOccurrence(
     const seriesEmpty = !occurrence.others;
     if (master === undefined) return { ics: vcal.toString(), mark: null, seriesEmpty, ...notified };
     const { time, tzid } = originalStart(master, occurrence);
-    const exdate = master.addProperty(timeProperty("exdate", time, tzid));
+    const exdate = addTimeProp(master, "exdate", time, tzid);
     const range = seriesFor(vcal, uid).overrides.filter(modifiesFuture);
     coverGenerated(vcal, writtenZones([exdate, ...range.flatMap(timesOf)]));
     const sequence = stampRevision(master, now);

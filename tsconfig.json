@@ -17,7 +17,10 @@
     "resolveJsonModule": true,
     "declaration": false,
     "sourceMap": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    // A local or an import nothing reads is an error (#234). tsconfig.test.json
+    // extends this, so the tests are held to it too.
+    "noUnusedLocals": true
   },
   "include": ["src/**/*", "shared/**/*"],
   "exclude": ["node_modules", "dist"]

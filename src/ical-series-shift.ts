@@ -9,7 +9,8 @@
  *
  * The rules of src/ical-edit.ts hold here too — the stored object is edited
  * in place, never rebuilt; every refusal ends in the caller's `nothingDone`;
- * a written VEVENT has its revision stamped. Split out of src/ical-edit.ts in
+ * a written VEVENT has its revision stamped, with the helpers of
+ * src/ical-edit-kit.ts every writer shares. Split out of src/ical-edit.ts in
  * the code-health review of PR #229, with its wall-clock helpers, which now
  * live in src/ical-zones.ts beside the rest of the clock arithmetic.
  */
@@ -20,32 +21,32 @@ import {
   coverGenerated,
   mayNotifyOf,
   patchText,
-  setTime,
   shown,
   stampRevision,
   withReadableZones,
   type EditContext,
   type EditResult,
   type EventPatch,
-} from "./ical-edit.js";
+} from "./ical-edit-kit.js";
 import type { FoundOccurrence } from "./ical-expand.js";
 import { calendarDate, dateMs, isoDate, timedBound } from "./ical-input.js";
 import { seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { keyOf } from "./ical-series.js";
 import {
   addToWall,
-  DAY_MS,
   clockSeconds,
   dayOf,
   instantAt,
   storedInstant,
+  tzidOf,
   wallAt,
   wallOf,
+  writeTimeProp,
   writeZoneOf,
   writtenTime,
   type WriteZone,
-  type ZonedWall,
 } from "./ical-zones.js";
+import { DAY_MS, type ZonedWall } from "./ical-zones-intl.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** True when two zones are the same clock: both UTC, both floating, or one TZID. */
@@ -95,7 +96,7 @@ const SUB_DAILY = new Set(["HOURLY", "MINUTELY", "SECONDLY"]);
  * attendee change needs. The master and every override that moved or whose guest list
  * changed get a new revision — one, however many of the two reached it. A VTIMEZONE this
  * connector generated is regenerated to cover the series, to its UNTIL or ten
- * years on (`coverGenerated` in src/ical-edit.ts).
+ * years on (`coverGenerated` in src/ical-edit-kit.ts).
  *
  * Refused, each ending in `nothingDone`: a start on another *date* than the
  * occurrence it describes (the day of a series is its rule's, not its time);
@@ -103,9 +104,9 @@ const SUB_DAILY = new Set(["HOURLY", "MINUTELY", "SECONDLY"]);
  * BYSECOND — when the start moves; a switch between all-day and timed; an
  * end at or before the start; an offset for a floating series; a zone
  * nothing can place; and a VTIMEZONE whose observance rules this connector
- * will not walk on its own thread (`withReadableZones` in src/ical-edit.ts,
+ * will not walk on its own thread (`withReadableZones` in src/ical-edit-kit.ts,
  * milestone review of v0.7.4). The answer's `mayNotify` is `mayNotifyOf`'s
- * (src/ical-edit.ts): for a meeting, whom the server may email about the
+ * (src/ical-edit-kit.ts): for a meeting, whom the server may email about the
  * new time. "This and all following occurrences" is not this
  * function's: it would be a new series (§2.4 C, out of v0.7.4).
  */
@@ -123,7 +124,7 @@ export function shiftSeries(
   return withReadableZones(nothingDone, () => shiftMaster(vcal, uid, master, overrides, anchor, patch, ctx));
 }
 
-/** {@link shiftSeries} once its master is found, run through `withReadableZones` (src/ical-edit.ts). */
+/** {@link shiftSeries} once its master is found, run through `withReadableZones` (src/ical-edit-kit.ts). */
 function shiftMaster(
   vcal: ICAL.Component,
   uid: string,
@@ -196,7 +197,7 @@ function shiftAllDaySeries(
       return;
     }
     const own = ve.getFirstPropertyValue("dtstart") as ICAL.Time;
-    setTime(ve, "dtend", ICAL.Time.fromDateString(isoDate(dateMs(own.toString().slice(0, 10)) + days * DAY_MS)), null);
+    writeTimeProp(ve, "dtend", ICAL.Time.fromDateString(isoDate(dateMs(own.toString().slice(0, 10)) + days * DAY_MS)), null);
   };
   lengthen(master);
   for (const ve of overrides) {
@@ -289,7 +290,7 @@ function shiftTimedSeries(
   };
   /**
    * A new DTEND (or DURATION) `length` after `ve`'s own start. That start is
-   * read in the zone its own DTSTART is stored in, as `patchTimes` (src/ical-edit.ts)
+   * read in the zone its own DTSTART is stored in, as `patchTimes` (src/ical-edit-kit.ts)
    * reads one — an override another client stored in UTC beside a Berlin
    * series had its `…Z` fields read as Berlin clock time, and came out 30
    * minutes long, or negative (fix-pass review of PR #229).
@@ -304,7 +305,7 @@ function shiftTimedSeries(
     const ownZone = writeZoneOf(startProp);
     const ownStart = storedInstant(startProp.getFirstValue() as ICAL.Time, ownZone.kind === "unresolved" ? zone : ownZone);
     const end = writtenTime(ownStart + length, ownEndZone);
-    setTime(ve, "dtend", end.time, end.zone);
+    writeTimeProp(ve, "dtend", end.time, tzidOf(end.zone));
   };
 
   move(startProp);

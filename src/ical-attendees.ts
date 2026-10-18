@@ -146,7 +146,7 @@ export function distinctAddresses(addresses: readonly string[], nothingDone: str
   }
 }
 
-/** The attendee half of `update_event`'s patch (#205); `EventPatch` (src/ical-edit.ts) extends it. */
+/** The attendee half of `update_event`'s patch (#205); `EventPatch` (src/ical-edit-kit.ts) extends it. */
 export interface AttendeePatch {
   /** Email addresses to invite. Non-empty needs {@link AttendeePatch.notifyAttendees}. */
   addAttendees?: string[];

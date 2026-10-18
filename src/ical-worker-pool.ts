@@ -56,7 +56,7 @@ import { createHash } from "node:crypto";
 import { Worker } from "node:worker_threads";
 
 import { describeFailure } from "../shared/credential-failure.js";
-import type { ExpandResult, ExpandWindow, StoredObject } from "./ical-expand.js";
+import type { StoredObject } from "./ical-expand.js";
 import {
   OP_ACTIONS,
   type WorkerOpName,
@@ -75,7 +75,7 @@ import {
 export const EXPANSION_DEADLINE_MS = 3_000;
 
 /** Workers kept, so one object at its deadline does not hold up the rest. */
-export const EXPANSION_WORKERS = 2;
+const EXPANSION_WORKERS = 2;
 
 /**
  * How long an object that timed out is skipped without a new try. Long
@@ -83,7 +83,7 @@ export const EXPANSION_WORKERS = 2;
  * that one which only timed out because the host was starved gets another
  * chance the same day.
  */
-export const HANGING_REMEMBERED_MS = 60 * 60_000;
+const HANGING_REMEMBERED_MS = 60 * 60_000;
 
 /** Objects remembered as timed out, at most; the oldest is forgotten first. */
 const HANGING_REMEMBERED_MAX = 1000;
@@ -119,7 +119,7 @@ export class ExpansionTimeout extends Error {
 }
 
 /** What every call to a closed pool, and everything queued when it closed, is refused with. */
-export class PoolClosed extends Error {
+class PoolClosed extends Error {
   constructor() {
     super("The expansion pool is closed.");
     this.name = "PoolClosed";
@@ -132,9 +132,9 @@ export class PoolClosed extends Error {
  * else is the worker's failure — it threw, ran out of heap, or could not be
  * started — with its message, bounded by `describeFailure`
  * (shared/credential-failure.ts), since it reaches the tool's answer as it
- * is. `expand()` uses it, and so does every caller of
- * {@link ExpansionPool.runOn} and {@link ExpansionPool.runOnEach}, which
- * reject with the error as it is.
+ * is. Every caller of {@link ExpansionPool.runOn} and
+ * {@link ExpansionPool.runOnEach} uses it, since they reject with the error
+ * as it is.
  */
 export function reasonOf(err: unknown): string {
   if (err instanceof ExpansionTimeout || err instanceof PoolClosed) return err.message;
@@ -227,8 +227,8 @@ export class ExpansionPool {
 
   /**
    * {@link runOn} for each of `objects`, in order, as **one** request taking
-   * turns with every other — what `expand` is for `expandObject`, for any
-   * operation. `argsOf` gives each object's arguments. Never rejects: each
+   * turns with every other, for any operation. `argsOf` gives each object's
+   * arguments. Never rejects: each
    * object's outcome is settled on its own, an object that timed out (now or
    * within {@link HANGING_REMEMBERED_MS}) or whose worker failed coming back
    * `rejected` — turn its reason into words with {@link reasonOf}.
@@ -246,24 +246,6 @@ export class ExpansionPool {
     const group = this.group();
     return Promise.allSettled(
       objects.map((o) => this.submit(group, objectKey(o), op, argsOf(o)) as Promise<ReturnType<WorkerOps[K]>>)
-    );
-  }
-
-  /**
-   * `expandObject` for each of `objects`, in order, each under its own
-   * deadline, as one request taking turns with every other. Never rejects:
-   * an object that timed out — now or within {@link HANGING_REMEMBERED_MS} —
-   * or whose worker failed comes back with no instances and
-   * {@link reasonOf} in `skipped`.
-   *
-   * {@link runOnEach} underneath, so there is one batch path (code-health
-   * review of PR #232); `CalDavClient.listEvents` calls that directly, and
-   * this stays as the shorthand the pool's own tests use.
-   */
-  async expand(objects: StoredObject[], window: ExpandWindow): Promise<ExpandResult[]> {
-    const settled = await this.runOnEach(objects, "expand", (o) => [o.data, window, { url: o.url, etag: o.etag }]);
-    return settled.map((result) =>
-      result.status === "fulfilled" ? result.value : { instances: [], skipped: reasonOf(result.reason) }
     );
   }
 

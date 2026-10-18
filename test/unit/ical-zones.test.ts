@@ -20,24 +20,26 @@ import assert from "node:assert/strict";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ICAL from "ical.js";
 
+import { vtimezoneFromIntl } from "../../src/ical-vtimezone.js";
 import {
   addToWall,
   calendarZone,
-  canonicalZone,
   instantAt,
-  instantToZonedWall,
   readDateTime,
   storedInstant,
   UTC_ZONE,
-  vtimezoneFromIntl,
-  resolveUnknownTzid,
-  utcOffsetMs,
   withResolvedZones,
-  zonedWallToInstant,
   zoneOf,
   zonedWriteZone,
-  IntlTimezone,
 } from "../../src/ical-zones.js";
+import {
+  canonicalZone,
+  instantToZonedWall,
+  resolveUnknownTzid,
+  utcOffsetMs,
+  zonedWallToInstant,
+  IntlTimezone,
+} from "../../src/ical-zones-intl.js";
 
 const ZONES = ["Europe/Berlin", "America/New_York", "Australia/Sydney", "Asia/Jerusalem", "Africa/Casablanca"];
 

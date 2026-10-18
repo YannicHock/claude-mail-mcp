@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { buildIcs } from "../../src/ical-build.js";
-import type { EventPatch } from "../../src/ical-edit.js";
+import type { EventPatch } from "../../src/ical-edit-kit.js";
 import { expandObject } from "../../src/ical-expand.js";
 import { parseCalendar } from "../../src/ical-parse.js";
 import { shiftSeries } from "../../src/ical-series-shift.js";

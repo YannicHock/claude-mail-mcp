@@ -802,7 +802,6 @@ export interface MailboxAddressData {
  * a password — an older page, a back button — is carried on as before.
  */
 export function renderMailboxAddress(opts: MailboxAddressData): string {
-  const emailError = opts.errors?.[ADDRESS_FIELD] ?? "";
   const body = `<h1>Add mailbox</h1>
 <p class="sub">Start with the address. Most providers publish their own settings, so the
 servers, ports and encryption can usually be worked out from it.</p>

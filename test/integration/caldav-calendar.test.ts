@@ -22,7 +22,7 @@ import { AccountsStore } from "../../src/accounts.js";
 import { CalDavClient } from "../../src/caldav-client.js";
 import { ClientPool } from "../../src/client-pool.js";
 import { registerCalendarTools } from "../../src/tools-calendar.js";
-import { ToolRefusal } from "../../src/tool-errors.js";
+import { ToolRefusal } from "../../src/tool-refusal.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { cleanupTmpDir, makeAccount, makeAccountsFile, makeTmpDir } from "../helpers/fixtures.js";
 import { composeDown, composeUp, isDockerAvailable } from "../helpers/docker.js";
@@ -30,7 +30,6 @@ import {
   RADICALE_PASSWORD,
   RADICALE_URL,
   addRadicaleCalendar,
-  startCalDavProxy,
   deleteBehindTheBack,
   editBehindTheBack,
   getRawEvent,
@@ -39,9 +38,9 @@ import {
   serverExpands,
   serverFindsIn,
   waitForRadicaleReady,
-  type CalDavProxy,
   type RadicaleCalendar,
 } from "../helpers/radicale.js";
+import { startCalDavProxy, type CalDavProxy } from "../helpers/caldav-proxy.js";
 
 const DOCKER_AVAILABLE = isDockerAvailable();
 const SKIP: { skip: string } | Record<string, never> = DOCKER_AVAILABLE
@@ -321,12 +320,12 @@ describe("lookup robustness (#211)", SKIP, () => {
     const own = await makeRadicaleCalendar();
     await putRawEvent(own, "a-bad.ics", richEvent("bad@example.com", "Unreadable"));
     await putRawEvent(own, "b-good.ics", richEvent("good@example.com", "Readable"));
-    const proxy = await startCalDavProxy({ corruptObject: "a-bad.ics" });
+    const proxy = await startCalDavProxy({ corrupt: { name: "a-bad.ics" } });
     try {
       const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
       const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
       const { events, skipped } = await viaProxy.listEvents(calendarUrl, WINDOW.start, WINDOW.end);
-      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the corrupt object");
+      assert.ok(proxy.counts().corruptedReports > 0, "the proxy never planted the corrupt object");
       assert.deepEqual(
         events.map((e) => e.summary),
         ["Readable"]
@@ -358,12 +357,12 @@ describe("lookup robustness (#211)", SKIP, () => {
       "END:VEVENT",
       "END:VCALENDAR"
     );
-    const proxy = await startCalDavProxy({ corruptObject: "a-hangs.ics", corruptWith: hangs });
+    const proxy = await startCalDavProxy({ corrupt: { name: "a-hangs.ics", data: hangs } });
     try {
       const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
       const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
       const { events, skipped } = await viaProxy.listEvents(calendarUrl, WINDOW.start, WINDOW.end);
-      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the object");
+      assert.ok(proxy.counts().corruptedReports > 0, "the proxy never planted the object");
       assert.deepEqual(
         events.map((e) => e.summary),
         ["Readable"]
@@ -382,12 +381,12 @@ describe("lookup robustness (#211)", SKIP, () => {
     // unreadable one first.
     await putRawEvent(own, "a-bad.ics", richEvent("late@example.com-old", "Unreadable"));
     const etag = await putRawEvent(own, "z-exact.ics", richEvent("late@example.com", "Before"));
-    const proxy = await startCalDavProxy({ corruptObject: "a-bad.ics" });
+    const proxy = await startCalDavProxy({ corrupt: { name: "a-bad.ics" } });
     try {
       const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
       const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
       await viaProxy.updateEvent({ calendarUrl, uid: "late@example.com", etag, summary: "After" });
-      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the corrupt object");
+      assert.ok(proxy.counts().corruptedReports > 0, "the proxy never planted the corrupt object");
       assert.match((await getRawEvent(own, "z-exact.ics")) ?? "", /SUMMARY:After/);
     } finally {
       await proxy.close();
@@ -458,12 +457,12 @@ describe("lookup robustness (#211)", SKIP, () => {
       "END:VEVENT",
       "END:VCALENDAR"
     );
-    const proxy = await startCalDavProxy({ corruptObject: "hostile-zone.ics", corruptWith: hostile });
+    const proxy = await startCalDavProxy({ corrupt: { name: "hostile-zone.ics", data: hostile } });
     try {
       const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
       const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
       const message = await refusal(viaProxy.updateEvent({ calendarUrl, uid, etag, start: "2026-10-01T11:00:00" }));
-      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the object");
+      assert.ok(proxy.counts().corruptedReports > 0, "the proxy never planted the object");
       assert.match(message, /time zone definition could not be read/);
       assert.match(message, /Hostile Standard Time/);
       assert.match(message, /Nothing was changed/);
@@ -497,7 +496,7 @@ describe("lookup robustness (#211)", SKIP, () => {
       "END:VEVENT",
       "END:VCALENDAR"
     );
-    const proxy = await startCalDavProxy({ corruptObject: "remembered-hang.ics", corruptWith: hangs });
+    const proxy = await startCalDavProxy({ corrupt: { name: "remembered-hang.ics", data: hangs } });
     try {
       const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
       const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
@@ -881,7 +880,7 @@ describe("one occurrence of a series (#206)", SKIP, () => {
       const viaProxy = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
       const calendarUrl = own.calendarUrl.replace(RADICALE_URL, proxy.url);
       const first = await viaProxy.updateEvent({ calendarUrl, uid, etag, recurrenceId: "2026-10-08T07:00:00.000Z", summary: "One" });
-      assert.equal(proxy.strippedPuts(), 1, "the proxy never took the ETag away");
+      assert.equal(proxy.counts().strippedPuts, 1, "the proxy never took the ETag away");
       assert.ok(first.etag, "the read-back did not recognise its own override");
       await viaProxy.updateEvent({ calendarUrl, uid, etag: first.etag, recurrenceId: "2026-10-08T07:00:00.000Z", summary: "Two" });
       assert.match((await getRawEvent(own, "weekly.ics")) ?? "", /SUMMARY:Two/);
@@ -1048,7 +1047,7 @@ describe("update_event on a server that answers a PUT without an ETag", SKIP, ()
       const second = await viaProxy.updateEvent({ calendarUrl, uid, etag: first.etag, summary: "Two" });
       assert.ok(second.etag);
       assert.match((await getRawEvent(cal, "etagless.ics")) ?? "", /SUMMARY:Two/);
-      assert.equal(proxy.strippedPuts(), 2, "the proxy never took an ETag away, so the fallback was not exercised");
+      assert.equal(proxy.counts().strippedPuts, 2, "the proxy never took an ETag away, so the fallback was not exercised");
     } finally {
       await proxy.close();
     }
@@ -1122,7 +1121,7 @@ describe("a change that lands between the lookup and the write (#214)", SKIP, ()
     try {
       const { client: viaProxy, calendarUrl } = through(proxy, own);
       const result = await viaProxy.updateEvent({ calendarUrl, uid, etag, summary: "Claude" });
-      assert.equal(proxy.strippedPuts(), 1, "the PUT still carried an ETag, so no read-back happened");
+      assert.equal(proxy.counts().strippedPuts, 1, "the PUT still carried an ETag, so no read-back happened");
       assert.equal(result.etag, null);
       assert.match((await getRawEvent(own, "overtaken.ics")) ?? "", /SUMMARY:Phone/);
     } finally {
@@ -1219,7 +1218,7 @@ describe("ETags the server hands out oddly (#210, spec §2.8)", SKIP, () => {
     try {
       const { client: mine, calendarUrl } = via(proxy, own);
       await mine.updateEvent({ calendarUrl, uid, summary: "After the retry" });
-      assert.equal(proxy.starRefusals(), 1, "If-Match: * was never sent, so the retry never ran");
+      assert.equal(proxy.counts().starRefusals, 1, "If-Match: * was never sent, so the retry never ran");
       assert.deepEqual(puts(proxy).map((r) => r.ifMatch), ["*", null]);
       assert.match((await getRawEvent(own, "star.ics")) ?? "", /SUMMARY:After the retry/);
     } finally {
@@ -1238,7 +1237,7 @@ describe("ETags the server hands out oddly (#210, spec §2.8)", SKIP, () => {
     try {
       const { client: mine, calendarUrl } = via(proxy, own);
       await mine.updateEvent({ calendarUrl, uid, summary: "Still here" });
-      assert.equal(proxy.starRefusals(), 1, "If-Match: * was never sent, so the retry never ran");
+      assert.equal(proxy.counts().starRefusals, 1, "If-Match: * was never sent, so the retry never ran");
       assert.deepEqual(proxy.requests().filter((r) => r.method === "DELETE"), [], "the update sent a DELETE");
       assert.match((await getRawEvent(own, "star-201.ics")) ?? "", /SUMMARY:Still here/);
     } finally {
@@ -1363,7 +1362,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
     };
   }
 
-  /** Only the calendar's path, as the proxy's `failSourceDelete` takes it. */
+  /** Only the calendar's path, as the proxy's `failSourceDelete` and `failTargetPut` take it. */
   const pathOf = (calendar: RadicaleCalendar): string => new URL(calendar.calendarUrl).pathname;
 
   it("moves an event with a VALARM and an ATTENDEE by MOVE: the source answers 404, the target holds the same text, the etag is the stored one", async () => {
@@ -1435,14 +1434,14 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
   });
 
   it("a server that refuses MOVE (405): the event is put into the target and deleted from the source, and the answer says so", async () => {
-    const proxy = await startCalDavProxy({ refuseMove: 405 });
+    const proxy = await startCalDavProxy({ refuseMove: { status: 405 } });
     try {
       const { source, target, mover, sourceUrl, targetUrl } = await twoCalendars(proxy);
       const uid = "move-copy@example.com";
       const etag = await putRawEvent(source, "move-copy.ics", richEvent(uid));
       const before = await getRawEvent(source, "move-copy.ics");
       const moved = await mover.moveEvent({ calendarUrl: sourceUrl, uid, etag, targetCalendarUrl: targetUrl });
-      assert.equal(proxy.refusedMoves(), 1);
+      assert.equal(proxy.counts().refusedMoves, 1);
       assert.equal(moved.via, "copy-then-delete");
       assert.equal(moved.url, `${targetUrl}move-copy.ics`);
       assert.equal(await getRawEvent(source, "move-copy.ics"), null);
@@ -1457,7 +1456,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
   it("MOVE refused and the source's DELETE answering 412: the copy is removed, the call refused, the event exists once, in the source", async () => {
     const own = await makeRadicaleCalendar();
     const target = await addRadicaleCalendar(own, "other");
-    const proxy = await startCalDavProxy({ refuseMove: 405, failSourceDelete: pathOf(own) });
+    const proxy = await startCalDavProxy({ refuseMove: { status: 405 }, failSourceDelete: { under: pathOf(own) } });
     try {
       const mover = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
       const uid = "move-rollback@example.com";
@@ -1485,7 +1484,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
 
   it("the same rollback on a server whose PUT answers no ETag: the copy is compared with what was put, then removed", async () => {
     const own = await makeRadicaleCalendar();
-    const proxy = await startCalDavProxy({ refuseMove: 405, failSourceDelete: pathOf(own), etaglessPuts: true });
+    const proxy = await startCalDavProxy({ refuseMove: { status: 405 }, failSourceDelete: { under: pathOf(own) }, etaglessPuts: true });
     try {
       const target = await addRadicaleCalendar(own, "other");
       const mover = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
@@ -1500,7 +1499,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
         })
       );
       assert.match(message, /Nothing was moved/);
-      assert.equal(proxy.strippedPuts(), 1);
+      assert.equal(proxy.counts().strippedPuts, 1);
       assert.equal(await getRawEvent(target, "move-rollback-etagless.ics"), null);
       assert.notEqual(await getRawEvent(own, "move-rollback-etagless.ics"), null);
     } finally {
@@ -1513,8 +1512,8 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
       const own = await makeRadicaleCalendar();
       const target = await addRadicaleCalendar(own, "other");
       const proxy = await startCalDavProxy({
-        refuseMove: 405,
-        failSourceDelete: pathOf(own),
+        refuseMove: { status: 405 },
+        failSourceDelete: { under: pathOf(own) },
         etaglessPuts: etagless,
         // Someone edits the copy in the target the moment it is written.
         after: async ({ method, path }, status) => {
@@ -1549,7 +1548,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
   it("a server that refuses MOVE, and a target that already holds the name: the PUT is refused, the object there never deleted", async () => {
     const own = await makeRadicaleCalendar();
     const target = await addRadicaleCalendar(own, "other");
-    const proxy = await startCalDavProxy({ refuseMove: 405, failSourceDelete: pathOf(own) });
+    const proxy = await startCalDavProxy({ refuseMove: { status: 405 }, failSourceDelete: { under: pathOf(own) } });
     try {
       const mover = new CalDavClient({ url: proxy.url, user: own.user, pass: RADICALE_PASSWORD });
       const uid = "move-occupied@example.com";
@@ -1610,7 +1609,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
 
   it("a read-only source whose DELETE answers 403: the copy is removed again and the call refused, nothing moved (review of PR #231)", async () => {
     await throughProxy(
-      (source) => ({ refuseMove: 405, failSourceDelete: pathOf(source), failSourceDeleteWith: 403 }),
+      (source) => ({ refuseMove: { status: 405 }, failSourceDelete: { under: pathOf(source), status: 403 } }),
       async ({ source, target, move }) => {
         const uid = "move-readonly@example.com";
         const etag = await putRawEvent(source, "move-readonly.ics", richEvent(uid));
@@ -1625,7 +1624,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
 
   it("a source DELETE answering 503 leaves the copy, since the source may be gone, and names both URLs", async () => {
     await throughProxy(
-      (source) => ({ refuseMove: 405, failSourceDelete: pathOf(source), failSourceDeleteWith: 503 }),
+      (source) => ({ refuseMove: { status: 405 }, failSourceDelete: { under: pathOf(source), status: 503 } }),
       async ({ source, target, sourceUrl, targetUrl, move }) => {
         const uid = "move-unsure@example.com";
         const etag = await putRawEvent(source, "move-unsure.ics", richEvent(uid));
@@ -1640,7 +1639,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
 
   it("a target that already holds the UID is refused before anything is sent, on a server that answers it 400 as Nextcloud does (review of PR #231)", async () => {
     await throughProxy(
-      () => ({ refuseMove: 405, uidConflictAs400: true }),
+      () => ({ refuseMove: { status: 405 }, uidConflictAs400: true }),
       async ({ source, target, proxy, move }) => {
         const uid = "move-twin-nc@example.com";
         const etag = await putRawEvent(source, "move-twin-nc.ics", richEvent(uid));
@@ -1689,7 +1688,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
 
   it("Radicale's own 502 to a MOVE it will not do (\"Remote destination not supported\") still gets the fallback", async () => {
     await throughProxy(
-      () => ({ refuseMove: 502, refuseMoveBody: "Remote destination not supported" }),
+      () => ({ refuseMove: { status: 502, body: "Remote destination not supported" } }),
       async ({ source, target, move }) => {
         const uid = "move-remote@example.com";
         const etag = await putRawEvent(source, "move-remote.ics", richEvent(uid));
@@ -1734,7 +1733,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
     it(`${mode}: an edit landing in the source between the copy and the DELETE is never lost; the copy is removed and nothing moved (review of PR #231)`, async () => {
       await throughProxy(
         (source, target) => ({
-          refuseMove: 405,
+          refuseMove: { status: 405 },
           [mode]: true,
           // Someone edits the source the moment the copy is written.
           after: async ({ method, path }, status) => {
@@ -1759,9 +1758,10 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
   it("a 403 whose body names no-uid-conflict is that refusal, not a reason for the fallback (review of PR #231)", async () => {
     await throughProxy(
       () => ({
-        refuseMove: 403,
-        refuseMoveBody:
-          '<?xml version="1.0"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><C:no-uid-conflict/></D:error>',
+        refuseMove: {
+          status: 403,
+          body: '<?xml version="1.0"?><D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><C:no-uid-conflict/></D:error>',
+        },
       }),
       async ({ source, target, proxy, move }) => {
         const uid = "move-403-uid@example.com";
@@ -1779,7 +1779,7 @@ describe("move_event (#212, spec 2026-09-29 §2.6)", SKIP, () => {
   for (const status of [403, 507]) {
     it(`a target that refuses the fallback's copy with ${status}: refused, the source untouched, nothing moved (review of PR #231)`, async () => {
       await throughProxy(
-        (_source, target) => ({ refuseMove: 405, failTargetPut: pathOf(target), failTargetPutWith: status }),
+        (_source, target) => ({ refuseMove: { status: 405 }, failTargetPut: { under: pathOf(target), status: status } }),
         async ({ source, proxy, move }) => {
           const uid = `move-put-${status}@example.com`;
           const etag = await putRawEvent(source, `move-put-${status}.ics`, richEvent(uid));
@@ -2274,13 +2274,13 @@ describe("find_free_slot (#213, R14, R15, spec 2026-09-29 §2.7)", SKIP, () => {
     const own = await makeRadicaleCalendar();
     await putRawEvent(own, "a-bad.ics", tuesday("bad@example.com", "1000", "1100"));
     await putRawEvent(own, "b-good.ics", tuesday("good@example.com", "1300", "1400"));
-    const proxy = await startCalDavProxy({ corruptObject: "a-bad.ics" });
+    const proxy = await startCalDavProxy({ corrupt: { name: "a-bad.ics" } });
     try {
       const answer = await findFreeSlot(proxy.url, own.user, {
         calendar_urls: [own.calendarUrl.replace(RADICALE_URL, proxy.url)],
         ...TUESDAY_9_TO_17,
       });
-      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the corrupt object");
+      assert.ok(proxy.counts().corruptedReports > 0, "the proxy never planted the corrupt object");
       const skipped = answer.skipped as Array<{ url: string; reason: string }> | undefined;
       assert.ok(skipped, "the answer has no skipped");
       assert.equal(skipped.length, 1);
@@ -2343,7 +2343,7 @@ describe("find_free_slot (#213, R14, R15, spec 2026-09-29 §2.7)", SKIP, () => {
   it("a calendar named twice, with and without its trailing slash, is read once (review of PR #232)", async () => {
     const own = await makeRadicaleCalendar();
     await putRawEvent(own, "a-bad.ics", tuesday("bad-twice@example.com", "1000", "1100"));
-    const proxy = await startCalDavProxy({ corruptObject: "a-bad.ics" });
+    const proxy = await startCalDavProxy({ corrupt: { name: "a-bad.ics" } });
     try {
       const url = own.calendarUrl.replace(RADICALE_URL, proxy.url);
       const answer = await findFreeSlot(proxy.url, own.user, {
@@ -2374,13 +2374,13 @@ describe("find_free_slot (#213, R14, R15, spec 2026-09-29 §2.7)", SKIP, () => {
       "END:VEVENT",
       "END:VCALENDAR"
     );
-    const proxy = await startCalDavProxy({ corruptObject: "a-hangs.ics", corruptWith: hangs });
+    const proxy = await startCalDavProxy({ corrupt: { name: "a-hangs.ics", data: hangs } });
     try {
       const answer = await findFreeSlot(proxy.url, own.user, {
         calendar_urls: [own.calendarUrl.replace(RADICALE_URL, proxy.url)],
         ...TUESDAY_9_TO_17,
       });
-      assert.ok(proxy.corruptedReports() > 0, "the proxy never planted the object");
+      assert.ok(proxy.counts().corruptedReports > 0, "the proxy never planted the object");
       const skipped = answer.skipped as Array<{ url: string; reason: string }> | undefined;
       assert.ok(skipped, "the answer has no skipped");
       assert.equal(skipped.length, 1);
