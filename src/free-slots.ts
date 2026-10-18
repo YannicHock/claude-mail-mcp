@@ -77,7 +77,7 @@ export interface WorkingHours {
   endHour: number;
 }
 
-export interface FreeSlotOptions {
+interface FreeSlotOptions {
   /** Absent: the whole range is searched, nights and all. */
   workingHours?: WorkingHours;
   /**

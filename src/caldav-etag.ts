@@ -11,7 +11,7 @@ import type { EventTarget } from "./caldav-types.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** An ETag's opaque part: without `W/` and without its quotes, so `abc`, `"abc"` and `W/"abc"` compare equal. */
-export function opaqueTag(etag: string): string {
+function opaqueTag(etag: string): string {
   return etag.trim().replace(/^W\//i, "").replace(/^"(.*)"$/, "$1");
 }
 

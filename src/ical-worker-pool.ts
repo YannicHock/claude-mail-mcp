@@ -75,7 +75,7 @@ import {
 export const EXPANSION_DEADLINE_MS = 3_000;
 
 /** Workers kept, so one object at its deadline does not hold up the rest. */
-export const EXPANSION_WORKERS = 2;
+const EXPANSION_WORKERS = 2;
 
 /**
  * How long an object that timed out is skipped without a new try. Long
@@ -83,7 +83,7 @@ export const EXPANSION_WORKERS = 2;
  * that one which only timed out because the host was starved gets another
  * chance the same day.
  */
-export const HANGING_REMEMBERED_MS = 60 * 60_000;
+const HANGING_REMEMBERED_MS = 60 * 60_000;
 
 /** Objects remembered as timed out, at most; the oldest is forgotten first. */
 const HANGING_REMEMBERED_MAX = 1000;
@@ -119,7 +119,7 @@ export class ExpansionTimeout extends Error {
 }
 
 /** What every call to a closed pool, and everything queued when it closed, is refused with. */
-export class PoolClosed extends Error {
+class PoolClosed extends Error {
   constructor() {
     super("The expansion pool is closed.");
     this.name = "PoolClosed";

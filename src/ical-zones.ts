@@ -82,7 +82,7 @@ import {
 } from "./ical-zones-intl.js";
 
 /** What zone a stored time is in, as {@link zoneOf} reads it. */
-export type ZoneKind =
+type ZoneKind =
   /** `…Z`, or `TZID=UTC`. */
   | { kind: "utc" }
   /** No zone at all: a clock time, or a DATE. */

@@ -149,7 +149,7 @@ export interface ExpandWindow {
   end: number;
 }
 
-export interface ExpandOptions {
+interface ExpandOptions {
   /** The object's URL, copied onto every instance. */
   url: string;
   etag: string | null;
@@ -480,7 +480,7 @@ export interface FoundOccurrence {
 }
 
 /** The occurrence after a {@link FoundOccurrence}: plain data, as that is. */
-export interface NextOccurrence {
+interface NextOccurrence {
   /** Its original start's clock fields in the zone of the master's DTSTART, as {@link FoundOccurrence.wall}. */
   wall: ZonedWall;
   /** True when it has an override of its own. */

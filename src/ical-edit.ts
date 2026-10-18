@@ -67,7 +67,7 @@ import {
 import { parseCalendar, seriesFor, type ParsedCalendar, type Series } from "./ical-parse.js";
 import { allDaySeries, currentOverrides, sequenceOf } from "./ical-series.js";
 
-export interface StoredEventShape {
+interface StoredEventShape {
   /** Some VEVENT in the object carries exactly this UID. */
   found: boolean;
   /** RRULE or RDATE on the main VEVENT, or any VEVENT with a RECURRENCE-ID. */
