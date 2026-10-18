@@ -44,13 +44,13 @@ Four categories:
 `src/providers.ts` holds one registry, `PROVIDERS`, whose entries each have an
 optional preset half and an optional advice half, and the column below says which
 halves an entry has. **Preset** is the `MAIL_PROVIDERS` view: hosts, ports and TLS,
-offered as a choice on the provider screen. **Advice** is the `PROVIDER_ADVICE`
-view: what to say about
-a password, matched against the domain the operator's address ends in, and shown
-when it is relevant — a `credentialNote` when a server has just rejected the
-password (#148), and an `unsupported` warning from the moment the address is
-looked up onward, in its own box on every screen that address survives on, in
-the settings UI and in the setup wizard alike (#151, #186, #180).
+offered as a choice on the provider screen, with a `note` shown beside it.
+**Advice** is the `PROVIDER_ADVICE` view: what to say about a password, matched
+against the domain the operator's address ends in, and shown when it is relevant
+— a `credentialNote` when a server has just rejected the password (#148), and an
+`unsupported` warning from the moment the address is looked up onward, in its own
+box on every screen that address survives on, in the settings UI and in the setup
+wizard alike (#151, #186, #180).
 
 The two sets do not coincide, and neither one is a subset of the other. A
 provider whose customers use their own domain (mailcow, iRedMail, Migadu,
@@ -62,25 +62,26 @@ the failure mode `src/providers.ts` exists to avoid.
 
 The first two columns restate the registry, and `test/unit/providers-doc.test.ts`
 checks them against it in both directions: each provider is named by its registry
-label, and a row whose second column disagrees with the code fails the unit suite.
-The third column and everything below it is the research, written by hand.
+label and linked to the section headed with it, and the second column is exactly
+`preset + advice`, `preset` or `advice`, or the unit suite fails. The third column
+and everything below it is the research, written by hand.
 
 | Provider | In `src/providers.ts` | What the password must be |
 | --- | --- | --- |
 | [Gmail](#gmail) | preset + advice | App password when 2FA is on |
 | [mailbox.org](#mailboxorg) | preset + advice | App password when 2FA is on |
-| [Zoho Mail](#zoho-mail) | advice only | App password when 2FA is on |
-| [mailcow (self-hosted)](#mailcow-self-hosted) | preset (`note`) | App password when 2FA is on |
+| [Zoho Mail](#zoho-mail) | advice | App password when 2FA is on |
+| [mailcow (self-hosted)](#mailcow-self-hosted) | preset | App password when 2FA is on |
 | [Fastmail](#fastmail) | preset + advice | **App password always** |
 | [iCloud Mail](#icloud-mail) | preset + advice | **App password always** |
-| [Yahoo Mail](#yahoo-mail) | advice only | **App password always** |
-| [AOL Mail](#aol-mail) | advice only | **App password always** |
+| [Yahoo Mail](#yahoo-mail) | advice | **App password always** |
+| [AOL Mail](#aol-mail) | advice | **App password always** |
 | [Posteo](#posteo) | preset + advice | App password (see the entry — Posteo documents it as *the* credential) |
 | [Migadu](#migadu) | preset | Password |
 | [Hetzner Web Hosting / Managed Server](#hetzner-web-hosting--managed-server) | preset | Password |
 | [iRedMail (self-hosted)](#iredmail-self-hosted) | preset | Password |
-| [Outlook.com and Microsoft 365](#outlookcom-and-microsoft-365) | advice (`unsupported`) | **Cannot be served** |
-| [Proton Mail](#proton-mail) | advice (`unsupported`) | **Cannot be served without the Bridge** |
+| [Outlook.com and Microsoft 365](#outlookcom-and-microsoft-365) | advice | **Cannot be served** |
+| [Proton Mail](#proton-mail) | advice | **Cannot be served without the Bridge** |
 
 ---
 

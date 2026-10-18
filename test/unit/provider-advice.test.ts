@@ -23,7 +23,6 @@ import {
   MAIL_PROVIDERS,
   PROVIDER_ADVICE,
   PROVIDERS,
-  SHARED_PASSWORD_CLAUSES,
   unsupportedNoticeFor,
 } from "../../src/providers.js";
 import {
@@ -73,10 +72,12 @@ describe("one registry, two views (#182)", () => {
   // ids are one-sided is a decision, and a decision is pinned here as literals,
   // the way the presets' ids are pinned next door.
 
-  it("holds the advice ids in this order", () => {
+  it("holds exactly these advice ids", () => {
+    // As a set: nothing renders the advice list, so its order means nothing,
+    // while an entry appearing or vanishing does.
     assert.deepEqual(
-      PROVIDER_ADVICE.map((entry) => entry.id),
-      ["gmail", "mailbox-org", "zoho", "fastmail", "icloud", "yahoo", "aol", "posteo", "microsoft", "proton"]
+      PROVIDER_ADVICE.map((entry) => entry.id).sort(),
+      ["aol", "fastmail", "gmail", "icloud", "mailbox-org", "microsoft", "posteo", "proton", "yahoo", "zoho"]
     );
   });
 
@@ -100,15 +101,7 @@ describe("one registry, two views (#182)", () => {
     );
   });
 
-  it("derives both views from the registry, and every registry entry is in one", () => {
-    assert.deepEqual(
-      MAIL_PROVIDERS.map((provider) => provider.id),
-      PROVIDERS.filter((provider) => provider.preset !== undefined).map((provider) => provider.id)
-    );
-    assert.deepEqual(
-      PROVIDER_ADVICE.map((entry) => entry.id),
-      PROVIDERS.filter((provider) => provider.advice !== undefined).map((provider) => provider.id)
-    );
+  it("holds every registry entry in at least one view, under an id of its own", () => {
     const ids = PROVIDERS.map((provider) => provider.id);
     assert.equal(new Set(ids).size, ids.length, "an id is in the registry twice");
     for (const provider of PROVIDERS) {
@@ -116,7 +109,6 @@ describe("one registry, two views (#182)", () => {
         provider.preset !== undefined || provider.advice !== undefined,
         `${provider.id} is in neither view`
       );
-      assert.notEqual(provider.label, "", `${provider.id} has no label`);
     }
   });
 
@@ -124,30 +116,53 @@ describe("one registry, two views (#182)", () => {
     // #150 reworded iCloud's note and had to hand-edit the advice entry to keep
     // the two saying the same thing. It is one string now.
     const clause = "The IMAP username is the part before the @; the SMTP username is the whole address.";
-    assert.ok(SHARED_PASSWORD_CLAUSES.icloud?.includes(clause));
     assert.ok(findProvider("icloud")?.note.includes(clause));
     assert.ok(credentialNoteFor("anna@icloud.com")?.includes(clause));
   });
 
-  it("composes every shared password clause into both the note and the credential note", () => {
-    assert.deepEqual(Object.keys(SHARED_PASSWORD_CLAUSES).sort(), [
-      "fastmail",
-      "gmail",
-      "icloud",
-      "mailbox-org",
-      "posteo",
-    ]);
-    for (const [id, clauses] of Object.entries(SHARED_PASSWORD_CLAUSES)) {
-      const provider = PROVIDERS.find((entry) => entry.id === id);
-      assert.ok(provider, id);
-      assert.ok(clauses.length > 0, `${id} shares nothing`);
-      for (const clause of clauses) {
-        assert.ok(provider.preset?.note.includes(clause), `${id}'s note lacks: ${clause}`);
-        assert.ok(
-          provider.advice?.credentialNote?.includes(clause),
-          `${id}'s credential note lacks: ${clause}`
-        );
-      }
+  it("says each shared password clause on the form and on a rejection, in the same words", () => {
+    // Literals, not the constants: a test that read the clause out of the module
+    // and found it in the module would pass whatever the sentence said.
+    const shared: Array<[id: string, address: string, clause: string]> = [
+      [
+        "gmail",
+        "anna@gmail.com",
+        "With 2-Step Verification on, Gmail needs an app password rather than your Google password.",
+      ],
+      [
+        "gmail",
+        "anna@gmail.com",
+        "IMAP itself is always on: Google removed the switch for it in January 2025, so there is " +
+          "no setting to go and enable.",
+      ],
+      ["mailbox-org", "anna@mailbox.org", "Log in with your main address, not an alias."],
+      [
+        "fastmail",
+        "anna@fastmail.com",
+        "Your regular Fastmail password never works here, with two-step verification on or off: " +
+          "every third-party program needs its own app password. Create one and give it both mail " +
+          "and calendar access.",
+      ],
+      [
+        "icloud",
+        "anna@icloud.com",
+        "iCloud always needs an app-specific password here, never your Apple Account password.",
+      ],
+      [
+        "icloud",
+        "anna@icloud.com",
+        "The IMAP username is the part before the @; the SMTP username is the whole address.",
+      ],
+      [
+        "posteo",
+        "anna@posteo.de",
+        "Posteo tells you to use an app password for both servers — including the outgoing one, " +
+          "even where your client calls its authentication optional.",
+      ],
+    ];
+    for (const [id, address, clause] of shared) {
+      assert.ok(findProvider(id)?.note.includes(clause), `${id}'s note lacks: ${clause}`);
+      assert.ok(credentialNoteFor(address)?.includes(clause), `${id}'s credential note lacks: ${clause}`);
     }
   });
 });
@@ -298,11 +313,6 @@ describe("Gmail as a preset (#150)", () => {
     // Google's CalDAV surface is OAuth-only and this connector sends a
     // password. Absent on purpose, like iCloud's and Hetzner's.
     assert.equal(gmail.caldav, null);
-  });
-
-  it("keeps every preset id unique now that gmail is one of them", () => {
-    const ids = MAIL_PROVIDERS.map((provider) => provider.id);
-    assert.equal(new Set(ids).size, ids.length);
   });
 });
 

@@ -187,15 +187,9 @@ The connector speaks the **Streamable HTTP MCP transport**, gated by a single st
 
 ## Provider notes
 
-### App passwords (mandatory on 2FA accounts)
+### Hosts, ports and passwords
 
-| Provider | IMAP host | SMTP host | App password page |
-|----------|-----------|-----------|---------------------|
-| Mailbox.org | `imap.mailbox.org:993` | `smtp.mailbox.org:465` | App passwords aren't needed; main password works |
-| Fastmail | `imap.fastmail.com:993` | `smtp.fastmail.com:465` | <https://app.fastmail.com/settings/security/devicekeys> |
-| iCloud | `imap.mail.me.com:993` | `smtp.mail.me.com:587` (STARTTLS) | <https://appleid.apple.com> → App-Specific Passwords |
-| Gmail | `imap.gmail.com:993` | `smtp.gmail.com:465` | <https://myaccount.google.com/apppasswords> |
-| Mailcow / iRedMail / Postfix | your server | your server | n/a |
+You rarely type a host or a port: the setup wizard and *Add mailbox* look the address up, then offer a list of providers whose settings are verified against their own documentation (`src/providers.ts`). Which providers need an app password, and which cannot be reached with any password, is in [`docs/PROVIDERS.md`](docs/PROVIDERS.md), with the documentation each claim was checked against. The README keeps no copy of either list, so the two cannot drift apart.
 
 ### TLS off means STARTTLS
 
@@ -203,12 +197,7 @@ The connector speaks the **Streamable HTTP MCP transport**, gated by a single st
 
 ### CalDAV endpoints
 
-| Provider | URL |
-|----------|-----|
-| Fastmail | `https://caldav.fastmail.com/dav/principals/user/USER@fastmail.com/` |
-| Mailbox.org | `https://dav.mailbox.org/caldav/` |
-| iCloud | `https://caldav.icloud.com/` |
-| Nextcloud | `https://cloud.example.com/remote.php/dav/principals/users/USER/` |
+A provider preset fills in the CalDAV URL where the provider documents one, and leaves it blank where it does not. Nextcloud has no preset, since it runs no mail server; its CalDAV URL is `https://cloud.example.com/remote.php/dav/principals/users/USER/`.
 
 If your provider doesn't speak CalDAV, leave the CalDAV fields blank in the setup wizard or the settings UI — the calendar tools are always registered, but they return a clear error for any account with no `caldav` configured. Mail still works regardless.
 

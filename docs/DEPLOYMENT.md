@@ -78,10 +78,9 @@ stays unused.
   non-HTTPS `PUBLIC_URL`. [Step 4](#4-reverse-proxy-and-tls) gives a worked nginx
   recipe; Caddy, Traefik or Nginx Proxy Manager are equally fine as long as they
   deliver the same properties.
-- **An IMAP + SMTP capable mailbox.** On any provider with two-factor
-  authentication — Gmail, iCloud, Fastmail — use an **app-specific password**,
-  never the account password. The [README](../README.md#app-passwords-mandatory-on-2fa-accounts)
-  has the direct links.
+- **An IMAP + SMTP capable mailbox.** Many providers want an **app-specific
+  password** rather than the account password, and a few cannot be reached with
+  any password. [`PROVIDERS.md`](PROVIDERS.md) says which.
 - Optionally, a CalDAV endpoint. Omit it and the calendar tools return a clear
   error for that mailbox while mail keeps working.
 

@@ -20,7 +20,7 @@
  * and iRedMail have presets and no domain an address could be recognised by.
  * The full reasoning is above the registry. What one list buys (#182) is that
  * a provider in both views is one entry — one id, one label, and each password
- * clause the two halves share written once ({@link SHARED_PASSWORD_CLAUSES}) —
+ * clause the two halves share written once, as a constant composed into both —
  * so the views cannot drift apart, and `docs/PROVIDERS.md`'s summary table is
  * checked against this list by `test/unit/providers-doc.test.ts`.
  *
@@ -192,14 +192,9 @@ export interface MailProvider extends PresetPart {
  *
  * No `label`: nothing renders one, and the registry entry it came from has it.
  */
-export interface ProviderAdvice {
+export interface ProviderAdvice extends Omit<AdvicePart, "source"> {
   /** Stable; the {@link Provider} id, so equal to a {@link MailProvider} id when there is a preset too. */
   id: string;
-  domains: readonly string[];
-  /** See {@link AdvicePart.credentialNote}. */
-  credentialNote?: string;
-  /** See {@link AdvicePart.unsupported}. */
-  unsupported?: string;
   /** The documentation this entry was read off, for whoever checks it next. */
   source: string;
 }
@@ -212,7 +207,8 @@ export interface ProviderAdvice {
 // hand-edit the advice entry to keep the two agreeing. Each shared clause is now
 // one constant, composed into both renderings, so they cannot say different
 // things. What only one of them says — the 16-digit passcode, where the
-// calendar needs its own password — stays on that one.
+// calendar needs its own password — stays on that one. The tests pin each
+// shared clause as a literal and hold it to appearing in both.
 
 const GMAIL_APP_PASSWORD =
   "With 2-Step Verification on, Gmail needs an app password rather than your Google password.";
@@ -231,18 +227,6 @@ const ICLOUD_USERNAMES =
 const POSTEO_APP_PASSWORD =
   "Posteo tells you to use an app password for both servers — including the outgoing one, " +
   "even where your client calls its authentication optional.";
-
-/**
- * Every clause above, by the provider whose note and credential note both carry
- * it. Exported so a test can hold each one to being in both.
- */
-export const SHARED_PASSWORD_CLAUSES: Readonly<Record<string, readonly string[]>> = {
-  gmail: [GMAIL_APP_PASSWORD, GMAIL_IMAP_ALWAYS_ON],
-  "mailbox-org": [MAILBOX_ORG_MAIN_ADDRESS],
-  fastmail: [FASTMAIL_APP_PASSWORD],
-  icloud: [ICLOUD_APP_PASSWORD, ICLOUD_USERNAMES],
-  posteo: [POSTEO_APP_PASSWORD],
-};
 
 // ---- Why an entry has two optional halves -------------------------------------
 //
@@ -562,35 +546,14 @@ export const PROVIDERS: readonly Provider[] = [
 ];
 
 /** The presets, in the order they are shown: every registry entry with a preset half. */
-export const MAIL_PROVIDERS: readonly MailProvider[] = PROVIDERS.flatMap((provider) =>
-  provider.preset === undefined
-    ? []
-    : [
-        {
-          id: provider.id,
-          label: provider.label,
-          imap: provider.preset.imap,
-          smtp: provider.preset.smtp,
-          caldav: provider.preset.caldav,
-          note: provider.preset.note,
-          source: provider.source,
-        },
-      ]
+export const MAIL_PROVIDERS: readonly MailProvider[] = PROVIDERS.flatMap(({ id, label, source, preset }) =>
+  preset === undefined ? [] : [{ id, label, ...preset, source }]
 );
 
 /** The advice: every registry entry with an advice half. Nothing renders the list. */
-export const PROVIDER_ADVICE: readonly ProviderAdvice[] = PROVIDERS.flatMap((provider) => {
-  const advice = provider.advice;
-  if (advice === undefined) return [];
-  const entry: ProviderAdvice = {
-    id: provider.id,
-    domains: advice.domains,
-    source: advice.source ?? provider.source,
-  };
-  if (advice.credentialNote !== undefined) entry.credentialNote = advice.credentialNote;
-  if (advice.unsupported !== undefined) entry.unsupported = advice.unsupported;
-  return [entry];
-});
+export const PROVIDER_ADVICE: readonly ProviderAdvice[] = PROVIDERS.flatMap(({ id, source, advice }) =>
+  advice === undefined ? [] : [{ id, ...advice, source: advice.source ?? source }]
+);
 
 /** Looked up by what the provider radio submitted. */
 export function findProvider(id: string): MailProvider | null {
@@ -695,9 +658,15 @@ export function providerPresets(email: string): ProviderPreset[] {
  * told confidently, and an address this cannot split matches nothing at all.
  */
 export function adviceForAddress(email: string): ProviderAdvice | null {
+  const id = providerForAddress(email)?.id;
+  return id === undefined ? null : (PROVIDER_ADVICE.find((entry) => entry.id === id) ?? null);
+}
+
+/** The registry entry whose advice half claims the address's domain, or null. Same match as {@link adviceForAddress}. */
+function providerForAddress(email: string): Provider | null {
   const domain = domainOf(email).toLowerCase();
   if (domain === "") return null;
-  return PROVIDER_ADVICE.find((entry) => entry.domains.includes(domain)) ?? null;
+  return PROVIDERS.find((provider) => provider.advice?.domains.includes(domain) ?? false) ?? null;
 }
 
 /**
@@ -726,26 +695,26 @@ export interface PresetServer {
 }
 
 /**
- * The verified preset for an address whose domain the advice view knows, or
- * null (#194).
+ * The verified preset for an address whose domain a registry entry's advice
+ * half claims, or null (#194).
  *
  * What makes the address lookup's answer never worse than this table's: the
  * ISPDB gives `gmail.com` exactly one SMTP server, on 465, while Google's own
  * setup table — and so this one — says 587. The lookup offers both and keeps
- * the one that answers from this host. Matched by domain through
- * {@link PROVIDER_ADVICE} and by id into {@link MAIL_PROVIDERS}, so a provider
- * needs both halves, and a host still holding a placeholder is no preset.
+ * the one that answers from this host. The domain is matched by the entry's
+ * advice half and the servers read off the same entry's preset half, so only a
+ * provider with both halves answers, and a host still holding a placeholder is
+ * no preset.
  */
 export function presetServersFor(email: string): { imap: PresetServer; smtp: PresetServer } | null {
-  const advice = adviceForAddress(email);
-  const provider = advice === null ? null : findProvider(advice.id);
-  if (provider === null) return null;
+  const preset = providerForAddress(email)?.preset;
+  if (preset === undefined) return null;
   const server = (s: ProviderServer): PresetServer | null => {
     const host = fillTemplate(s.host, email);
     return host === "" ? null : { host, port: s.port, tls: s.tls, user: loginFor(s.user, email) };
   };
-  const imap = server(provider.imap);
-  const smtp = server(provider.smtp);
+  const imap = server(preset.imap);
+  const smtp = server(preset.smtp);
   return imap === null || smtp === null ? null : { imap, smtp };
 }
 
