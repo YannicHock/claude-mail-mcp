@@ -17,7 +17,8 @@
  * written into (code-health review of PR #230).
  */
 
-import { canonicalZone, hasOffset, readDateTime, type WriteZone } from "./ical-zones.js";
+import { hasOffset, readDateTime, type WriteZone } from "./ical-zones.js";
+import { canonicalZone } from "./ical-zones-intl.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** Midnight UTC of the date part, so all-day arithmetic counts whole days. */
@@ -75,11 +76,11 @@ export function timedBound(field: "start" | "end", value: string, zone: WriteZon
 
 /**
  * A caller's `timezone` in `Intl`'s spelling of the IANA name
- * (`canonicalZone`, src/ical-zones.ts), or a refusal ending in `nothingDone`.
- * `omitted` says what leaving it out uses instead: "the calendar's own" for
- * `create_event`, "the calendars' own" for `find_free_slot`. The one refusal
- * of a zone that is no IANA name, which the two wrote out separately until
- * #234.
+ * (`canonicalZone`, src/ical-zones-intl.ts), or a refusal ending in
+ * `nothingDone`. `omitted` says what leaving it out uses instead: "the
+ * calendar's own" for `create_event`, "the calendars' own" for
+ * `find_free_slot`. The one refusal of a zone that is no IANA name, which
+ * the two wrote out separately until #234.
  */
 export function zoneOrRefuse(name: string, omitted: string, nothingDone: string): string {
   const zone = canonicalZone(name);

@@ -74,7 +74,8 @@ import {
   modifiesFuture,
   type Override,
 } from "./ical-series.js";
-import { DAY_MS, hasOffset, isFloating, wallAt, wallOf, writeZoneOf, zoneNameOf, type ZonedWall } from "./ical-zones.js";
+import { hasOffset, isFloating, wallAt, wallOf, writeZoneOf, zoneNameOf } from "./ical-zones.js";
+import { DAY_MS, type ZonedWall } from "./ical-zones-intl.js";
 
 // Where its unit tests have always found it; it lives in src/ical-series.ts
 // since the milestone review of v0.7.4, so that src/ical-zones.ts can refuse

@@ -34,7 +34,6 @@ import { seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { keyOf } from "./ical-series.js";
 import {
   addToWall,
-  DAY_MS,
   clockSeconds,
   dayOf,
   instantAt,
@@ -44,8 +43,8 @@ import {
   writeZoneOf,
   writtenTime,
   type WriteZone,
-  type ZonedWall,
 } from "./ical-zones.js";
+import { DAY_MS, type ZonedWall } from "./ical-zones-intl.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** True when two zones are the same clock: both UTC, both floating, or one TZID. */

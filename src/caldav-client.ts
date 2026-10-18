@@ -69,7 +69,8 @@ import { zoneOrRefuse } from "./ical-input.js";
 import { parseCalendar, seriesFor, type ParsedCalendar } from "./ical-parse.js";
 import { expansionPool, reasonOf } from "./ical-worker-pool.js";
 import type { WorkerOps } from "./ical-worker-ops.js";
-import { calendarZone, DAY_MS } from "./ical-zones.js";
+import { calendarZone } from "./ical-zones.js";
+import { DAY_MS } from "./ical-zones-intl.js";
 import { assertWritten, notFound, refuseLostRace, requireEtag, strongOrNone } from "./caldav-etag.js";
 import { alreadyThere, CalDavMove, uidTaken } from "./caldav-move.js";
 import type {

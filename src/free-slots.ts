@@ -37,7 +37,8 @@
  */
 
 import { zoneOrRefuse } from "./ical-input.js";
-import { addToWall, calendarZone, DAY_MS, hasOffset, instantAt, utcMs, wallAt, zonedWriteZone, type WriteZone, type ZonedWall } from "./ical-zones.js";
+import { addToWall, calendarZone, hasOffset, instantAt, wallAt, zonedWriteZone, type WriteZone } from "./ical-zones.js";
+import { DAY_MS, utcMs, type ZonedWall } from "./ical-zones-intl.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /**

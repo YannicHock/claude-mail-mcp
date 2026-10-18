@@ -16,7 +16,8 @@ import ICAL from "ical.js";
 import { addAttendee, addOrganizer, distinctAddresses, notifyChoice, organizerOf } from "./ical-attendees.js";
 import { calendarDate, timedBound } from "./ical-input.js";
 import { parseCalendar } from "./ical-parse.js";
-import { generatedVtimezone, writtenTime, zonedWriteZone, zoneNameOf } from "./ical-zones.js";
+import { generatedVtimezone } from "./ical-vtimezone.js";
+import { writtenTime, zonedWriteZone, zoneNameOf } from "./ical-zones.js";
 import { ToolRefusal } from "./tool-refusal.js";
 
 /** What `create_event` is given for the event itself; `CalDavClient` adds the calendar and the zone. */

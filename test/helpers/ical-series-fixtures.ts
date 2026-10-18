@@ -19,7 +19,7 @@
 import assert from "node:assert/strict";
 
 import { expandObject, findOccurrence, type FoundOccurrence } from "../../src/ical-expand.js";
-import { instantToZonedWall } from "../../src/ical-zones.js";
+import { instantToZonedWall } from "../../src/ical-zones-intl.js";
 
 export const NOW = new Date("2026-09-28T12:00:00Z");
 export const CHANGED = "Nothing was changed.";
