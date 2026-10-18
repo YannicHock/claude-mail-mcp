@@ -23,6 +23,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { makeAccount, makeAccountsFile, makeTmpDir, cleanupTmpDir } from "../helpers/fixtures.js";
 import { startMcpApp, type McpTestApp } from "../helpers/mcp-app.js";
 import { isDockerAvailable, composeUp, composeDown, waitForGreenmailReady } from "../helpers/docker.js";
+import { ensureMailboxes } from "../helpers/imap-setup.js";
 
 const DOCKER_AVAILABLE = isDockerAvailable();
 const SKIP: { skip: string } | Record<string, never> = DOCKER_AVAILABLE
@@ -53,6 +54,12 @@ before(async () => {
   if (!DOCKER_AVAILABLE) return;
   composeUp();
   await waitForGreenmailReady();
+  // A handshake is not a login: GreenMail registers its preloaded users a
+  // moment after its listeners answer, and a LOGIN in that window is refused
+  // as bad credentials. ensureMailboxes logs in with retries until alice
+  // exists — the same wait mail-server.test.ts gets from it — and the
+  // account's Drafts folder is created while it is there.
+  await ensureMailboxes({ host: "127.0.0.1", port: 3143, user: "alice", pass: "pw1" }, ["Drafts"]);
 
   globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const href = input instanceof Request ? input.url : String(input);
