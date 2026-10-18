@@ -18,6 +18,16 @@ import { createDAVClient } from "tsdav";
 import type { ImapCreds, SmtpCreds, CalDavCreds } from "./accounts.js";
 import { withTimeout } from "./timeout.js";
 import {
+  imapTlsOptions,
+  smtpTlsOptions,
+  localMailAddress,
+  startTlsError,
+  type ImapTlsOptions,
+  type LocalAddressCheck,
+  type MailTlsTestOptions,
+  type SmtpTlsOptions,
+} from "./mail-tls.js";
+import {
   classifyFailure,
   describeFailure,
   CREDENTIAL_REJECTION_MESSAGE,
@@ -82,7 +92,9 @@ export interface ProbeReport {
  * login or was never reached. Nothing here re-derives that from a message.
  */
 function toFailure(err: unknown): ProbeResult {
-  const { credentialRejection, reason } = classifyFailure(err);
+  // A STARTTLS refusal (#220) is reworded by src/mail-tls.ts first; it was
+  // never sent the credentials, so it is no rejection either.
+  const { credentialRejection, reason } = classifyFailure(startTlsError(err));
   return { ok: false, message: reason, credentialRejection };
 }
 
@@ -119,11 +131,21 @@ function toFailure(err: unknown): ProbeResult {
  * failure it describes has already been returned — so it is deliberately a
  * no-op sink. See the mid-LOGIN-drop case in test/unit/probe.test.ts.
  */
-async function probeImap(creds: ImapCreds, perProbeMs: number): Promise<ProbeResult> {
+async function probeImap(
+  creds: ImapCreds,
+  perProbeMs: number,
+  localAddress: LocalAddressCheck
+): Promise<ProbeResult> {
+  // Host and TLS by src/mail-tls.ts (#220), its lookup inside the same deadline.
+  let tls: ImapTlsOptions;
+  try {
+    tls = await withTimeout(imapTlsOptions(creds.host, creds.tls, localAddress), perProbeMs, "IMAP");
+  } catch (err) {
+    return toFailure(err);
+  }
   const client = new ImapFlow({
-    host: creds.host,
     port: creds.port,
-    secure: creds.tls,
+    ...tls,
     auth: { user: creds.user, pass: creds.pass },
     logger: false,
     connectionTimeout: perProbeMs,
@@ -169,11 +191,21 @@ async function probeImap(creds: ImapCreds, perProbeMs: number): Promise<ProbeRes
  * likewise ref'd, so leaving them unset would strand a live socket for
  * minutes past the point this function has already reported failure.
  */
-async function probeSmtp(creds: SmtpCreds, perProbeMs: number): Promise<ProbeResult> {
+async function probeSmtp(
+  creds: SmtpCreds,
+  perProbeMs: number,
+  localAddress: LocalAddressCheck
+): Promise<ProbeResult> {
+  // Host and TLS by src/mail-tls.ts (#220), its lookup inside the same deadline.
+  let tls: SmtpTlsOptions;
+  try {
+    tls = await withTimeout(smtpTlsOptions(creds.host, creds.tls, localAddress), perProbeMs, "SMTP");
+  } catch (err) {
+    return toFailure(err);
+  }
   const transporter = nodemailer.createTransport({
-    host: creds.host,
     port: creds.port,
-    secure: creds.tls,
+    ...tls,
     auth: { user: creds.user, pass: creds.pass },
     connectionTimeout: perProbeMs,
     greetingTimeout: perProbeMs,
@@ -384,15 +416,16 @@ async function probeCalDav(creds: CalDavCreds, perProbeMs: number): Promise<Prob
  */
 export async function probeAccount(
   input: ProbeInput,
-  opts: { perProbeMs?: number; totalMs?: number } = {}
+  opts: { perProbeMs?: number; totalMs?: number } & MailTlsTestOptions = {}
 ): Promise<ProbeReport> {
   const perProbeMs = opts.perProbeMs ?? PER_PROBE_TIMEOUT_MS;
   const totalMs = opts.totalMs ?? TOTAL_TIMEOUT_MS;
+  const localAddress = opts.localAddress ?? localMailAddress;
 
   const runAll = async (): Promise<ProbeReport> => {
     const [imap, smtp, caldav] = await Promise.all([
-      probeImap(input.imap, perProbeMs).catch(toFailure),
-      probeSmtp(input.smtp, perProbeMs).catch(toFailure),
+      probeImap(input.imap, perProbeMs, localAddress).catch(toFailure),
+      probeSmtp(input.smtp, perProbeMs, localAddress).catch(toFailure),
       input.caldav
         ? probeCalDav(input.caldav, perProbeMs).catch(toFailure)
         : Promise.resolve(null),

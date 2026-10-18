@@ -87,6 +87,7 @@ import type { Readable } from "node:stream";
 import { reachable as reachableDefault, type ReachTarget } from "./lookup-reachability.js";
 import { presetServersFor } from "./providers.js";
 import { withTimeout } from "./timeout.js";
+import { isPublicIp, resolveAddresses } from "./net-address.js";
 import {
   CONNECTOR_AUTOCONFIG_BUDGET_MS,
   CONNECTOR_AUTOCONFIG_DISCOVERY_MS,
@@ -215,97 +216,10 @@ export interface LookupOptions {
 // ---------------------------------------------------------------- addresses
 
 /**
- * Is this a public unicast address we are willing to open a connection to?
- *
- * Anything unparseable is `false`: this is the deny-by-default half of
- * resolve-then-refuse, so an address shape we do not recognise must not be
- * treated as safe.
+ * Declared in `src/net-address.ts` since #220, beside the allow-list
+ * `tls: false` needs; re-exported so every existing import keeps working.
  */
-export function isPublicIp(address: string): boolean {
-  if (net.isIPv4(address)) return isPublicIpv4(address);
-  if (net.isIPv6(address)) return isPublicIpv6(address);
-  return false;
-}
-
-function isPublicIpv4(address: string): boolean {
-  const parts = address.split(".").map((p) => Number(p));
-  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
-    return false;
-  }
-  const [a, b] = parts as [number, number, number, number];
-  if (a === 0) return false; // "this network"
-  if (a === 10) return false; // RFC 1918
-  if (a === 127) return false; // loopback
-  if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT, RFC 6598
-  if (a === 169 && b === 254) return false; // link-local, incl. cloud metadata
-  if (a === 172 && b >= 16 && b <= 31) return false; // RFC 1918
-  if (a === 192 && b === 168) return false; // RFC 1918
-  if (a === 198 && (b === 18 || b === 19)) return false; // benchmarking, RFC 2544
-  if (a >= 224) return false; // multicast, reserved, broadcast
-  return true;
-}
-
-function isPublicIpv6(address: string): boolean {
-  const groups = expandIpv6(address);
-  if (!groups) return false;
-
-  // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible addresses reach the v4
-  // internet, so they are judged by the v4 rules — otherwise ::ffff:127.0.0.1
-  // walks straight past a v6-only check.
-  const isMapped = groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff;
-  const isCompat = groups.slice(0, 6).every((g) => g === 0) && (groups[6] !== 0 || groups[7] !== 0);
-  if (isMapped || isCompat) {
-    const hi = groups[6]!;
-    const lo = groups[7]!;
-    return isPublicIpv4(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
-  }
-
-  const first = groups[0]!;
-  if (groups.every((g) => g === 0)) return false; // ::
-  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return false; // ::1
-  if ((first & 0xfe00) === 0xfc00) return false; // unique local, fc00::/7
-  if ((first & 0xffc0) === 0xfe80) return false; // link-local, fe80::/10
-  if ((first & 0xffc0) === 0xfec0) return false; // site-local (deprecated)
-  if ((first & 0xff00) === 0xff00) return false; // multicast
-  return true;
-}
-
-/** Expand an IPv6 literal into its eight 16-bit groups, or null if malformed. */
-function expandIpv6(address: string): number[] | null {
-  let text = address;
-  const zone = text.indexOf("%");
-  if (zone !== -1) text = text.slice(0, zone);
-
-  // A trailing dotted-quad (::ffff:1.2.3.4) becomes two more groups first.
-  const dotted = text.lastIndexOf(":");
-  const tail = text.slice(dotted + 1);
-  if (tail.includes(".")) {
-    if (!net.isIPv4(tail)) return null;
-    const octets = tail.split(".").map(Number);
-    const hi = ((octets[0]! << 8) | octets[1]!).toString(16);
-    const lo = ((octets[2]! << 8) | octets[3]!).toString(16);
-    text = `${text.slice(0, dotted + 1)}${hi}:${lo}`;
-  }
-
-  const halves = text.split("::");
-  if (halves.length > 2) return null;
-  const parse = (part: string): number[] | null => {
-    if (part === "") return [];
-    const out: number[] = [];
-    for (const group of part.split(":")) {
-      if (!/^[0-9a-fA-F]{1,4}$/.test(group)) return null;
-      out.push(parseInt(group, 16));
-    }
-    return out;
-  };
-  const head = parse(halves[0]!);
-  const rest = halves.length === 2 ? parse(halves[1]!) : [];
-  if (!head || !rest) return null;
-  if (halves.length === 1) return head.length === 8 ? head : null;
-  const fill = 8 - head.length - rest.length;
-  if (fill < 0) return null;
-  return [...head, ...new Array<number>(fill).fill(0), ...rest];
-}
+export { isPublicIp };
 
 /**
  * The guard every request passes through: HTTPS, then resolve, then refuse
@@ -373,10 +287,7 @@ export async function readCapped(stream: Readable, maxBytes: number): Promise<st
  * bound the whole exchange, not just the gaps in it.
  */
 export const defaultDeps: AutoconfigDeps = {
-  async resolveAddresses(hostname) {
-    const entries = await dns.lookup(hostname, { all: true, verbatim: true });
-    return entries.map((entry) => entry.address);
-  },
+  resolveAddresses,
 
   httpsGet(url, addresses, timeoutMs) {
     return new Promise<HttpResponse>((resolve, reject) => {

@@ -24,6 +24,11 @@ import { createServer, type Server, type Socket } from "node:net";
 
 export interface FakeImapServer {
   readonly port: number;
+  /**
+   * Every command line any client sent, in order. What lets a test say a
+   * client never got as far as `LOGIN` (#220), not only that it failed.
+   */
+  readonly received: readonly string[];
   close(): Promise<void>;
 }
 
@@ -35,8 +40,12 @@ type LineHandler = (socket: Socket, line: string) => void;
  * line through `handleLine`. Resolves once it is listening; call `close()` to
  * stop it and drop any live sockets.
  */
-async function startFakeImapServer(handleLine: LineHandler): Promise<FakeImapServer> {
+async function startFakeImapServer(
+  handleLine: LineHandler,
+  capabilities = "IMAP4rev1"
+): Promise<FakeImapServer> {
   const sockets = new Set<Socket>();
+  const received: string[] = [];
 
   const server: Server = createServer((socket) => {
     sockets.add(socket);
@@ -44,7 +53,8 @@ async function startFakeImapServer(handleLine: LineHandler): Promise<FakeImapSer
     // A client that goes away mid-command must not take the process with it.
     socket.on("error", () => {});
 
-    socket.write("* OK [CAPABILITY IMAP4rev1] fake-imap ready\r\n");
+    // imapflow takes the greeting's capabilities and does not ask again.
+    socket.write(`* OK [CAPABILITY ${capabilities}] fake-imap ready\r\n`);
 
     let buffer = "";
     socket.on("data", (chunk) => {
@@ -53,6 +63,7 @@ async function startFakeImapServer(handleLine: LineHandler): Promise<FakeImapSer
       while ((index = buffer.indexOf("\r\n")) !== -1) {
         const line = buffer.slice(0, index);
         buffer = buffer.slice(index + 2);
+        received.push(line);
         handleLine(socket, line);
       }
     });
@@ -70,6 +81,7 @@ async function startFakeImapServer(handleLine: LineHandler): Promise<FakeImapSer
 
   return {
     port: address.port,
+    received,
     close: () =>
       new Promise<void>((resolve) => {
         for (const socket of sockets) socket.destroy();
@@ -101,6 +113,60 @@ export async function startRejectingImapServer(): Promise<FakeImapServer> {
  */
 export async function startMidLoginDropImapServer(): Promise<FakeImapServer> {
   return startFakeImapServer(handleMidLoginDropLine);
+}
+
+/**
+ * A server that accepts any `LOGIN`, once `loginGate` has settled, and answers
+ * `LIST` with no mailboxes. The gate holds a connect in flight for as long as a
+ * test needs: what `ImapClient.close()` does to a connect it overtakes is the
+ * case it exists for.
+ */
+export async function startAcceptingImapServer(
+  loginGate: Promise<void> = Promise.resolve()
+): Promise<FakeImapServer> {
+  return startFakeImapServer((socket, line) => {
+    const parsed = parseCommand(line);
+    if (!parsed) return;
+    switch (parsed.command) {
+      case "CAPABILITY":
+        writeCapability(socket, parsed.tag);
+        return;
+      case "LOGIN":
+        void loginGate.then(() => {
+          if (!socket.destroyed) socket.write(`${parsed.tag} OK LOGIN completed\r\n`);
+        });
+        return;
+      case "LIST":
+        socket.write(`${parsed.tag} OK LIST completed\r\n`);
+        return;
+      default:
+        handleRejectingLine(socket, line);
+    }
+  });
+}
+
+/**
+ * A server that advertises STARTTLS and then answers it `NO` (#220): an
+ * on-path attacker who leaves the capability in place and refuses the command
+ * instead. `LOGIN` is answered as the rejecting server does, so a client that
+ * carried on regardless shows up in `received`.
+ */
+export async function startStartTlsRefusingImapServer(): Promise<FakeImapServer> {
+  return startFakeImapServer((socket, line) => {
+    const parsed = parseCommand(line);
+    if (!parsed) return;
+    switch (parsed.command) {
+      case "CAPABILITY":
+        socket.write("* CAPABILITY IMAP4rev1 STARTTLS\r\n");
+        socket.write(`${parsed.tag} OK CAPABILITY completed\r\n`);
+        return;
+      case "STARTTLS":
+        socket.write(`${parsed.tag} NO STARTTLS not available\r\n`);
+        return;
+      default:
+        handleRejectingLine(socket, line);
+    }
+  }, "IMAP4rev1 STARTTLS");
 }
 
 /**

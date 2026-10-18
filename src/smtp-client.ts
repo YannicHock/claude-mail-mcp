@@ -7,6 +7,14 @@
 
 import nodemailer, { Transporter, SendMailOptions } from "nodemailer";
 
+import {
+  smtpTlsOptions,
+  localMailAddress,
+  startTlsError,
+  type LocalAddressCheck,
+  type MailTlsTestOptions,
+} from "./mail-tls.js";
+
 export interface SmtpAuth {
   host: string;
   port: number;
@@ -54,28 +62,45 @@ export interface SendResult {
 }
 
 export class SmtpClient {
-  private readonly transporter: Transporter;
+  private readonly auth: SmtpAuth;
   private readonly defaults: SmtpDefaults;
+  private readonly localAddress: LocalAddressCheck;
 
-  constructor(auth: SmtpAuth, defaults: SmtpDefaults) {
-    this.transporter = nodemailer.createTransport({
-      host: auth.host,
-      port: auth.port,
-      secure: auth.secure,
-      auth: { user: auth.user, pass: auth.pass },
-    });
+  constructor(auth: SmtpAuth, defaults: SmtpDefaults, options: MailTlsTestOptions = {}) {
+    this.auth = auth;
     this.defaults = defaults;
+    this.localAddress = options.localAddress ?? localMailAddress;
+  }
+
+  /**
+   * A transport per send: the plain (non-pooled) transport opens a connection
+   * per message anyway. Host and TLS by src/mail-tls.ts (#220).
+   */
+  private async transporter(): Promise<Transporter> {
+    const tls = await smtpTlsOptions(this.auth.host, this.auth.secure, this.localAddress);
+    return nodemailer.createTransport({
+      port: this.auth.port,
+      ...tls,
+      auth: { user: this.auth.user, pass: this.auth.pass },
+    });
   }
 
   async send(msg: OutgoingMessage): Promise<SendResult> {
     const mail = this.toMailOptions(msg);
-    const info = await this.transporter.sendMail(mail);
-    return {
-      messageId: info.messageId,
-      accepted: (info.accepted ?? []).map(String),
-      rejected: (info.rejected ?? []).map(String),
-      response: info.response,
-    };
+    const transporter = await this.transporter();
+    try {
+      const info = await transporter.sendMail(mail);
+      return {
+        messageId: info.messageId,
+        accepted: (info.accepted ?? []).map(String),
+        rejected: (info.rejected ?? []).map(String),
+        response: info.response,
+      };
+    } catch (err) {
+      throw startTlsError(err);
+    } finally {
+      transporter.close();
+    }
   }
 
   /**

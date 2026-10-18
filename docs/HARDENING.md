@@ -833,6 +833,44 @@ subscribe to advisories and run `npm audit`.
 **MITM between claude.ai and the deployment.** TLS with a valid certificate, HSTS,
 no HTTP fallback. Residual risk: very low.
 
+**MITM between the connector and a mail server (STARTTLS stripping).** An account
+with `"tls": false` uses STARTTLS, and before v0.7.5 only when the server offered
+it: an attacker on the path who removed `STARTTLS` from the server's capabilities
+was sent the password in cleartext. Since #220, `tls: false` *requires* STARTTLS
+(imapflow's `doSTARTTLS`, nodemailer's `requireTLS`), and a server that does not
+offer it is refused before `LOGIN` or `AUTH`, by the connection test and by both
+clients alike. Plaintext is still allowed to a host that is local, decided by
+`src/mail-tls.ts` in this order:
+
+1. An address literal is local when it is on an allow-list: loopback (127/8,
+   `::1`), RFC 1918, link-local (169.254/16, fe80::/10) and unique local
+   (fc00::/7), or the IPv4-mapped form of one. `0.0.0.0`, `::`, CGNAT, the
+   benchmarking range, reserved, broadcast and multicast are not.
+2. A name is local only when no public DNS name could have its shape: a single
+   label (`localhost`, a Docker service such as `protonmail-bridge`), or a name
+   under `.localhost`, `.local`, `.home.arpa` or `.internal`. Every other name
+   requires STARTTLS and is not looked up, so no DNS answer, forged or not, can let
+   `smtp.gmail.com` fall back to plaintext.
+3. Such a name must then resolve, and only to local addresses. A short name a
+   search domain turns into a public server therefore requires STARTTLS too.
+
+A name allowed plaintext by step 3 is then connected to at the address that was
+checked (IPv4 first), with the name kept for SNI and the certificate check, and is
+not resolved again: a resolver that answered the check with a private address and
+the connection with a public one would otherwise get a plaintext login to a public
+host.
+
+**Residual risk, plainly:** a name of step 2's shape is local only by its DNS
+answer. An attacker who can forge that answer — which is this threat's attacker,
+on the path — can point it at an address that passes and read the plaintext login;
+for a `.local` name, answered by multicast DNS, that is any peer on the LAN.
+Configure a bridge as an address literal (`127.0.0.1`, `172.18.0.4`) or a Docker
+service name, which Docker's own resolver answers inside the host, and anything on
+the internet by its dotted public name, which never falls back. An attacker on the
+private network itself can still read plaintext to a literal there, which is what
+plaintext on a private network always meant. A certificate the connector does not
+trust still fails the STARTTLS handshake, as before.
+
 **A compromised MCP client.** It holds an access token and can call every tool that
 token's scope allows, against every configured mailbox. Revoke it from
 `/settings/clients`; the access token dies with the session on the next request,

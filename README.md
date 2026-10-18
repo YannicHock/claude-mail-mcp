@@ -197,6 +197,10 @@ The connector speaks the **Streamable HTTP MCP transport**, gated by a single st
 | Gmail | `imap.gmail.com:993` | `smtp.gmail.com:465` | <https://myaccount.google.com/apppasswords> |
 | Mailcow / iRedMail / Postfix | your server | your server | n/a |
 
+### TLS off means STARTTLS
+
+**Use TLS** on (`"tls": true` in `accounts.json`) is implicit TLS, the usual 993 and 465. Off is STARTTLS on the same connection, the usual 143 and 587, and since v0.7.5 it is required: a server that does not offer STARTTLS is refused before the password is sent, and the connection test says so. The one exception is a server on this machine or a private network (a loopback or private address, or a short name such as a Docker service that resolves only to one), which may still be spoken to in plaintext, as a local bridge needs. Such a short name is local only by its DNS answer, which someone able to forge DNS can change, so give a bridge an IP address or a Docker service name, and a public server its full dotted name. [`docs/HARDENING.md`](docs/HARDENING.md#threat-scenarios) has the exact rule. (#220)
+
 ### CalDAV endpoints
 
 | Provider | URL |
